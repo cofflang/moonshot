@@ -27,6 +27,7 @@ hand.
 | `run_qemu.sh` | The main regression gate. Builds, boots headlessly, and asserts invariants on the serial log. |
 | `test_*.sh` | Nine test scripts that cover the keyboard, shell, panic, double fault, disk, REPL, and three scroll paths. |
 | `grub.cfg` | The GRUB menu entry. |
+| `moonshot.iso` | Pre-built bootable ISO. Included temporarily while the released coff lacks the `extern` keyword needed to build from source. |
 | `LICENSE` | GPL-3.0. |
 
 ## Building
@@ -41,7 +42,13 @@ You need Linux on x86_64, and these packages on Arch (`apt` names vary):
 
 The kernel is compiled by `coff1`, the self-hosted c0 compiler. That compiler
 lives in its own repository, and this one expects to find it at `../c0-coff/`
-next to the moonshot directory:
+next to the moonshot directory.
+
+**Important:** the latest release of coff on GitHub does not yet include the
+`extern` keyword that Moonshot needs to resolve linker symbols. Until coff's
+next release, you cannot build Moonshot from source using the released coff.
+A pre-built `moonshot.iso` is included in this repository so you can boot the
+OS right away.
 
 ```sh
 # 1. clone both repositories side by side
@@ -67,12 +74,30 @@ only need `./build.sh && ./sync_addrs.sh`.
 
 ## Running
 
+If you cannot build from source yet (see the note above about coff's
+`extern` keyword), boot the pre-built ISO directly:
+
+```sh
+# headless (serial console only)
+qemu-system-x86_64 -cdrom moonshot.iso -display none -no-reboot \
+  -serial file:serial.log -m 128 -drive file=disk.img,format=raw,if=ide,index=0,media=disk
+
+# interactive graphical window (needs qemu-ui-gtk on Arch)
+qemu-system-x86_64 -cdrom moonshot.iso -display gtk -m 128 \
+  -drive file=disk.img,format=raw,if=ide,index=0,media=disk
+```
+
+Create the disk image first if it does not exist:
+
+```sh
+dd if=/dev/zero of=disk.img bs=512 count=20480
+```
+
+Once you have a working coff with `extern`, the full build-and-test flow is:
+
 ```sh
 # headless boot with invariant checks (the main regression gate)
 ./run_qemu.sh
-
-# interactive graphical window (needs qemu-ui-gtk on Arch)
-# ./run_graphical.sh is in the dev repository but not in this release tree
 ```
 
 `run_qemu.sh` builds the kernel, creates a disk image if one does not exist,
@@ -82,9 +107,6 @@ banner, memory map, physical page allocator correctness, heap behaviour,
 page tables, demand paging, scheduler round-robin fairness, framebuffer
 pixel readback, windowing layer layout, ATA detection, filesystem load, and
 timer ticks. On any failure it dumps the full serial log and exits non-zero.
-
-For interactive use (a real QEMU window with keyboard input), the
-`run_graphical.sh` script in the dev repository boots with `-display gtk`.
 
 ## Testing
 
