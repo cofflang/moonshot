@@ -1,0 +1,428 @@
+// jenna.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// jenna.c0 -- memory management: the physical-page allocator (a bump
+// allocator with an intrusive LIFO free-list) and the 4-level page tables
+// c0 builds and switches to.
+
+// Paging. PRESENT_WRITE (0x3) is the present|writable flag pair every
+// entry carries; since page frames are 4096-aligned the low 12 bits are
+// pure flags. IDMAP_PAGES is a page *count*, not an address/flag, so it
+// stays decimal (4096 * 4096 bytes = 16MB the c0-built tables
+// identity-map -- ample for the kernel, its stack, every page-table
+// frame, jenna's arena, and GRUB's own low-memory structures).
+// SENTINEL_VIRT is a high virtual address deliberately ABOVE boot.s's 1GB
+// identity map, mapped a second time to a sentinel page as a liveness
+// proof (see paging_init) -- 4GB, hence 0x100000000. SENTINEL_VALUE stays
+// decimal: it's an arbitrary human-recognizable magic number for
+// eyeballing in the serial log, not a hardware-meaningful constant.
+int PRESENT_WRITE = 0x3;
+int IDMAP_PAGES = 4096;
+int SENTINEL_VIRT = 0x100000000;
+int SENTINEL_VALUE = 1234567890;
+int pml4_phys = 0;
+
+// Demand-paging test (see page_fault_handler/knekt.c0's kernel_post_init):
+// a virtual address deliberately left unmapped (5GB, hence 0x140000000 --
+// above the 16MB identity map and the 4GB paging sentinel, so touching it
+// is a guaranteed page fault), and the value the fault handler seeds the
+// freshly-mapped page with so the recovered read is verifiable.
+// FAULT_SENTINEL stays decimal for the same eyeballing reason as
+// SENTINEL_VALUE above.
+int FAULT_TEST_VIRT = 0x140000000;
+int FAULT_SENTINEL = 2020202020;
+
+int pmm_start = 0;
+int pmm_next = 0;
+int pmm_limit = 0;
+// Head of the intrusive free-list (0 = empty). Freed pages are linked
+// through their own first 8 bytes, so no separate bookkeeping array is
+// needed -- see pmm_free_page/pmm_alloc_page.
+int pmm_free_head = 0;
+
+// Tracks how many pages currently sit on the free list, for the on-screen
+// status bar. Incremented by pmm_free_page, decremented by the free-list pop
+// in pmm_alloc_page. Does NOT count pages that simply haven't been bumped
+// yet — those are "available" rather than "freed."
+int pmm_free_count = 0;
+
+// Walks the Multiboot memory map (a variable-length list of {size, addr,
+// len, type} entries, `size` NOT counting itself -- next entry is at
+// `entry + size + 4`) and picks the first available (type 1) region that
+// can actually hold something at-or-after kernel_end, as jenna's initial
+// physical-memory arena. Prints every region regardless of type/fit, so
+// the full map is visible over serial, not just whichever one got picked.
+//
+// addr/len are real 64-bit fields (unlike Multiboot's other u32 fields),
+// so this uses load64 directly -- no load32 reconstruction needed here.
+void pmm_init(int mb_info) {
+    int flags = load32(mb_info);
+    // bit 6 of flags: mmap_addr/mmap_length valid. Same isolate-one-bit
+    // arithmetic as the mem_lower/upper check in knekt.c0's main() (bit 0),
+    // just shifted: (flags/64) - (flags/128)*2 keeps only bit 6.
+    int has_mmap = (flags / 64) - (flags / 128) * 2;
+    if (has_mmap != 1) {
+        serial_print("No memory map from bootloader\n");
+        return;
+    }
+
+    int mmap_length = load32(mb_info + 44);
+    int mmap_addr = load32(mb_info + 48);
+    int entry = mmap_addr;
+    int end = mmap_addr + mmap_length;
+
+    serial_print("Memory map:\n");
+    while (entry < end) {
+        int size = load32(entry);
+        int base = load64(entry + 4);
+        int len = load64(entry + 12);
+        int type = load32(entry + 20);
+
+        serial_print("  base=");
+        serial_print_int(base);
+        serial_print(" len=");
+        serial_print_int(len);
+        serial_print(" type=");
+        serial_print_int(type);
+        serial_print("\n");
+
+        if (type == 1 && pmm_start == 0) {
+            int region_start = base;
+            if (region_start < _kernel_end) { region_start = _kernel_end; }
+            // Round up to a 4096-byte page boundary (same no-bitwise-ops
+            // idiom as everywhere else: only round up if not already
+            // aligned, using the remainder from integer division).
+            int rem = region_start - (region_start / 4096) * 4096;
+            int aligned = region_start;
+            if (rem != 0) { aligned = region_start + (4096 - rem); }
+            if (aligned + 4096 <= base + len) {
+                pmm_start = aligned;
+                pmm_next = aligned;
+                pmm_limit = base + len;
+            }
+        }
+
+        entry = entry + size + 4;
+    }
+
+    serial_print("Allocator range: ");
+    serial_print_int(pmm_start);
+    serial_print(" .. ");
+    serial_print_int(pmm_limit);
+    serial_print("\n");
+    return;
+}
+
+// Returns a 4096-byte physical page to the allocator by pushing it onto an
+// intrusive free-list: the page is free, so its own first 8 bytes are ours
+// to reuse as the link to the previous free-list head -- no separate
+// bookkeeping array or bitmap needed. LIFO, so the most recently freed page
+// is the next one handed back out (pmm_alloc_page pops from this same head).
+void pmm_free_page(int addr) {
+    store64(addr, pmm_free_head);
+    pmm_free_head = addr;
+    pmm_free_count = pmm_free_count + 1;
+    return;
+}
+
+// Allocates one 4096-byte physical page. Checks the free-list first --
+// popping the most recently freed page, whose stored link becomes the new
+// head -- and only bumps the watermark upward through the region when the
+// free-list is empty. This is what makes jenna a real allocator rather than
+// a pure bump arena: freed pages actually get reused. Returns 0 on true
+// exhaustion (free-list empty AND the watermark has reached the region
+// limit); a richer out-of-memory story (spanning multiple regions, eviction)
+// is a later problem.
+int pmm_alloc_page() {
+    int p = pmm_free_head;
+    if (p != 0) {
+        pmm_free_head = load64(p);
+        pmm_free_count = pmm_free_count - 1;
+        return p;
+    }
+    if (pmm_next + 4096 > pmm_limit) {
+        serial_print("pmm: out of memory\n");
+        return 0;
+    }
+    p = pmm_next;
+    pmm_next = pmm_next + 4096;
+    return p;
+}
+
+// Returns the count of pages currently on the intrusive free list -- the
+// pages that have been freed and can be reallocated. Does not include pages
+// that simply haven't been bumped past pmm_next yet (those are "available"
+// rather than "freed"). Used by the on-screen status bar.
+int pmm_free_pages() {
+    return pmm_free_count;
+}
+
+// Returns the total number of 4096-byte pages in the arena [pmm_start,
+// pmm_limit). This is a compile-time constant for any given boot, since
+// pmm_init carves one fixed region from the Multiboot memory map.
+int pmm_total_pages() {
+    return (pmm_limit - pmm_start) / 4096;
+}
+
+// Fresh PMM pages hold arbitrary bytes -- jenna hands out raw physical RAM,
+// unlike the userspace alloc() builtin which relied on the kernel zeroing
+// brk pages -- so every page used as a page table MUST be zeroed first, or
+// its garbage entries would be read as present mappings to nonsense frames.
+// Writes 512 zero quads (one 4096-byte page).
+void zero_page(int addr) {
+    int i = 0;
+    while (i < 512) {
+        store64(addr + i * 8, 0);
+        i = i + 1;
+    }
+    return;
+}
+
+// --- Kernel heap: kmalloc / kfree -------------------------------------
+// The first thing in Moonshot that hands out sub-page, variable-size memory
+// -- pmm_alloc_page only ever gives whole 4096-byte pages, which is too
+// coarse the moment anything wants many small, differently-sized pieces
+// (shell line/argument buffers now; a filesystem's nodes later). A plain
+// first-fit allocator over one contiguous arena carved from jenna.
+//
+// Layout: the arena is a packed sequence of blocks, each an implicit-list
+// node with a 16-byte header -- [block+0] = payload size in bytes,
+// [block+8] = free flag (1 free / 0 used) -- immediately followed by its
+// payload. The NEXT block always sits at (block + 16 + size), so no explicit
+// next-pointer is stored: the list is walked by address. That address-order
+// walk is also what lets kfree coalesce neighbours (a separate free-list
+// would throw away the adjacency information). Payloads stay 8-aligned
+// because heap_start is page-aligned, the header is 16 bytes, and every
+// requested size is rounded up to a multiple of 8.
+int HEAP_HDR = 16;
+int heap_start = 0;
+int heap_end = 0;
+
+// Carves `num_pages` contiguous pages out of jenna and lays the whole arena
+// down as a single big free block. MUST be called early, while pmm's
+// free-list is still empty, so pmm_alloc_page takes its bump path and
+// returns physically-contiguous pages -- the implicit list requires one
+// unbroken address range. Contiguity is asserted, not assumed: a loud
+// serial warning fires if it ever stops holding.
+void heap_init(int num_pages) {
+    int first = pmm_alloc_page();
+    heap_start = first;
+    int expect = first + 4096;
+    int i = 1;
+    while (i < num_pages) {
+        int pg = pmm_alloc_page();
+        if (pg != expect) {
+            serial_print("heap_init: NON-CONTIGUOUS pmm page, heap broken\n");
+        }
+        expect = expect + 4096;
+        i = i + 1;
+    }
+    heap_end = first + num_pages * 4096;
+    store64(heap_start, heap_end - heap_start - HEAP_HDR); // one big block...
+    store64(heap_start + 8, 1);                            // ...marked free
+    return;
+}
+
+// Allocates `n` usable bytes (rounded up to 8), first-fit across the arena.
+// When the chosen block is big enough to ALSO hold another header plus a
+// minimal 8-byte payload, it splits, leaving the remainder as a smaller
+// free block so the slack stays reusable instead of being lost to internal
+// fragmentation. Returns the payload address, or 0 if nothing fits -- this
+// is a fixed arena; growing it with more (necessarily non-contiguous) pmm
+// pages is a later problem.
+int kmalloc(int n) {
+    if (n <= 0) { return 0; }
+    n = ((n + 7) / 8) * 8;
+    int b = heap_start;
+    while (b < heap_end) {
+        int size = load64(b);
+        int free = load64(b + 8);
+        if (free == 1 && size >= n) {
+            if (size >= n + HEAP_HDR + 8) {
+                int rem = b + HEAP_HDR + n;
+                store64(rem, size - n - HEAP_HDR);
+                store64(rem + 8, 1);
+                store64(b, n);
+            }
+            store64(b + 8, 0);
+            return b + HEAP_HDR;
+        }
+        b = b + HEAP_HDR + size;
+    }
+    return 0;
+}
+
+// Merges every run of adjacent free blocks into one, walking the arena once
+// in address order. Called after each kfree so freed neighbours recombine
+// into blocks big enough for later, larger requests -- without it, repeated
+// split/free would ratchet the heap into ever-smaller unusable fragments.
+// Absorbing a block deliberately does NOT advance the cursor, so a whole run
+// of adjacent free blocks collapses in this single pass.
+void heap_coalesce() {
+    int b = heap_start;
+    while (b < heap_end) {
+        int size = load64(b);
+        int free = load64(b + 8);
+        int nxt = b + HEAP_HDR + size;
+        if (free == 1 && nxt < heap_end && load64(nxt + 8) == 1) {
+            store64(b, size + HEAP_HDR + load64(nxt));
+        } else {
+            b = nxt;
+        }
+    }
+    return;
+}
+
+// Frees a block returned by kmalloc -- its header is the 16 bytes just below
+// the payload -- then coalesces. A null pointer is a safe no-op, same as
+// free(NULL) in C.
+void kfree(int ptr) {
+    if (ptr == 0) { return; }
+    store64(ptr - HEAP_HDR + 8, 1);
+    heap_coalesce();
+    return;
+}
+
+// Returns the physical address of the next-level table reached through
+// table[index], creating and zeroing a fresh one (allocated from jenna) if
+// that slot isn't present yet. Entries are phys_addr + PRESENT_WRITE; since
+// phys is 4096-aligned the low bits are pure flags, so (e / 4096) * 4096
+// recovers the address and (e - (e / 2) * 2) isolates the present bit --
+// same no-bitwise-ops arithmetic as the rest of this file.
+int next_table(int table, int index) {
+    int e = load64(table + index * 8);
+    int present = e - (e / 2) * 2;
+    if (present == 1) {
+        return (e / 4096) * 4096;
+    }
+    int frame = pmm_alloc_page();
+    zero_page(frame);
+    store64(table + index * 8, frame + PRESENT_WRITE);
+    return frame;
+}
+
+// Maps one 4096-byte virtual page `virt` to physical page `phys` in the
+// 4-level hierarchy rooted at `pml4` (a physical address), creating any
+// missing PDPT/PD/PT tables along the way. Index extraction is pure
+// arithmetic (no shifts/masks): the linear page number split into five
+// 9-bit (0..511) fields by repeated divide-and-remainder, the same idiom
+// serial_print_int uses for decimal digits.
+void map_page(int pml4, int virt, int phys) {
+    int page = virt / 4096;
+    int pt_i = page - (page / 512) * 512;
+    int pd_n = page / 512;
+    int pd_i = pd_n - (pd_n / 512) * 512;
+    int pdpt_n = pd_n / 512;
+    int pdpt_i = pdpt_n - (pdpt_n / 512) * 512;
+    int pml4_i = pdpt_n / 512;
+
+    int pdpt = next_table(pml4, pml4_i);
+    int pd = next_table(pdpt, pdpt_i);
+    int pt = next_table(pd, pd_i);
+    store64(pt + pt_i * 8, phys + PRESENT_WRITE);
+    return;
+}
+
+// Builds a fresh 4-level page table (4KB granularity) entirely from
+// jenna-allocated frames. Identity-maps the low physical memory the kernel
+// actually runs on (its code/data/stack, every fixed hand-off slot, all the
+// page-table frames allocated right here, and jenna's arena -- all well
+// under 16MB), deliberately re-creating at 4KB granularity what boot.s set
+// up statically with 2MB pages. The point isn't a different map, it's that
+// from here on the kernel runs on tables IT built dynamically from
+// allocated frames -- the foundation every later VM feature (higher-half
+// kernel, per-process spaces, on-demand mapping) needs.
+void paging_init() {
+    pml4_phys = pmm_alloc_page();
+    zero_page(pml4_phys);
+
+    int i = 0;
+    while (i < IDMAP_PAGES) {
+        int p = i * 4096;
+        map_page(pml4_phys, p, p);
+        i = i + 1;
+    }
+
+    // Liveness proof: stash a sentinel in a fresh physical page, then map
+    // that page a SECOND time at a high virtual address boot.s's 1GB
+    // identity map doesn't cover. If paging_verify() (run by boot.s right
+    // after it switches CR3) can read the sentinel back through
+    // SENTINEL_VIRT, the CPU is provably using THESE tables -- a read
+    // through 4GB would fault on boot.s's map.
+    int sentinel_phys = pmm_alloc_page();
+    store64(sentinel_phys, SENTINEL_VALUE);
+    map_page(pml4_phys, SENTINEL_VIRT, sentinel_phys);
+
+    // Hand the new PML4's physical address to boot.s, which does the actual
+    // `mov cr3` (c0 can't execute it) -- same fixed-slot technique as the
+    // IDTR. See linker.ld's .cr3info.
+    store64(CR3INFO_ADDR, pml4_phys);
+
+    serial_print("Paging: built c0 page tables, PML4 at ");
+    serial_print_int(pml4_phys);
+    serial_print("\n");
+    return;
+}
+
+// Called from boot.s immediately after it loads CR3 with the c0-built PML4.
+// Reads the sentinel back through the high virtual address that only exists
+// in these tables: returning without faulting AND matching the value proves
+// the switch to c0-built paging is live. boot.s runs this before enabling
+// interrupts, so nothing else is competing for the serial port.
+void paging_verify() {
+    int v = load64(SENTINEL_VIRT);
+    if (v == SENTINEL_VALUE) {
+        serial_print("Paging: live on c0 tables (sentinel via 4GB OK)\n");
+    } else {
+        serial_print("Paging: sentinel mismatch\n");
+    }
+    return;
+}
+
+// Installed at IDT vector 14 (see knekt.c0's main) and reached through the
+// shared ISR trampoline + dispatch table like any other handler. This is a
+// RECOVERING handler, not a panic: it demand-maps the faulting page and
+// returns, so the instruction that faulted re-executes and succeeds. `cr2`
+// is the faulting linear address (read off CR2 by boot.s's isr_common and
+// handed in); `errcode` is the CPU's page-fault error code. The page is
+// aligned down to a 4KB boundary, backed by a fresh zeroed frame from
+// jenna, seeded with FAULT_SENTINEL so the recovered read is independently
+// verifiable, and mapped into the live c0 page tables (pml4_phys). No
+// explicit TLB flush is needed: x86 never caches a non-present translation,
+// so the re-walk after iretq sees the new entry. A real kernel would
+// consult a VMA list to decide map-vs-kill here; this always-map path
+// proves the fault path and recovery mechanics that any real demand-paging
+// policy would build on.
+void page_fault_handler(int vector, int errcode, int cr2) {
+    serial_print("page fault: addr=");
+    serial_print_int(cr2);
+    serial_print(" errcode=");
+    serial_print_int(errcode);
+    serial_print("\n");
+    int page_base = (cr2 / 4096) * 4096;
+
+    // Check errcode bit 0: if the page was NOT present, this is a genuine
+    // demand-paging request — allocate a frame and map it. If the page WAS
+    // present, the fault is a permission violation. Do NOT allocate on a
+    // present page — overwriting it with a fresh zeroed frame would destroy
+    // whatever was there (e.g., JIT-compiled code).
+    int bit0 = errcode - (errcode / 2) * 2;
+    if (bit0 == 0) {
+        int frame = pmm_alloc_page();
+        zero_page(frame);
+        store64(frame, FAULT_SENTINEL);
+        map_page(pml4_phys, page_base, frame);
+        return;
+    }
+
+    // Page IS present — permission fault. Halt (don't return — returning
+    // would re-execute the faulting instruction and loop forever).
+    serial_print("page fault: present page, halting\n");
+    while (1) { halt(); }
+    return;
+}

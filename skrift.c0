@@ -1,0 +1,1989 @@
+// skrift.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// skrift.c0 — text editor for Moonshot, running in a kakel window.
+// Named "skrift" (Swedish for "writing/script"), chosen by the user.
+// Architecture: runs directly in the keyboard IRQ handler (like skalman v1),
+// not as a separate scheduled task. Buffer ops are fast; file I/O only at
+// launch (shell task context) and quit (IRQ context — jakel_write for a small
+// buffer is one kmalloc + memcpy).
+
+// --- constants ---------------------------------------------------------------
+int SKRIFT_BUF_MAX   = 8192;
+int SKRIFT_MODE_INSERT  = 0;
+int SKRIFT_MODE_COMMAND = 1;
+int SKRIFT_TAB_WIDTH    = 4;
+
+// --- state -------------------------------------------------------------------
+int skrift_active       = 0;
+int skrift_win          = 0;
+int skrift_buf          = 0;   // kmalloc'd flat char array (SKRIFT_BUF_MAX)
+int skrift_size         = 0;   // bytes currently in the buffer
+int skrift_cursor       = 0;   // byte offset where the next insert goes
+int skrift_mode         = 0;   // SKRIFT_MODE_INSERT (default) or COMMAND
+int skrift_modified     = 0;
+int skrift_filename     = 0;   // kmalloc'd NUL-terminated name
+int skrift_filename_len = 0;
+int skrift_scroll_row   = 0;   // first visible buffer line (0-indexed)
+int skrift_col_hint     = 0;   // remembered column for up/down
+int skrift_cmd_pending  = 0;   // command-mode prefix: 'd' for dd, 'g' for gg
+int skrift_cmd_count    = 0;   // digit prefix for N+G goto-line
+int skrift_yank_buf     = 0;   // kmalloc'd yank buffer (freed on next yank)
+int skrift_yank_len     = 0;   // length of yanked text
+int skrift_search_mode  = 0;   // 1 = entering search term
+int skrift_search_buf   = 0;   // kmalloc'd search buffer (128 bytes)
+int skrift_search_len   = 0;   // current search-term length
+int skrift_last_search  = 0;   // kmalloc'd copy of last executed search
+int skrift_last_search_len = 0;// length of last search term
+int skrift_sel_anchor    = -1;  // byte offset of selection anchor, -1 = none
+int skrift_undo_buf      = 0;   // kmalloc'd undo buffer (SKRIFT_BUF_MAX)
+int skrift_undo_size     = 0;   // buffer size in saved undo state
+int skrift_undo_cursor   = 0;   // cursor position in saved undo state
+
+// --- navigation helpers ------------------------------------------------------
+
+// Returns the byte offset of the start of the line containing `cursor`.
+// Scans backward from `cursor` for the preceding '\n' (or buffer start).
+int skrift_line_start(int cursor) {
+    int p = cursor;
+    while (p > 0 && load8(skrift_buf + p - 1) != '\n') {
+        p = p - 1;
+    }
+    return p;
+}
+
+// Returns the byte offset just past the last char of the line containing
+// `cursor` — i.e. the offset of the '\n' that ends this line, or buffer end.
+int skrift_line_end(int cursor) {
+    int p = cursor;
+    while (p < skrift_size && load8(skrift_buf + p) != '\n') {
+        p = p + 1;
+    }
+    return p;
+}
+
+// Column (0-indexed) of `cursor` within its line.
+int skrift_line_col(int cursor) {
+    return cursor - skrift_line_start(cursor);
+}
+
+// Count how many '\n' appear before `offset` — the line number (0-indexed).
+int skrift_line_number(int offset) {
+    int n = 0;
+    int p = 0;
+    while (p < offset && p < skrift_size) {
+        if (load8(skrift_buf + p) == '\n') { n = n + 1; }
+        p = p + 1;
+    }
+    return n;
+}
+
+// Move `cursor` forward or backward by `delta` lines, trying to preserve the
+// column stored in skrift_col_hint. Returns the new byte offset.
+int skrift_advance_line(int cursor, int delta) {
+    if (delta == 0) { return cursor; }
+    int target_col = skrift_col_hint;
+    if (delta < 0) {
+        // Move up: go to start of current line, then back past the previous '\n'.
+        int p = skrift_line_start(cursor);
+        if (p == 0) { return 0; }  // already on first line
+        p = p - 1;  // step back past the '\n' before this line
+        p = skrift_line_start(p);  // now at start of previous line
+        // Recurse for multi-line jump (rare — delta is usually -1).
+        int i = delta + 1;
+        while (i < 0 && p > 0) {
+            p = skrift_line_start(p - 1);
+            i = i + 1;
+        }
+        // Advance within this line to target_col.
+        int end = skrift_line_end(p);
+        int col = 0;
+        while (p < end && col < target_col) {
+            p = p + 1;
+            col = col + 1;
+        }
+        return p;
+    }
+    // Move down: go to end of current line, step past '\n', repeat.
+    int p = skrift_line_end(cursor);
+    int i = 0;
+    while (i < delta && p < skrift_size) {
+        if (load8(skrift_buf + p) == '\n') { p = p + 1; }
+        i = i + 1;
+        if (i < delta) {
+            // Skip to end of this next line.
+            p = skrift_line_end(p);
+        }
+    }
+    // p is now at the start of the target line. Advance to target_col.
+    int end = skrift_line_end(p);
+    int col = 0;
+    while (p < end && col < target_col) {
+        p = p + 1;
+        col = col + 1;
+    }
+    return p;
+}
+
+// Compare `len` bytes starting at `a` and `b`. Returns 1 if equal, 0
+// otherwise. Used for substring search matching.
+int skrift_bytes_eq(int a, int b, int len) {
+    int i = 0;
+    while (i < len) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Forward search: move cursor to the start of the first occurrence of the
+// last-saved search term after the current cursor position. Wraps around
+// to the beginning of the buffer if not found before the end.
+void skrift_search_forward() {
+    if (skrift_last_search == 0 || skrift_last_search_len == 0) { return; }
+    int pos = skrift_cursor + 1;
+    while (pos <= skrift_size - skrift_last_search_len) {
+        if (skrift_bytes_eq(skrift_last_search,
+                            skrift_buf + pos, skrift_last_search_len) == 1) {
+            skrift_cursor = pos;
+            return;
+        }
+        pos = pos + 1;
+    }
+    // Wrap: search from start.
+    pos = 0;
+    while (pos <= skrift_cursor) {
+        if (skrift_bytes_eq(skrift_last_search,
+                            skrift_buf + pos, skrift_last_search_len) == 1) {
+            skrift_cursor = pos;
+            return;
+        }
+        pos = pos + 1;
+    }
+    return;
+}
+
+// Backward search: move cursor to the start of the last occurrence before
+// the current cursor position.
+void skrift_search_backward() {
+    if (skrift_last_search == 0 || skrift_last_search_len == 0) { return; }
+    int pos = skrift_cursor - 1;
+    while (pos >= 0) {
+        if (skrift_bytes_eq(skrift_last_search,
+                            skrift_buf + pos, skrift_last_search_len) == 1) {
+            skrift_cursor = pos;
+            return;
+        }
+        pos = pos - 1;
+    }
+    return;
+}
+
+// Return the byte offset of the start of the next word after `cursor`.
+// A word is contiguous non-space non-newline characters.
+int skrift_next_word_start(int cursor) {
+    int p = cursor;
+    // Skip the current word (if on one).
+    while (p < skrift_size && load8(skrift_buf + p) != ' '
+           && load8(skrift_buf + p) != '\n') {
+        p = p + 1;
+    }
+    // Skip spaces and newlines.
+    while (p < skrift_size && (load8(skrift_buf + p) == ' '
+           || load8(skrift_buf + p) == '\n')) {
+        p = p + 1;
+    }
+    return p;
+}
+
+// Return the byte offset of the start of the previous word before `cursor`.
+int skrift_prev_word_start(int cursor) {
+    if (cursor <= 0) { return 0; }
+    int p = cursor - 1;
+    // Skip spaces and newlines going left.
+    while (p > 0 && (load8(skrift_buf + p) == ' '
+           || load8(skrift_buf + p) == '\n')) {
+        p = p - 1;
+    }
+    // Skip non-spaces going left (the word).
+    while (p > 0 && load8(skrift_buf + p) != ' '
+           && load8(skrift_buf + p) != '\n') {
+        p = p - 1;
+    }
+    // If we're at a space or newline (from the outer loop), step forward.
+    // Also handle p=0 which might be a word char.
+    if (load8(skrift_buf + p) == ' ' || load8(skrift_buf + p) == '\n') {
+        p = p + 1;
+    }
+    return p;
+}
+
+// --- undo --------------------------------------------------------------------
+
+// Save current buffer state for undo. Called before the first modification
+// after an undo (or on first edit). Only saves once — subsequent modifications
+// before the next undo reuse the same saved state.
+void skrift_save_undo() {
+    if (skrift_undo_size > 0) { return; }  // already saved
+    if (skrift_undo_buf == 0) { return; }
+    int i = 0;
+    while (i < skrift_size && i < SKRIFT_BUF_MAX) {
+        store8(skrift_undo_buf + i, load8(skrift_buf + i));
+        i = i + 1;
+    }
+    skrift_undo_size = skrift_size;
+    skrift_undo_cursor = skrift_cursor;
+    return;
+}
+
+// Restore buffer from undo state. Called by the 'u' command.
+void skrift_undo() {
+    if (skrift_undo_size == 0) { return; }
+    if (skrift_undo_buf == 0) { return; }
+    // Swap: copy current → undo_buf (for redo), restore undo_buf → current.
+    // For single-level undo, just restore and invalidate.
+    int i = 0;
+    while (i < skrift_undo_size && i < SKRIFT_BUF_MAX) {
+        store8(skrift_buf + i, load8(skrift_undo_buf + i));
+        i = i + 1;
+    }
+    skrift_size = skrift_undo_size;
+    skrift_cursor = skrift_undo_cursor;
+    skrift_sel_anchor = -1;
+    skrift_undo_size = 0;  // invalidate — next modification will re-save
+    skrift_modified = 1;
+    return;
+}
+
+// --- editing operations ------------------------------------------------------
+
+// Shift bytes right by 1 starting at `pos`, growing the buffer.
+// Returns 1 on success, 0 if the buffer is full.
+int skrift_shift_right(int pos) {
+    if (skrift_size >= SKRIFT_BUF_MAX - 1) { return 0; }
+    int p = skrift_size;
+    while (p > pos) {
+        store8(skrift_buf + p, load8(skrift_buf + p - 1));
+        p = p - 1;
+    }
+    skrift_size = skrift_size + 1;
+    return 1;
+}
+
+// Shift bytes left by 1 starting at `pos`, shrinking the buffer.
+void skrift_shift_left(int pos) {
+    if (skrift_size == 0 || pos >= skrift_size) { return; }
+    int p = pos;
+    while (p < skrift_size - 1) {
+        store8(skrift_buf + p, load8(skrift_buf + p + 1));
+        p = p + 1;
+    }
+    skrift_size = skrift_size - 1;
+    return;
+}
+
+// Insert a single character at the cursor and advance.
+void skrift_insert(int ch) {
+    skrift_save_undo();
+    if (skrift_shift_right(skrift_cursor) == 1) {
+        store8(skrift_buf + skrift_cursor, ch);
+        skrift_cursor = skrift_cursor + 1;
+        skrift_modified = 1;
+    }
+    return;
+}
+
+// Delete the character BEFORE the cursor (Backspace).
+void skrift_delete_backward() {
+    skrift_save_undo();
+    if (skrift_cursor > 0) {
+        skrift_cursor = skrift_cursor - 1;
+        skrift_shift_left(skrift_cursor);
+        skrift_modified = 1;
+    }
+    return;
+}
+
+// Delete the character AT the cursor (Delete / command-mode 'x').
+void skrift_delete_forward() {
+    skrift_save_undo();
+    if (skrift_cursor < skrift_size) {
+        skrift_shift_left(skrift_cursor);
+        skrift_modified = 1;
+    }
+    return;
+}
+
+// Insert a newline at the cursor.
+void skrift_insert_newline() {
+    skrift_insert('\n');
+    return;
+}
+
+// Insert spaces to reach the next tab stop.
+void skrift_insert_tab() {
+    int col = skrift_line_col(skrift_cursor);
+    int target = SKRIFT_TAB_WIDTH;
+    // target = ((col / SKRIFT_TAB_WIDTH) + 1) * SKRIFT_TAB_WIDTH
+    // In c0 with no bitwise ops: col / tab * tab is the current stop.
+    int cur_stop = (col / SKRIFT_TAB_WIDTH) * SKRIFT_TAB_WIDTH;
+    target = cur_stop + SKRIFT_TAB_WIDTH;
+    while (col < target) {
+        skrift_insert(' ');
+        col = col + 1;
+    }
+    return;
+}
+
+// Delete the entire current line. If there is a trailing '\n' after the
+// line content, consume it too so the next line slides up.
+void skrift_delete_current_line() {
+    skrift_save_undo();
+    if (skrift_size == 0) { return; }
+    int ls = skrift_line_start(skrift_cursor);
+    int le = skrift_line_end(skrift_cursor);
+    int count = le - ls;
+    if (le < skrift_size && load8(skrift_buf + le) == '\n') {
+        count = count + 1;
+    }
+    int i = 0;
+    while (i < count) {
+        skrift_shift_left(ls);
+        i = i + 1;
+    }
+    if (ls > skrift_size) { ls = skrift_size; }
+    skrift_cursor = ls;
+    skrift_modified = 1;
+    return;
+}
+
+// --- selection helpers -------------------------------------------------------
+
+// Delete the current selection (if any) and clear the anchor. Returns 1 if
+// bytes were deleted, 0 if there was no non-empty selection.
+int skrift_delete_selection() {
+    skrift_save_undo();
+    if (skrift_sel_anchor < 0) { return 0; }
+    if (skrift_sel_anchor == skrift_cursor) { skrift_sel_anchor = -1; return 0; }
+    int ss = skrift_sel_anchor;
+    int se = skrift_cursor;
+    if (ss > se) { ss = ss + se; se = ss - se; ss = ss - se; }
+    int count = se - ss;
+    int i = 0;
+    while (i < count) {
+        skrift_shift_left(ss);
+        i = i + 1;
+    }
+    skrift_cursor = ss;
+    skrift_sel_anchor = -1;
+    skrift_modified = 1;
+    return 1;
+}
+
+// --- rendering (incremental) ------------------------------------------------
+// Instead of a full redraw on every keystroke, only the changed region is
+// updated. fb_draw_char is called directly — no kakel_putc overhead, no
+// cursor-erase/redraw per character. The editor cursor is an inverted-colour
+// cell drawn via fb_draw_char with swapped fg/bg.
+
+// Draw one character at a cell position within the editor window.
+// (row, col) are relative to the window's origin, not absolute screen coords.
+void skrift_draw_cell(int row, int col, int ch, int fg, int bg) {
+    int win = skrift_win;
+    int cx = load64(kakel_cx_base + win * 8);
+    int cy = load64(kakel_cy_base + win * 8);
+    fb_draw_char((cx + col) * FONT_W, (cy + row) * FONT_H, ch, fg, bg);
+    return;
+}
+
+// Erase the editor cursor — redraw the cell at the cursor position with
+// normal colours (FG on BG).
+void skrift_erase_cursor() {
+    int win = skrift_win;
+    int win_rows = load64(kakel_rows_base + win * 8);
+    int win_cols = load64(kakel_cols_base + win * 8);
+    int content_rows = win_rows - 1;
+    int bg = load64(kakel_bg_base + win * 8);
+    int cur_line = skrift_line_number(skrift_cursor);
+    int win_row = cur_line - skrift_scroll_row;
+    int win_col = skrift_line_col(skrift_cursor);
+    if (win_row < 0 || win_row >= content_rows) { return; }
+    if (win_col < 0 || win_col >= win_cols)           { return; }
+    int ch = ' ';
+    if (skrift_cursor < skrift_size) {
+        ch = load8(skrift_buf + skrift_cursor);
+        if (ch < 32 || ch > 126) { ch = ' '; }
+    }
+    skrift_draw_cell(win_row, win_col, ch, FB_FG, bg);
+    return;
+}
+
+// Draw the cursor as an inverted-colour cell (bg-on-fg instead of fg-on-bg).
+void skrift_show_cursor() {
+    int win = skrift_win;
+    int win_rows = load64(kakel_rows_base + win * 8);
+    int win_cols = load64(kakel_cols_base + win * 8);
+    int content_rows = win_rows - 1;
+    int bg = load64(kakel_bg_base + win * 8);
+    int cur_line = skrift_line_number(skrift_cursor);
+    int win_row = cur_line - skrift_scroll_row;
+    int win_col = skrift_line_col(skrift_cursor);
+    if (win_row < 0 || win_row >= content_rows) { return; }
+    if (win_col < 0 || win_col >= win_cols)           { return; }
+    int ch = ' ';
+    if (skrift_cursor < skrift_size) {
+        ch = load8(skrift_buf + skrift_cursor);
+        if (ch < 32 || ch > 126) { ch = ' '; }
+    }
+    skrift_draw_cell(win_row, win_col, ch, bg, FB_FG);
+    return;
+}
+
+// Highlight colour for c0 keywords — warm amber.
+int SKRIFT_HL = 0;  // set in skrift_start to fb_rgb(255, 180, 60)
+
+// Returns 1 if the `len`-byte substring at `start` in the editor buffer is a
+// c0 keyword, 0 otherwise. Used for syntax highlighting.
+int skrift_is_keyword(int start, int len) {
+    if (len < 2 || len > 8) { return 0; }
+    // "if"
+    if (len == 2
+        && load8(start) == 'i' && load8(start + 1) == 'f') { return 1; }
+    // "for"
+    if (len == 3
+        && load8(start) == 'f' && load8(start + 1) == 'o'
+        && load8(start + 2) == 'r') { return 1; }
+    // "int"
+    if (len == 3
+        && load8(start) == 'i' && load8(start + 1) == 'n'
+        && load8(start + 2) == 't') { return 1; }
+    // "else"
+    if (len == 4
+        && load8(start) == 'e' && load8(start + 1) == 'l'
+        && load8(start + 2) == 's' && load8(start + 3) == 'e') { return 1; }
+    // "void"
+    if (len == 4
+        && load8(start) == 'v' && load8(start + 1) == 'o'
+        && load8(start + 2) == 'i' && load8(start + 3) == 'd') { return 1; }
+    // "while"
+    if (len == 5
+        && load8(start) == 'w' && load8(start + 1) == 'h'
+        && load8(start + 2) == 'i' && load8(start + 3) == 'l'
+        && load8(start + 4) == 'e') { return 1; }
+    // "break"
+    if (len == 5
+        && load8(start) == 'b' && load8(start + 1) == 'r'
+        && load8(start + 2) == 'e' && load8(start + 3) == 'a'
+        && load8(start + 4) == 'k') { return 1; }
+    // "print"
+    if (len == 5
+        && load8(start) == 'p' && load8(start + 1) == 'r'
+        && load8(start + 2) == 'i' && load8(start + 3) == 'n'
+        && load8(start + 4) == 't') { return 1; }
+    // "return"
+    if (len == 6
+        && load8(start) == 'r' && load8(start + 1) == 'e'
+        && load8(start + 2) == 't' && load8(start + 3) == 'u'
+        && load8(start + 4) == 'r' && load8(start + 5) == 'n') { return 1; }
+    // "include"
+    if (len == 7
+        && load8(start) == 'i' && load8(start + 1) == 'n'
+        && load8(start + 2) == 'c' && load8(start + 3) == 'l'
+        && load8(start + 4) == 'u' && load8(start + 5) == 'd'
+        && load8(start + 6) == 'e') { return 1; }
+    // "continue"
+    if (len == 8
+        && load8(start) == 'c' && load8(start + 1) == 'o'
+        && load8(start + 2) == 'n' && load8(start + 3) == 't'
+        && load8(start + 4) == 'i' && load8(start + 5) == 'n'
+        && load8(start + 6) == 'u' && load8(start + 7) == 'e') { return 1; }
+    return 0;
+}
+
+// Redraw one buffer line at window row `win_row`. `line_start` is the byte
+// offset of the line's first character in the buffer. Characters past the
+// window width are clipped; the rest of the row is filled with bg.
+void skrift_draw_line(int win_row, int line_start) {
+    int win = skrift_win;
+    int win_cols = load64(kakel_cols_base + win * 8);
+    int bg = load64(kakel_bg_base + win * 8);
+    int pos = line_start;
+    int col = 0;
+    while (col < win_cols && pos < skrift_size
+           && load8(skrift_buf + pos) != '\n') {
+        int ch = load8(skrift_buf + pos);
+        // Word boundary — check for c0 keywords.
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+            || ch == '_') {
+            int wstart = pos;
+            int wlen = 0;
+            while (pos < skrift_size && pos < wstart + 16) {
+                int wch = load8(skrift_buf + pos);
+                if ((wch >= 'a' && wch <= 'z')
+                    || (wch >= 'A' && wch <= 'Z')
+                    || wch == '_' || (wch >= '0' && wch <= '9')) {
+                    wlen = wlen + 1;
+                    pos = pos + 1;
+                } else { break; }
+            }
+            int kw = skrift_is_keyword(wstart, wlen);
+            int ci = 0;
+            while (ci < wlen && col < win_cols) {
+                int wc = load8(skrift_buf + wstart + ci);
+                if (wc < 32 || wc > 126) { wc = ' '; }
+                int bp = wstart + ci;
+                int in_sel = 0;
+                if (skrift_sel_anchor >= 0
+                    && skrift_sel_anchor != skrift_cursor) {
+                    int ss = skrift_sel_anchor;
+                    int se = skrift_cursor;
+                    if (ss > se) { ss = ss + se; se = ss - se; ss = ss - se; }
+                    if (bp >= ss && bp < se) { in_sel = 1; }
+                }
+                int use_fg = FB_FG;
+                if (kw == 1) { use_fg = SKRIFT_HL; }
+                int use_bg = bg;
+                if (in_sel == 1) {
+                    int t2 = use_fg;
+                    use_fg = use_bg;
+                    use_bg = t2;
+                }
+                skrift_draw_cell(win_row, col, wc, use_fg, use_bg);
+                col = col + 1;
+                ci = ci + 1;
+            }
+        } else {
+            // Non-word character — draw normally (or inverted if selected).
+            if (ch < 32 || ch > 126) { ch = ' '; }
+            int in_sel = 0;
+            if (skrift_sel_anchor >= 0
+                && skrift_sel_anchor != skrift_cursor) {
+                int ss = skrift_sel_anchor;
+                int se = skrift_cursor;
+                if (ss > se) { ss = ss + se; se = ss - se; ss = ss - se; }
+                if (pos >= ss && pos < se) { in_sel = 1; }
+            }
+            int use_fg = FB_FG;
+            int use_bg = bg;
+            if (in_sel == 1) {
+                use_fg = use_fg + use_bg;
+                use_bg = use_fg - use_bg;
+                use_fg = use_fg - use_bg;
+            }
+            skrift_draw_cell(win_row, col, ch, use_fg, use_bg);
+            col = col + 1;
+            pos = pos + 1;
+        }
+    }
+    while (col < win_cols) {
+        skrift_draw_cell(win_row, col, ' ', FB_FG, bg);
+        col = col + 1;
+    }
+    return;
+}
+
+// Redraw all content rows from `win_row` to the bottom of the content area.
+// Used when content shifts across lines (newline, backspace-at-line-start).
+void skrift_draw_from_row(int win_row) {
+    int win = skrift_win;
+    int win_rows = load64(kakel_rows_base + win * 8);
+    int content_rows = win_rows - 1;
+    if (win_row < 0) { win_row = 0; }
+    int target = skrift_scroll_row + win_row;
+    // Find byte offset for the first affected buffer line.
+    int pos = 0;
+    int ln = 0;
+    while (ln < target && pos < skrift_size) {
+        if (load8(skrift_buf + pos) == '\n') { ln = ln + 1; }
+        pos = pos + 1;
+    }
+    int r = win_row;
+    while (r < content_rows) {
+        int ls = pos;
+        while (pos < skrift_size && load8(skrift_buf + pos) != '\n') {
+            pos = pos + 1;
+        }
+        if (pos < skrift_size && load8(skrift_buf + pos) == '\n') {
+            pos = pos + 1;
+        }
+        skrift_draw_line(r, ls);
+        r = r + 1;
+    }
+    return;
+}
+
+// Print a small non-negative integer `v` to window `win` at the current
+// kakel cursor position, using dim text. Used in the status bar.
+void skrift_status_int(int win, int v) {
+    if (v == 0) { kakel_putc_dim(win, '0'); return; }
+    int buf = kscratch_start + 32;
+    int di = 0;
+    int val = v;
+    while (val > 0) {
+        store8(buf + di, '0' + (val - (val / 10) * 10));
+        val = val / 10;
+        di = di + 1;
+    }
+    while (di > 0) {
+        di = di - 1;
+        kakel_putc_dim(win, load8(buf + di));
+    }
+    return;
+}
+
+// Redraw just the status bar (last row of the window). Uses kakel_putc_dim
+// for dim text — the status bar is short, so kakel overhead here is negligible.
+void skrift_draw_status() {
+    int win = skrift_win;
+    int win_rows = load64(kakel_rows_base + win * 8);
+    int win_cols = load64(kakel_cols_base + win * 8);
+    int status_row = win_rows - 1;
+    int bg = load64(kakel_bg_base + win * 8);
+
+    // Fill the status row with the window background.
+    int cx = load64(kakel_cx_base + win * 8);
+    int cy = load64(kakel_cy_base + win * 8);
+    fb_fill_rect(cx * FONT_W, (cy + status_row) * FONT_H,
+                 win_cols * FONT_W, FONT_H, bg);
+
+    // Position kakel cursor at the start of the status row.
+    store64(kakel_row_base + win * 8, status_row);
+    store64(kakel_col_base + win * 8, 0);
+    store64(kakel_crow_base + win * 8, -1);
+    store64(kakel_ccol_base + win * 8, -1);
+
+    // [insert] or [cmd]
+    if (skrift_mode == SKRIFT_MODE_INSERT) {
+        kakel_putc_dim(win, '['); kakel_putc_dim(win, 'i');
+        kakel_putc_dim(win, 'n'); kakel_putc_dim(win, 's');
+        kakel_putc_dim(win, 'e'); kakel_putc_dim(win, 'r');
+        kakel_putc_dim(win, 't'); kakel_putc_dim(win, ']');
+    } else {
+        kakel_putc_dim(win, '['); kakel_putc_dim(win, 'c');
+        kakel_putc_dim(win, 'm'); kakel_putc_dim(win, 'd');
+        kakel_putc_dim(win, ']');
+    }
+    kakel_putc_dim(win, ' ');
+
+    // Filename.
+    if (skrift_filename != 0) {
+        int i = 0;
+        while (i < skrift_filename_len && load8(skrift_filename + i) != 0) {
+            kakel_putc_dim(win, load8(skrift_filename + i));
+            i = i + 1;
+        }
+    } else {
+        kakel_putc_dim(win, '['); kakel_putc_dim(win, 'n');
+        kakel_putc_dim(win, 'o'); kakel_putc_dim(win, ' ');
+        kakel_putc_dim(win, 'n'); kakel_putc_dim(win, 'a');
+        kakel_putc_dim(win, 'm'); kakel_putc_dim(win, 'e');
+        kakel_putc_dim(win, ']');
+    }
+    if (skrift_modified == 1) {
+        kakel_putc_dim(win, ' '); kakel_putc_dim(win, '*');
+    }
+    kakel_putc_dim(win, ' ');
+    kakel_putc_dim(win, ' ');
+
+    // L <line>
+    int cur_line = skrift_line_number(skrift_cursor);
+    kakel_putc_dim(win, 'L');
+    skrift_status_int(win, cur_line + 1);
+    kakel_putc_dim(win, ' ');
+    kakel_putc_dim(win, 'C');
+    skrift_status_int(win, skrift_line_col(skrift_cursor) + 1);
+
+    // Right-side hints (or search prompt).
+    kakel_putc_dim(win, ' '); kakel_putc_dim(win, ' ');
+    if (skrift_search_mode == 1) {
+        kakel_putc_dim(win, '/');
+        int si = 0;
+        while (si < skrift_search_len) {
+            kakel_putc_dim(win, load8(skrift_search_buf + si));
+            si = si + 1;
+        }
+    } else if (skrift_mode == SKRIFT_MODE_INSERT) {
+        kakel_putc_dim(win, 'e'); kakel_putc_dim(win, 's');
+        kakel_putc_dim(win, 'c'); kakel_putc_dim(win, ':');
+        kakel_putc_dim(win, 'c'); kakel_putc_dim(win, 'm');
+        kakel_putc_dim(win, 'd');
+    } else {
+        kakel_putc_dim(win, 'c'); kakel_putc_dim(win, ':');
+        kakel_putc_dim(win, 'c'); kakel_putc_dim(win, 'h');
+        kakel_putc_dim(win, 'g'); kakel_putc_dim(win, ' ');
+        kakel_putc_dim(win, 'd'); kakel_putc_dim(win, 'd');
+        kakel_putc_dim(win, ':'); kakel_putc_dim(win, 'd');
+        kakel_putc_dim(win, 'e'); kakel_putc_dim(win, 'l');
+        kakel_putc_dim(win, ' '); kakel_putc_dim(win, 'y');
+        kakel_putc_dim(win, ':'); kakel_putc_dim(win, 'y');
+        kakel_putc_dim(win, 'a'); kakel_putc_dim(win, 'n');
+        kakel_putc_dim(win, 'k'); kakel_putc_dim(win, ' ');
+        kakel_putc_dim(win, '/'); kakel_putc_dim(win, ':');
+        kakel_putc_dim(win, 'f'); kakel_putc_dim(win, 'i');
+        kakel_putc_dim(win, 'n'); kakel_putc_dim(win, 'd');
+        kakel_putc_dim(win, ' '); kakel_putc_dim(win, 'q');
+        kakel_putc_dim(win, ':'); kakel_putc_dim(win, 'q');
+        kakel_putc_dim(win, 'u'); kakel_putc_dim(win, 'i');
+        kakel_putc_dim(win, 't');
+    }
+    // Selection size.
+    if (skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor) {
+        kakel_putc_dim(win, ' ');
+        kakel_putc_dim(win, 's'); kakel_putc_dim(win, 'e');
+        kakel_putc_dim(win, 'l'); kakel_putc_dim(win, ':');
+        int ss = skrift_sel_anchor;
+        int se = skrift_cursor;
+        if (ss > se) { ss = ss + se; se = ss - se; ss = ss - se; }
+        skrift_status_int(win, se - ss);
+    }
+    // Clear kakel cursor so it does not leave an underline on the status bar.
+    store64(kakel_crow_base + win * 8, -1);
+    store64(kakel_ccol_base + win * 8, -1);
+    return;
+}
+
+// Overlay the most recent repl_eval_ret result at the right end of the status
+// bar row. Does NOT redraw the normal status bar content — call
+// skrift_draw_status first (or after) to paint the full bar. The overlay is
+// temporary: the next keystroke that triggers a normal status-bar redraw
+// overwrites it.
+void skrift_show_eval_result() {
+    int win = skrift_win;
+    int win_rows = load64(kakel_rows_base + win * 8);
+    int win_cols = load64(kakel_cols_base + win * 8);
+    int sr = win_rows - 1;
+    int cx = load64(kakel_cx_base + win * 8);
+    int cy = load64(kakel_cy_base + win * 8);
+    int bg = load64(kakel_bg_base + win * 8);
+    // Reserve up to 14 cells at the right edge for "=> N" (max ~11 digits).
+    int start_col = win_cols - 14;
+    if (start_col < 0) { start_col = 0; }
+    fb_fill_rect((cx + start_col) * FONT_W, (cy + sr) * FONT_H,
+                 (win_cols - start_col) * FONT_W, FONT_H, bg);
+    store64(kakel_row_base + win * 8, sr);
+    store64(kakel_col_base + win * 8, start_col);
+    store64(kakel_crow_base + win * 8, -1);
+    store64(kakel_ccol_base + win * 8, -1);
+    kakel_putc_dim(win, '=');
+    kakel_putc_dim(win, '>');
+    kakel_putc_dim(win, ' ');
+    if (repl_last_ok == 1) {
+        int v = repl_last_result;
+        if (v < 0) { kakel_putc_dim(win, '-'); v = 0 - v; }
+        if (v == 0) { kakel_putc_dim(win, '0'); }
+        else {
+            int db = kscratch_start + 32;
+            int di = 0;
+            while (v > 0) {
+                store8(db + di, '0' + (v - (v / 10) * 10));
+                v = v / 10;
+                di = di + 1;
+            }
+            while (di > 0) {
+                di = di - 1;
+                kakel_putc_dim(win, load8(db + di));
+            }
+        }
+    } else {
+        kakel_putc_dim(win, 'e');
+        kakel_putc_dim(win, 'r');
+        kakel_putc_dim(win, 'r');
+    }
+    store64(kakel_crow_base + win * 8, -1);
+    store64(kakel_ccol_base + win * 8, -1);
+    return;
+}
+
+// Run every non-empty line in the editor buffer through the REPL interpreter.
+// Output goes to the editor window via sk_print (kakel_putc), so the results
+// scroll into view as the file executes. After execution the editor is fully
+// redrawn. Called from the 'r' command-mode handler (keyboard IRQ context).
+// Returns the number of lines executed.
+int skrift_run_file() {
+    int pos = 0;
+    int lines = 0;
+    while (pos < skrift_size) {
+        int ls = pos;
+        while (pos < skrift_size && load8(skrift_buf + pos) != '\n') {
+            pos = pos + 1;
+        }
+        int len = pos - ls;
+        if (pos < skrift_size && load8(skrift_buf + pos) == '\n') {
+            pos = pos + 1;
+        }
+        if (len > 0 && len < 127) {
+            int tmp = kmalloc(len + 1);
+            if (tmp != 0) {
+                int i = 0;
+                while (i < len) {
+                    store8(tmp + i, load8(skrift_buf + ls + i));
+                    i = i + 1;
+                }
+                store8(tmp + len, 0);
+                repl_eval(tmp);
+                kfree(tmp);
+                lines = lines + 1;
+            }
+        }
+    }
+    // Redraw — REPL output may have scrolled or overwritten the window.
+    skrift_render();
+    // Overlay a brief summary on the status bar.
+    int win = skrift_win;
+    int win_rows = load64(kakel_rows_base + win * 8);
+    int win_cols = load64(kakel_cols_base + win * 8);
+    int sr = win_rows - 1;
+    int cx = load64(kakel_cx_base + win * 8);
+    int cy = load64(kakel_cy_base + win * 8);
+    int bg = load64(kakel_bg_base + win * 8);
+    int start_col = win_cols - 14;
+    if (start_col < 0) { start_col = 0; }
+    fb_fill_rect((cx + start_col) * FONT_W, (cy + sr) * FONT_H,
+                 (win_cols - start_col) * FONT_W, FONT_H, bg);
+    store64(kakel_row_base + win * 8, sr);
+    store64(kakel_col_base + win * 8, start_col);
+    store64(kakel_crow_base + win * 8, -1);
+    store64(kakel_ccol_base + win * 8, -1);
+    kakel_putc_dim(win, 'r');
+    kakel_putc_dim(win, 'a');
+    kakel_putc_dim(win, 'n');
+    kakel_putc_dim(win, ' ');
+    // Print the line count.
+    int v = lines;
+    if (v == 0) { kakel_putc_dim(win, '0'); }
+    else {
+        int db = kscratch_start + 32;
+        int di = 0;
+        while (v > 0) {
+            store8(db + di, '0' + (v - (v / 10) * 10));
+            v = v / 10;
+            di = di + 1;
+        }
+        while (di > 0) {
+            di = di - 1;
+            kakel_putc_dim(win, load8(db + di));
+        }
+    }
+    kakel_putc_dim(win, ' ');
+    kakel_putc_dim(win, 'l');
+    kakel_putc_dim(win, 'n');
+    store64(kakel_crow_base + win * 8, -1);
+    store64(kakel_ccol_base + win * 8, -1);
+    return lines;
+}
+
+// Like skrift_run_file, but only runs lines from the cursor's line to the end
+// of the buffer. Called from the 'R' command-mode handler.
+int skrift_run_file_from_cursor() {
+    // Advance to the start of the cursor's line.
+    int pos = skrift_line_start(skrift_cursor);
+    int lines = 0;
+    while (pos < skrift_size) {
+        int ls = pos;
+        while (pos < skrift_size && load8(skrift_buf + pos) != '\n') {
+            pos = pos + 1;
+        }
+        int len = pos - ls;
+        if (pos < skrift_size && load8(skrift_buf + pos) == '\n') {
+            pos = pos + 1;
+        }
+        if (len > 0 && len < 127) {
+            int tmp = kmalloc(len + 1);
+            if (tmp != 0) {
+                int i = 0;
+                while (i < len) {
+                    store8(tmp + i, load8(skrift_buf + ls + i));
+                    i = i + 1;
+                }
+                store8(tmp + len, 0);
+                repl_eval(tmp);
+                kfree(tmp);
+                lines = lines + 1;
+            }
+        }
+    }
+    skrift_render();
+    int win = skrift_win;
+    int win_rows = load64(kakel_rows_base + win * 8);
+    int win_cols = load64(kakel_cols_base + win * 8);
+    int sr = win_rows - 1;
+    int cx = load64(kakel_cx_base + win * 8);
+    int cy = load64(kakel_cy_base + win * 8);
+    int bg = load64(kakel_bg_base + win * 8);
+    int start_col = win_cols - 14;
+    if (start_col < 0) { start_col = 0; }
+    fb_fill_rect((cx + start_col) * FONT_W, (cy + sr) * FONT_H,
+                 (win_cols - start_col) * FONT_W, FONT_H, bg);
+    store64(kakel_row_base + win * 8, sr);
+    store64(kakel_col_base + win * 8, start_col);
+    store64(kakel_crow_base + win * 8, -1);
+    store64(kakel_ccol_base + win * 8, -1);
+    kakel_putc_dim(win, 'r');
+    kakel_putc_dim(win, 'a');
+    kakel_putc_dim(win, 'n');
+    kakel_putc_dim(win, ' ');
+    int v = lines;
+    if (v == 0) { kakel_putc_dim(win, '0'); }
+    else {
+        int db = kscratch_start + 32;
+        int di = 0;
+        while (v > 0) {
+            store8(db + di, '0' + (v - (v / 10) * 10));
+            v = v / 10;
+            di = di + 1;
+        }
+        while (di > 0) {
+            di = di - 1;
+            kakel_putc_dim(win, load8(db + di));
+        }
+    }
+    kakel_putc_dim(win, ' ');
+    kakel_putc_dim(win, 'l');
+    kakel_putc_dim(win, 'n');
+    store64(kakel_crow_base + win * 8, -1);
+    store64(kakel_ccol_base + win * 8, -1);
+    return lines;
+}
+
+// Adjust the viewport if the cursor is outside the visible area. Returns 1
+// if skrift_scroll_row changed (caller must do a full redraw), 0 otherwise.
+int skrift_adjust_viewport() {
+    int win = skrift_win;
+    int win_rows = load64(kakel_rows_base + win * 8);
+    int content_rows = win_rows - 1;
+    int cur_line = skrift_line_number(skrift_cursor);
+    int old = skrift_scroll_row;
+    if (cur_line < skrift_scroll_row) { skrift_scroll_row = cur_line; }
+    if (cur_line >= skrift_scroll_row + content_rows) {
+        skrift_scroll_row = cur_line - content_rows + 1;
+    }
+    if (skrift_scroll_row < 0) { skrift_scroll_row = 0; }
+    if (skrift_scroll_row != old) { return 1; }
+    return 0;
+}
+
+// Full redraw — used for initial launch and viewport changes.
+void skrift_render() {
+    int win = skrift_win;
+    int win_rows = load64(kakel_rows_base + win * 8);
+    int content_rows = win_rows - 1;
+    int cur_line = skrift_line_number(skrift_cursor);
+    if (cur_line < skrift_scroll_row) { skrift_scroll_row = cur_line; }
+    if (cur_line >= skrift_scroll_row + content_rows) {
+        skrift_scroll_row = cur_line - content_rows + 1;
+    }
+    if (skrift_scroll_row < 0) { skrift_scroll_row = 0; }
+    kakel_clear(win);
+    // Find first visible byte.
+    int pos = 0;
+    int ln = 0;
+    while (ln < skrift_scroll_row && pos < skrift_size) {
+        if (load8(skrift_buf + pos) == '\n') { ln = ln + 1; }
+        pos = pos + 1;
+    }
+    int r = 0;
+    while (r < content_rows) {
+        int ls = pos;
+        while (pos < skrift_size && load8(skrift_buf + pos) != '\n') {
+            pos = pos + 1;
+        }
+        if (pos < skrift_size && load8(skrift_buf + pos) == '\n') {
+            pos = pos + 1;
+        }
+        skrift_draw_line(r, ls);
+        r = r + 1;
+    }
+    skrift_draw_status();
+    skrift_show_cursor();
+    return;
+}
+
+// --- key dispatch ------------------------------------------------------------
+
+// Called from keyboard_handler (IRQ context) for every key press while the
+// editor is active. Uses incremental redraw: only the changed region is
+// updated, not the whole window.
+
+void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int shift_down) {
+    int old_cursor;
+    int old_line;
+    int win_row;
+
+    // --- Ctrl chords (work in both modes) ---
+    if (ctrl_down == 1) {
+        // Ctrl+A — Home: go to beginning of current line.
+        if (ascii == 'a') {
+            skrift_sel_anchor = -1;
+            skrift_erase_cursor();
+            skrift_cursor = skrift_line_start(skrift_cursor);
+            skrift_col_hint = skrift_line_col(skrift_cursor);
+            if (skrift_adjust_viewport() == 1) { skrift_render(); }
+            else { skrift_show_cursor(); skrift_draw_status(); }
+            return;
+        }
+        // Ctrl+E — End: go to end of current line (before '\n').
+        if (ascii == 'e') {
+            skrift_sel_anchor = -1;
+            skrift_erase_cursor();
+            skrift_cursor = skrift_line_end(skrift_cursor);
+            skrift_col_hint = skrift_line_col(skrift_cursor);
+            if (skrift_adjust_viewport() == 1) { skrift_render(); }
+            else { skrift_show_cursor(); skrift_draw_status(); }
+            return;
+        }
+        // Ctrl+K — Kill: delete from cursor to end of line (or
+        // delete selection if one is active).
+        if (ascii == 'k') {
+            if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
+                skrift_erase_cursor();
+                skrift_delete_selection();
+                win_row = skrift_line_number(skrift_cursor) - skrift_scroll_row;
+                skrift_draw_from_row(win_row);
+                skrift_show_cursor();
+                skrift_draw_status();
+                return;
+            }
+            int le = skrift_line_end(skrift_cursor);
+            int count = le - skrift_cursor;
+            if (count == 0 && skrift_cursor < skrift_size
+                && load8(skrift_buf + skrift_cursor) == '\n') {
+                // Kill the newline (merge lines).
+                skrift_erase_cursor();
+                skrift_shift_left(skrift_cursor);
+                skrift_modified = 1;
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else {
+                    win_row = skrift_line_number(skrift_cursor) - skrift_scroll_row;
+                    skrift_draw_from_row(win_row);
+                    skrift_show_cursor();
+                    skrift_draw_status();
+                }
+                return;
+            }
+            if (count > 0) {
+                skrift_erase_cursor();
+                int i = 0;
+                while (i < count) {
+                    skrift_shift_left(skrift_cursor);
+                    i = i + 1;
+                }
+                skrift_modified = 1;
+                win_row = skrift_line_number(skrift_cursor) - skrift_scroll_row;
+                skrift_draw_line(win_row, skrift_line_start(skrift_cursor));
+                skrift_show_cursor();
+                skrift_draw_status();
+            }
+            return;
+        }
+        // Ctrl+D — Delete forward (or delete selection if active).
+        if (ascii == 'd') {
+            if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
+                skrift_erase_cursor();
+                skrift_delete_selection();
+                win_row = skrift_line_number(skrift_cursor) - skrift_scroll_row;
+                skrift_draw_from_row(win_row);
+                skrift_show_cursor();
+                skrift_draw_status();
+                return;
+            }
+            if (skrift_cursor < skrift_size) {
+                skrift_erase_cursor();
+                skrift_delete_forward();
+                skrift_col_hint = skrift_line_col(skrift_cursor);
+                old_line = skrift_line_number(skrift_cursor);
+                win_row = old_line - skrift_scroll_row;
+                skrift_draw_line(win_row, skrift_line_start(skrift_cursor));
+                skrift_show_cursor();
+                skrift_draw_status();
+            }
+            return;
+        }
+        // Unrecognized Ctrl chord — fall through to normal handling.
+    }
+
+    // --- search mode: capture input for the search term ---
+    if (skrift_search_mode == 1) {
+        // Escape or 'q' cancels search.
+        if (make_code == 1 || ascii == 'q') {
+            skrift_search_mode = 0;
+            skrift_search_len = 0;
+            skrift_draw_status();
+            return;
+        }
+        // Enter executes the search.
+        if (ascii == '\n') {
+            skrift_search_mode = 0;
+            // Save a copy of the search term for n/N.
+            if (skrift_search_len > 0 && skrift_search_buf != 0) {
+                if (skrift_last_search != 0) { kfree(skrift_last_search); }
+                skrift_last_search = kmalloc(skrift_search_len);
+                skrift_last_search_len = 0;
+                if (skrift_last_search != 0) {
+                    int si = 0;
+                    while (si < skrift_search_len) {
+                        store8(skrift_last_search + si,
+                               load8(skrift_search_buf + si));
+                        si = si + 1;
+                    }
+                    skrift_last_search_len = skrift_search_len;
+                }
+                // Execute forward search.
+                skrift_erase_cursor();
+                skrift_search_forward();
+                skrift_col_hint = skrift_line_col(skrift_cursor);
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else { skrift_show_cursor(); }
+            }
+            skrift_search_len = 0;
+            skrift_draw_status();
+            return;
+        }
+        // Backspace deletes last search char.
+        if (ascii == 8) {
+            if (skrift_search_len > 0) {
+                skrift_search_len = skrift_search_len - 1;
+            }
+            skrift_draw_status();
+            return;
+        }
+        // Printable chars append to search term (max 32 chars for status bar).
+        if (ascii >= 32 && ascii <= 126 && skrift_search_len < 32
+            && skrift_search_buf != 0) {
+            store8(skrift_search_buf + skrift_search_len, ascii);
+            skrift_search_len = skrift_search_len + 1;
+            skrift_draw_status();
+            return;
+        }
+        return;
+    }
+
+    // --- arrow keys: move cursor, optionally extend selection ---
+    if (was_e0 == 1) {
+        if (make_code != 72 && make_code != 80
+            && make_code != 75 && make_code != 77) { return; }
+        int old_cur = skrift_cursor;
+        skrift_erase_cursor();
+        // Shift+arrow: start or extend selection.
+        // Arrow without shift: clear any existing selection.
+        if (shift_down == 0) {
+            skrift_sel_anchor = -1;
+        } else {
+            if (skrift_sel_anchor < 0) {
+                skrift_sel_anchor = skrift_cursor;
+            }
+        }
+        skrift_col_hint = skrift_line_col(skrift_cursor);
+        if (make_code == 72) {
+            skrift_cursor = skrift_advance_line(skrift_cursor, -1);
+        } else if (make_code == 80) {
+            skrift_cursor = skrift_advance_line(skrift_cursor, 1);
+        } else if (make_code == 75) {
+            if (skrift_cursor > 0) { skrift_cursor = skrift_cursor - 1; }
+        } else if (make_code == 77) {
+            if (skrift_cursor < skrift_size) { skrift_cursor = skrift_cursor + 1; }
+        }
+        skrift_col_hint = skrift_line_col(skrift_cursor);
+        if (skrift_adjust_viewport() == 1) { skrift_render(); }
+        else if (shift_down == 1 && (skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
+            // Redraw lines affected by the selection change.
+            int min_byte = skrift_sel_anchor;
+            if (old_cur < min_byte) { min_byte = old_cur; }
+            if (skrift_cursor < min_byte) { min_byte = skrift_cursor; }
+            int min_row = skrift_line_number(min_byte) - skrift_scroll_row;
+            if (min_row < 0) { min_row = 0; }
+            skrift_draw_from_row(min_row);
+            skrift_show_cursor();
+            skrift_draw_status();
+        } else { skrift_show_cursor(); skrift_draw_status(); }
+        return;
+    }
+
+    // --- Escape: toggle mode (status bar only) ---
+    if (make_code == 1) {
+        if (skrift_mode == SKRIFT_MODE_INSERT) {
+            skrift_mode = SKRIFT_MODE_COMMAND;
+        } else {
+            skrift_mode = SKRIFT_MODE_INSERT;
+        }
+        skrift_draw_status();
+        return;
+    }
+
+    // --- command mode ---
+    if (skrift_mode == SKRIFT_MODE_COMMAND) {
+        // Digits accumulate into cmd_count for N+G goto-line.
+        if (ascii >= '0' && ascii <= '9') {
+            skrift_cmd_count = skrift_cmd_count * 10 + (ascii - '0');
+            skrift_cmd_pending = 0;
+            skrift_draw_status();  // could echo the count — skip for now
+            return;
+        }
+        // 'd' — delete selection if active, otherwise pend for dd.
+        if (ascii == 'd') {
+            if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
+                skrift_erase_cursor();
+                skrift_cursor = skrift_line_start(skrift_cursor);
+                skrift_col_hint = 0;
+                int del_line = skrift_line_number(skrift_cursor);
+                skrift_delete_selection();
+                skrift_cmd_pending = 0;
+                skrift_cmd_count = 0;
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else {
+                    win_row = del_line - skrift_scroll_row;
+                    if (win_row < 0) { win_row = 0; }
+                    skrift_draw_from_row(win_row);
+                    skrift_show_cursor();
+                    skrift_draw_status();
+                }
+                return;
+            }
+            if (skrift_cmd_pending == 'd') {
+                skrift_erase_cursor();
+                int repeat = 1;
+                if (skrift_cmd_count > 0) { repeat = skrift_cmd_count; }
+                int ri = 0;
+                while (ri < repeat) {
+                    skrift_delete_current_line();
+                    ri = ri + 1;
+                }
+                skrift_col_hint = 0;
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else {
+                    win_row = skrift_line_number(skrift_cursor) - skrift_scroll_row;
+                    skrift_draw_from_row(win_row);
+                    skrift_show_cursor();
+                    skrift_draw_status();
+                }
+                skrift_cmd_pending = 0;
+                skrift_cmd_count = 0;
+                return;
+            }
+            skrift_cmd_pending = 'd';
+            skrift_cmd_count = 0;
+            return;
+        }
+        // 'c' — change: delete and enter insert mode. Selection → delete it.
+        // cc = change current line. cw = change to end of word (handled in 'w').
+        if (ascii == 'c') {
+            if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
+                skrift_erase_cursor();
+                int cl = skrift_line_number(skrift_cursor);
+                skrift_delete_selection();
+                skrift_mode = SKRIFT_MODE_INSERT;
+                skrift_cmd_pending = 0;
+                skrift_cmd_count = 0;
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else {
+                    win_row = cl - skrift_scroll_row;
+                    if (win_row < 0) { win_row = 0; }
+                    skrift_draw_from_row(win_row);
+                    skrift_show_cursor();
+                    skrift_draw_status();
+                }
+                return;
+            }
+            if (skrift_cmd_pending == 'c') {
+                // cc — change N lines (default 1).
+                skrift_erase_cursor();
+                int repeat = 1;
+                if (skrift_cmd_count > 0) { repeat = skrift_cmd_count; }
+                int ri = 0;
+                while (ri < repeat) {
+                    skrift_delete_current_line();
+                    ri = ri + 1;
+                }
+                skrift_col_hint = 0;
+                skrift_mode = SKRIFT_MODE_INSERT;
+                skrift_cmd_pending = 0;
+                skrift_cmd_count = 0;
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else {
+                    win_row = skrift_line_number(skrift_cursor) - skrift_scroll_row;
+                    skrift_draw_from_row(win_row);
+                    skrift_show_cursor();
+                    skrift_draw_status();
+                }
+                return;
+            }
+            skrift_cmd_pending = 'c';
+            skrift_cmd_count = 0;
+            return;
+        }
+        // 'g' — go-to-first-line on second press, otherwise pend.
+        if (ascii == 'g') {
+            skrift_sel_anchor = -1;
+            if (skrift_cmd_pending == 'g') {
+                skrift_erase_cursor();
+                skrift_cursor = 0;
+                skrift_scroll_row = 0;
+                skrift_col_hint = 0;
+                skrift_render();
+                skrift_cmd_pending = 0;
+                skrift_cmd_count = 0;
+                return;
+            }
+            skrift_cmd_pending = 'g';
+            skrift_cmd_count = 0;
+            return;
+        }
+        // 'y' — yank selection if active, otherwise pend for yy.
+        if (ascii == 'y') {
+            if (skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor) {
+                // Yank the selected range.
+                int yss = skrift_sel_anchor;
+                int yse = skrift_cursor;
+                if (yss > yse) { yss = yss + yse; yse = yss - yse; yss = yss - yse; }
+                int ylen = yse - yss;
+                if (skrift_yank_buf != 0) { kfree(skrift_yank_buf); }
+                skrift_yank_buf = kmalloc(ylen);
+                skrift_yank_len = 0;
+                if (skrift_yank_buf != 0) {
+                    int yi = 0;
+                    while (yi < ylen) {
+                        store8(skrift_yank_buf + yi,
+                               load8(skrift_buf + yss + yi));
+                        yi = yi + 1;
+                    }
+                    skrift_yank_len = ylen;
+                }
+                skrift_sel_anchor = -1;
+                skrift_cmd_pending = 0;
+                skrift_cmd_count = 0;
+                skrift_draw_status();
+                return;
+            }
+            if (skrift_cmd_pending == 'y') {
+                // Free previous yank buffer.
+                if (skrift_yank_buf != 0) { kfree(skrift_yank_buf); }
+                int repeat = 1;
+                if (skrift_cmd_count > 0) { repeat = skrift_cmd_count; }
+                int ls = skrift_line_start(skrift_cursor);
+                int le = ls;
+                int ri = 0;
+                while (ri < repeat && le < skrift_size) {
+                    le = skrift_line_end(le);
+                    if (le < skrift_size
+                        && load8(skrift_buf + le) == '\n') {
+                        le = le + 1;
+                    }
+                    ri = ri + 1;
+                }
+                int ylen = le - ls;
+                skrift_yank_buf = kmalloc(ylen);
+                skrift_yank_len = 0;
+                if (skrift_yank_buf != 0) {
+                    int i = 0;
+                    while (i < ylen) {
+                        store8(skrift_yank_buf + i,
+                               load8(skrift_buf + ls + i));
+                        i = i + 1;
+                    }
+                    skrift_yank_len = ylen;
+                }
+                skrift_cmd_pending = 0;
+                skrift_cmd_count = 0;
+                return;
+            }
+            skrift_cmd_pending = 'y';
+            skrift_cmd_count = 0;
+            return;
+        }
+        // 'G' — go-to-line or end-of-buffer.
+        if (ascii == 'G') {
+            skrift_sel_anchor = -1;
+            skrift_erase_cursor();
+            if (skrift_cmd_count > 0) {
+                // Go to line N (1-indexed). Line 1 = first line.
+                int target = skrift_cmd_count - 1;
+                if (target < 0) { target = 0; }
+                int pos = 0;
+                int ln = 0;
+                while (ln < target && pos < skrift_size) {
+                    if (load8(skrift_buf + pos) == '\n') { ln = ln + 1; }
+                    pos = pos + 1;
+                }
+                skrift_cursor = pos;
+            } else {
+                // Go to last line.
+                skrift_cursor = skrift_size;
+            }
+            skrift_col_hint = skrift_line_col(skrift_cursor);
+            if (skrift_adjust_viewport() == 1) { skrift_render(); }
+            else { skrift_show_cursor(); skrift_draw_status(); }
+            skrift_cmd_pending = 0;
+            skrift_cmd_count = 0;
+            return;
+        }
+        // Anything else cancels the pending prefix.
+        skrift_cmd_pending = 0;
+        skrift_cmd_count = 0;
+        if (ascii == 'i') {
+            skrift_mode = SKRIFT_MODE_INSERT;
+            skrift_draw_status();
+            return;
+        }
+        if (ascii == 'u') {
+            // Undo — restore buffer to state before last modification.
+            if (skrift_undo_size > 0) {
+                int old_scroll = skrift_scroll_row;
+                skrift_undo();
+                skrift_scroll_row = 0;
+                skrift_col_hint = skrift_line_col(skrift_cursor);
+                skrift_render();
+            }
+            skrift_cmd_pending = 0;
+            skrift_cmd_count = 0;
+            return;
+        }
+        if (ascii == 'h') {
+            // Show key reference in the status-bar area.
+            kakel_print_dim(skrift_win, "esc:toggle  i:insert  h:help  q:quit    ");
+            kakel_print_dim(skrift_win, "c=chg cc=chg-ln cw=chg-wd dd=del-ln  ");
+            kakel_print_dim(skrift_win, "yy:yank  p:paste  /:search  n/N:next  ");
+            kakel_print_dim(skrift_win, "e:eval  E:eval+insert  r:run  R:run");
+            skrift_cmd_pending = 0;
+            skrift_cmd_count = 0;
+            skrift_draw_status();
+            return;
+        }
+        if (ascii == 'q') { skrift_quit(); return; }
+        if (ascii == 'x') {
+            // Delete selection if active, otherwise delete forward char.
+            if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
+                skrift_erase_cursor();
+                skrift_cursor = skrift_line_start(skrift_cursor);
+                skrift_col_hint = 0;
+                int xs_line = skrift_line_number(skrift_cursor);
+                skrift_delete_selection();
+                skrift_cmd_pending = 0;
+                skrift_cmd_count = 0;
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else {
+                    win_row = xs_line - skrift_scroll_row;
+                    if (win_row < 0) { win_row = 0; }
+                    skrift_draw_from_row(win_row);
+                    skrift_show_cursor();
+                    skrift_draw_status();
+                }
+                return;
+            }
+            skrift_erase_cursor();
+            skrift_delete_forward();
+            skrift_col_hint = skrift_line_col(skrift_cursor);
+            old_line = skrift_line_number(skrift_cursor);
+            win_row = old_line - skrift_scroll_row;
+            skrift_draw_line(win_row, skrift_line_start(skrift_cursor));
+            skrift_show_cursor();
+            skrift_draw_status();
+            return;
+        }
+        // 'e' — eval selection (if active) or current line through the REPL.
+        if (ascii == 'e') {
+            int ev_start;
+            int ev_len;
+            if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
+                int ss = skrift_sel_anchor;
+                int se = skrift_cursor;
+                if (ss > se) { ss = ss + se; se = ss - se; ss = ss - se; }
+                ev_start = ss; ev_len = se - ss;
+                skrift_sel_anchor = -1;
+            } else {
+                int ls = skrift_line_start(skrift_cursor);
+                int le = skrift_line_end(skrift_cursor);
+                ev_start = ls; ev_len = le - ls;
+            }
+            if (ev_len > 0 && ev_len < 127) {
+                int tmp = kmalloc(ev_len + 1);
+                if (tmp != 0) {
+                    int ci = 0;
+                    while (ci < ev_len) {
+                        store8(tmp + ci, load8(skrift_buf + ev_start + ci));
+                        ci = ci + 1;
+                    }
+                    store8(tmp + ev_len, 0);
+                    repl_eval_ret(tmp);
+                    kfree(tmp);
+                }
+            }
+            skrift_draw_status();
+            skrift_show_eval_result();
+            return;
+        }
+        // 'E' — eval selection (if active) or current line AND insert the
+        // result as a comment ("// => N"). Selection is consumed if active.
+        if (ascii == 'E') {
+            int ev_start;
+            int ev_len;
+            int ins_point;
+            if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
+                int ss = skrift_sel_anchor;
+                int se = skrift_cursor;
+                if (ss > se) { ss = ss + se; se = ss - se; ss = ss - se; }
+                ev_start = ss; ev_len = se - ss;
+                ins_point = se;
+                skrift_sel_anchor = -1;
+            } else {
+                int ls = skrift_line_start(skrift_cursor);
+                int le = skrift_line_end(skrift_cursor);
+                ev_start = ls; ev_len = le - ls;
+                ins_point = le;
+            }
+            if (ev_len > 0 && ev_len < 127) {
+                int tmp = kmalloc(ev_len + 1);
+                if (tmp != 0) {
+                    int ci = 0;
+                    while (ci < ev_len) {
+                        store8(tmp + ci, load8(skrift_buf + ev_start + ci));
+                        ci = ci + 1;
+                    }
+                    store8(tmp + ev_len, 0);
+                    repl_eval_ret(tmp);
+                    kfree(tmp);
+                }
+                // Build comment string "// => N" in the scratch area.
+                int cmt = kscratch_start;
+                store8(cmt + 0, '/'); store8(cmt + 1, '/');
+                store8(cmt + 2, ' '); store8(cmt + 3, '=');
+                store8(cmt + 4, '>'); store8(cmt + 5, ' ');
+                int cmt_len = 6;
+                if (repl_last_ok == 1) {
+                    int v = repl_last_result;
+                    if (v < 0) {
+                        store8(cmt + cmt_len, '-');
+                        cmt_len = cmt_len + 1;
+                        v = 0 - v;
+                    }
+                    if (v == 0) {
+                        store8(cmt + cmt_len, '0');
+                        cmt_len = cmt_len + 1;
+                    } else {
+                        int db = kscratch_start + 32;
+                        int di = 0;
+                        while (v > 0) {
+                            store8(db + di, '0' + (v - (v / 10) * 10));
+                            v = v / 10;
+                            di = di + 1;
+                        }
+                        while (di > 0) {
+                            di = di - 1;
+                            store8(cmt + cmt_len, load8(db + di));
+                            cmt_len = cmt_len + 1;
+                        }
+                    }
+                } else {
+                    store8(cmt + 6, 'e'); store8(cmt + 7, 'r');
+                    store8(cmt + 8, 'r');
+                    cmt_len = 9;
+                }
+                // Move cursor to insertion point (after current line's '\n',
+                // or at end of buffer for the last line).
+                skrift_erase_cursor();
+                skrift_cursor = ins_point;
+                if (skrift_cursor < skrift_size
+                    && load8(skrift_buf + skrift_cursor) == '\n') {
+                    skrift_cursor = skrift_cursor + 1;
+                }
+                int ins_row = skrift_line_number(skrift_cursor);
+                // Insert the comment characters followed by a newline.
+                int ii = 0;
+                while (ii < cmt_len) {
+                    skrift_insert(load8(cmt + ii));
+                    ii = ii + 1;
+                }
+                skrift_insert('\n');
+                skrift_col_hint = 0;
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else {
+                    int wr = ins_row - skrift_scroll_row;
+                    skrift_draw_from_row(wr);
+                    skrift_show_cursor();
+                    skrift_draw_status();
+                }
+            }
+            return;
+        }
+        // 'r' — run every line in the buffer through the REPL interpreter.
+        if (ascii == 'r') {
+            skrift_sel_anchor = -1;
+            skrift_run_file();
+            return;
+        }
+        // 'R' — run from current line to end of file.
+        if (ascii == 'R') {
+            skrift_sel_anchor = -1;
+            skrift_run_file_from_cursor();
+            return;
+        }
+        // 'w' — cw (change word) if 'c' is pending, otherwise word forward.
+        if (ascii == 'w') {
+            if (skrift_cmd_pending == 'c') {
+                // cw — delete from cursor to end of current word, insert mode.
+                skrift_erase_cursor();
+                int we = skrift_cursor;
+                while (we < skrift_size && load8(skrift_buf + we) != ' '
+                       && load8(skrift_buf + we) != '\n') {
+                    we = we + 1;
+                }
+                int count = we - skrift_cursor;
+                int cwi = 0;
+                while (cwi < count) {
+                    skrift_shift_left(skrift_cursor);
+                    cwi = cwi + 1;
+                }
+                skrift_modified = 1;
+                skrift_sel_anchor = -1;
+                skrift_mode = SKRIFT_MODE_INSERT;
+                skrift_col_hint = 0;
+                skrift_cmd_pending = 0;
+                skrift_cmd_count = 0;
+                win_row = skrift_line_number(skrift_cursor) - skrift_scroll_row;
+                skrift_draw_line(win_row, skrift_line_start(skrift_cursor));
+                skrift_show_cursor();
+                skrift_draw_status();
+                return;
+            }
+            skrift_sel_anchor = -1;
+            int new_cur = skrift_next_word_start(skrift_cursor);
+            if (new_cur != skrift_cursor && new_cur < skrift_size) {
+                skrift_erase_cursor();
+                skrift_cursor = new_cur;
+                skrift_col_hint = skrift_line_col(skrift_cursor);
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else { skrift_show_cursor(); skrift_draw_status(); }
+            }
+            return;
+        }
+        // 'b' — jump to start of previous word.
+        if (ascii == 'b') {
+            skrift_sel_anchor = -1;
+            int new_cur = skrift_prev_word_start(skrift_cursor);
+            if (new_cur != skrift_cursor) {
+                skrift_erase_cursor();
+                skrift_cursor = new_cur;
+                skrift_col_hint = skrift_line_col(skrift_cursor);
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else { skrift_show_cursor(); skrift_draw_status(); }
+            }
+            return;
+        }
+        // '/' — enter search mode (prompt on status bar).
+        if (ascii == '/') {
+            skrift_search_mode = 1;
+            skrift_search_len = 0;
+            skrift_draw_status();
+            return;
+        }
+        // 'n' — repeat last search forward.
+        if (ascii == 'n') {
+            skrift_sel_anchor = -1;
+            if (skrift_last_search != 0 && skrift_last_search_len > 0) {
+                skrift_erase_cursor();
+                skrift_search_forward();
+                skrift_col_hint = skrift_line_col(skrift_cursor);
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else { skrift_show_cursor(); skrift_draw_status(); }
+            }
+            return;
+        }
+        // 'N' — repeat last search backward.
+        if (ascii == 'N') {
+            skrift_sel_anchor = -1;
+            if (skrift_last_search != 0 && skrift_last_search_len > 0) {
+                skrift_erase_cursor();
+                skrift_search_backward();
+                skrift_col_hint = skrift_line_col(skrift_cursor);
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else { skrift_show_cursor(); skrift_draw_status(); }
+            }
+            return;
+        }
+        // '0' — go to beginning of current line.
+        if (ascii == '0') {
+            skrift_sel_anchor = -1;
+            int new_cur = skrift_line_start(skrift_cursor);
+            if (new_cur != skrift_cursor) {
+                skrift_erase_cursor();
+                skrift_cursor = new_cur;
+                skrift_col_hint = 0;
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else { skrift_show_cursor(); skrift_draw_status(); }
+            }
+            return;
+        }
+        // '$' — go to end of current line (before the '\n').
+        if (ascii == '$') {
+            skrift_sel_anchor = -1;
+            int new_cur = skrift_line_end(skrift_cursor);
+            if (new_cur != skrift_cursor) {
+                skrift_erase_cursor();
+                skrift_cursor = new_cur;
+                skrift_col_hint = skrift_line_col(skrift_cursor);
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else { skrift_show_cursor(); skrift_draw_status(); }
+            }
+            return;
+        }
+        // 'p' — paste yanked text after the current line.
+        if (ascii == 'p') {
+            skrift_sel_anchor = -1;
+            if (skrift_yank_buf != 0 && skrift_yank_len > 0) {
+                skrift_erase_cursor();
+                // Move cursor to end of current line.
+                int le = skrift_line_end(skrift_cursor);
+                skrift_cursor = le;
+                if (skrift_cursor < skrift_size
+                    && load8(skrift_buf + skrift_cursor) == '\n') {
+                    skrift_cursor = skrift_cursor + 1;
+                }
+                // Insert the yanked text.
+                int yi = 0;
+                while (yi < skrift_yank_len) {
+                    skrift_insert(load8(skrift_yank_buf + yi));
+                    yi = yi + 1;
+                }
+                // If yanked text doesn't end with newline, add one.
+                if (skrift_yank_len > 0
+                    && load8(skrift_yank_buf + skrift_yank_len - 1) != '\n') {
+                    skrift_insert('\n');
+                }
+                skrift_modified = 1;
+                skrift_col_hint = 0;
+                if (skrift_adjust_viewport() == 1) { skrift_render(); }
+                else {
+                    win_row = skrift_line_number(skrift_cursor) - skrift_scroll_row;
+                    skrift_draw_from_row(win_row);
+                    skrift_show_cursor();
+                    skrift_draw_status();
+                }
+            }
+            return;
+        }
+        return;
+    }
+
+    // --- insert mode ---
+    if (ascii == 8) {
+        // Backspace — or delete selection if active.
+        if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
+            skrift_erase_cursor();
+            int del_line = skrift_line_number(skrift_cursor);
+            skrift_delete_selection();
+            if (skrift_adjust_viewport() == 1) { skrift_render(); }
+            else {
+                win_row = del_line - skrift_scroll_row;
+                if (win_row < 0) { win_row = 0; }
+                skrift_draw_from_row(win_row);
+                skrift_show_cursor();
+                skrift_draw_status();
+            }
+            return;
+        }
+        old_cursor = skrift_cursor;
+        old_line = skrift_line_number(old_cursor);
+        int at_line_start = (skrift_line_col(old_cursor) == 0);
+        skrift_erase_cursor();
+        skrift_delete_backward();
+        skrift_col_hint = skrift_line_col(skrift_cursor);
+        if (at_line_start == 1 && old_cursor > 0) {
+            // Merged two lines — redraw from this row down.
+            if (skrift_adjust_viewport() == 1) { skrift_render(); }
+            else {
+                win_row = skrift_line_number(skrift_cursor) - skrift_scroll_row;
+                skrift_draw_from_row(win_row);
+                skrift_show_cursor();
+                skrift_draw_status();
+            }
+        } else if (skrift_adjust_viewport() == 1) {
+            skrift_render();
+        } else {
+            // Deleted within a line — redraw this line only.
+            win_row = skrift_line_number(skrift_cursor) - skrift_scroll_row;
+            skrift_draw_line(win_row, skrift_line_start(skrift_cursor));
+            skrift_show_cursor();
+            skrift_draw_status();
+        }
+        return;
+    }
+    if (ascii == '\n') {
+        // Enter — delete selection first if active, then split the line.
+        if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
+            skrift_erase_cursor();
+            skrift_delete_selection();
+        }
+        old_cursor = skrift_cursor;
+        skrift_erase_cursor();
+        skrift_insert_newline();
+        skrift_col_hint = 0;
+        if (skrift_adjust_viewport() == 1) { skrift_render(); }
+        else {
+            win_row = skrift_line_number(old_cursor) - skrift_scroll_row;
+            skrift_draw_from_row(win_row);
+            skrift_show_cursor();
+            skrift_draw_status();
+        }
+        return;
+    }
+    if (ascii == 9) {
+        // Tab — delete selection first if active, then insert spaces.
+        if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
+            skrift_erase_cursor();
+            skrift_delete_selection();
+        }
+        skrift_erase_cursor();
+        skrift_insert_tab();
+        skrift_col_hint = skrift_line_col(skrift_cursor);
+        win_row = skrift_line_number(skrift_cursor) - skrift_scroll_row;
+        skrift_draw_line(win_row, skrift_line_start(skrift_cursor));
+        skrift_show_cursor();
+        skrift_draw_status();
+        return;
+    }
+    if (ascii >= 32 && ascii <= 126) {
+        // Printable character — delete selection first if active, then insert.
+        if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
+            skrift_erase_cursor();
+            int ins_line = skrift_line_number(skrift_cursor);
+            skrift_delete_selection();
+            skrift_insert(ascii);
+            skrift_col_hint = skrift_line_col(skrift_cursor);
+            if (skrift_adjust_viewport() == 1) { skrift_render(); }
+            else {
+                win_row = ins_line - skrift_scroll_row;
+                if (win_row < 0) { win_row = 0; }
+                skrift_draw_from_row(win_row);
+                skrift_show_cursor();
+                skrift_draw_status();
+            }
+            return;
+        }
+        skrift_erase_cursor();
+        skrift_insert(ascii);
+        skrift_col_hint = skrift_line_col(skrift_cursor);
+        win_row = skrift_line_number(skrift_cursor) - skrift_scroll_row;
+        skrift_draw_line(win_row, skrift_line_start(skrift_cursor));
+        skrift_show_cursor();
+        skrift_draw_status();
+        return;
+    }
+    return;
+}
+
+// --- lifecycle ---------------------------------------------------------------
+
+// Copy a NUL-terminated string into a kmalloc'd buffer, return the pointer.
+int skrift_copy_str(int src) {
+    int len = 0;
+    while (load8(src + len) != 0) { len = len + 1; }
+    int buf = kmalloc(len + 1);
+    if (buf == 0) { return 0; }
+    int i = 0;
+    while (i <= len) {
+        store8(buf + i, load8(src + i));
+        i = i + 1;
+    }
+    return buf;
+}
+
+// Launch the editor on the given kakel window, opening `filename_str` from
+// jakel. Called from shell_run (shell task context, IF enabled — safe for
+// jakel_open / jakel_read).
+void skrift_start(int win, int filename_str) {
+    // Allocate the buffer.
+    skrift_buf = kmalloc(SKRIFT_BUF_MAX);
+    if (skrift_buf == 0) {
+        sk_print("skrift: could not allocate buffer\n");
+        return;
+    }
+    // Allocate undo buffer.
+    if (skrift_undo_buf == 0) {
+        skrift_undo_buf = kmalloc(SKRIFT_BUF_MAX);
+    }
+    // Allocate search buffers.
+    if (skrift_search_buf == 0) {
+        skrift_search_buf = kmalloc(64);
+    }
+    // Initialise highlight colour for c0 keywords (warm amber).
+    if (SKRIFT_HL == 0) { SKRIFT_HL = fb_rgb(255, 180, 60); }
+    skrift_size = 0;
+    skrift_cursor = 0;
+    skrift_mode = SKRIFT_MODE_INSERT;
+    skrift_modified = 0;
+    skrift_scroll_row = 0;
+    skrift_col_hint = 0;
+    skrift_sel_anchor = -1;
+    skrift_win = win;
+
+    // Copy the filename.
+    skrift_filename = skrift_copy_str(filename_str);
+    if (skrift_filename != 0) {
+        skrift_filename_len = 0;
+        while (load8(skrift_filename + skrift_filename_len) != 0) {
+            skrift_filename_len = skrift_filename_len + 1;
+        }
+    }
+
+    // Try to open and read the file from jakel.
+    int cwd = 0;
+    if (kakel_active == 1) {
+        cwd = load64(sk_cwd_base + win * 8);
+    }
+    int fid = jakel_open(cwd, filename_str);
+    if (fid >= 0) {
+        int ftype = load64(jakel_type_base + fid * 8);
+        if (ftype == JAKEL_TYPE_FILE) {
+            int fsize = load64(jakel_size_base + fid * 8);
+            if (fsize > SKRIFT_BUF_MAX - 1) { fsize = SKRIFT_BUF_MAX - 1; }
+            if (fsize > 0) {
+                int n = jakel_read(fid, 0, skrift_buf, fsize);
+                skrift_size = n;
+            }
+        }
+    }
+
+    skrift_active = 1;
+    skrift_render();
+    return;
+}
+
+// Quit the editor: write the buffer back to jakel, free memory, restore the
+// shell prompt. Called from skrift_handle_key (keyboard IRQ context).
+void skrift_quit() {
+    // Write the buffer to jakel.
+    if (skrift_filename != 0 && skrift_modified == 1) {
+        int cwd = 0;
+        if (kakel_active == 1) {
+            cwd = load64(sk_cwd_base + skrift_win * 8);
+        }
+        int fid = jakel_lookup(cwd, skrift_filename);
+        if (fid < 0) {
+            fid = jakel_make_file(cwd, skrift_filename);
+        }
+        if (fid >= 0) {
+            jakel_write(fid, 0, skrift_buf, skrift_size);
+            store64(jakel_size_base + fid * 8, skrift_size);
+        }
+    }
+
+    // Free memory.
+    if (skrift_buf != 0) { kfree(skrift_buf); skrift_buf = 0; }
+    if (skrift_filename != 0) { kfree(skrift_filename); skrift_filename = 0; }
+
+    skrift_active = 0;
+    skrift_size = 0;
+    skrift_cursor = 0;
+
+    // Restore the shell.
+    if (kakel_active == 1) {
+        kakel_clear(skrift_win);
+        shell_prompt_win(skrift_win);
+    } else {
+        shell_prompt();
+    }
+    return;
+}

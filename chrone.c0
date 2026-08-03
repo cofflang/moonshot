@@ -1,0 +1,452 @@
+// chrone.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// chrone.c0 -- the preemptive scheduler: a task table with spawn/exit and
+// round-robin over however many tasks are runnable. Tasks are switched by
+// the timer ISR itself (isr_common in boot.s) rather than by any task
+// yielding voluntarily -- see sched_tick, and isr_common's own comment in
+// boot.s for the actual full-interrupt-frame swap mechanics.
+//
+// isr_common's switch path only ever reads SCHED_SAVE_SLOT_ADDR (where to
+// save the outgoing task's rsp) and SCHED_NEXT_RSP (the incoming task's
+// rsp), both computed here in c0 -- it has no notion of a fixed task count
+// or fixed per-task slots, so "how many tasks exist" is purely a c0-side
+// question.
+
+// How many timer ticks (~100Hz) a task runs before being forcibly switched
+// out -- purely a demo cadence choice, not derived from anything.
+int SCHED_SWITCH_PERIOD = 10;
+
+// Task-table sizing. MAX_TASKS is the fixed slot count of the parallel arrays
+// below; NUM_TASKS is how many the boot-time demo actually spawns. Task states
+// (one per slot): FREE = slot unused, RUNNABLE = ready or currently running,
+// EXITED = ran task_exit(), never to be scheduled again.
+int MAX_TASKS = 8;
+int NUM_TASKS = 4;
+int TASK_FREE = 0;
+int TASK_RUNNABLE = 1;
+int TASK_EXITED = 2;
+int TASK_BLOCKED = 3;
+
+// The demo's one exiting task (see thread_exiter) calls task_exit() once it has
+// been *scheduled* this many times -- gated on schedule count (task_runs),
+// deliberately NOT on wall-clock or raw work count, so exit happens after a
+// deterministic number of quanta regardless of QEMU timing.
+int EXIT_AFTER_RUNS = 3;
+
+// Which task id is currently running, and how many ticks have elapsed since
+// the last forced switch. Pure c0-side bookkeeping -- see kmain.c0's .sched
+// slot comment for why these are ordinary globals, not fixed memory slots.
+int sched_current = 0;
+int sched_tick_count = 0;
+
+// Base addresses of the five parallel task-table arrays, each MAX_TASKS 8-byte
+// entries, carved from the kernel heap (kmalloc, jenna.c0) in sched_start.
+// This is the same "parallel fixed-size arrays indexed by a small id, no
+// structs" idiom .sctable and the planned windowing layer use, and makes the
+// task table the heap's second real consumer after skalman's line buffer.
+//   task_rsp_base[i]     -- task i's saved full-interrupt-frame rsp (the ONLY
+//                           array isr_common ever touches, and only via the
+//                           slot address sched_tick hands it, never by name).
+//   task_state_base[i]   -- FREE / RUNNABLE / EXITED (see above).
+//   task_counter_base[i] -- task i's own work counter, incremented by the task
+//                           itself (thread_worker/thread_exiter). Surviving
+//                           across a task's successive resumes proves its
+//                           full register/stack state was preserved, not
+//                           restarted.
+//   task_runs_base[i]    -- how many times task i has been scheduled; bumped by
+//                           sched_tick on each switch TO i (plus once for task
+//                           0's initial launch). Drives EXIT_AFTER_RUNS.
+//   task_stack_base[i]   -- the physical page task i's stack was allocated from
+//                           (pmm_alloc_page in task_spawn), kept so the reaper
+//                           (sched_tick) can pmm_free_page it once the task has
+//                           EXITED. Set to 0 once reclaimed, both as the
+//                           "already reaped, don't double-free" marker and
+//                           because a task that never got a stack has none to
+//                           free.
+int task_rsp_base = 0;
+int task_state_base = 0;
+int task_counter_base = 0;
+int task_runs_base = 0;
+int task_stack_base = 0;
+
+// Calls boot.s's sched_launch(rsp) indirectly, exactly once. c0 can't call an
+// externally-defined asm symbol by name (coff0's resolve() knows only
+// builtins, same-file functions, and indirect calls through a value), so
+// boot.s stashed sched_launch's address in the .sched slot and this reads it
+// back and calls through it -- the same indirect-call mechanism int_dispatch
+// uses for interrupt handlers. sched_launch never returns (it iretqs into the
+// task), so neither does this, in normal operation.
+void sched_launch_call(int rsp) {
+    int launch = load64(SCHED_LAUNCH_ADDR);
+    launch(rsp);
+    return;
+}
+
+// Unblocks a BLOCKED task so sched_pick_next can schedule it again. Called by
+// shell_enqueue (keyboard IRQ path) after depositing a character into the
+// shell's input queue. Only acts if the task is actually BLOCKED -- a task
+// that is RUNNABLE already (e.g. still in its current quantum) is left alone.
+void task_wake(int id) {
+    if (load64(task_state_base + id * 8) == TASK_BLOCKED) {
+        store64(task_state_base + id * 8, TASK_RUNNABLE);
+    }
+    return;
+}
+
+// Builds a fresh stack for `entry` that LOOKS like a task isr_common just
+// preempted: 15 general-purpose registers (zeroed -- a fresh task has no prior
+// state), a dummy vector/error-code pair (never read on resume, only discarded
+// by isr_epilogue's `add rsp, 16`), then the 5 qwords `iretq` actually pops in
+// 64-bit mode -- RIP (-> `entry`), CS (0x08, gdt64's flat selector), RFLAGS
+// (0x200 = just the IF bit -- setting it here rather than via an explicit `sti`
+// is what lets the first task launch and every later resume share the exact
+// same code path, see isr_common), RSP (the task's real stack top,
+// `stack_base + 4096`), and SS (0). The RSP/SS fields exist because of a real
+// x86-64 wrinkle: `iretq` unconditionally pops RSP/SS too, even with no
+// privilege change -- see isr_common's own comment in boot.s for the full
+// story (a fresh, zeroed page reading as RSP=0 there triple-faults, which is
+// exactly why these fields cannot be omitted). 176 bytes total, matching
+// isr_common's own frame-size accounting. Reused unchanged per spawned task.
+int sched_craft_stack(int stack_base, int entry) {
+    int sp = stack_base + 4096 - 176;
+    store64(sp, 0);        // r15
+    store64(sp + 8, 0);    // r14
+    store64(sp + 16, 0);   // r13
+    store64(sp + 24, 0);   // r12
+    store64(sp + 32, 0);   // r11
+    store64(sp + 40, 0);   // r10
+    store64(sp + 48, 0);   // r9
+    store64(sp + 56, 0);   // r8
+    store64(sp + 64, 0);   // rbp
+    store64(sp + 72, 0);   // rdi
+    store64(sp + 80, 0);   // rsi
+    store64(sp + 88, 0);   // rdx
+    store64(sp + 96, 0);   // rcx
+    store64(sp + 104, 0);  // rbx
+    store64(sp + 112, 0);  // rax
+    store64(sp + 120, 0);  // vector (unused on resume)
+    store64(sp + 128, 0);  // error code (unused on resume)
+    store64(sp + 136, entry);            // RIP -> task entry point
+    store64(sp + 144, 0x08);              // CS = 0x08, gdt64's flat code selector
+    store64(sp + 152, 0x200);             // RFLAGS: IF (bit 9) set, else clear
+    store64(sp + 160, stack_base + 4096); // RSP: the task's real stack top
+    store64(sp + 168, 0);                 // SS
+    return sp;
+}
+
+// Allocates the next FREE task-table slot, gives it a fresh 4096-byte stack
+// from jenna, crafts that stack for `entry`, and marks it RUNNABLE. Returns the
+// new task id, or -1 if the table is full. This is the "spawn" half of the
+// process model: the whole table is set up by repeated task_spawn calls in
+// sched_start.
+int task_spawn(int entry) {
+    int id = 0;
+    while (id < MAX_TASKS) {
+        if (load64(task_state_base + id * 8) == TASK_FREE) {
+            int stack = pmm_alloc_page();
+            int sp = sched_craft_stack(stack, entry);
+            store64(task_rsp_base + id * 8, sp);
+            store64(task_stack_base + id * 8, stack);
+            store64(task_counter_base + id * 8, 0);
+            store64(task_runs_base + id * 8, 0);
+            store64(task_state_base + id * 8, TASK_RUNNABLE);
+            // Log the stack page too: paired with the reaper's "reaped ...
+            // stack=" line, this is what lets test_shell.sh prove a reaped
+            // page is genuinely handed back out (a later spawn's stack ==
+            // an earlier reaped stack, via pmm's LIFO free list).
+            serial_print("[sched] spawned task ");
+            serial_print_int(id);
+            serial_print(" stack=");
+            serial_print_int(stack);
+            serial_print("\n");
+            return id;
+        }
+        id = id + 1;
+    }
+    return -1;
+}
+
+// Round-robin "next runnable task" starting the search just AFTER `cur` and
+// wrapping around, so no single task can monopolize the CPU. Returns the first
+// slot that is RUNNABLE, or -1 if none are (e.g. every task has exited). Note
+// the scan's last candidate is `cur` itself, so if `cur` is the only runnable
+// task it is returned (sched_tick then simply keeps it running); an EXITED
+// `cur` is skipped like any other. No % operator in c0, so the wrap is a single
+// conditional subtraction -- safe because cand = cur + i stays below 2*MAX_TASKS.
+int sched_pick_next(int cur) {
+    int i = 1;
+    while (i <= MAX_TASKS) {
+        int cand = cur + i;
+        if (cand >= MAX_TASKS) {
+            cand = cand - MAX_TASKS;
+        }
+        if (load64(task_state_base + cand * 8) == TASK_RUNNABLE) {
+            return cand;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Frees the stack page of every EXITED task other than `cur` (the task this is
+// running on) that still owns its page. Safe precisely because such a task is
+// NOT executing -- it was switched away, so nothing is on its stack -- while
+// this code runs on `cur`'s stack, never a reaped one. That is also why exit/
+// kill can't free their own stack inline: a task can't free the stack it is
+// standing on, so reclamation is deferred to here, a different task's context.
+// After reclaiming the stack page, the slot is fully reset to FREE so
+// task_spawn can reuse it -- zeroing all five table arrays eliminates any
+// stale values a future spawn would inherit. Uses pmm's LIFO free list, so
+// the page a spawn gets next is exactly the one most recently reaped -- what
+// test_shell.sh checks to prove the memory is genuinely reclaimed, not just
+// dropped.
+void sched_reap(int cur) {
+    int r = 0;
+    while (r < MAX_TASKS) {
+        if (r != cur && load64(task_state_base + r * 8) == TASK_EXITED) {
+            int sb = load64(task_stack_base + r * 8);
+            if (sb != 0) {
+                pmm_free_page(sb);
+                store64(task_stack_base + r * 8, 0);
+                serial_print("[sched] reaped task ");
+                serial_print_int(r);
+                serial_print(" stack=");
+                serial_print_int(sb);
+                serial_print("\n");
+                // Reset the slot fully to FREE so task_spawn can reuse it.
+                store64(task_state_base + r * 8, TASK_FREE);
+                store64(task_rsp_base + r * 8, 0);
+                store64(task_counter_base + r * 8, 0);
+                store64(task_runs_base + r * 8, 0);
+            }
+        }
+        r = r + 1;
+    }
+    return;
+}
+
+// Refreshes the on-screen status bar (1 row at the top of the log strip) with
+// live system info. Called from sched_tick each switch period, so about once
+// every 10 timer ticks (~0.1s). Runs in the timer ISR (IF cleared), so it
+// cannot nest with itself or with the keyboard ISR -- safe to touch kakel
+// and the shared .kscratch buffer.
+//
+// Format: up Xh Xm Xs | tasks N/M | mem free/total
+// Cached status-bar values so we only redraw when something actually
+// changes. The bar is the most expensive thing on screen (full-width fill
+// + ~40 glyphs, every SCHED_SWITCH_PERIOD ticks), and most ticks nothing
+// visible changes — uptime rolls over once per second, task count only on
+// spawn/kill/exit, free pages only on alloc/free.
+int stats_last_secs = -1;
+int stats_last_tasks = -1;
+int stats_last_free = -1;
+
+void sched_stats_update() {
+    int secs = ticks / 100;
+    int n = 0;
+    int i = 0;
+    while (i < MAX_TASKS) {
+        int st = load64(task_state_base + i * 8);
+        if (st == TASK_RUNNABLE || st == TASK_BLOCKED) { n = n + 1; }
+        i = i + 1;
+    }
+    int free_pages = pmm_free_pages();
+
+    // Skip the entire redraw if nothing visible changed.
+    if (secs == stats_last_secs && n == stats_last_tasks
+        && free_pages == stats_last_free) { return; }
+    stats_last_secs = secs;
+    stats_last_tasks = n;
+    stats_last_free = free_pages;
+
+    fb_fill_rect(0, (fb_height / FONT_H - 1) * FONT_H, fb_width, FONT_H,
+                 load64(kakel_bg_base + kakel_stats_win * 8));
+    store64(kakel_row_base + kakel_stats_win * 8, 0);
+    store64(kakel_col_base + kakel_stats_win * 8, 0);
+    kakel_stats_print("uptime ");
+
+    int hours = secs / 3600;
+    int rem = secs - hours * 3600;
+    int mins = rem / 60;
+    int s = rem - mins * 60;
+    kakel_stats_int(hours);
+    kakel_stats_putc('h');
+    kakel_stats_putc(' ');
+    kakel_stats_int(mins);
+    kakel_stats_putc('m');
+    kakel_stats_putc(' ');
+    kakel_stats_int(s);
+    kakel_stats_putc('s');
+
+    kakel_stats_print(" | tasks ");
+    kakel_stats_int(n);
+    kakel_stats_putc('/');
+    kakel_stats_int(MAX_TASKS);
+
+    kakel_stats_print(" | memory ");
+    kakel_stats_int(free_pages);
+    kakel_stats_putc('/');
+    kakel_stats_int(pmm_total_pages());
+
+    return;
+}
+
+// Every SCHED_SWITCH_PERIOD timer ticks, refreshes the status bar, reaps any
+// dead tasks' stacks, then picks the next runnable task and, if it differs from
+// the current one, forces a switch by writing isr_common's two swap inputs
+// (SCHED_SAVE_SLOT_ADDR = the outgoing task's rsp slot address, SCHED_NEXT_RSP
+// = the incoming task's saved rsp) and setting SCHED_SWITCH_PENDING -- isr_common
+// performs the actual rsp swap once this (and int_dispatch) returns. Called from
+// timer_tick (interrupts.c0), so this only ever runs on the timer vector, never
+// keyboard.
+void sched_tick() {
+    sched_tick_count = sched_tick_count + 1;
+    if (sched_tick_count < SCHED_SWITCH_PERIOD) {
+        return;
+    }
+    sched_tick_count = 0;
+
+    // Refresh the on-screen status bar before running the scheduler logic.
+    // Runs on every switch period (~0.1s) so it stays current.
+    sched_stats_update();
+
+    int cur = sched_current;
+    sched_reap(cur);
+    int next = sched_pick_next(cur);
+    if (next < 0) {
+        return;   // nothing runnable at all (all tasks exited) -- just idle
+    }
+    if (next == cur) {
+        return;   // only the current task is runnable -- no switch needed
+    }
+
+    // Count this scheduling of the incoming task (drives EXIT_AFTER_RUNS, and
+    // proves fair round-robin: every runnable task's run count climbs).
+    store64(task_runs_base + next * 8, load64(task_runs_base + next * 8) + 1);
+
+    int next_counter = load64(task_counter_base + next * 8);
+    serial_print("[sched] -> task ");
+    serial_print_int(next);
+    serial_print(" (counter=");
+    serial_print_int(next_counter);
+    serial_print(")\n");
+
+    // task_rsp_base + id*8 is "task id's saved-rsp slot address". isr_common
+    // saves the outgoing task's rsp into the slot SCHED_SAVE_SLOT_ADDR points
+    // at, and loads rsp from SCHED_NEXT_RSP -- see boot.s.
+    store64(SCHED_SAVE_SLOT_ADDR, task_rsp_base + cur * 8);
+    store64(SCHED_NEXT_RSP, load64(task_rsp_base + next * 8));
+    sched_current = next;
+    store64(SCHED_SWITCH_PENDING, 1);
+    return;
+}
+
+// The "exit" half of the process model. Marks the current task EXITED so
+// sched_pick_next skips it forever, then parks: we can't context-switch
+// ourselves here (this runs in ordinary task context, not an ISR), so we idle
+// via hlt and wait for the very next timer tick, which will pick_next past this
+// now-exited task and never schedule it again. The task's stack page is
+// intentionally leaked for now -- freeing the *running* task's own stack from
+// on top of it is unsafe, so reclaiming an exited task's stack is a later item.
+void task_exit() {
+    int me = sched_current;
+    store64(task_state_base + me * 8, TASK_EXITED);
+    serial_print("[sched] task ");
+    serial_print_int(me);
+    serial_print(" exited\n");
+    while (1) {
+        halt();
+    }
+    return;
+}
+
+// The demo workload's ordinary task body: a tight loop that only increments its
+// OWN work counter, deliberately never yielding or calling into the scheduler
+// -- all interleaving comes purely from the timer ISR forcibly switching, which
+// is what makes this PREEMPTIVE (not cooperative). A single generic body serves
+// every worker: while a task runs, sched_current == that task's id, so
+// task_counter[sched_current] is always this task's own slot. (sched_current
+// only changes when the scheduler has switched to a different task, at which
+// point a different task -- not this loop -- is the one running.)
+void thread_worker() {
+    while (1) {
+        int me = sched_current;
+        store64(task_counter_base + me * 8,
+                load64(task_counter_base + me * 8) + 1);
+    }
+    return;
+}
+
+// Same as thread_worker, but voluntarily exits after being scheduled
+// EXIT_AFTER_RUNS times -- the demo's proof that task_exit + sched_pick_next's
+// skip actually work: the other tasks keep round-robining after this one drops
+// out. task_runs[me] only advances when the scheduler switches TO this task, so
+// the loop runs a deterministic number of quanta regardless of QEMU timing.
+void thread_exiter() {
+    while (load64(task_runs_base + sched_current * 8) < EXIT_AFTER_RUNS) {
+        int me = sched_current;
+        store64(task_counter_base + me * 8,
+                load64(task_counter_base + me * 8) + 1);
+    }
+    task_exit();
+    return;
+}
+
+// Sets up the task table on the kernel heap, spawns the demo workload (three
+// plain workers + one exiter), then hands off to sched_launch to start task 0
+// running -- see sched_launch_call/sched_craft_stack. Never returns in normal
+// operation; every later switch happens transparently inside the timer ISR, not
+// here. Called once from boot.s after kernel_post_init (heap already inited).
+void sched_start() {
+    task_rsp_base = kmalloc(MAX_TASKS * 8);
+    task_state_base = kmalloc(MAX_TASKS * 8);
+    task_counter_base = kmalloc(MAX_TASKS * 8);
+    task_runs_base = kmalloc(MAX_TASKS * 8);
+    task_stack_base = kmalloc(MAX_TASKS * 8);
+
+    // kmalloc does not zero, so every slot starts explicitly FREE before any
+    // spawn -- otherwise task_spawn/sched_pick_next would read stale heap bytes
+    // as bogus task states.
+    int i = 0;
+    while (i < MAX_TASKS) {
+        store64(task_state_base + i * 8, TASK_FREE);
+        store64(task_rsp_base + i * 8, 0);
+        store64(task_counter_base + i * 8, 0);
+        store64(task_runs_base + i * 8, 0);
+        store64(task_stack_base + i * 8, 0);
+        i = i + 1;
+    }
+
+    // Demo workload -- ids come back 0,1,2,3. Three identical counter workers
+    // plus one exiter proves a real N(>2)-task round-robin AND task exit/skip.
+    task_spawn(thread_worker);
+    task_spawn(thread_worker);
+    task_spawn(thread_worker);
+    task_spawn(thread_exiter);
+
+    // Shell task (id 4). Must be spawned AFTER the demo workers so their ids
+    // stay 0-3 (the automated tests check task 3's exit by id). shell_task
+    // immediately blocks on an empty input queue, so it is invisible to the
+    // preemptive round-robin during headless test runs; the keyboard IRQ wakes
+    // it via task_wake when input is available.
+    shell_task_id = task_spawn(shell_task);
+
+    sched_current = 0;
+    sched_tick_count = 0;
+    store64(SCHED_SWITCH_PENDING, 0);
+    // Task 0's initial launch below is a scheduling too, but it doesn't go
+    // through sched_tick's bump, so count it here for consistency.
+    store64(task_runs_base, 1);
+
+    serial_print("[sched] starting ");
+    serial_print_int(NUM_TASKS);
+    serial_print(" preemptive tasks\n");
+    sched_launch_call(load64(task_rsp_base));
+    return;
+}

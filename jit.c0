@@ -1,0 +1,902 @@
+// jit.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// jit.c0 — minimal x86-64 JIT compiler for REPL expressions.
+// Walks the REPL AST (same nodes repl_eval_node interprets) and emits raw
+// x86-64 machine code into an identity-mapped page. The generated code is
+// invoked through c0's indirect-call mechanism; the return value in RAX
+// becomes the c0 return value.
+//
+// MVP scope: ND_NUM, ND_NEG, ND_ADD, ND_SUB, ND_MUL, ND_DIV, and the six
+// comparison nodes (ND_EQ, ND_NE, ND_LT, ND_LE, ND_GT, ND_GE). Variables,
+// assignments, and control-flow nodes are deferred.
+
+// --- JIT page ----------------------------------------------------------------
+int jit_page     = 0;   // physical (and thus virtual) address of the code page
+int jit_pos       = 0;   // current write offset within the page
+int jit_str_pos   = 0;   // string data offset (starts at 3072, grows upward)
+
+// NX bit (bit 63) for page-table entries — computed once in jit_init.
+// EFER.NXE is enabled at boot (boot.s), so bit 63 controls whether a page
+// is executable (0) or non-executable (1). We compute 2^63 as 2^31 * 2^32
+// because c0 has no bit-shift operator.
+int JIT_NX = 0;
+
+// Walk the identity-mapped page tables to find the PTE for jit_page and
+// toggle the writable and NX bits together to enforce W^X:
+//   writable=1 → present + writable + NX    (compile: can write, cannot execute)
+//   writable=0 → present                    (execute: can execute, cannot write)
+// The page is never both writable and executable at the same time.
+// Does NOT flush the TLB (the architecture is correct even without a flush —
+// the CPU will #PF on a write to a non-writable page or #PF on fetch from a
+// non-executable page, but we never write during execution nor execute during
+// compilation).
+void jit_set_writable(int writable) {
+    if (jit_page == 0) { return; }
+    int pml4 = pml4_phys;
+    // PML4[0] → PDPT
+    int pdpt_entry = load64(pml4 + 0);
+    int pdpt = (pdpt_entry / 4096) * 4096;
+    // PDPT[0] → PD
+    int pd_entry = load64(pdpt + 0);
+    int pd = (pd_entry / 4096) * 4096;
+    // PD index and PT
+    int page = jit_page / 4096;
+    int pd_idx = page / 512;
+    int pt_entry = load64(pd + pd_idx * 8);
+    int pt = (pt_entry / 4096) * 4096;
+    // PT index and PTE
+    int pt_idx = page - pd_idx * 512;
+    int pte_val = load64(pt + pt_idx * 8);
+
+    // Extract physical address from the PTE. (pte_val / 4096) * 4096 only
+    // works when the PTE is positive — if the NX bit (bit 63) is set, the
+    // value is negative and c0's truncate-toward-zero division rounds the
+    // wrong way. Clear the NX bit arithmetically before extracting phys.
+    if (JIT_NX == 0) { JIT_NX = 0x80000000; JIT_NX = JIT_NX * 0x100000000; }
+    int clean_pte = pte_val;
+    if (clean_pte < 0) { clean_pte = clean_pte - JIT_NX; }
+    int phys = (clean_pte / 4096) * 4096;
+
+    if (writable == 1) {
+        // Compile mode: present (1) + writable (2) + NX (bit 63).
+        store64(pt + pt_idx * 8, phys + 3 + JIT_NX);
+    } else {
+        // Execute mode: present (1), no W, no NX — executable.
+        store64(pt + pt_idx * 8, phys + 1);
+    }
+    return;
+}
+
+void jit_init() {
+    jit_page = pmm_alloc_page();
+    jit_pos = 0;
+    jit_str_pos = 3072;  // string data starts at 3 KB into the page
+    if (jit_page == 0) {
+        serial_print("[jit] could not allocate code page\n");
+        return;
+    }
+    // Allocate loop/break tracking arrays (heap, small).
+    if (jit_loop_labels == 0) {
+        jit_loop_labels = kmalloc(16 * 8);   // 16 loop depths
+    }
+    if (jit_break_patches == 0) {
+        jit_break_patches = kmalloc(32 * 8); // 32 break placeholders
+    }
+    serial_print("[jit] code page at ");
+    serial_print_int(jit_page);
+    serial_print("\n");
+    return;
+}
+
+// Wrapper called from JIT-compiled code for the print() builtin. The JIT
+// emits a call to this function via the address stored in JIT_PRINT_ADDR.
+// Prints the integer to the screen and serial, followed by a newline.
+int jit_print_helper(int v) {
+    sk_print_int(v);
+    sk_print("\n");
+    return v;
+}
+
+// Wrapper called from JIT-compiled code for print() with a string argument.
+// The string pointer is passed in rdi. Returns the string pointer so the
+// JIT REPL prints it as the expression result.
+int jit_print_str_helper(int str) {
+    serial_print(str);
+    serial_print("\n");
+    sk_print(str);
+    sk_print("\n");
+    return str;
+}
+
+// Wrapper called from JIT-compiled code for assignment (x = expr). The JIT
+// emits a call to this function via JIT_ASSIGN_ADDR. Delegates to the REPL's
+// repl_assign, which creates or updates the variable and returns the value.
+int jit_assign_helper(int name_ptr, int name_len, int value) {
+    return repl_assign(name_ptr, name_len, value);
+}
+
+// --- x86-64 instruction encoder ----------------------------------------------
+// Each function returns the new write position.
+
+int jit_emit(int pos, int byte) {
+    store8(jit_page + pos, byte);
+    return pos + 1;
+}
+
+// Extract byte n (0 = LSB) from value v using arithmetic (c0 has no shifts).
+// n=7 overflows: d = 256^7 = 2^56, then d*256 = 2^64 which wraps to 0 in
+// 64-bit arithmetic → divide-by-zero (#DE). All our 64-bit immediates
+// (kernel addresses) are identity-mapped and fit in < 4 GB, so bytes 4-7
+// are always 0. Return 0 directly for n >= 4 to avoid the overflow.
+int jit_byte(int v, int n) {
+    if (n >= 4) { return 0; }
+    int d = 1;
+    int i = 0;
+    while (i < n) { d = d * 256; i = i + 1; }
+    return (v / d) - (v / (d * 256)) * 256;
+}
+
+// mov eax, imm32 — 5 bytes: B8 + 4-byte little-endian immediate.
+// Zero-extends to RAX in 64-bit mode.
+int jit_mov_eax_imm(int pos, int v) {
+    pos = jit_emit(pos, 0xB8);
+    pos = jit_emit(pos, jit_byte(v, 0));
+    pos = jit_emit(pos, jit_byte(v, 1));
+    pos = jit_emit(pos, jit_byte(v, 2));
+    pos = jit_emit(pos, jit_byte(v, 3));
+    return pos;
+}
+
+// push rax — 1 byte: 50
+int jit_push_rax(int pos) {
+    return jit_emit(pos, 0x50);
+}
+
+// pop rbx — 1 byte: 5B
+int jit_pop_rbx(int pos) {
+    return jit_emit(pos, 0x5B);
+}
+
+// mov rax, rbx — 3 bytes: 48 89 D8
+int jit_mov_rax_rbx(int pos) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0x89);
+    pos = jit_emit(pos, 0xD8);
+    return pos;
+}
+
+// pop rax — 1 byte: 58
+int jit_pop_rax(int pos) {
+    return jit_emit(pos, 0x58);
+}
+
+// mov rdi, rax — 3 bytes: 48 89 C7
+int jit_mov_rdi_rax(int pos) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0x89);
+    pos = jit_emit(pos, 0xC7);
+    return pos;
+}
+
+// mov rdx, rax — 3 bytes: 48 89 C2
+int jit_mov_rdx_rax(int pos) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0x89);
+    pos = jit_emit(pos, 0xC2);
+    return pos;
+}
+
+// mov edi, imm32 — 5 bytes: BF + 4-byte little-endian immediate.
+// Zero-extends to RDI in 64-bit mode (safe for kernel addresses < 4 GB).
+int jit_mov_edi_imm32(int pos, int v) {
+    pos = jit_emit(pos, 0xBF);
+    pos = jit_emit(pos, jit_byte(v, 0));
+    pos = jit_emit(pos, jit_byte(v, 1));
+    pos = jit_emit(pos, jit_byte(v, 2));
+    pos = jit_emit(pos, jit_byte(v, 3));
+    return pos;
+}
+
+// mov esi, imm32 — 5 bytes: BE + 4-byte little-endian immediate.
+// Zero-extends to RSI in 64-bit mode.
+int jit_mov_esi_imm32(int pos, int v) {
+    pos = jit_emit(pos, 0xBE);
+    pos = jit_emit(pos, jit_byte(v, 0));
+    pos = jit_emit(pos, jit_byte(v, 1));
+    pos = jit_emit(pos, jit_byte(v, 2));
+    pos = jit_emit(pos, jit_byte(v, 3));
+    return pos;
+}
+
+// call rax — 2 bytes: FF D0
+int jit_call_rax(int pos) {
+    pos = jit_emit(pos, 0xFF);
+    pos = jit_emit(pos, 0xD0);
+    return pos;
+}
+
+// mov rax, imm64 — 10 bytes: 48 B8 + 8-byte little-endian immediate.
+int jit_mov_rax_imm64(int pos, int v) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0xB8);
+    pos = jit_emit(pos, jit_byte(v, 0));
+    pos = jit_emit(pos, jit_byte(v, 1));
+    pos = jit_emit(pos, jit_byte(v, 2));
+    pos = jit_emit(pos, jit_byte(v, 3));
+    pos = jit_emit(pos, jit_byte(v, 4));
+    pos = jit_emit(pos, jit_byte(v, 5));
+    pos = jit_emit(pos, jit_byte(v, 6));
+    pos = jit_emit(pos, jit_byte(v, 7));
+    return pos;
+}
+
+// add rax, rbx — 3 bytes: 48 01 D8  (rax = rax + rbx)
+int jit_add_rax_rbx(int pos) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0x01);
+    pos = jit_emit(pos, 0xD8);
+    return pos;
+}
+
+// sub rax, rbx — 3 bytes: 48 29 D8  (rax = rax - rbx)
+int jit_sub_rax_rbx(int pos) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0x29);
+    pos = jit_emit(pos, 0xD8);
+    return pos;
+}
+
+// imul rax, rbx — 4 bytes: 48 0F AF C3
+int jit_imul_rax_rbx(int pos) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0x0F);
+    pos = jit_emit(pos, 0xAF);
+    pos = jit_emit(pos, 0xC3);
+    return pos;
+}
+
+// cqo — 2 bytes: 48 99  (sign-extend RAX into RDX:RAX)
+int jit_cqo(int pos) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0x99);
+    return pos;
+}
+
+// idiv rbx — 3 bytes: 48 F7 FB  (signed divide RDX:RAX by rbx)
+int jit_idiv_rbx(int pos) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0xF7);
+    pos = jit_emit(pos, 0xFB);
+    return pos;
+}
+
+// neg rax — 3 bytes: 48 F7 D8
+int jit_neg_rax(int pos) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0xF7);
+    pos = jit_emit(pos, 0xD8);
+    return pos;
+}
+
+// cmp rax, rbx — 3 bytes: 48 39 D8  (sets flags for rax - rbx)
+int jit_cmp_rax_rbx(int pos) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0x39);
+    pos = jit_emit(pos, 0xD8);
+    return pos;
+}
+
+// sete al  — 3 bytes: 0F 94 C0  (AL = 1 if ZF=1)
+int jit_sete_al(int pos) {
+    pos = jit_emit(pos, 0x0F);
+    pos = jit_emit(pos, 0x94);
+    pos = jit_emit(pos, 0xC0);
+    return pos;
+}
+
+// setne al — 3 bytes: 0F 95 C0  (AL = 1 if ZF=0)
+int jit_setne_al(int pos) {
+    pos = jit_emit(pos, 0x0F);
+    pos = jit_emit(pos, 0x95);
+    pos = jit_emit(pos, 0xC0);
+    return pos;
+}
+
+// setl al  — 3 bytes: 0F 9C C0  (AL = 1 if SF≠OF)
+int jit_setl_al(int pos) {
+    pos = jit_emit(pos, 0x0F);
+    pos = jit_emit(pos, 0x9C);
+    pos = jit_emit(pos, 0xC0);
+    return pos;
+}
+
+// setle al — 3 bytes: 0F 9E C0  (AL = 1 if ZF=1 or SF≠OF)
+int jit_setle_al(int pos) {
+    pos = jit_emit(pos, 0x0F);
+    pos = jit_emit(pos, 0x9E);
+    pos = jit_emit(pos, 0xC0);
+    return pos;
+}
+
+// setg al  — 3 bytes: 0F 9F C0  (AL = 1 if ZF=0 and SF=OF)
+int jit_setg_al(int pos) {
+    pos = jit_emit(pos, 0x0F);
+    pos = jit_emit(pos, 0x9F);
+    pos = jit_emit(pos, 0xC0);
+    return pos;
+}
+
+// setge al — 3 bytes: 0F 9D C0  (AL = 1 if SF=OF)
+int jit_setge_al(int pos) {
+    pos = jit_emit(pos, 0x0F);
+    pos = jit_emit(pos, 0x9D);
+    pos = jit_emit(pos, 0xC0);
+    return pos;
+}
+
+// movzx rax, al — 4 bytes: 48 0F B6 C0  (zero-extend AL to RAX)
+int jit_movzx_rax_al(int pos) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0x0F);
+    pos = jit_emit(pos, 0xB6);
+    pos = jit_emit(pos, 0xC0);
+    return pos;
+}
+
+// ret — 1 byte: C3
+int jit_ret(int pos) {
+    return jit_emit(pos, 0xC3);
+}
+
+// test rax, rax — 3 bytes: 48 85 C0. Sets ZF if rax == 0.
+int jit_test_rax_rax(int pos) {
+    pos = jit_emit(pos, 0x48);
+    pos = jit_emit(pos, 0x85);
+    pos = jit_emit(pos, 0xC0);
+    return pos;
+}
+
+// je rel32 — 6 bytes: 0F 84 + 4-byte little-endian signed offset.
+int jit_je_rel32(int pos, int target) {
+    int offset = target - (pos + 6);
+    pos = jit_emit(pos, 0x0F);
+    pos = jit_emit(pos, 0x84);
+    pos = jit_emit(pos, jit_byte(offset, 0));
+    pos = jit_emit(pos, jit_byte(offset, 1));
+    pos = jit_emit(pos, jit_byte(offset, 2));
+    pos = jit_emit(pos, jit_byte(offset, 3));
+    return pos;
+}
+
+// je with placeholder offset 0 (patched later via jit_patch_je).
+int jit_je_placeholder(int pos) {
+    return jit_je_rel32(pos, pos + 6);  // jump to self
+}
+
+// jmp rel32 — 5 bytes: E9 + 4-byte little-endian signed offset.
+int jit_jmp_rel32(int pos, int target) {
+    int offset = target - (pos + 5);
+    pos = jit_emit(pos, 0xE9);
+    pos = jit_emit(pos, jit_byte(offset, 0));
+    pos = jit_emit(pos, jit_byte(offset, 1));
+    pos = jit_emit(pos, jit_byte(offset, 2));
+    pos = jit_emit(pos, jit_byte(offset, 3));
+    return pos;
+}
+
+// jmp with placeholder offset 0.
+int jit_jmp_placeholder(int pos) {
+    return jit_jmp_rel32(pos, pos + 5);  // jump to self
+}
+
+// Patch a je at `pos` to jump to `target` (pos = start of 0F 84).
+void jit_patch_je(int pos, int target) {
+    int offset = target - (pos + 6);
+    store8(jit_page + pos + 2, jit_byte(offset, 0));
+    store8(jit_page + pos + 3, jit_byte(offset, 1));
+    store8(jit_page + pos + 4, jit_byte(offset, 2));
+    store8(jit_page + pos + 5, jit_byte(offset, 3));
+    return;
+}
+
+// Patch a jmp at `pos` to jump to `target` (pos = start of E9).
+void jit_patch_jmp(int pos, int target) {
+    int offset = target - (pos + 5);
+    store8(jit_page + pos + 1, jit_byte(offset, 0));
+    store8(jit_page + pos + 2, jit_byte(offset, 1));
+    store8(jit_page + pos + 3, jit_byte(offset, 2));
+    store8(jit_page + pos + 4, jit_byte(offset, 3));
+    return;
+}
+
+// --- helpers -----------------------------------------------------------------
+
+// Returns 1 if `nd` is ND_NUM with value 0, 0 otherwise.
+int jit_is_zero(int nd) {
+    if (nd != 0 && load64(nd) == ND_NUM && load64(nd + 8) == 0) { return 1; }
+    return 0;
+}
+
+// Compile a binary operation: emit code for left and right operands, leaving
+// rax = left, rbx = right. Returns the new write position, or -1 on error.
+//
+// Pattern (right-first to minimise instruction bytes):
+//   compile right → rax = right → push rax  [stack: right]
+//   compile left  → rax = left  → pop rbx   [rbx = right]
+//   Now rax = left, rbx = right — correct for all binary operators.
+int jit_compile_binary(int left, int right, int pos) {
+    pos = jit_compile_node(right, pos);
+    if (pos < 0) { return -1; }
+    pos = jit_push_rax(pos);
+    pos = jit_compile_node(left, pos);
+    if (pos < 0) { return -1; }
+    return jit_pop_rbx(pos);
+}
+
+// --- AST compiler ------------------------------------------------------------
+// Recursively walks a REPL AST node and emits x86-64 code. Returns the new
+// write position, or -1 on error (unsupported node kind).
+
+// Loop label tracking for break/continue — same pattern as coff's loop_labels.
+int jit_loop_labels = 0;   // alloc'd in jit_init: 16 slots × 8B (loop start pos)
+int jit_loop_depth  = 0;
+int jit_break_patches = 0; // alloc'd in jit_init: 32 slots × 8B (placeholder pos)
+int jit_break_count   = 0;
+
+int jit_compile_node(int nd, int pos) {
+    if (nd == 0) { return pos; }
+    int kind = load64(nd);
+    int left;
+    int right;
+
+    // ND_NUM: mov eax, <value>
+    if (kind == ND_NUM) {
+        return jit_mov_eax_imm(pos, load64(nd + 8));
+    }
+
+    // ND_STR: embed string in the page's string area, load its address.
+    if (kind == ND_STR) {
+        int str_ptr = load64(nd + 8);
+        int str_len = load64(nd + 24);
+        int str_addr = jit_page + jit_str_pos;
+        int si = 0;
+        while (si <= str_len) {
+            store8(str_addr + si, load8(str_ptr + si));
+            si = si + 1;
+        }
+        jit_str_pos = jit_str_pos + str_len + 1;
+        // Align to 8 bytes.
+        while ((jit_str_pos - (jit_str_pos / 8) * 8) != 0) {
+            store8(jit_page + jit_str_pos, 0);
+            jit_str_pos = jit_str_pos + 1;
+        }
+        return jit_mov_rax_imm64(pos, str_addr);
+    }
+
+    // ND_NEG: compile child, then neg rax
+    if (kind == ND_NEG) {
+        pos = jit_compile_node(load64(nd + 8), pos);
+        if (pos < 0) { return -1; }
+        return jit_neg_rax(pos);
+    }
+
+    // ND_ADD
+    if (kind == ND_ADD) {
+        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        if (pos < 0) { return -1; }
+        return jit_add_rax_rbx(pos);
+    }
+
+    // ND_SUB
+    if (kind == ND_SUB) {
+        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        if (pos < 0) { return -1; }
+        return jit_sub_rax_rbx(pos);
+    }
+
+    // ND_MUL
+    if (kind == ND_MUL) {
+        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        if (pos < 0) { return -1; }
+        return jit_imul_rax_rbx(pos);
+    }
+
+    // ND_DIV
+    if (kind == ND_DIV) {
+        right = load64(nd + 16);
+        if (jit_is_zero(right) == 1) {
+            serial_print("[jit] division by zero\n");
+            return -1;
+        }
+        pos = jit_compile_binary(load64(nd + 8), right, pos);
+        if (pos < 0) { return -1; }
+        pos = jit_cqo(pos);
+        return jit_idiv_rbx(pos);
+    }
+
+    // ND_EQ
+    if (kind == ND_EQ) {
+        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        if (pos < 0) { return -1; }
+        pos = jit_cmp_rax_rbx(pos);
+        pos = jit_sete_al(pos);
+        return jit_movzx_rax_al(pos);
+    }
+
+    // ND_NE
+    if (kind == ND_NE) {
+        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        if (pos < 0) { return -1; }
+        pos = jit_cmp_rax_rbx(pos);
+        pos = jit_setne_al(pos);
+        return jit_movzx_rax_al(pos);
+    }
+
+    // ND_LT
+    if (kind == ND_LT) {
+        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        if (pos < 0) { return -1; }
+        pos = jit_cmp_rax_rbx(pos);
+        pos = jit_setl_al(pos);
+        return jit_movzx_rax_al(pos);
+    }
+
+    // ND_LE
+    if (kind == ND_LE) {
+        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        if (pos < 0) { return -1; }
+        pos = jit_cmp_rax_rbx(pos);
+        pos = jit_setle_al(pos);
+        return jit_movzx_rax_al(pos);
+    }
+
+    // ND_GT
+    if (kind == ND_GT) {
+        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        if (pos < 0) { return -1; }
+        pos = jit_cmp_rax_rbx(pos);
+        pos = jit_setg_al(pos);
+        return jit_movzx_rax_al(pos);
+    }
+
+    // ND_GE
+    if (kind == ND_GE) {
+        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        if (pos < 0) { return -1; }
+        pos = jit_cmp_rax_rbx(pos);
+        pos = jit_setge_al(pos);
+        return jit_movzx_rax_al(pos);
+    }
+
+    // ND_PRINT: compile the argument, then call the appropriate print helper.
+    // String arguments use jit_print_str_helper; integers use jit_print_helper.
+    if (kind == ND_PRINT) {
+        int arg = load64(nd + 8);  // argument expression
+        if (arg != 0 && load64(arg) == ND_STR) {
+            // String argument — compile it (loads string address into rax),
+            // then call jit_print_str_helper.
+            pos = jit_compile_node(arg, pos);
+            if (pos < 0) { return -1; }
+            pos = jit_push_rax(pos);
+            pos = jit_mov_rdi_rax(pos);
+            pos = jit_mov_rax_imm64(pos, JIT_PRINT_STR_ADDR);
+            pos = jit_call_rax(pos);
+            pos = jit_pop_rax(pos);
+            return pos;
+        }
+        // Integer argument.
+        pos = jit_compile_node(arg, pos);
+        if (pos < 0) { return -1; }
+        pos = jit_push_rax(pos);          // push rax (save value)
+        pos = jit_mov_rdi_rax(pos);       // rdi = rax (first argument)
+        pos = jit_mov_rax_imm64(pos, JIT_PRINT_ADDR);  // load helper address
+        pos = jit_call_rax(pos);          // call jit_print_helper
+        pos = jit_pop_rax(pos);           // pop rax (restore return value)
+        return pos;
+    }
+
+    // ND_ASSIGN: compile the value expression, then call jit_assign_helper to
+    // store it in the REPL symbol table at runtime. Same call pattern as print.
+    if (kind == ND_ASSIGN) {
+        int name_ptr = load64(nd + 8);
+        int value_expr = load64(nd + 16);
+        int name_len  = load64(nd + 24);
+        pos = jit_compile_node(value_expr, pos);
+        if (pos < 0) { return -1; }
+        pos = jit_mov_rdx_rax(pos);         // rdx = rax (arg3: value)
+        pos = jit_push_rax(pos);            // save value for return
+        pos = jit_mov_edi_imm32(pos, name_ptr);  // rdi = name_ptr (arg1)
+        pos = jit_mov_esi_imm32(pos, name_len);  // rsi = name_len (arg2)
+        pos = jit_mov_rax_imm64(pos, JIT_ASSIGN_ADDR);
+        pos = jit_call_rax(pos);            // call jit_assign_helper
+        pos = jit_pop_rax(pos);             // restore return value
+        return pos;
+    }
+
+    // ND_VAR: look up the variable at compile time and emit its current value
+    // as an immediate. Each eval -c recompiles from scratch, so the compile-
+    // time value is always up to date. Deferred to an actual runtime lookup
+    // later (needs function-call support in the JIT).
+    if (kind == ND_VAR) {
+        int name_ptr = load64(nd + 8);
+        int name_len = load64(nd + 24);
+        int idx = repl_lookup(name_ptr, name_len);
+        if (idx < 0) {
+            serial_print("[jit] unknown variable '");
+            // Print the variable name character by character.
+            int ci = 0;
+            while (ci < name_len) {
+                serial_putc(load64(name_ptr + ci));
+                ci = ci + 1;
+            }
+            serial_print("'\n");
+            return -1;
+        }
+        int val = load64(repl_var_values + idx * 8);
+        serial_print("[jit] var ");
+        int ci = 0;
+        while (ci < name_len) {
+            serial_putc(load64(name_ptr + ci));
+            ci = ci + 1;
+        }
+        serial_print(" = ");
+        serial_print_int(val);
+        serial_print("\n");
+        return jit_mov_eax_imm(pos, val);
+    }
+
+    // --- control flow ---
+
+    // ND_IF: if (cond) then_stmt [else else_stmt]
+    if (kind == ND_IF) {
+        int cond = load64(nd + 8);
+        int then_body = load64(nd + 16);
+        int else_body = load64(nd + 24);
+        pos = jit_compile_node(cond, pos);
+        if (pos < 0) { return -1; }
+        pos = jit_test_rax_rax(pos);
+        int je_slot = pos;
+        pos = jit_je_placeholder(pos);  // je to else or end
+        pos = jit_compile_node(then_body, pos);
+        if (pos < 0) { return -1; }
+        if (else_body != 0) {
+            int jmp_slot = pos;
+            pos = jit_jmp_placeholder(pos);  // jmp over else
+            jit_patch_je(je_slot, pos);       // je now lands at else
+            pos = jit_compile_node(else_body, pos);
+            if (pos < 0) { return -1; }
+            jit_patch_jmp(jmp_slot, pos);     // jmp lands at end
+        } else {
+            jit_patch_je(je_slot, pos);       // je lands at end
+        }
+        return pos;
+    }
+
+    // ND_WHILE: while (cond) body. Supports break/continue.
+    if (kind == ND_WHILE) {
+        int cond = load64(nd + 8);
+        int body = load64(nd + 16);
+        if (jit_loop_depth >= 8) {
+            serial_print("[jit] loop nesting too deep\n");
+            return -1;
+        }
+        store64(jit_loop_labels + jit_loop_depth * 8, pos);  // loop start
+        jit_loop_depth = jit_loop_depth + 1;
+        int saved_breaks = jit_break_count;
+        int loop_start = pos;
+        pos = jit_compile_node(cond, pos);
+        if (pos < 0) { return -1; }
+        pos = jit_test_rax_rax(pos);
+        int je_slot = pos;
+        pos = jit_je_placeholder(pos);  // je to end
+        pos = jit_compile_node(body, pos);
+        if (pos < 0) { return -1; }
+        pos = jit_jmp_rel32(pos, loop_start);  // jmp back to cond
+        jit_patch_je(je_slot, pos);             // je lands at end
+        // Patch all break placeholders to current position.
+        int bi = saved_breaks;
+        while (bi < jit_break_count) {
+            int bp = load64(jit_break_patches + bi * 8);
+            jit_patch_jmp(bp, pos);
+            bi = bi + 1;
+        }
+        jit_break_count = saved_breaks;
+        jit_loop_depth = jit_loop_depth - 1;
+        // Loop returns 0 (repl_eval semantics: initial result = 0).
+        pos = jit_mov_eax_imm(pos, 0);
+        return pos;
+    }
+
+    // ND_FOR: for (init; cond; incr) body. Supports break/continue.
+    if (kind == ND_FOR) {
+        int init = load64(nd + 8);
+        int cond = load64(nd + 16);
+        int incr = load64(nd + 24);
+        int body = load64(nd + 32);
+        // Compile init (result ignored).
+        if (init != 0) {
+            pos = jit_compile_node(init, pos);
+            if (pos < 0) { return -1; }
+        }
+        if (jit_loop_depth >= 8) {
+            serial_print("[jit] loop nesting too deep\n");
+            return -1;
+        }
+        int loop_start = pos;
+        store64(jit_loop_labels + jit_loop_depth * 8, pos);  // for continue
+        jit_loop_depth = jit_loop_depth + 1;
+        int saved_breaks = jit_break_count;
+        // Compile condition (or emit "true" = 1 if absent).
+        if (cond != 0) {
+            pos = jit_compile_node(cond, pos);
+            if (pos < 0) { return -1; }
+        } else {
+            pos = jit_mov_eax_imm(pos, 1);
+        }
+        pos = jit_test_rax_rax(pos);
+        int je_slot = pos;
+        pos = jit_je_placeholder(pos);  // je to end
+        pos = jit_compile_node(body, pos);
+        if (pos < 0) { return -1; }
+        if (incr != 0) {
+            pos = jit_compile_node(incr, pos);
+            if (pos < 0) { return -1; }
+        }
+        pos = jit_jmp_rel32(pos, loop_start);
+        jit_patch_je(je_slot, pos);
+        // Patch break placeholders.
+        int bi = saved_breaks;
+        while (bi < jit_break_count) {
+            int bp = load64(jit_break_patches + bi * 8);
+            jit_patch_jmp(bp, pos);
+            bi = bi + 1;
+        }
+        jit_break_count = saved_breaks;
+        jit_loop_depth = jit_loop_depth - 1;
+        pos = jit_mov_eax_imm(pos, 0);
+        return pos;
+    }
+
+    // ND_EXPR_STMT: unwrap the expression and compile it.
+    if (kind == ND_EXPR_STMT) {
+        return jit_compile_node(load64(nd + 8), pos);
+    }
+
+    // ND_CALL: function call — dispatch known single-arg builtins inline.
+    if (kind == ND_CALL) {
+        int fname = load64(nd + 8);   // function name pointer
+        int flen  = load64(nd + 24);  // name length
+        int arg   = load64(nd + 16);  // argument expression
+        // load8(addr)
+        int kw = kscratch_start;
+        store8(kw,'l');store8(kw+1,'o');store8(kw+2,'a');store8(kw+3,'d');store8(kw+4,'8');store8(kw+5,0);
+        if (repl_word_is(fname, flen, kw) == 1) {
+            pos = jit_compile_node(arg, pos);
+            if (pos < 0) { return -1; }
+            pos = jit_emit(pos, 0x48); pos = jit_emit(pos, 0x0F);
+            pos = jit_emit(pos, 0xB6); pos = jit_emit(pos, 0x00);
+            return pos;  // movzx rax, byte ptr [rax]
+        }
+        // load64(addr)
+        store8(kw,'l');store8(kw+1,'o');store8(kw+2,'a');store8(kw+3,'d');store8(kw+4,'6');store8(kw+5,'4');store8(kw+6,0);
+        if (repl_word_is(fname, flen, kw) == 1) {
+            pos = jit_compile_node(arg, pos);
+            if (pos < 0) { return -1; }
+            pos = jit_emit(pos, 0x48); pos = jit_emit(pos, 0x8B);
+            pos = jit_emit(pos, 0x00);
+            return pos;  // mov rax, [rax]
+        }
+        // store8(addr, val)
+        store8(kw,'s');store8(kw+1,'t');store8(kw+2,'o');store8(kw+3,'r');store8(kw+4,'e');store8(kw+5,'8');store8(kw+6,0);
+        if (repl_word_is(fname, flen, kw) == 1) {
+            int val_arg = load64(arg + 32);
+            if (val_arg == 0) { return -1; }
+            pos = jit_compile_node(val_arg, pos);   // value in rax
+            if (pos < 0) { return -1; }
+            pos = jit_push_rax(pos);
+            pos = jit_compile_node(arg, pos);        // address in rax
+            if (pos < 0) { return -1; }
+            pos = jit_pop_rbx(pos);                   // rbx = value
+            pos = jit_emit(pos, 0x88); pos = jit_emit(pos, 0x18);  // mov [rax], bl
+            pos = jit_mov_rax_rbx(pos);               // return value
+            return pos;
+        }
+        // store64(addr, val)
+        store8(kw,'s');store8(kw+1,'t');store8(kw+2,'o');store8(kw+3,'r');store8(kw+4,'e');store8(kw+5,'6');store8(kw+6,'4');store8(kw+7,0);
+        if (repl_word_is(fname, flen, kw) == 1) {
+            int val_arg = load64(arg + 32);
+            if (val_arg == 0) { return -1; }
+            pos = jit_compile_node(val_arg, pos);   // value in rax
+            if (pos < 0) { return -1; }
+            pos = jit_push_rax(pos);
+            pos = jit_compile_node(arg, pos);        // address in rax
+            if (pos < 0) { return -1; }
+            pos = jit_pop_rbx(pos);                   // rbx = value
+            pos = jit_emit(pos, 0x48); pos = jit_emit(pos, 0x89);
+            pos = jit_emit(pos, 0x18);  // mov [rax], rbx
+            pos = jit_mov_rax_rbx(pos);               // return value
+            return pos;
+        }
+        serial_print("[jit] unknown function call\n");
+        return -1;
+    }
+
+    // ND_BLOCK: compile each statement in sequence.
+    if (kind == ND_BLOCK) {
+        int stmt = load64(nd + 8);
+        while (stmt != 0) {
+            pos = jit_compile_node(stmt, pos);
+            if (pos < 0) { return -1; }
+            stmt = load64(stmt + 32);
+        }
+        return pos;
+    }
+
+    // ND_BREAK: emit jmp placeholder, record for patching by enclosing loop.
+    if (kind == ND_BREAK) {
+        if (jit_loop_depth <= 0) {
+            serial_print("[jit] break outside loop\n");
+            return pos;
+        }
+        store64(jit_break_patches + jit_break_count * 8, pos);
+        jit_break_count = jit_break_count + 1;
+        pos = jit_jmp_placeholder(pos);
+        return pos;
+    }
+
+    // ND_CONTINUE: jump to the loop condition check (start of loop).
+    if (kind == ND_CONTINUE) {
+        if (jit_loop_depth <= 0) {
+            serial_print("[jit] continue outside loop\n");
+            return pos;
+        }
+        int start_pos = load64(jit_loop_labels + (jit_loop_depth - 1) * 8);
+        pos = jit_jmp_rel32(pos, start_pos);
+        return pos;
+    }
+
+    // --- unsupported node kind ---
+    serial_print("[jit] unsupported node kind ");
+    serial_print_int(kind);
+    serial_print("\n");
+    return -1;
+}
+
+// --- execution ---------------------------------------------------------------
+// Call the generated code at `jit_page` through c0's indirect-call mechanism.
+// The generated code returns its result in RAX, which c0 picks up.
+int jit_exec() {
+    int fn = jit_page;
+    return fn();
+}
+
+// --- entry point -------------------------------------------------------------
+// Compile the REPL AST rooted at `nd` into machine code and execute it.
+// Returns the result (from RAX), or prints an error if compilation fails.
+int jit_compile_and_run(int nd) {
+    if (jit_page == 0) {
+        serial_print("[jit] not initialized\n");
+        return 0;
+    }
+    jit_set_writable(1);       // ensure writable for compilation
+    jit_pos = 0;
+    int pos = jit_compile_node(nd, 0);
+    if (pos < 0) {
+        serial_print("[jit] compile error\n");
+        return 0;
+    }
+    pos = jit_ret(pos);
+    serial_print("[jit] compiled ");
+    serial_print_int(pos);
+    serial_print(" bytes\n");
+    jit_set_writable(0);       // remove W bit before execution
+    int result = jit_exec();
+    jit_set_writable(1);       // restore W bit for next compilation
+    return result;
+}

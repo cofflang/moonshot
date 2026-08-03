@@ -1,0 +1,1871 @@
+// skalman.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// skalman.c0 -- the interactive shell. skalman runs as a real scheduled
+// task (shell_task, spawned by chrone's sched_start as task 4). It blocks
+// on an empty input queue and is woken by the keyboard IRQ: keyboard_handler
+// echoes the key then calls shell_enqueue(session, ascii), which deposits
+// the char into a ring buffer and calls task_wake(shell_task_id) to flip
+// the shell's state from BLOCKED to RUNNABLE. shell_task dequeues one
+// character at a time and calls shell_input(f, ascii) to accumulate the line
+// and run builtins on Enter. The demo worker threads keep running in parallel.
+//
+// `spawn`, `kill`, and `tasks` reach into chrone's process model and run
+// from shell_task context (not the keyboard IRQ path), so they race only
+// with the timer ISR, which uses interrupt gates (type_attr 0x8E) -- IF is
+// cleared on timer entry, so timer_tick/sched_tick cannot nest mid-spawn/
+// kill/tasks even though the shell task itself runs with IF set.
+//
+// Input routing with kakel windows: shell_enqueue captures the focused session
+// id (sk_console()) at keypress time, alongside the ASCII value, in a parallel
+// byte ring buffer. shell_input receives that saved session id `f` directly
+// rather than re-reading kakel_focus at processing time, so a key typed in
+// window 0 always goes to window 0's line buffer even if focus switches before
+// the shell task runs. This is the reason shell_input takes an explicit `f`
+// argument rather than calling sk_console() internally.
+//
+// The line buffers are heap-allocated fixed-capacity arrays (SHELL_LINE_MAX),
+// same idiom as the scancode tables -- fixed capacity, heap location. The input
+// ring buffer (sk_queue / sk_queue_sess, SK_QUEUE_MAX bytes each) is also
+// heap-allocated, allocated in shell_init before the shell task exists.
+
+int SHELL_LINE_MAX = 128;
+int shell_ncons = 0;      // session count: kakel_count with windows, else 1
+int shell_line_base = 0;  // per-session heap buffer pointers (stride 8)
+int shell_len_base = 0;   // per-session buffered-char counts (stride 8)
+int shell_cpos_base = 0;  // per-session cursor position within line (stride 8)
+int sk_cwd_base = 0;      // per-session jakel cwd node ids (stride 8)
+int sk_uid_base = 0;      // per-session user id (stride 8, default 0 = root)
+
+// Simple user table — names stored on the heap, allocated on first use.
+// user_count at kscratch_start + 1800 (8 bytes)
+// user_names at kscratch_start + 1808 (array of name pointers, stride 8, max 8)
+int SK_USER_MAX = 8;
+int sk_users_inited = 0;
+
+void sk_users_init() {
+    if (sk_users_inited == 1) { return; }
+    store64(kscratch_start + 1800, 0);  // user_count = 0
+    sk_users_inited = 1;
+}
+
+int sk_user_lookup(int name) {
+    sk_users_init();
+    int count = load64(kscratch_start + 1800);
+    int i = 0;
+    while (i < count && i < SK_USER_MAX) {
+        int n = load64(kscratch_start + 1808 + i * 8);
+        if (n != 0 && str_eq(n, name) == 1) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+int sk_user_name(int uid) {
+    sk_users_init();
+    int count = load64(kscratch_start + 1800);
+    if (uid >= 0 && uid < count && uid < SK_USER_MAX) {
+        int n = load64(kscratch_start + 1808 + uid * 8);
+        if (n != 0) { return n; }
+    }
+    // Fallback: uid 0 is always "root"
+    if (uid == 0) { return kscratch_start + 1856; }
+    return 0;
+}
+
+int sk_user_add(int name) {
+    sk_users_init();
+    int count = load64(kscratch_start + 1800);
+    if (count >= SK_USER_MAX) { return -1; }
+    if (sk_user_lookup(name) >= 0) { return -1; }
+    // Copy the name to the heap.
+    int nl = 0;
+    while (load8(name + nl) != 0 && nl < 31) { nl = nl + 1; }
+    int copy = kmalloc(nl + 1);
+    if (copy == 0) { return -1; }
+    int ci = 0;
+    while (ci <= nl) { store8(copy + ci, load8(name + ci)); ci = ci + 1; }
+    store64(kscratch_start + 1808 + count * 8, copy);
+    store64(kscratch_start + 1800, count + 1);
+    return count;
+}
+
+// Input ring buffer: keyboard IRQ enqueues (ascii, session) pairs here;
+// shell_task dequeues them. Two parallel byte arrays of SK_QUEUE_MAX entries,
+// both allocated from the heap in shell_init. head/tail/count are plain
+// globals (ints, not heap); SK_QUEUE_MAX=16 handles a burst of up to 16
+// keystrokes queued before the shell task gets a chance to run.
+int SK_QUEUE_MAX = 16;
+int sk_queue = 0;       // heap ptr: ascii values (one byte per slot)
+int sk_queue_sess = 0;  // heap ptr: session ids (one byte per slot)
+int sk_queue_head = 0;  // next slot to dequeue
+int sk_queue_tail = 0;  // next slot to enqueue
+int sk_queue_count = 0; // chars currently in the buffer
+
+// Task id of the shell task, assigned by sched_start (after task_spawn).
+// -1 before the shell task exists: shell_enqueue's task_wake call is gated
+// on this being >= 0, so early keystrokes (typed before sched_start) are
+// buffered but don't try to wake a nonexistent task.
+int shell_task_id = -1;
+
+// Command history ring buffer — 8 entries of up to 128 bytes each, allocated
+// from the heap in shell_init. Entries are saved on Enter and recalled with
+// up/down arrow keys (called from the keyboard IRQ).
+int SK_HIST_MAX = 8;
+int sk_hist_buf  = 0;  // heap ptr: SK_HIST_MAX * SHELL_LINE_MAX bytes
+int sk_hist_count = 0; // saved entries (0..SK_HIST_MAX)
+int sk_hist_next  = 0; // next slot to write into
+int sk_hist_pos   = -1;// navigation position: -1 = not navigating, 0 = newest
+int sk_tab_last_match_count = 0;  // match count from previous Tab press
+int sk_tab_last_prefix      = 0;  // heap ptr: prefix from previous Tab press
+int sk_tab_last_prefix_len  = 0;
+
+// The session (= window, when kakel is active) that keyboard input and
+// shell output currently belong to. Never returns the log window id (which
+// is not an interactive session) -- falls back to session 0 if focus is
+// somehow on it (shouldn't happen via kakel_focus_next, which wraps at
+// kakel_shell_wins, but guard anyway).
+int sk_console() {
+    if (kakel_active == 1) {
+        int f = kakel_focus;
+        if (f == kakel_stats_win && kakel_stats_win >= 0) { return 0; }
+        return f;
+    }
+    return 0;
+}
+
+// Current foreground color for console output. Set via sk_color(), read
+// by sk_putc. Defaults to FB_FG (bright white). REPL output uses this
+// to print [repl]/[jit] prefixes and errors in different colors.
+int sk_fg = 0;
+
+// Set the foreground color for subsequent sk_putc/sk_print output.
+void sk_color(int c) {
+    sk_fg = c;
+    return;
+}
+
+// Console output that picks the focused kakel window, the full-screen
+// pixel framebuffer, or the VGA-text fallback — the same choice
+// keyboard_handler makes per keypress, so the shell prints correctly
+// whichever mode GRUB granted at boot (and into the right window once
+// kakel has carved the screen up).
+void sk_putc(int ch) {
+    if (kakel_active == 1) {
+        kakel_putc_fg(kakel_focus, ch, sk_fg);
+    } else if (fb_available == 1) {
+        fb_putc(ch, sk_fg, FB_BG);
+    } else {
+        vga_putc(ch, VGA_DEFAULT_ATTR);
+        vga_move_cursor();
+    }
+    return;
+}
+void sk_print(int s) {
+    int i = 0;
+    while (load8(s + i) != 0) {
+        sk_putc(load8(s + i));
+        i = i + 1;
+    }
+    return;
+}
+
+// Prints an integer to the shell console (framebuffer/VGA), the screen-facing
+// counterpart to serial_print_int -- needed by `ps`/`spawn` to show task ids
+// and counters. Same digit-extraction idiom (no % in c0, so v - (v/10)*10) and
+// same fixed .kscratch buffer; safe to share kscratch_start with
+// serial_print_int because interrupts don't nest (see the file header), so the
+// two never build a number in that buffer at the same time.
+void sk_print_int(int v) {
+    int tmp = kscratch_start;
+    int i = 31;
+    if (v == 0) { sk_putc('0'); return; }
+    if (v < 0) { sk_putc('-'); v = 0 - v; }
+    while (v > 0) {
+        i = i - 1;
+        store8(tmp + i, '0' + (v - (v / 10) * 10));
+        v = v / 10;
+    }
+    while (i < 31) {
+        sk_putc(load8(tmp + i));
+        i = i + 1;
+    }
+    return;
+}
+
+// Equality of two NUL-terminated strings -- used to match a typed command
+// against a builtin name. Returns 1 if equal (including ending together),
+// 0 otherwise. c0 has no string library, so this and str_starts below are
+// the whole "string toolkit" the shell needs.
+int str_eq(int a, int b) {
+    int i = 0;
+    while (load8(a + i) != 0 && load8(b + i) != 0) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    if (load8(a + i) == load8(b + i)) { return 1; }
+    return 0;
+}
+
+// If `s` begins with `prefix`, returns the index in `s` just past the
+// prefix (so `s + result` is the remainder); returns -1 if it does not
+// match. Used to split "echo <text>" into the command and its argument.
+int str_starts(int s, int prefix) {
+    int i = 0;
+    while (load8(prefix + i) != 0) {
+        if (load8(s + i) != load8(prefix + i)) { return 0 - 1; }
+        i = i + 1;
+    }
+    return i;
+}
+
+// Parses a NUL-terminated string of ASCII digits into a non-negative int.
+// Returns -1 on anything that isn't purely digits (empty, a stray space, a
+// sign, letters) -- used by `kill (id)` to turn its typed argument into a task
+// id. Deliberately strict/minimal, matching the shell's other tiny string
+// helpers; no whitespace trimming, no sign, no overflow guard (task ids are
+// small).
+int str_to_int(int s) {
+    int i = 0;
+    int val = 0;
+    int any = 0;
+    while (load8(s + i) != 0) {
+        int c = load8(s + i);
+        if (c < '0' || c > '9') { return 0 - 1; }
+        val = val * 10 + (c - '0');
+        any = 1;
+        i = i + 1;
+    }
+    if (any == 0) { return 0 - 1; }
+    return val;
+}
+
+// Print the shell prompt to window `f`. The prompt is printed in a dimmer
+// colour so it reads as a prompt, not as command output; the space after
+// ">" stays bright since that's where typed text begins.
+void shell_prompt_win(int f) {
+    if (kakel_active == 1) {
+        kakel_putc_dim(f, 'm'); kakel_putc_dim(f, 'o'); kakel_putc_dim(f, 'o');
+        kakel_putc_dim(f, 'n'); kakel_putc_dim(f, 's'); kakel_putc_dim(f, 'h');
+        kakel_putc_dim(f, 'o'); kakel_putc_dim(f, 't'); kakel_putc_dim(f, '>');
+        kakel_putc(f, ' ');  // space stays bright — user text begins here
+        store64(kakel_prompt_col_base + f * 8,
+                load64(kakel_col_base + f * 8));
+    }
+    return;
+}
+
+void shell_prompt() {
+    if (kakel_active == 1) {
+        shell_prompt_win(kakel_focus);
+    } else {
+        sk_print("moonshot> ");
+    }
+    return;
+}
+
+// Allocates the per-session line buffers from the kernel heap and draws
+// each session's greeting + first prompt -- one session per kakel window
+// when the windowing layer is up (each window boots into its own live
+// shell), one total otherwise. Called once, after the boot banner and
+// kakel_init (see kernel_post_init) -- runs in normal context, not an
+// interrupt, so the kmallocs here are never on the IRQ path
+// (shell_input/shell_run below never allocate).
+void shell_init() {
+    sk_fg = FB_FG;  // initialise foreground colour (can't cross-ref globals)
+    shell_ncons = 1;
+    if (kakel_active == 1) { shell_ncons = kakel_shell_wins; }
+    // Pre-allocate up to KAKEL_MAX_WIN line buffers so new windows created
+    // at runtime (via `split`) have sessions immediately. Unused slots
+    // waste a small amount of heap memory (12 * 128 = 1536 bytes max).
+    shell_line_base = kmalloc(KAKEL_MAX_WIN * 8);
+    shell_len_base  = kmalloc(KAKEL_MAX_WIN * 8);
+    shell_cpos_base = kmalloc(KAKEL_MAX_WIN * 8);
+    sk_cwd_base     = kmalloc(KAKEL_MAX_WIN * 8);
+    sk_uid_base     = kmalloc(KAKEL_MAX_WIN * 8);
+    sk_queue = kmalloc(SK_QUEUE_MAX);
+    sk_queue_sess = kmalloc(SK_QUEUE_MAX);
+    sk_hist_buf = kmalloc(SK_HIST_MAX * SHELL_LINE_MAX);
+    sk_hist_count = 0;
+    sk_hist_next = 0;
+    sk_hist_pos = -1;
+    int i = 0;
+    while (i < KAKEL_MAX_WIN) {
+        store64(shell_line_base + i * 8, kmalloc(SHELL_LINE_MAX));
+        store64(shell_len_base + i * 8, 0);
+        store64(shell_cpos_base + i * 8, 0);
+        store64(sk_cwd_base + i * 8, 0);  // each session starts at root
+        store64(sk_uid_base + i * 8, 0);  // each session starts as root
+        i = i + 1;
+    }
+    // Seed the user table with root and guest.
+    sk_users_init();
+    sk_pass_init();  // password storage (lazy-init safe, explicit here)
+    int root_name = kscratch_start + 1856;
+    store8(root_name,'r');store8(root_name+1,'o');store8(root_name+2,'o');store8(root_name+3,'t');store8(root_name+4,0);
+    int guest_name = kscratch_start + 1872;
+    store8(guest_name,'g');store8(guest_name+1,'u');store8(guest_name+2,'e');store8(guest_name+3,'s');store8(guest_name+4,'t');store8(guest_name+5,0);
+    sk_user_add(root_name);
+    sk_user_add(guest_name);
+    // Only greet the sessions that are actually visible at boot.
+    i = 0;
+    while (i < shell_ncons) {
+        if (kakel_active == 1) {
+            kakel_print(i, "\ntype 'help' for commands.\n");
+            shell_prompt_win(i);
+        } else {
+            sk_print("\ntype 'help' for commands.\n");
+            shell_prompt();
+        }
+        i = i + 1;
+    }
+    return;
+}
+
+// Extract the next argument from `cmd` starting at `pos`. Supports both
+// plain (space-delimited) and "..." (double-quoted) arguments. Quotes are
+// stripped. Copies up to 127 chars into `out` (caller provides buffer) and
+// NUL-terminates. Returns position after the argument, or -1 at end.
+int shell_next_arg(int cmd, int pos, int out) {
+    while (load8(cmd + pos) == ' ') { pos = pos + 1; }
+    if (load8(cmd + pos) == 0) { return -1; }
+    int quoted = 0;
+    if (load8(cmd + pos) == '"') { quoted = 1; pos = pos + 1; }
+    int o = 0;
+    while (load8(cmd + pos) != 0 && o < 127) {
+        if (quoted == 1 && load8(cmd + pos) == '"') {
+            pos = pos + 1; break;
+        }
+        if (quoted == 0 && load8(cmd + pos) == ' ') { break; }
+        store8(out + o, load8(cmd + pos));
+        o = o + 1; pos = pos + 1;
+    }
+    store8(out + o, 0);
+    if (load8(cmd + pos) == ' ') { pos = pos + 1; }
+    return pos;
+}
+
+// Runs the command in `cmd` (the calling session's line buffer, already
+// NUL-terminated by shell_input). `f` is the session id whose line buffer
+// `cmd` lives in -- used to look up per-session state (cwd). Builtins only:
+// help, clear, echo, ps, spawn, kill. An empty line just reprompts; anything
+// unrecognized reports itself back. Output goes through sk_print/sk_putc,
+// i.e. to the focused window -- necessarily the one the command was typed in
+// (see the file header).
+void shell_run(int f, int cmd) {
+    if (load8(cmd) == 0) {
+        return;
+    }
+    // Set the effective uid for this session.
+    jakel_current_uid = load64(sk_uid_base + f * 8);
+    if (str_eq(cmd, "help") == 1) {
+        sk_print("commands:\n\n");
+        sk_print("  help (command)    clear              chars\n");
+        sk_print("  echo (text)       echo --file (path)\n");
+        sk_print("  list (path)       change (path)      make (name)\n");
+        sk_print("  remove (name)     copy (src) (dst)   rename (src) (dst)\n");
+        sk_print("  count (file)      write (name) (text)\n");
+        sk_print("  mode (path) (lvl) own (path) (user)  whoami\n");
+        sk_print("  login (name)      passwd (user) (pw) adduser (name)\n");
+        sk_print("  eval (expr)       eval -c (expr)     run (file)\n");
+        sk_print("  edit (file)       run3               spawn3\n");
+        sk_print("  tasks             spawn              kill (id)\n");
+        sk_print("  split             close              sync\n");
+        sk_print("\ntab: complete commands and filenames\n");
+        sk_print("type help (command) for details\n");
+        return;
+    }
+    // help <command> — show a one-line explanation of a builtin.
+    int hr = str_starts(cmd, "help ");
+    if (hr >= 0) {
+        int c = cmd + hr;
+        if (str_eq(c, "clear") == 1) { sk_print("clear: clear the focused window.\n"); return; }
+        if (str_eq(c, "chars") == 1) { sk_print("chars: print a grid of all printable ascii glyphs.\n"); return; }
+        if (str_eq(c, "echo") == 1) { sk_print("echo (text): print text. echo --file (name): print file contents.\n"); return; }
+        if (str_eq(c, "tasks") == 1) { sk_print("tasks: list all running tasks and their states.\n"); return; }
+        if (str_eq(c, "spawn") == 1) { sk_print("spawn: start a new worker task.\n"); return; }
+        if (str_eq(c, "kill") == 1) { sk_print("kill (id): terminate a task by its id number.\n"); return; }
+        if (str_eq(c, "list") == 1) { sk_print("list (path): show the contents of a directory.\n"); return; }
+        if (str_eq(c, "change") == 1) { sk_print("change (path): change the current working directory.\n"); return; }
+        if (str_eq(c, "make") == 1) { sk_print("make (name): create an empty file (name has a dot) or directory.\n"); return; }
+        if (str_eq(c, "remove") == 1) { sk_print("remove (name): delete a file or empty directory.\n"); return; }
+        if (str_eq(c, "mode") == 1) { sk_print("mode (path) public|private|locked: set file permissions.\n"); return; }
+        if (str_eq(c, "own") == 1) { sk_print("own (path) (user): change a file's owner.\n"); return; }
+        if (str_eq(c, "whoami") == 1) { sk_print("whoami: print your current user name.\n"); return; }
+        if (str_eq(c, "login") == 1) { sk_print("login (name) [password]: switch user for this session.\n"); return; }
+        if (str_eq(c, "passwd") == 1) { sk_print("passwd (user) (password): set a user's password.\n"); return; }
+        if (str_eq(c, "write") == 1) { sk_print("write (name) (text): write text into a file.\n"); return; }
+        if (str_eq(c, "split") == 1) { sk_print("split: add a new window to the grid (max 4).\n"); return; }
+        if (str_eq(c, "close") == 1) { sk_print("close: remove the focused window.\n"); return; }
+        if (str_eq(c, "where") == 1) { sk_print("where: print the current working directory path.\n"); return; }
+        if (str_eq(c, "sync") == 1) { sk_print("sync: persist all files to disk.\n"); return; }
+        if (str_eq(c, "eval") == 1) { sk_print("eval (expr): evaluate a c0 expression.\n"); return; }
+        if (str_eq(c, "edit") == 1) { sk_print("edit (file): open in skrift text editor (esc=toggle, cmd: c=chg cc=chg-line cw=chg-word dd=del-line yy=yank /search q=quit).\n"); return; }
+        if (str_eq(c, "run") == 1) { sk_print("run (file): execute a file through the REPL interpreter.\n"); return; }
+        if (str_eq(c, "help") == 1) { sk_print("help (command): show what a command does.\n"); return; }
+        sk_print("help: unknown command '");
+        sk_print(c);
+        sk_print("'\n");
+        return;
+    }
+    if (str_eq(cmd, "clear") == 1) {
+        // With windows, clear means THIS window -- the other windows'
+        // content is none of this session's business.
+        if (kakel_active == 1) {
+            kakel_clear(kakel_focus);
+        } else if (fb_available == 1) {
+            fb_clear(FB_BG);
+        } else {
+            vga_clear(VGA_DEFAULT_ATTR);
+        }
+        return;
+    }
+    // chars — print a grid of all 95 printable ASCII glyphs (32-126) so the
+    // user can visually verify every font glyph in one screenful. Six rows of
+    // 16 characters each (the last row has only 15).
+    if (str_eq(cmd, "chars") == 1) {
+        sk_print("chars: printable ascii 32-126\n\n");
+        int ch = 32;
+        while (ch <= 126) {
+            sk_putc(ch);
+            ch = ch + 1;
+            // 16 columns — newline at the end of each row.
+            if ((ch - 32) - ((ch - 32) / 16) * 16 == 0) {
+                sk_print("\n");
+            }
+        }
+        if ((ch - 32) - ((ch - 32) / 16) * 16 != 0) {
+            sk_print("\n");
+        }
+        return;
+    }
+    // tasks -- list the chrone task table. One line per non-FREE slot:
+    // id, state, how many times it has been scheduled, and its own work
+    // counter. The task the shell interrupted to run (sched_current) is shown
+    // as "cur"; other runnable tasks as "run"; exited ones as "exit". Reading
+    // the table here is race-free against the timer for the reason in the file
+    // header (interrupt gates, no nesting).
+    if (str_eq(cmd, "tasks") == 1) {
+        int id = 0;
+        while (id < MAX_TASKS) {
+            int st = load64(task_state_base + id * 8);
+            if (st != TASK_FREE) {
+                sk_print("task ");
+                sk_print_int(id);
+                if (st == TASK_EXITED) {
+                    sk_print(" exit");
+                } else if (st == TASK_BLOCKED) {
+                    sk_print(" blk ");
+                } else if (id == sched_current) {
+                    sk_print(" cur ");
+                } else {
+                    sk_print(" run ");
+                }
+                // ':' not '=': punkt's font has ':' but not '=' (which renders
+                // as a blank gap, same as '>'/'>' -- see the help text note).
+                sk_print(" runs:");
+                sk_print_int(load64(task_runs_base + id * 8));
+                sk_print(" count:");
+                sk_print_int(load64(task_counter_base + id * 8));
+                sk_print("\n");
+            }
+            id = id + 1;
+        }
+        return;
+    }
+    // spawn -- start a new worker task at runtime via chrone's task_spawn.
+    // The new task immediately joins the round-robin; proof it really ran is
+    // its id appearing in the scheduler's own [sched] serial log (a fresh id
+    // past the boot-time 0..3), which is what test_shell.sh checks.
+    if (str_eq(cmd, "spawn") == 1) {
+        int nid = task_spawn(thread_worker);
+        if (nid < 0) {
+            sk_print("task table full\n");
+        } else {
+            sk_print("spawned task ");
+            sk_print_int(nid);
+            sk_print("\n");
+        }
+        return;
+    }
+    // kill (id) -- terminate ANOTHER task from the shell (spawn's counterpart).
+    // Just marks the target EXITED; sched_pick_next then skips it forever, so
+    // the task simply stops being scheduled wherever it was -- no cooperation
+    // from the target needed (unlike task_exit's self-exit, the target is off in
+    // its own loop, not parked). Killing the CURRENT task (the one the shell
+    // interrupted) is allowed -- it runs until the next tick, then gets skipped
+    // -- guarded only against killing the LAST runnable task, which would leave
+    // nothing for sched_pick_next to switch to (it would idle on an EXITED
+    // task). Like exit, a killed task's stack page is leaked for now (see the
+    // reaper note in moonshot.md's Next Steps).
+    if (str_eq(cmd, "kill") == 1) {
+        sk_print("usage: kill (id)\n");
+        return;
+    }
+    int krest = str_starts(cmd, "kill ");
+    if (krest >= 0) {
+        int kid = str_to_int(cmd + krest);
+        if (kid < 0 || kid >= MAX_TASKS) {
+            sk_print("kill: bad task id\n");
+            return;
+        }
+        if (load64(task_state_base + kid * 8) != TASK_RUNNABLE) {
+            sk_print("kill: task not running\n");
+            return;
+        }
+        int rc = 0;
+        int j = 0;
+        while (j < MAX_TASKS) {
+            if (load64(task_state_base + j * 8) == TASK_RUNNABLE) {
+                rc = rc + 1;
+            }
+            j = j + 1;
+        }
+        if (rc <= 1) {
+            sk_print("kill: cannot kill the last runnable task\n");
+            return;
+        }
+        store64(task_state_base + kid * 8, TASK_EXITED);
+        sk_print("killed task ");
+        sk_print_int(kid);
+        sk_print("\n");
+        return;
+    }
+    // run3 — run the built-in ring-3 test binary in the current task.
+    // Drops the shell to ring 3; when the binary exits (sys_exit), this task
+    // is marked EXITED and the shell is lost. Prefer spawn3 for normal use.
+    if (str_eq(cmd, "run3") == 1) {
+        sk_print("running ring-3 test in current task...\n");
+        run_ring3_test();
+        return;
+    }
+    // spawn3 — run the ring-3 test binary in a new task.
+    // Unlike run3, the shell stays alive. The spawned task enters ring 3,
+    // runs the test, and exits cleanly without affecting other tasks.
+    if (str_eq(cmd, "spawn3") == 1) {
+        int code = ring3_test_code();
+        spawn3_code = code;
+        spawn3_len = RING3_TEST_LEN;
+        int nid = task_spawn(spawn3_entry);
+        if (nid < 0) {
+            sk_print("task table full\n");
+        } else {
+            sk_print("spawned ring-3 task ");
+            sk_print_int(nid);
+            sk_print("\n");
+        }
+        return;
+    }
+    // echo --file <name> — checked BEFORE plain echo so the flag is not
+    // mistaken for text to print.
+    int efr = str_starts(cmd, "echo --file ");
+    if (efr >= 0) {
+        int path_str = cmd + efr;
+        int fid = jakel_open(load64(sk_cwd_base + f * 8), path_str);
+        if (fid < 0) {
+            sk_print("echo: file not found\n");
+            return;
+        }
+        if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) {
+            sk_print("echo: not a file\n");
+            return;
+        }
+        // Read the file content into .kscratch, up to the scratch buffer's
+        // usable space (leave room for NUL). Safe because this runs in shell
+        // task context, not an ISR.
+        int n = jakel_read(fid, 0, kscratch_start, 1008);
+        store8(kscratch_start + n, 0);
+        sk_print(kscratch_start);
+        sk_print("\n");
+        serial_print("[echo] ");
+        serial_print(kscratch_start);
+        serial_print("\n");
+        return;
+    }
+    // Plain echo: print everything after "echo " as text.
+    int rest = str_starts(cmd, "echo ");
+    if (rest >= 0) {
+        sk_print(cmd + rest);
+        sk_print("\n");
+        return;
+    }
+    if (str_eq(cmd, "echo") == 1) {
+        sk_print("\n");
+        return;
+    }
+    // list [path] -- show directory contents. No argument means cwd.
+    if (str_eq(cmd, "list") == 1) {
+        jakel_list(load64(sk_cwd_base + f * 8));
+        return;
+    }
+    int lr = str_starts(cmd, "list ");
+    if (lr >= 0) {
+        int did = jakel_open(load64(sk_cwd_base + f * 8), cmd + lr);
+        if (did < 0 || load64(jakel_type_base + did * 8) != JAKEL_TYPE_DIR) {
+            sk_print("list: not a directory\n");
+            return;
+        }
+        jakel_list(did);
+        return;
+    }
+    // cd <path> -- change the current working directory.
+    int cdr = str_starts(cmd, "change ");
+    if (cdr >= 0) {
+        int did = jakel_open(load64(sk_cwd_base + f * 8), cmd + cdr);
+        if (did < 0 || load64(jakel_type_base + did * 8) != JAKEL_TYPE_DIR) {
+            sk_print("change: not a directory\n");
+            return;
+        }
+        store64(sk_cwd_base + f * 8, did);
+        return;
+    }
+    // where — print the current working directory path.
+    if (str_eq(cmd, "where") == 1) {
+        jakel_where(load64(sk_cwd_base + f * 8));
+        sk_print("\n");
+        return;
+    }
+    // make <name> -- create an empty file (if the final component has a '.')
+    // or a directory (if it does not). Supports nested paths like
+    // "projects/readme.txt" -- intermediate directories are created as needed.
+    int mr = str_starts(cmd, "make ");
+    if (mr >= 0) {
+        int name_str = cmd + mr;
+        // Find the last '/' to separate the parent path from the final name.
+        int last_slash = -1;
+        int si = 0;
+        while (load8(name_str + si) != 0) {
+            if (load8(name_str + si) == '/') { last_slash = si; }
+            si = si + 1;
+        }
+        int parent = load64(sk_cwd_base + f * 8);
+        if (last_slash >= 0) {
+            // Walk the directory part, creating any missing directories.
+            int pos = 0;
+            while (pos < last_slash) {
+                int end = pos;
+                while (load8(name_str + end) != 0 && load8(name_str + end) != '/') {
+                    end = end + 1;
+                }
+                if (end > pos) {
+                    int tmp = kscratch_start;
+                    int ci = 0;
+                    while (pos < end) {
+                        store8(tmp + ci, load8(name_str + pos));
+                        ci = ci + 1;
+                        pos = pos + 1;
+                    }
+                    store8(tmp + ci, 0);
+                    int comp = jakel_lookup(parent, tmp);
+                    if (comp < 0) {
+                        comp = jakel_mkdir(parent, tmp);
+                        if (comp < 0) {
+                            sk_print("make: could not create intermediate directory\n");
+                            return;
+                        }
+                    }
+                    if (load64(jakel_type_base + comp * 8) != JAKEL_TYPE_DIR) {
+                        sk_print("make: '");
+                        sk_print(tmp);
+                        sk_print("' is not a directory\n");
+                        return;
+                    }
+                    parent = comp;
+                }
+                pos = end + 1;
+            }
+            name_str = name_str + last_slash + 1;
+        }
+        // Determine type: has a '.' → file, otherwise → directory.
+        int has_dot = 0;
+        si = 0;
+        while (load8(name_str + si) != 0) {
+            if (load8(name_str + si) == '.') { has_dot = 1; }
+            si = si + 1;
+        }
+        int nid = -1;
+        if (has_dot == 1) {
+            nid = jakel_make_file(parent, name_str);
+        } else {
+            nid = jakel_mkdir(parent, name_str);
+        }
+        if (nid < 0) {
+            sk_print("make: name already exists or table full\n");
+            return;
+        }
+        sk_print("created ");
+        sk_print(name_str);
+        sk_print("\n");
+        return;
+    }
+    // write <name> <text> -- write text into a file. Supports "..." quoting
+    // for names with spaces. Text is everything after the filename.
+    int wr = str_starts(cmd, "write ");
+    if (wr >= 0) {
+        int name_buf = kscratch_start;
+        int np = shell_next_arg(cmd, wr, name_buf);
+        if (np < 0 || load8(name_buf) == 0) {
+            sk_print("write: usage: write (name) (text)\n");
+            return;
+        }
+        int text = cmd + np;
+        while (load8(text) == ' ') { text = text + 1; }
+        int fid = jakel_lookup(load64(sk_cwd_base + f * 8), name_buf);
+        if (fid < 0) {
+            fid = jakel_make_file(load64(sk_cwd_base + f * 8), name_buf);
+            if (fid < 0) {
+                sk_print("write: could not create file\n");
+                return;
+            }
+        }
+        if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) {
+            sk_print("write: not a file\n");
+            return;
+        }
+        int tlen = jakel_str_len(text);
+        if (tlen > 0) {
+            jakel_write(fid, 0, text, tlen);
+        }
+        store64(jakel_size_base + fid * 8, tlen);
+        return;
+    }
+    // remove <name> -- delete a file or an EMPTY directory from cwd.
+    int rmr = str_starts(cmd, "remove ");
+    if (rmr >= 0) {
+        int name_str = cmd + rmr;
+        int rid = jakel_lookup(load64(sk_cwd_base + f * 8), name_str);
+        if (rid < 0) {
+            sk_print("remove: not found\n");
+            return;
+        }
+        int result = jakel_remove(rid);
+        if (result == -1) {
+            sk_print("remove: directory not empty\n");
+            return;
+        }
+        if (result == -2) {
+            sk_print("remove: cannot remove root\n");
+            return;
+        }
+        sk_print("removed ");
+        sk_print(name_str);
+        sk_print("\n");
+        return;
+    }
+    // split -- split the focused window's row.
+    if (str_eq(cmd, "split") == 1) {
+        if (kakel_active == 1) {
+            kakel_split();
+            int w = 0;
+            while (w < KAKEL_MAX_WIN) {
+                if (load64(kakel_rows_base + w * 8) > 0
+                    && w != kakel_stats_win
+                    && w != kakel_focus) {
+                    shell_prompt_win(w);
+                }
+                w = w + 1;
+            }
+        }
+        return;
+    }
+    // close -- remove the focused window.
+    if (str_eq(cmd, "close") == 1) {
+        if (kakel_active == 1) {
+            kakel_close();
+            int w = 0;
+            while (w < KAKEL_MAX_WIN) {
+                if (load64(kakel_rows_base + w * 8) > 0
+                    && w != kakel_stats_win
+                    && w != kakel_focus) {
+                    shell_prompt_win(w);
+                }
+                w = w + 1;
+            }
+        }
+        return;
+    }
+    // sync -- persist the filesystem to disk.
+    if (str_eq(cmd, "sync") == 1) {
+        jakel_sync();
+        return;
+    }
+    // copy <src> <dst> — copy a file; both paths may contain slashes.
+    int cpr = str_starts(cmd, "copy ");
+    if (cpr >= 0) {
+        int args = cmd + cpr;
+        // Find the space between src and dst.
+        int sp = 0;
+        while (load8(args + sp) != 0 && load8(args + sp) != ' ') { sp = sp + 1; }
+        if (sp == 0 || load8(args + sp) != ' ') {
+            sk_print("copy: usage: copy (src) (dst)\n");
+            return;
+        }
+        store8(args + sp, 0);  // NUL-terminate src
+        int src_name = args;
+        int dst_name = args + sp + 1;
+        if (load8(dst_name) == 0) {
+            sk_print("copy: usage: copy (src) (dst)\n");
+            store8(args + sp, ' ');  // restore
+            return;
+        }
+        int cwd = 0;
+        if (kakel_active == 1) { cwd = load64(sk_cwd_base + f * 8); }
+        int src_fd = jakel_open(cwd, src_name);
+        if (src_fd < 0) {
+            sk_print("copy: source not found\n");
+            store8(args + sp, ' ');  // restore
+            return;
+        }
+        int ftype = load64(jakel_type_base + src_fd * 8);
+        if (ftype != JAKEL_TYPE_FILE) {
+            sk_print("copy: source must be a file\n");
+            store8(args + sp, ' ');  // restore
+            return;
+        }
+        int fsize = load64(jakel_size_base + src_fd * 8);
+        int buf = 0;
+        if (fsize > 0) {
+            buf = kmalloc(fsize);
+            if (buf == 0) {
+                sk_print("copy: out of memory\n");
+                store8(args + sp, ' ');  // restore
+                return;
+            }
+            jakel_read(src_fd, 0, buf, fsize);
+        }
+        // Resolve destination path: find the last '/' to split parent from leaf.
+        int dst_parent = cwd;
+        int dst_leaf = dst_name;
+        int dlen = 0;
+        int last_slash = -1;
+        while (load8(dst_name + dlen) != 0) {
+            if (load8(dst_name + dlen) == '/') { last_slash = dlen; }
+            dlen = dlen + 1;
+        }
+        if (last_slash >= 0) {
+            store8(dst_name + last_slash, 0);  // split at the slash
+            dst_leaf = dst_name + last_slash + 1;
+            if (load8(dst_leaf) == 0) {
+                sk_print("copy: destination path ends in /\n");
+                store8(dst_name + last_slash, '/');  // restore
+                store8(args + sp, ' '); return;
+            }
+            int pdir = jakel_open(cwd, dst_name);
+            if (pdir < 0) {
+                sk_print("copy: destination directory not found\n");
+                store8(dst_name + last_slash, '/');  // restore
+                store8(args + sp, ' '); return;
+            }
+            dst_parent = pdir;
+            store8(dst_name + last_slash, '/');  // restore the slash
+        }
+        // Create or overwrite the destination leaf in the resolved parent.
+        int dst_fd = jakel_lookup(dst_parent, dst_leaf);
+        if (dst_fd < 0) {
+            dst_fd = jakel_make_file(dst_parent, dst_leaf);
+        }
+        if (dst_fd >= 0 && fsize > 0 && buf != 0) {
+            jakel_write(dst_fd, 0, buf, fsize);
+            store64(jakel_size_base + dst_fd * 8, fsize);
+        }
+        if (buf != 0) { kfree(buf); }
+        store8(args + sp, ' ');  // restore
+        return;
+    }
+    // rename <src> <dst> — rename (and optionally reparent) a file or directory.
+    int mvr = str_starts(cmd, "rename ");
+    if (mvr >= 0) {
+        int args = cmd + mvr;
+        int sp = 0;
+        while (load8(args + sp) != 0 && load8(args + sp) != ' ') { sp = sp + 1; }
+        if (sp == 0 || load8(args + sp) != ' ') {
+            sk_print("rename: usage: rename (src) (dst)\n");
+            return;
+        }
+        store8(args + sp, 0);
+        int src_name = args;
+        int dst_name = args + sp + 1;
+        if (load8(dst_name) == 0) {
+            sk_print("rename: usage: rename (src) (dst)\n");
+            store8(args + sp, ' ');  // restore
+            return;
+        }
+        int cwd = 0;
+        if (kakel_active == 1) { cwd = load64(sk_cwd_base + f * 8); }
+        int src_fd = jakel_open(cwd, src_name);
+        if (src_fd < 0) {
+            sk_print("rename: source not found\n");
+            store8(args + sp, ' ');  // restore
+            return;
+        }
+        // Resolve destination path.
+        int dst_parent = cwd;
+        int dst_leaf = dst_name;
+        int dlen = 0;
+        int last_slash = -1;
+        while (load8(dst_name + dlen) != 0) {
+            if (load8(dst_name + dlen) == '/') { last_slash = dlen; }
+            dlen = dlen + 1;
+        }
+        if (last_slash >= 0) {
+            store8(dst_name + last_slash, 0);
+            dst_leaf = dst_name + last_slash + 1;
+            if (load8(dst_leaf) == 0) {
+                sk_print("rename: destination path ends in /\n");
+                store8(dst_name + last_slash, '/');
+                store8(args + sp, ' '); return;
+            }
+            int pdir = jakel_open(cwd, dst_name);
+            if (pdir < 0) {
+                sk_print("rename: destination directory not found\n");
+                store8(dst_name + last_slash, '/');
+                store8(args + sp, ' '); return;
+            }
+            dst_parent = pdir;
+            store8(dst_name + last_slash, '/');
+        }
+        // Check destination leaf does not already exist in resolved parent.
+        int existing = jakel_lookup(dst_parent, dst_leaf);
+        if (existing >= 0) {
+            sk_print("rename: destination already exists\n");
+            store8(args + sp, ' ');  // restore
+            return;
+        }
+        // Allocate a new name buffer and swap it in.
+        int nlen = 0;
+        while (load8(dst_leaf + nlen) != 0 && nlen < 127) { nlen = nlen + 1; }
+        int new_name = kmalloc(nlen + 1);
+        if (new_name == 0) {
+            sk_print("rename: out of memory\n");
+            store8(args + sp, ' ');  // restore
+            return;
+        }
+        int ni = 0;
+        while (ni <= nlen) {
+            store8(new_name + ni, load8(dst_leaf + ni));
+            ni = ni + 1;
+        }
+        // Reparent if destination is in a different directory.
+        int old_parent = load64(jakel_parent_base + src_fd * 8);
+        if (dst_parent != old_parent) {
+            store64(jakel_parent_base + src_fd * 8, dst_parent);
+            jakel_add_child(dst_parent, src_fd);
+            // Remove from old parent's child list (compact the array).
+            int op_sz = load64(jakel_size_base + old_parent * 8);
+            int op_data = load64(jakel_data_base + old_parent * 8);
+            int oi = 0;
+            while (oi < op_sz) {
+                if (load64(op_data + oi) == src_fd) {
+                    // Shift remaining children left.
+                    int sj = oi;
+                    while (sj < op_sz - 8) {
+                        store64(op_data + sj, load64(op_data + sj + 8));
+                        sj = sj + 8;
+                    }
+                    store64(jakel_size_base + old_parent * 8, op_sz - 8);
+                    break;
+                }
+                oi = oi + 8;
+            }
+        }
+        int old_name = load64(jakel_name_base + src_fd * 8);
+        store64(jakel_name_base + src_fd * 8, new_name);
+        if (old_name != 0) { kfree(old_name); }
+        store8(args + sp, ' ');  // restore
+        return;
+    }
+    // count <file> — count lines, words, and bytes in a file.
+    int wcr = str_starts(cmd, "count ");
+    if (wcr >= 0) {
+        int fname = cmd + wcr;
+        if (load8(fname) == 0) {
+            sk_print("count: usage: wc (filename)\n");
+            return;
+        }
+        int cwd = 0;
+        if (kakel_active == 1) { cwd = load64(sk_cwd_base + f * 8); }
+        int fid = jakel_open(cwd, fname);
+        if (fid < 0) {
+            sk_print("count: file not found\n");
+            return;
+        }
+        int fsize = load64(jakel_size_base + fid * 8);
+        if (fsize == 0) { sk_print("0 0 0\n"); return; }
+        int buf = kmalloc(fsize);
+        if (buf == 0) { sk_print("count: out of memory\n"); return; }
+        jakel_read(fid, 0, buf, fsize);
+        int lines = 0;
+        int words = 0;
+        int in_word = 0;
+        int i = 0;
+        while (i < fsize) {
+            int ch = load8(buf + i);
+            if (ch == '\n') { lines = lines + 1; }
+            if (ch == ' ' || ch == '\n' || ch == '\t') {
+                if (in_word == 1) { words = words + 1; }
+                in_word = 0;
+            } else {
+                in_word = 1;
+            }
+            i = i + 1;
+        }
+        if (in_word == 1) { words = words + 1; }
+        sk_print_int(lines);
+        sk_print(" ");
+        sk_print_int(words);
+        sk_print(" ");
+        sk_print_int(fsize);
+        sk_print("\n");
+        kfree(buf);
+        return;
+    }
+    // edit <filename> — open a file in the skrift text editor.
+    int edr = str_starts(cmd, "edit ");
+    if (edr >= 0) {
+        int name = cmd + edr;
+        if (load8(name) == 0) {
+            sk_print("edit: usage: edit (filename)\n");
+            return;
+        }
+        int win = 0;
+        if (kakel_active == 1) { win = kakel_focus; }
+        skrift_start(win, name);
+        return;
+    }
+    if (str_eq(cmd, "edit") == 1) {
+        sk_print("edit: usage: edit (filename)\n");
+        return;
+    }
+    // eval -c <expression> — JIT-compile and execute (must come before eval —
+    // str_starts would also match "eval -c ..." as "eval ").
+    int ecr = str_starts(cmd, "eval -c ");
+    if (ecr >= 0) {
+        int src = cmd + ecr;
+        repl_eval_jit(src);
+        return;
+    }
+    // run <filename> — read a file from jakel and execute it through the REPL.
+    // Uses the interpreter (full statement support). For JIT compilation,
+    // use eval -c with an inline expression, or copy the expression from a file.
+    int rnr = str_starts(cmd, "run ");
+    if (rnr >= 0) {
+        int name = cmd + rnr;
+        if (load8(name) == 0) {
+            sk_print("run: usage: run (filename)\n");
+            return;
+        }
+        int cwd = 0;
+        if (kakel_active == 1) { cwd = load64(sk_cwd_base + f * 8); }
+        serial_print("[run] opening '");
+        serial_print(name);
+        serial_print("' from cwd=");
+        serial_print_int(cwd);
+        serial_print("\n");
+        int fid = jakel_open(cwd, name);
+        if (fid < 0) {
+            sk_print("run: file not found: ");
+            sk_print(name);
+            sk_print("\n");
+            return;
+        }
+        int ftype = load64(jakel_type_base + fid * 8);
+        if (ftype != JAKEL_TYPE_FILE) {
+            sk_print("run: not a file\n");
+            return;
+        }
+        int fsize = load64(jakel_size_base + fid * 8);
+        if (fsize == 0) {
+            sk_print("run: file is empty\n");
+            return;
+        }
+        // Cap at 4 KB — large enough for any expression or short script,
+        // small enough to not stress the heap for a REPL command.
+        if (fsize > 4096) { fsize = 4096; }
+        int buf = kmalloc(fsize + 1);
+        if (buf == 0) {
+            sk_print("run: out of memory\n");
+            return;
+        }
+        int n = jakel_read(fid, 0, buf, fsize);
+        store8(buf + n, 0);
+        repl_eval(buf);
+        kfree(buf);
+        return;
+    }
+    if (str_eq(cmd, "run") == 1) {
+        sk_print("run: usage: run (filename)\n");
+        return;
+    }
+    // eval <expression> — evaluate a c0 expression (REPL interpret mode).
+    int evr = str_starts(cmd, "eval ");
+    if (evr >= 0) {
+        repl_eval(cmd + evr);
+        return;
+    }
+    if (str_eq(cmd, "eval") == 1) {
+        sk_print("eval: usage: eval (expression)\n");
+        return;
+    }
+    // whoami — print the current user name.
+    if (str_eq(cmd, "whoami") == 1) {
+        int nm = sk_user_name(jakel_current_uid);
+        if (nm != 0) { sk_print(nm); sk_print("\n"); }
+        else { sk_print("user "); sk_print_int(jakel_current_uid); sk_print("\n"); }
+        return;
+    }
+    // login <name> [password] — switch user for this session.
+    int logr = str_starts(cmd, "login ");
+    if (logr >= 0) {
+        int args = cmd + logr; int sp = 0;
+        while (load8(args + sp) != 0 && load8(args + sp) != ' ') { sp = sp + 1; }
+        int name = args;
+        int pass = 0;
+        if (load8(args + sp) == ' ') {
+            store8(args + sp, 0);
+            pass = args + sp + 1;
+        }
+        int new_uid = sk_user_lookup(name);
+        if (new_uid < 0) {
+            sk_print("login: unknown user '");
+            sk_print(name);
+            sk_print("'\n");
+            if (pass != 0) { store8(args + sp, ' '); }
+            return;
+        }
+        // Check password if one is set for this user.
+        if (pass != 0) {
+            int ok = sk_user_check_pass(new_uid, pass);
+            if (ok == 0) {
+                sk_print("login: wrong password\n");
+                store8(args + sp, ' '); return;
+            }
+        }
+        store64(sk_uid_base + f * 8, new_uid);
+        jakel_current_uid = new_uid;
+        sk_print("logged in as ");
+        sk_print(name);
+        sk_print("\n");
+        if (pass != 0) { store8(args + sp, ' '); }
+        return;
+    }
+    // adduser <name> — create a new user.
+    int aur = str_starts(cmd, "adduser ");
+    if (aur >= 0) {
+        int name = cmd + aur;
+        if (load8(name) == 0) {
+            sk_print("adduser: usage: adduser (name)\n"); return;
+        }
+        int uid = sk_user_add(name);
+        if (uid < 0) { sk_print("adduser: name taken or table full\n"); return; }
+        sk_print("added user '");
+        sk_print(name);
+        sk_print("' (uid ");
+        sk_print_int(uid);
+        sk_print(")\n");
+        return;
+    }
+    // passwd <user> <password> — set or change a user's password.
+    int pwr = str_starts(cmd, "passwd ");
+    if (pwr >= 0) {
+        int args = cmd + pwr; int sp = 0;
+        while (load8(args + sp) != 0 && load8(args + sp) != ' ') { sp = sp + 1; }
+        if (sp == 0 || load8(args + sp) != ' ') {
+            sk_print("passwd: usage: passwd (user) (password)\n"); return;
+        }
+        store8(args + sp, 0);
+        int user_str = args;
+        int pass_str = args + sp + 1;
+        int uid = sk_user_lookup(user_str);
+        if (uid < 0) {
+            sk_print("passwd: unknown user '");
+            sk_print(user_str);
+            sk_print("'\n");
+            store8(args + sp, ' '); return;
+        }
+        sk_user_set_pass(uid, pass_str);
+        sk_print("password set for '");
+        sk_print(user_str);
+        sk_print("'\n");
+        store8(args + sp, ' ');
+        return;
+    }
+    // own <path> <user> — change file ownership.
+    int ownr = str_starts(cmd, "own ");
+    if (ownr >= 0) {
+        int args = cmd + ownr; int sp = 0;
+        while (load8(args + sp) != 0 && load8(args + sp) != ' ') { sp = sp + 1; }
+        if (sp == 0 || load8(args + sp) != ' ') {
+            sk_print("own: usage: own (path) (user)\n"); return;
+        }
+        store8(args + sp, 0);
+        int path_str = args;
+        int user_str = args + sp + 1;
+        int new_uid = sk_user_lookup(user_str);
+        if (new_uid < 0) {
+            sk_print("own: unknown user '");
+            sk_print(user_str);
+            sk_print("'\n");
+            store8(args + sp, ' '); return;
+        }
+        int nid = jakel_open(load64(sk_cwd_base + f * 8), path_str);
+        if (nid < 0) { sk_print("own: path not found\n"); store8(args + sp, ' '); return; }
+        store64(jakel_uid_base + nid * 8, new_uid);
+        store8(args + sp, ' '); return;
+    }
+    // mode <path> <public|private|locked> — set permissions.
+    int modr = str_starts(cmd, "mode ");
+    if (modr >= 0) {
+        int args = cmd + modr; int sp = 0;
+        while (load8(args + sp) != 0 && load8(args + sp) != ' ') { sp = sp + 1; }
+        if (sp == 0 || load8(args + sp) != ' ') {
+            sk_print("mode: usage: mode (path) public|private|locked\n"); return;
+        }
+        store8(args + sp, 0);
+        int level_str = args + sp + 1; int new_mode = -1;
+        if (load8(level_str) == 'p' && load8(level_str + 1) == 'u') { new_mode = 2; }
+        else if (load8(level_str) == 'p' && load8(level_str + 1) == 'r') { new_mode = 1; }
+        else if (load8(level_str) == 'l') { new_mode = 0; }
+        if (new_mode < 0) {
+            sk_print("mode: level must be public, private, or locked\n");
+            store8(args + sp, ' '); return;
+        }
+        int nid = jakel_open(load64(sk_cwd_base + f * 8), args);
+        if (nid < 0) { sk_print("mode: path not found\n"); store8(args + sp, ' '); return; }
+        store64(jakel_mode_base + nid * 8, new_mode);
+        store8(args + sp, ' '); return;
+    }
+    sk_print("unknown command: ");
+    sk_print(cmd);
+    sk_print("\n");
+    return;
+}
+
+// Redraw the shell line for session `f` from its prompt column through
+// the current buffer contents. Used by the history navigation functions to
+// replace the visible line after recalling a different command.
+void shell_redraw_line(int f) {
+    int line = load64(shell_line_base + f * 8);
+    int len  = load64(shell_len_base + f * 8);
+    int pc   = load64(kakel_prompt_col_base + f * 8);
+    int cy   = load64(kakel_cy_base + f * 8);
+    int cx   = load64(kakel_cx_base + f * 8);
+    int bg   = load64(kakel_bg_base + f * 8);
+    int pr   = load64(kakel_row_base + f * 8);
+    int cols = load64(kakel_cols_base + f * 8);
+
+    // Clear from prompt column to end of line.
+    fb_fill_rect((cx + pc) * FONT_W, (cy + pr) * FONT_H,
+                 (cols - pc) * FONT_W, FONT_H, bg);
+    // Reset kakel cursor to prompt position.
+    store64(kakel_row_base + f * 8, pr);
+    store64(kakel_col_base + f * 8, pc);
+    store64(kakel_crow_base + f * 8, -1);
+    store64(kakel_ccol_base + f * 8, -1);
+    // Draw each buffered character.
+    int i = 0;
+    while (i < len) {
+        kakel_putc(f, load8(line + i));
+        i = i + 1;
+    }
+    return;
+}
+
+// Recall a command from the history ring buffer and replace the current line.
+// Called from the keyboard IRQ in response to up/down arrow keys.
+// `dir`: -1 = older (up arrow), 1 = newer (down arrow).
+void shell_history_nav(int f, int dir) {
+    if (sk_hist_buf == 0) { return; }
+    if (sk_hist_count == 0) { return; }
+    if (kakel_active != 1) { return; }
+
+    int line = load64(shell_line_base + f * 8);
+    int len  = load64(shell_len_base + f * 8);
+
+    if (dir == -1) {
+        // Up arrow — go to older entry.
+        if (sk_hist_pos < 0) {
+            // First press: start at newest (position 0).
+            sk_hist_pos = 0;
+        } else {
+            sk_hist_pos = sk_hist_pos + 1;
+        }
+        if (sk_hist_pos >= sk_hist_count) {
+            sk_hist_pos = sk_hist_count - 1;
+            return;  // already at oldest
+        }
+    } else {
+        // Down arrow — go to newer entry.
+        if (sk_hist_pos < 0) { return; }  // not navigating
+        sk_hist_pos = sk_hist_pos - 1;
+        if (sk_hist_pos < 0) {
+            // Past newest — restore blank line.
+            store64(shell_len_base + f * 8, 0);
+            store64(shell_cpos_base + f * 8, 0);
+            shell_redraw_line(f);
+            return;
+        }
+    }
+
+    // Compute the ring buffer index.
+    // Ring layout: sk_hist_next points to the next write slot.
+    // The newest entry is at (next - 1), next-newest at (next - 2), etc.
+    int idx = sk_hist_next - sk_hist_pos - 1;
+    while (idx < 0) { idx = idx + SK_HIST_MAX; }
+
+    // Copy the history entry into the line buffer.
+    int src = sk_hist_buf + idx * SHELL_LINE_MAX;
+    int n = 0;
+    while (n < SHELL_LINE_MAX - 1) {
+        int ch = load8(src + n);
+        if (ch == 0) { break; }
+        store8(line + n, ch);
+        n = n + 1;
+    }
+    store64(shell_len_base + f * 8, n);
+    store64(shell_cpos_base + f * 8, n);  // cursor at end of recalled line
+    shell_redraw_line(f);
+    return;
+}
+
+// Move the visible cursor within the current shell line by `dir` (-1 = left,
+// 1 = right). Called from the keyboard IRQ for left/right arrow keys.
+// Updates shell_cpos_base and the kakel cursor position; erases the old
+// underline and draws the new one via fb_draw_cursor.
+void shell_cursor_move(int f, int dir) {
+    if (kakel_active != 1) { return; }
+    int len  = load64(shell_len_base + f * 8);
+    int cpos = load64(shell_cpos_base + f * 8);
+    int new_pos = cpos + dir;
+    if (new_pos < 0 || new_pos > len) { return; }
+    if (new_pos == cpos) { return; }
+    int pc  = load64(kakel_prompt_col_base + f * 8);
+    int pr  = load64(kakel_row_base + f * 8);
+    int bg  = load64(kakel_bg_base + f * 8);
+    int cx  = load64(kakel_cx_base + f * 8);
+    int cy  = load64(kakel_cy_base + f * 8);
+    // Erase the underline at the old cursor position.
+    fb_draw_cursor(cy + pr, cx + pc + cpos, bg);
+    // Update state.
+    store64(shell_cpos_base + f * 8, new_pos);
+    store64(kakel_col_base + f * 8, pc + new_pos);
+    store64(kakel_crow_base + f * 8, -1);
+    store64(kakel_ccol_base + f * 8, -1);
+    // Draw the underline at the new cursor position.
+    fb_draw_cursor(cy + pr, cx + pc + new_pos, FB_FG);
+    return;
+}
+
+// Ctrl+A / Home — jump cursor to beginning of line.
+void shell_cursor_home(int f) {
+    if (kakel_active != 1) { return; }
+    int cpos = load64(shell_cpos_base + f * 8);
+    if (cpos == 0) { return; }
+    int pc = load64(kakel_prompt_col_base + f * 8);
+    int pr = load64(kakel_row_base + f * 8);
+    int bg = load64(kakel_bg_base + f * 8);
+    int cx = load64(kakel_cx_base + f * 8);
+    int cy = load64(kakel_cy_base + f * 8);
+    fb_draw_cursor(cy + pr, cx + pc + cpos, bg);
+    store64(shell_cpos_base + f * 8, 0);
+    store64(kakel_col_base + f * 8, pc);
+    store64(kakel_crow_base + f * 8, -1);
+    store64(kakel_ccol_base + f * 8, -1);
+    fb_draw_cursor(cy + pr, cx + pc + 0, FB_FG);
+    return;
+}
+
+// Ctrl+E / End — jump cursor to end of line.
+void shell_cursor_end(int f) {
+    if (kakel_active != 1) { return; }
+    int len  = load64(shell_len_base + f * 8);
+    int cpos = load64(shell_cpos_base + f * 8);
+    if (cpos == len) { return; }
+    int pc = load64(kakel_prompt_col_base + f * 8);
+    int pr = load64(kakel_row_base + f * 8);
+    int bg = load64(kakel_bg_base + f * 8);
+    int cx = load64(kakel_cx_base + f * 8);
+    int cy = load64(kakel_cy_base + f * 8);
+    fb_draw_cursor(cy + pr, cx + pc + cpos, bg);
+    store64(shell_cpos_base + f * 8, len);
+    store64(kakel_col_base + f * 8, pc + len);
+    store64(kakel_crow_base + f * 8, -1);
+    store64(kakel_ccol_base + f * 8, -1);
+    fb_draw_cursor(cy + pr, cx + pc + len, FB_FG);
+    return;
+}
+
+// Ctrl+W — delete the word before the cursor. Skips trailing spaces,
+// then deletes the preceding non-space word.
+void shell_cursor_delete_word(int f) {
+    if (kakel_active != 1) { return; }
+    int cpos = load64(shell_cpos_base + f * 8);
+    if (cpos == 0) { return; }
+    int line = load64(shell_line_base + f * 8);
+    int len  = load64(shell_len_base + f * 8);
+    int p = cpos - 1;
+    while (p >= 0 && load8(line + p) == ' ') { p = p - 1; }
+    while (p >= 0 && load8(line + p) != ' ') { p = p - 1; }
+    int start = p + 1;
+    int count = cpos - start;
+    if (count == 0) { return; }
+    int si = start;
+    while (si < len - count) {
+        store8(line + si, load8(line + si + count));
+        si = si + 1;
+    }
+    store64(shell_len_base + f * 8, len - count);
+    store64(shell_cpos_base + f * 8, start);
+    shell_redraw_line(f);
+    return;
+}
+
+// Tab completion for the shell. Scans the word before the cursor: if it is the
+// first word on the line, completes against builtin command names; otherwise
+// completes against filenames in the current working directory (via jakel).
+// Single match: replace the word and, for commands, append a space. Multiple
+// matches: complete the longest common prefix shared by all candidates.
+// Called from shell_input (shell task context, IF enabled — safe for jakel).
+void shell_tab_complete(int f) {
+    int line = load64(shell_line_base + f * 8);
+    int len  = load64(shell_len_base + f * 8);
+    int cpos = load64(shell_cpos_base + f * 8);
+    if (cpos == 0) { return; }
+
+    // Find the start of the current word (scan backward to a space or bol).
+    int ws = cpos - 1;
+    while (ws > 0 && load8(line + ws - 1) != ' ') { ws = ws - 1; }
+    int plen = cpos - ws;
+    if (plen == 0) { return; }
+    // Is this the first word on the line?
+    int is_cmd = 1;
+    if (ws > 0) { is_cmd = 0; }  // preceded by a space → not first word
+
+    // ".." is not a real directory entry — insert "/" so the normal
+    // mid-path completion resolves it as "../" (parent directory).
+    if (plen == 2 && load8(line + ws) == '.' && load8(line + ws + 1) == '.') {
+        if (len + 1 < SHELL_LINE_MAX - 1) {
+            int p = len;
+            while (p > ws + 2) { store8(line + p + 1, load8(line + p)); p = p - 1; }
+            store8(line + ws + 2, '/');
+            len = len + 1; cpos = cpos + 1;
+            store64(shell_len_base + f * 8, len);
+            store64(shell_cpos_base + f * 8, cpos);
+            plen = 3; is_cmd = 0;
+        }
+    }
+
+    // --- collect matches into the kscratch buffer ---
+    int mbase = kscratch_start;       // match name pointers (up to 32 slots × 8B each)
+    int mlens = mbase + 256;         // match name lengths (32 × 8B)
+    int mcount = 0;
+    int mlimit = 32;
+
+    if (is_cmd == 1) {
+        // --- command completion: hardcoded list of 30 builtins ---
+        int cmd_ptrs = kscratch_start + 600;
+        int cmd_idx = 0;
+
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 700); cmd_idx = cmd_idx + 1;
+        int s0 = kscratch_start + 700; store8(s0+0,'h');store8(s0+1,'e');store8(s0+2,'l');store8(s0+3,'p');store8(s0+4,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 710); cmd_idx = cmd_idx + 1;
+        int s1 = kscratch_start + 710; store8(s1+0,'c');store8(s1+1,'l');store8(s1+2,'e');store8(s1+3,'a');store8(s1+4,'r');store8(s1+5,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 720); cmd_idx = cmd_idx + 1;
+        int s2 = kscratch_start + 720; store8(s2+0,'c');store8(s2+1,'h');store8(s2+2,'a');store8(s2+3,'r');store8(s2+4,'s');store8(s2+5,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 730); cmd_idx = cmd_idx + 1;
+        int s3 = kscratch_start + 730; store8(s3+0,'e');store8(s3+1,'c');store8(s3+2,'h');store8(s3+3,'o');store8(s3+4,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 740); cmd_idx = cmd_idx + 1;
+        int s4 = kscratch_start + 740; store8(s4+0,'l');store8(s4+1,'i');store8(s4+2,'s');store8(s4+3,'t');store8(s4+4,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 750); cmd_idx = cmd_idx + 1;
+        int s5 = kscratch_start + 750; store8(s5+0,'c');store8(s5+1,'h');store8(s5+2,'a');store8(s5+3,'n');store8(s5+4,'g');store8(s5+5,'e');store8(s5+6,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 760); cmd_idx = cmd_idx + 1;
+        int s6 = kscratch_start + 760; store8(s6+0,'m');store8(s6+1,'a');store8(s6+2,'k');store8(s6+3,'e');store8(s6+4,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 770); cmd_idx = cmd_idx + 1;
+        int s7 = kscratch_start + 770; store8(s7+0,'r');store8(s7+1,'e');store8(s7+2,'m');store8(s7+3,'o');store8(s7+4,'v');store8(s7+5,'e');store8(s7+6,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 780); cmd_idx = cmd_idx + 1;
+        int s8 = kscratch_start + 780; store8(s8+0,'w');store8(s8+1,'r');store8(s8+2,'i');store8(s8+3,'t');store8(s8+4,'e');store8(s8+5,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 790); cmd_idx = cmd_idx + 1;
+        int s9 = kscratch_start + 790; store8(s9+0,'w');store8(s9+1,'h');store8(s9+2,'e');store8(s9+3,'r');store8(s9+4,'e');store8(s9+5,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 800); cmd_idx = cmd_idx + 1;
+        int s10 = kscratch_start + 800; store8(s10+0,'s');store8(s10+1,'y');store8(s10+2,'n');store8(s10+3,'c');store8(s10+4,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 810); cmd_idx = cmd_idx + 1;
+        int s11 = kscratch_start + 810; store8(s11+0,'c');store8(s11+1,'o');store8(s11+2,'p');store8(s11+3,'y');store8(s11+4,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 820); cmd_idx = cmd_idx + 1;
+        int s12 = kscratch_start + 820; store8(s12+0,'r');store8(s12+1,'e');store8(s12+2,'n');store8(s12+3,'a');store8(s12+4,'m');store8(s12+5,'e');store8(s12+6,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 830); cmd_idx = cmd_idx + 1;
+        int s13 = kscratch_start + 830; store8(s13+0,'c');store8(s13+1,'o');store8(s13+2,'u');store8(s13+3,'n');store8(s13+4,'t');store8(s13+5,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 840); cmd_idx = cmd_idx + 1;
+        int s14 = kscratch_start + 840; store8(s14+0,'e');store8(s14+1,'v');store8(s14+2,'a');store8(s14+3,'l');store8(s14+4,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 850); cmd_idx = cmd_idx + 1;
+        int s15 = kscratch_start + 850; store8(s15+0,'e');store8(s15+1,'d');store8(s15+2,'i');store8(s15+3,'t');store8(s15+4,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 860); cmd_idx = cmd_idx + 1;
+        int s16 = kscratch_start + 860; store8(s16+0,'r');store8(s16+1,'u');store8(s16+2,'n');store8(s16+3,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 870); cmd_idx = cmd_idx + 1;
+        int s17 = kscratch_start + 870; store8(s17+0,'t');store8(s17+1,'a');store8(s17+2,'s');store8(s17+3,'k');store8(s17+4,'s');store8(s17+5,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 880); cmd_idx = cmd_idx + 1;
+        int s18 = kscratch_start + 880; store8(s18+0,'s');store8(s18+1,'p');store8(s18+2,'a');store8(s18+3,'w');store8(s18+4,'n');store8(s18+5,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 890); cmd_idx = cmd_idx + 1;
+        int s19 = kscratch_start + 890; store8(s19+0,'k');store8(s19+1,'i');store8(s19+2,'l');store8(s19+3,'l');store8(s19+4,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 900); cmd_idx = cmd_idx + 1;
+        int s20 = kscratch_start + 900; store8(s20+0,'s');store8(s20+1,'p');store8(s20+2,'l');store8(s20+3,'i');store8(s20+4,'t');store8(s20+5,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 910); cmd_idx = cmd_idx + 1;
+        int s21 = kscratch_start + 910; store8(s21+0,'c');store8(s21+1,'l');store8(s21+2,'o');store8(s21+3,'s');store8(s21+4,'e');store8(s21+5,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 920); cmd_idx = cmd_idx + 1;
+        int s22 = kscratch_start + 920; store8(s22+0,'r');store8(s22+1,'u');store8(s22+2,'n');store8(s22+3,'3');store8(s22+4,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 930); cmd_idx = cmd_idx + 1;
+        int s23 = kscratch_start + 930; store8(s23+0,'s');store8(s23+1,'p');store8(s23+2,'a');store8(s23+3,'w');store8(s23+4,'n');store8(s23+5,'3');store8(s23+6,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 940); cmd_idx = cmd_idx + 1;
+        int s24 = kscratch_start + 940; store8(s24+0,'m');store8(s24+1,'o');store8(s24+2,'d');store8(s24+3,'e');store8(s24+4,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 950); cmd_idx = cmd_idx + 1;
+        int s25 = kscratch_start + 950; store8(s25+0,'o');store8(s25+1,'w');store8(s25+2,'n');store8(s25+3,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 960); cmd_idx = cmd_idx + 1;
+        int s26 = kscratch_start + 960; store8(s26+0,'w');store8(s26+1,'h');store8(s26+2,'o');store8(s26+3,'a');store8(s26+4,'m');store8(s26+5,'i');store8(s26+6,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 970); cmd_idx = cmd_idx + 1;
+        int s27 = kscratch_start + 970; store8(s27+0,'l');store8(s27+1,'o');store8(s27+2,'g');store8(s27+3,'i');store8(s27+4,'n');store8(s27+5,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 980); cmd_idx = cmd_idx + 1;
+        int s28 = kscratch_start + 980; store8(s28+0,'a');store8(s28+1,'d');store8(s28+2,'d');store8(s28+3,'u');store8(s28+4,'s');store8(s28+5,'e');store8(s28+6,'r');store8(s28+7,0);
+        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 990); cmd_idx = cmd_idx + 1;
+        int s29 = kscratch_start + 990; store8(s29+0,'p');store8(s29+1,'a');store8(s29+2,'s');store8(s29+3,'s');store8(s29+4,'w');store8(s29+5,'d');store8(s29+6,0);
+        int total_cmds = 30;
+
+        // Match commands against the prefix.
+        int mi = 0;
+        while (mi < total_cmds) {
+            int cname = load64(cmd_ptrs + mi * 8);
+            // Check if cname starts with the prefix.
+            int match = 1;
+            int pi = 0;
+            while (pi < plen) {
+                if (load8(cname + pi) != load8(line + ws + pi)) {
+                    match = 0;
+                    break;
+                }
+                pi = pi + 1;
+            }
+            if (load8(cname + pi) == 0 && pi < plen) { match = 0; }
+            if (match == 1 && mcount < mlimit) {
+                store64(mbase + mcount * 8, cname);
+                // Compute name length.
+                int nl = 0;
+                while (load8(cname + nl) != 0) { nl = nl + 1; }
+                store64(mlens + mcount * 8, nl);
+                mcount = mcount + 1;
+            }
+            mi = mi + 1;
+        }
+    } else {
+        // --- filename completion from jakel cwd ---
+        int cwd = 0;
+        if (kakel_active == 1) { cwd = load64(sk_cwd_base + f * 8); }
+        int sz = load64(jakel_size_base + cwd * 8);
+        int data = load64(jakel_data_base + cwd * 8);
+        int i = 0;
+        while (i < sz) {
+            int cid = load64(data + i);
+            int cname = load64(jakel_name_base + cid * 8);
+            // Check if cname starts with the prefix.
+            int match = 1;
+            int pi = 0;
+            while (pi < plen) {
+                if (load8(cname + pi) != load8(line + ws + pi)) {
+                    match = 0;
+                    break;
+                }
+                pi = pi + 1;
+            }
+            if (load8(cname + pi) == 0 && pi < plen) { match = 0; }
+            if (match == 1 && mcount < mlimit) {
+                store64(mbase + mcount * 8, cname);
+                int nl = 0;
+                while (load8(cname + nl) != 0) { nl = nl + 1; }
+                store64(mlens + mcount * 8, nl);
+                mcount = mcount + 1;
+            }
+            i = i + 8;
+        }
+    }
+
+    if (mcount == 0) { return; }
+
+    // --- find longest common prefix among all matches ---
+    int lcp = plen;  // start from current prefix length
+    int keep_going = 1;
+    while (keep_going == 1) {
+        int first_name = load64(mbase);
+        int first_len  = load64(mlens);
+        if (lcp >= first_len) { keep_going = 0; break; }
+        int ch = load8(first_name + lcp);
+        int mi = 1;
+        while (mi < mcount) {
+            int mname = load64(mbase + mi * 8);
+            int mlen  = load64(mlens + mi * 8);
+            if (lcp >= mlen || load8(mname + lcp) != ch) {
+                keep_going = 0;
+                break;
+            }
+            mi = mi + 1;
+        }
+        if (keep_going == 1) { lcp = lcp + 1; }
+    }
+
+    // --- apply the completion ---
+    // Replace the current word (ws..cpos) with the completed text.
+    // First, remove the old prefix by shifting left.
+    // Then, insert the new text by shifting right.
+    // Use the first match name if lcp == full length (exact completion).
+
+    int comp_len = lcp;
+    // For single-command exact match, append a trailing space.
+    int add_space = 0;
+    if (is_cmd == 1 && mcount == 1 && lcp == load64(mlens)) {
+        add_space = 1;
+    }
+
+    // Remove old word and insert new text. Since lcp >= plen always,
+    // we need to insert (lcp - plen) + add_space new characters.
+    int insert_count = lcp - plen;
+    if (add_space == 1) { insert_count = insert_count + 1; }
+    if (insert_count == 0 && mcount > 1) {
+        // Second Tab with multiple matches — list them all.
+        sk_print("\n");
+        int mi = 0;
+        while (mi < mcount) {
+            sk_print("  ");
+            sk_print(load64(mbase + mi * 8));
+            sk_print("\n");
+            mi = mi + 1;
+        }
+        shell_prompt_win(f);
+        // Redraw the current line.
+        shell_redraw_line(f);
+        return;
+    }
+    if (insert_count == 0) { return; }  // nothing to do (single match, already complete)
+
+    if (len + insert_count >= SHELL_LINE_MAX - 1) { return; }
+
+    // Shift right to make room.
+    int p = len;
+    while (p > cpos) {
+        store8(line + p + insert_count, load8(line + p));
+        p = p - 1;
+    }
+    // Copy the completion characters from the first match.
+    int src = load64(mbase);
+    int ci = plen;
+    while (ci < lcp) {
+        store8(line + ws + ci, load8(src + ci));
+        ci = ci + 1;
+    }
+    if (add_space == 1) {
+        store8(line + ws + lcp, ' ');
+    }
+    int new_len = len + insert_count;
+    int new_cpos = ws + lcp;
+    if (add_space == 1) { new_cpos = new_cpos + 1; }
+    store64(shell_len_base + f * 8, new_len);
+    store64(shell_cpos_base + f * 8, new_cpos);
+    if (kakel_active == 1) {
+        shell_redraw_line(f);
+    }
+    return;
+}
+
+// Feeds one decoded key into session `f`'s shell -- called from shell_task
+// AFTER keyboard_handler has already echoed the key to the screen, so this
+// only manages the line buffer and command execution, never re-draws typed
+// characters. `f` is the session id captured at keypress time (not re-read
+// from kakel_focus here -- see the file header). Enter terminates and runs
+// the line, then reprompts; Backspace drops the last buffered char (the
+// on-screen erase was keyboard_handler's job); Tab (9) is ignored in the
+// buffer; any other char is appended if the fixed buffer has room (one byte
+// always reserved for the NUL terminator).
+void shell_input(int f, int ascii) {
+    if (shell_ncons == 0) {
+        return;  // shell not initialized yet -- ignore stray early keys
+    }
+    int line = load64(shell_line_base + f * 8);
+    int len  = load64(shell_len_base + f * 8);
+    int cpos = load64(shell_cpos_base + f * 8);
+    // Clamp cpos to len — during normal typing, cpos tracks len. Arrow
+    // keys move it independently; typing or backspace may trigger a redraw
+    // if we were inserting mid-line.
+    if (cpos > len) { cpos = len; store64(shell_cpos_base + f * 8, cpos); }
+    if (ascii == '\n') {
+        store8(line + len, 0);
+        if (len > 0 && sk_hist_buf != 0) {
+            int slot = sk_hist_next * SHELL_LINE_MAX;
+            int ci = 0;
+            while (ci <= len) {
+                store8(sk_hist_buf + slot + ci, load8(line + ci));
+                ci = ci + 1;
+            }
+            sk_hist_next = sk_hist_next + 1;
+            if (sk_hist_next >= SK_HIST_MAX) { sk_hist_next = 0; }
+            if (sk_hist_count < SK_HIST_MAX) {
+                sk_hist_count = sk_hist_count + 1;
+            }
+        }
+        sk_hist_pos = -1;
+        shell_run(f, line);
+        store64(shell_len_base + f * 8, 0);
+        store64(shell_cpos_base + f * 8, 0);
+        shell_prompt();
+        return;
+    }
+    if (ascii == 8) {
+        if (cpos > 0) {
+            // Shift buffer left by one starting at (cpos - 1).
+            int p = cpos - 1;
+            while (p < len - 1) {
+                store8(line + p, load8(line + p + 1));
+                p = p + 1;
+            }
+            store64(shell_len_base + f * 8, len - 1);
+            store64(shell_cpos_base + f * 8, cpos - 1);
+            // Redraw if we deleted mid-line (visual position was wrong).
+            if (cpos < len && kakel_active == 1) {
+                shell_redraw_line(f);
+            }
+        }
+        sk_hist_pos = -1;
+        return;
+    }
+    if (ascii == 9) {
+        sk_hist_pos = -1;
+        shell_tab_complete(f);
+        return;
+    }
+    // Printable character — insert at cursor position.
+    if (len < SHELL_LINE_MAX - 1) {
+        int needs_redraw = 0;
+        if (cpos < len) {
+            // Insert mid-line: shift right then store.
+            int p = len;
+            while (p > cpos) {
+                store8(line + p, load8(line + p - 1));
+                p = p - 1;
+            }
+            needs_redraw = 1;
+        }
+        store8(line + cpos, ascii);
+        store64(shell_len_base + f * 8, len + 1);
+        store64(shell_cpos_base + f * 8, cpos + 1);
+        if (needs_redraw == 1 && kakel_active == 1) {
+            shell_redraw_line(f);
+        }
+    }
+    sk_hist_pos = -1;
+    return;
+}
+
+// Called from keyboard_handler (IRQ path) to deposit a decoded character into
+// the shell's input queue and wake the shell task if it is blocked. `f` is the
+// focused session at keypress time, captured here so shell_task can route the
+// char to the right line buffer even if focus changes before it runs.
+// Drops the char silently when the ring buffer is full (a burst of more than
+// SK_QUEUE_MAX keys before the shell task runs -- not realistic for a shell).
+// The `sk_queue == 0` guard covers stray early keys before shell_init.
+void shell_enqueue(int f, int ascii) {
+    if (sk_queue == 0) { return; }
+    if (sk_queue_count < SK_QUEUE_MAX) {
+        store8(sk_queue + sk_queue_tail, ascii);
+        store8(sk_queue_sess + sk_queue_tail, f);
+        sk_queue_tail = sk_queue_tail + 1;
+        if (sk_queue_tail >= SK_QUEUE_MAX) { sk_queue_tail = 0; }
+        sk_queue_count = sk_queue_count + 1;
+    }
+    if (shell_task_id >= 0) {
+        task_wake(shell_task_id);
+    }
+    return;
+}
+
+// --- password infrastructure ---
+
+// Duplicates a NUL-terminated string into a kmalloc'd buffer.
+int sk_strdup(int src) {
+    if (src == 0) { return 0; }
+    int len = 0;
+    while (load8(src + len) != 0) { len = len + 1; }
+    int buf = kmalloc(len + 1);
+    if (buf == 0) { return 0; }
+    int i = 0;
+    while (i <= len) { store8(buf + i, load8(src + i)); i = i + 1; }
+    return buf;
+}
+
+// Per-user password storage. 8 users × 8 bytes (pointers to kmalloc'd strings).
+int sk_pass_base = 0;
+
+void sk_pass_init() {
+    sk_pass_base = kmalloc(64);
+    int i = 0;
+    while (i < 64) { store8(sk_pass_base + i, 0); i = i + 1; }
+    return;
+}
+
+// Byte-by-byte comparison of two NUL-terminated strings. Returns 1 if equal.
+int sk_pass_cmp(int a, int b) {
+    int i = 0;
+    while (i < 64) {
+        int ca = load8(a + i);
+        int cb = load8(b + i);
+        if (ca != cb) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Check password for user uid: 1 = match, 0 = no match or no password set.
+int sk_user_check_pass(int uid, int pass) {
+    if (sk_pass_base == 0) { return 0; }
+    int stored = load64(sk_pass_base + uid * 8);
+    if (stored == 0) { return 0; }
+    return sk_pass_cmp(stored, pass);
+}
+
+// Store (or replace) a password for user uid.
+void sk_user_set_pass(int uid, int pass) {
+    if (sk_pass_base == 0) { sk_pass_init(); }
+    kfree(load64(sk_pass_base + uid * 8));
+    store64(sk_pass_base + uid * 8, sk_strdup(pass));
+    return;
+}
+
+// The shell task body. Loops forever: blocks when the input queue is empty,
+// dequeues one char when one arrives, and calls shell_input to process it.
+//
+// Blocking protocol: set state to TASK_BLOCKED, then re-check the queue
+// count before halting -- this closes the window where keyboard_handler
+// could enqueue a char and call task_wake between the empty-check and
+// the BLOCKED store. After halt() returns (any IRQ delivered us here),
+// the while condition is re-evaluated to see if the queue is still empty.
+// Missed-wakeup race (very narrow window between re-check and hlt): if a
+// keyboard IRQ fires there, task_wake sets us RUNNABLE; the next timer tick
+// will pick us, and we wake from hlt with a non-empty queue.
+void shell_task() {
+    while (1) {
+        while (sk_queue_count == 0) {
+            int me = sched_current;
+            store64(task_state_base + me * 8, TASK_BLOCKED);
+            if (sk_queue_count != 0) {
+                store64(task_state_base + me * 8, TASK_RUNNABLE);
+                break;
+            }
+            halt();
+        }
+        int ascii = load8(sk_queue + sk_queue_head);
+        int f = load8(sk_queue_sess + sk_queue_head);
+        sk_queue_head = sk_queue_head + 1;
+        if (sk_queue_head >= SK_QUEUE_MAX) { sk_queue_head = 0; }
+        sk_queue_count = sk_queue_count - 1;
+        shell_input(f, ascii);
+    }
+    return;
+}

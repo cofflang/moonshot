@@ -1,0 +1,689 @@
+// jakel.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+int JAKEL_MAX_NODES = 32;
+int JAKEL_NAME_LEN = 32;
+int JAKEL_TYPE_FREE = 0;
+int JAKEL_TYPE_FILE = 1;
+int JAKEL_TYPE_DIR  = 2;
+
+// Permission modes — named levels, not octal. Owner always has full access
+// (read + write + execute). The level controls what everyone else gets.
+int JAKEL_MODE_LOCKED  = 0;  // others: nothing
+int JAKEL_MODE_PRIVATE = 1;  // others: read only (default)
+int JAKEL_MODE_PUBLIC  = 2;  // others: read + execute
+
+int jakel_type_base = 0;
+int jakel_name_base = 0;
+int jakel_parent_base = 0;
+int jakel_size_base = 0;
+int jakel_data_base = 0;
+int jakel_created_base = 0;   // creation counter (in-memory only)
+int jakel_creation_counter = 0;
+int jakel_uid_base = 0;       // owner uid (in-memory only)
+int jakel_mode_base = 0;      // permission level (in-memory only)
+
+// Current user id. Root (uid 0) bypasses all permission checks.
+int jakel_current_uid = 0;
+
+// --- permission checks --------------------------------------------------------
+int jakel_can_read(int uid, int id) {
+    if (uid == 0) { return 1; }
+    if (uid == load64(jakel_uid_base + id * 8)) { return 1; }
+    if (load64(jakel_mode_base + id * 8) == JAKEL_MODE_LOCKED) { return 0; }
+    return 1;
+}
+int jakel_can_write(int uid, int id) {
+    if (uid == 0) { return 1; }
+    if (uid == load64(jakel_uid_base + id * 8)) { return 1; }
+    return 0;
+}
+
+int jakel_copy_name(int src) {
+    int buf = kmalloc(JAKEL_NAME_LEN);
+    int i = 0;
+    while (i < JAKEL_NAME_LEN - 1) {
+        int c = load8(src + i);
+        if (c == 0) { break; }
+        store8(buf + i, c);
+        i = i + 1;
+    }
+    store8(buf + i, 0);
+    return buf;
+}
+
+int jakel_str_eq(int a, int b) {
+    int i = 0;
+    while (load8(a + i) != 0 && load8(b + i) != 0) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    if (load8(a + i) == load8(b + i)) { return 1; }
+    return 0;
+}
+
+int jakel_str_len(int s) {
+    int i = 0;
+    while (load8(s + i) != 0) { i = i + 1; }
+    return i;
+}
+int jakel_alloc_node(int type, int parent, int name_str) {
+    int id = 0;
+    while (id < JAKEL_MAX_NODES) {
+        if (load64(jakel_type_base + id * 8) == JAKEL_TYPE_FREE) {
+            store64(jakel_type_base + id * 8, type);
+            store64(jakel_name_base + id * 8, jakel_copy_name(name_str));
+            store64(jakel_parent_base + id * 8, parent);
+            store64(jakel_size_base + id * 8, 0);
+            store64(jakel_data_base + id * 8, 0);
+            store64(jakel_created_base + id * 8, jakel_creation_counter);
+            store64(jakel_uid_base + id * 8, 0);
+            store64(jakel_mode_base + id * 8, JAKEL_MODE_PRIVATE);
+            jakel_creation_counter = jakel_creation_counter + 1;
+            return id;
+        }
+        id = id + 1;
+    }
+    return -1;
+}
+
+void jakel_free_node(int id) {
+    int name = load64(jakel_name_base + id * 8);
+    if (name != 0) { kfree(name); }
+    int data = load64(jakel_data_base + id * 8);
+    if (data != 0) { kfree(data); }
+    store64(jakel_type_base + id * 8, JAKEL_TYPE_FREE);
+    store64(jakel_name_base + id * 8, 0);
+    store64(jakel_parent_base + id * 8, 0);
+    store64(jakel_size_base + id * 8, 0);
+    store64(jakel_data_base + id * 8, 0);
+    store64(jakel_created_base + id * 8, 0);
+    store64(jakel_uid_base + id * 8, 0);
+    store64(jakel_mode_base + id * 8, 0);
+    return;
+}
+void jakel_add_child(int dir_id, int child_id) {
+    int old_size = load64(jakel_size_base + dir_id * 8);
+    int old_data = load64(jakel_data_base + dir_id * 8);
+    int new_size = old_size + 8;
+    int new_data = kmalloc(new_size);
+    int i = 0;
+    while (i < old_size) {
+        store64(new_data + i, load64(old_data + i));
+        i = i + 8;
+    }
+    store64(new_data + old_size, child_id);
+    if (old_data != 0) { kfree(old_data); }
+    store64(jakel_data_base + dir_id * 8, new_data);
+    store64(jakel_size_base + dir_id * 8, new_size);
+    return;
+}
+
+void jakel_remove_child(int dir_id, int child_id) {
+    int old_size = load64(jakel_size_base + dir_id * 8);
+    int old_data = load64(jakel_data_base + dir_id * 8);
+    int new_size = old_size - 8;
+    int new_data = 0;
+    if (new_size > 0) { new_data = kmalloc(new_size); }
+    int i = 0;
+    int w = 0;
+    while (i < old_size) {
+        int cid = load64(old_data + i);
+        if (cid != child_id) {
+            store64(new_data + w, cid);
+            w = w + 8;
+        }
+        i = i + 8;
+    }
+    kfree(old_data);
+    store64(jakel_data_base + dir_id * 8, new_data);
+    store64(jakel_size_base + dir_id * 8, new_size);
+    return;
+}
+
+int jakel_lookup(int dir_id, int name_str) {
+    int sz = load64(jakel_size_base + dir_id * 8);
+    int data = load64(jakel_data_base + dir_id * 8);
+    int i = 0;
+    while (i < sz) {
+        int cid = load64(data + i);
+        int cname = load64(jakel_name_base + cid * 8);
+        if (jakel_str_eq(cname, name_str) == 1) { return cid; }
+        i = i + 8;
+    }
+    return -1;
+}
+int jakel_mkdir(int parent, int name_str) {
+    if (jakel_lookup(parent, name_str) >= 0) { return -1; }
+    int id = jakel_alloc_node(JAKEL_TYPE_DIR, parent, name_str);
+    if (id < 0) { return -1; }
+    jakel_add_child(parent, id);
+    return id;
+}
+
+int jakel_make_file(int parent, int name_str) {
+    if (jakel_lookup(parent, name_str) >= 0) { return -1; }
+    int id = jakel_alloc_node(JAKEL_TYPE_FILE, parent, name_str);
+    if (id < 0) { return -1; }
+    jakel_add_child(parent, id);
+    return id;
+}
+
+int jakel_remove(int id) {
+    if (id == 0) { return -2; }
+    int type = load64(jakel_type_base + id * 8);
+    if (type == JAKEL_TYPE_DIR) {
+        int sz = load64(jakel_size_base + id * 8);
+        if (sz != 0) { return -1; }
+    }
+    int parent = load64(jakel_parent_base + id * 8);
+    jakel_remove_child(parent, id);
+    jakel_free_node(id);
+    return 0;
+}
+
+int jakel_path_next(int s, int offset) {
+    if (load8(s + offset) == 0) { return -1; }
+    int i = offset;
+    while (load8(s + i) != 0 && load8(s + i) != '/') {
+        i = i + 1;
+    }
+    return i;
+}
+int jakel_open(int parent, int path_str) {
+    int cur = parent;
+    int pos = 0;
+    if (load8(path_str) == '/') {
+        cur = 0;
+        pos = 1;
+    }
+    while (1) {
+        int end = jakel_path_next(path_str, pos);
+        if (end < 0) { break; }
+        if (end == pos) { break; }
+        int tmp = kscratch_start;
+        int ci = 0;
+        while (pos < end) {
+            store8(tmp + ci, load8(path_str + pos));
+            ci = ci + 1;
+            pos = pos + 1;
+        }
+        store8(tmp + ci, 0);
+        // ".." goes to the parent directory.
+        int next;
+        if (jakel_str_eq(tmp, "..") == 1) {
+            next = load64(jakel_parent_base + cur * 8);
+        } else {
+            next = jakel_lookup(cur, tmp);
+        }
+        if (next < 0) { return -1; }
+        int ntype = load64(jakel_type_base + next * 8);
+        if (ntype != JAKEL_TYPE_DIR) {
+            // Only check for more components if the current one ended at
+            // a '/' — if it ended at NUL, this is the last component and
+            // we should return the found node. Without this guard,
+            // jakel_path_next would scan past the NUL into leftover
+            // line-buffer garbage and falsely detect trailing components.
+            if (load8(path_str + end) == '/') {
+                int after = jakel_path_next(path_str, end + 1);
+                if (after >= 0) { return -1; }
+            }
+            return next;
+        }
+        cur = next;
+        if (load8(path_str + end) == '/') { pos = end + 1; }
+        else { pos = end; }
+    }
+    return cur;
+}
+int jakel_read(int id, int offset, int buf, int len) {
+    if (jakel_can_read(jakel_current_uid, id) == 0) { return 0; }
+    int type = load64(jakel_type_base + id * 8);
+    if (type != JAKEL_TYPE_FILE) { return 0; }
+    int sz = load64(jakel_size_base + id * 8);
+    if (offset >= sz) { return 0; }
+    int data = load64(jakel_data_base + id * 8);
+    int avail = sz - offset;
+    int n = len;
+    if (n > avail) { n = avail; }
+    int i = 0;
+    while (i < n) {
+        store8(buf + i, load8(data + offset + i));
+        i = i + 1;
+    }
+    return n;
+}
+
+int jakel_write(int id, int offset, int buf, int len) {
+    if (jakel_can_write(jakel_current_uid, id) == 0) { return 0; }
+    int type = load64(jakel_type_base + id * 8);
+    if (type != JAKEL_TYPE_FILE) { return 0; }
+    int old_sz = load64(jakel_size_base + id * 8);
+    int old_data = load64(jakel_data_base + id * 8);
+    int new_end = offset + len;
+    int new_sz = old_sz;
+    if (new_end > old_sz) { new_sz = new_end; }
+    int new_data = old_data;
+    if (new_sz > 0) {
+        new_data = kmalloc(new_sz);
+        int i = 0;
+        while (i < offset && i < old_sz) {
+            store8(new_data + i, load8(old_data + i));
+            i = i + 1;
+        }
+        i = 0;
+        while (i < len) {
+            store8(new_data + offset + i, load8(buf + i));
+            i = i + 1;
+        }
+        i = new_end;
+        while (i < old_sz) {
+            store8(new_data + i, load8(old_data + i));
+            i = i + 1;
+        }
+    }
+    if (old_data != 0 && old_data != new_data) { kfree(old_data); }
+    store64(jakel_data_base + id * 8, new_data);
+    store64(jakel_size_base + id * 8, new_sz);
+    return len;
+}
+
+void jakel_list(int id) {
+    int sz = load64(jakel_size_base + id * 8);
+    int data = load64(jakel_data_base + id * 8);
+    int i = 0;
+    while (i < sz) {
+        int cid = load64(data + i);
+        int cname = load64(jakel_name_base + cid * 8);
+        int ctype = load64(jakel_type_base + cid * 8);
+        sk_print("  ");
+        sk_print(cname);
+        if (ctype == JAKEL_TYPE_DIR) {
+            sk_print("/");
+        } else {
+            int fsize = load64(jakel_size_base + cid * 8);
+            sk_print(" (");
+            if (fsize < 1024) {
+                sk_print_int(fsize);
+                sk_print(" bytes)");
+            } else if (fsize < 1048576) {
+                int whole = fsize / 1024;
+                int frac = ((fsize - whole * 1024) * 10) / 1024;
+                sk_print_int(whole);
+                sk_print(".");
+                sk_print_int(frac);
+                sk_print(" KB)");
+            } else {
+                int whole = fsize / 1048576;
+                int frac = ((fsize - whole * 1048576) * 10) / 1048576;
+                sk_print_int(whole);
+                sk_print(".");
+                sk_print_int(frac);
+                sk_print(" MB)");
+            }
+            sk_print(")");
+        }
+        sk_print("  #");
+        sk_print_int(load64(jakel_created_base + cid * 8));
+        sk_print("  ");
+        int cmode = load64(jakel_mode_base + cid * 8);
+        if (cmode == JAKEL_MODE_PUBLIC)  { sk_print("public"); }
+        if (cmode == JAKEL_MODE_PRIVATE) { sk_print("private"); }
+        if (cmode == JAKEL_MODE_LOCKED)  { sk_print("locked"); }
+        sk_print("\n");
+        i = i + 8;
+    }
+    return;
+}
+
+// Prints the full path of a node by walking its parent chain. Names are
+// collected bottom-up in .kscratch then printed in reverse (root first).
+void jakel_where(int id) {
+    int buf = kscratch_start + 512;
+    int pos = 0;
+    int cur = id;
+    while (cur != 0) {
+        int name = load64(jakel_name_base + cur * 8);
+        int nl = jakel_str_len(name);
+        int i = nl - 1;
+        while (i >= 0) {
+            store8(buf + pos, load8(name + i));
+            pos = pos + 1;
+            i = i - 1;
+        }
+        store8(buf + pos, '/');
+        pos = pos + 1;
+        cur = load64(jakel_parent_base + cur * 8);
+    }
+    if (pos == 0) {
+        sk_print("/");
+    } else {
+        while (pos > 0) {
+            pos = pos - 1;
+            sk_putc(load8(buf + pos));
+        }
+    }
+    return;
+}
+
+// Verify the 8-byte magic at `buf` matches "JAKELBK\0".
+// Returns 1 on match, 0 otherwise.
+int jakel_verify_magic(int buf) {
+    if (load8(buf + 0) != 0x4A) { return 0; }
+    if (load8(buf + 1) != 0x41) { return 0; }
+    if (load8(buf + 2) != 0x4B) { return 0; }
+    if (load8(buf + 3) != 0x45) { return 0; }
+    if (load8(buf + 4) != 0x4C) { return 0; }
+    if (load8(buf + 5) != 0x42) { return 0; }
+    if (load8(buf + 6) != 0x4B) { return 0; }
+    if (load8(buf + 7) != 0x00) { return 0; }
+    return 1;
+}
+
+// Attempt to load a previously-synced filesystem from disk.
+// If a valid superblock is found, reads the node table and file data
+// and reconstructs the full in-memory filesystem state. Directory
+// children are rebuilt from parent pointers in a second pass.
+// If no disk is present or the magic does not match, leaves the
+// parallel arrays in their zero-initialised state (type=FREE for all
+// slots) so the caller can fall back to fresh initialisation.
+void jakel_load() {
+    if (ata_present == 0) {
+        serial_print("[jakel] no disk, using fresh filesystem\n");
+        return;
+    }
+    int sb = kmalloc(512);
+    ata_read(0, sb);
+    if (jakel_verify_magic(sb) == 0) {
+        serial_print("[jakel] no filesystem on disk, creating fresh\n");
+        kfree(sb);
+        return;
+    }
+    // Read the node table (sectors 1-4, 2048 bytes).
+    int nt = kmalloc(2048);
+    int s = 1;
+    while (s < 5) {
+        int sector = kmalloc(512);
+        ata_read(s, sector);
+        int j = 0;
+        while (j < 512) {
+            store8(nt + (s - 1) * 512 + j, load8(sector + j));
+            j = j + 1;
+        }
+        kfree(sector);
+        s = s + 1;
+    }
+    // First pass: create every non-free node, allocating name and data
+    // buffers. File data is read from disk; directory data (child-ID
+    // arrays) is rebuilt in the second pass from parent pointers.
+    int loaded = 0;
+    int data_sector = 5;
+    int i = 0;
+    while (i < JAKEL_MAX_NODES) {
+        int off = i * 64;
+        int type = load64(nt + off);
+        i = i + 1;
+        if (type == JAKEL_TYPE_FREE) { continue; }
+        int parent = load64(nt + off + 8);
+        int sz     = load64(nt + off + 16);
+        int nl     = load64(nt + off + 24);  // name_len
+        // Copy the inline name into a heap buffer.
+        int name_buf = kmalloc(JAKEL_NAME_LEN);
+        int j = 0;
+        while (j < nl && j < JAKEL_NAME_LEN - 1) {
+            store8(name_buf + j, load8(nt + off + 32 + j));
+            j = j + 1;
+        }
+        store8(name_buf + j, 0);
+        // Allocate the node and fill in its fields.
+        int id = loaded;  // nodes are allocated sequentially from 0
+        store64(jakel_type_base    + id * 8, type);
+        store64(jakel_parent_base  + id * 8, parent);
+        store64(jakel_name_base    + id * 8, name_buf);
+        store64(jakel_created_base + id * 8, 0);
+        store64(jakel_uid_base + id * 8, 0);
+        store64(jakel_mode_base + id * 8, JAKEL_MODE_PRIVATE);
+        int data_buf = 0;
+        int node_sz = 0;
+        if (type == JAKEL_TYPE_DIR) {
+            // Directory children are rebuilt from parent pointers in the
+            // second pass -- start with an empty child list. The on-disk
+            // `sz` was the serialised child-array size, not meaningful here.
+            node_sz = 0;
+            data_buf = 0;
+        } else if (type == JAKEL_TYPE_FILE && sz > 0) {
+            node_sz = sz;
+            int nsec = (sz + 511) / 512;
+            data_buf = kmalloc(sz);
+            int temp = kmalloc(512);
+            int pos = 0;
+            int si = 0;
+            while (si < nsec) {
+                ata_read(data_sector, temp);
+                int k = 0;
+                while (k < 512 && pos + k < sz) {
+                    store8(data_buf + pos + k, load8(temp + k));
+                    k = k + 1;
+                }
+                pos = pos + 512;
+                data_sector = data_sector + 1;
+                si = si + 1;
+            }
+            kfree(temp);
+        }
+        store64(jakel_size_base + id * 8, node_sz);
+        store64(jakel_data_base + id * 8, data_buf);
+        loaded = loaded + 1;
+    }
+    kfree(nt);
+    kfree(sb);
+    // Rebuild directory children from parent pointers: for every non-free
+    // node where parent != node, add it as a child of its parent.
+    i = 0;
+    while (i < loaded) {
+        int parent = load64(jakel_parent_base + i * 8);
+        if (parent != i) {
+            jakel_add_child(parent, i);
+        }
+        i = i + 1;
+    }
+    serial_print("[jakel] loaded ");
+    serial_print_int(loaded);
+    serial_print(" nodes from disk\n");
+    return;
+}
+
+// Persist the entire in-memory filesystem state to disk.
+// Writes a superblock (sector 0), the node table (sectors 1-4), and
+// all file data (sectors 5+). Directory child-ID arrays are NOT
+// serialised -- they are rebuilt from parent pointers on load.
+// Allocates temporary heap buffers for sector-sized writes and frees
+// them before returning.
+void jakel_sync() {
+    if (ata_present == 0) {
+        serial_print("[jakel] no disk, sync skipped\n");
+        return;
+    }
+    // --- Build superblock (sector 0) ---
+    int sb = kmalloc(512);
+    int i = 0;
+    while (i < 512) { store8(sb + i, 0); i = i + 1; }
+    store8(sb + 0, 0x4A); store8(sb + 1, 0x41); store8(sb + 2, 0x4B);
+    store8(sb + 3, 0x45); store8(sb + 4, 0x4C); store8(sb + 5, 0x42);
+    store8(sb + 6, 0x4B); store8(sb + 7, 0x00);
+    store64(sb + 8,  1);                // version
+    store64(sb + 16, JAKEL_MAX_NODES);  // node_count
+    store64(sb + 24, JAKEL_NAME_LEN);   // name_max
+    store64(sb + 32, 5);                // first_data_sector
+    // total_data_sectors filled below
+    // --- Build node table (sectors 1-4, 2048 bytes) ---
+    int nt = kmalloc(2048);
+    i = 0;
+    while (i < 2048) { store8(nt + i, 0); i = i + 1; }
+    int node_count = 0;
+    int data_secs = 0;
+    i = 0;
+    while (i < JAKEL_MAX_NODES) {
+        int type = load64(jakel_type_base + i * 8);
+        int off = i * 64;
+        store64(nt + off,      type);
+        store64(nt + off + 8,  load64(jakel_parent_base + i * 8));
+        store64(nt + off + 16, load64(jakel_size_base   + i * 8));
+        int name = load64(jakel_name_base + i * 8);
+        if (name != 0) {
+            int nl = 0;
+            while (nl < JAKEL_NAME_LEN && load8(name + nl) != 0) {
+                store8(nt + off + 32 + nl, load8(name + nl));
+                nl = nl + 1;
+            }
+            store64(nt + off + 24, nl);  // name_len
+        }
+        if (type == JAKEL_TYPE_FILE) {
+            int sz = load64(jakel_size_base + i * 8);
+            if (sz > 0) { data_secs = data_secs + (sz + 511) / 512; }
+        }
+        node_count = node_count + 1;
+        i = i + 1;
+    }
+    store64(sb + 40, data_secs);  // total_data_sectors
+    // Write superblock
+    ata_write(0, sb);
+    kfree(sb);
+    // Write node table (4 sectors)
+    int sec = 1;
+    int ntoff = 0;
+    while (sec < 5) {
+        int secbuf = kmalloc(512);
+        int j = 0;
+        while (j < 512) {
+            store8(secbuf + j, load8(nt + ntoff + j));
+            j = j + 1;
+        }
+        ata_write(sec, secbuf);
+        kfree(secbuf);
+        ntoff = ntoff + 512;
+        sec = sec + 1;
+    }
+    kfree(nt);
+    // --- Write file data ---
+    int ds = 5;
+    i = 0;
+    while (i < JAKEL_MAX_NODES) {
+        int type = load64(jakel_type_base + i * 8);
+        if (type == JAKEL_TYPE_FILE) {
+            int sz = load64(jakel_size_base + i * 8);
+            if (sz > 0) {
+                int data = load64(jakel_data_base + i * 8);
+                int nsec = (sz + 511) / 512;
+                int pos = 0;
+                int si = 0;
+                while (si < nsec) {
+                    int secbuf = kmalloc(512);
+                    int j = 0;
+                    while (j < 512) {
+                        if (pos + j < sz) {
+                            store8(secbuf + j, load8(data + pos + j));
+                        } else {
+                            store8(secbuf + j, 0);
+                        }
+                        j = j + 1;
+                    }
+                    ata_write(ds, secbuf);
+                    kfree(secbuf);
+                    pos = pos + 512;
+                    ds = ds + 1;
+                    si = si + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    serial_print("[jakel] synced ");
+    serial_print_int(node_count);
+    serial_print(" nodes, ");
+    serial_print_int(data_secs);
+    serial_print(" data sectors\n");
+    return;
+}
+
+void jakel_init() {
+    jakel_type_base = kmalloc(JAKEL_MAX_NODES * 8);
+    jakel_name_base = kmalloc(JAKEL_MAX_NODES * 8);
+    jakel_parent_base = kmalloc(JAKEL_MAX_NODES * 8);
+    jakel_size_base = kmalloc(JAKEL_MAX_NODES * 8);
+    jakel_data_base = kmalloc(JAKEL_MAX_NODES * 8);
+    jakel_created_base = kmalloc(JAKEL_MAX_NODES * 8);
+    jakel_uid_base = kmalloc(JAKEL_MAX_NODES * 8);
+    jakel_mode_base = kmalloc(JAKEL_MAX_NODES * 8);
+    int i = 0;
+    while (i < JAKEL_MAX_NODES) {
+        store64(jakel_type_base + i * 8, JAKEL_TYPE_FREE);
+        store64(jakel_name_base + i * 8, 0);
+        store64(jakel_parent_base + i * 8, 0);
+        store64(jakel_size_base + i * 8, 0);
+        store64(jakel_data_base + i * 8, 0);
+        store64(jakel_created_base + i * 8, 0);
+        store64(jakel_uid_base + i * 8, 0);
+        store64(jakel_mode_base + i * 8, 0);
+        i = i + 1;
+    }
+    // Try to load from disk; if no valid filesystem is found, the
+    // arrays stay zero-filled and we create a fresh root below.
+    jakel_load();
+    if (load64(jakel_type_base) == JAKEL_TYPE_FREE) {
+        int root_name = kscratch_start;
+        store8(root_name, '/');
+        store8(root_name + 1, 0);
+        store64(jakel_type_base, JAKEL_TYPE_DIR);
+        store64(jakel_name_base, jakel_copy_name(root_name));
+        store64(jakel_parent_base, 0);
+        store64(jakel_size_base, 0);
+        store64(jakel_data_base, 0);
+        store64(jakel_created_base, 0);
+        store64(jakel_uid_base, 0);
+        store64(jakel_mode_base, JAKEL_MODE_PUBLIC);
+        serial_print("[jakel] filesystem ready, ");
+        serial_print_int(JAKEL_MAX_NODES);
+        serial_print(" node slots\n");
+
+        // Seed a demo c0 file for REPL testing on first boot only.
+        // Built byte-by-byte because c0 has no string-literal syntax.
+        // No // comments -- the REPL tokenizer treats / as division.
+        int demo = jakel_make_file(0, "demo.c0");
+        if (demo >= 0) {
+            int b = kscratch_start;
+            int p = 0;
+            // Use distinctive values (777, 888, 999) that won't match earlier
+            // test assertions — avoids false positives in the test script.
+            store8(b+p, 'p'); p=p+1; store8(b+p, 'r'); p=p+1;
+            store8(b+p, 'i'); p=p+1; store8(b+p, 'n'); p=p+1;
+            store8(b+p, 't'); p=p+1; store8(b+p, '('); p=p+1;
+            store8(b+p, '7'); p=p+1; store8(b+p, '7'); p=p+1;
+            store8(b+p, '7'); p=p+1; store8(b+p, ')'); p=p+1;
+            store8(b+p, ';'); p=p+1; store8(b+p, '\n'); p=p+1;
+            store8(b+p, 'n'); p=p+1; store8(b+p, ' '); p=p+1;
+            store8(b+p, '='); p=p+1; store8(b+p, ' '); p=p+1;
+            store8(b+p, '8'); p=p+1; store8(b+p, '8'); p=p+1;
+            store8(b+p, '8'); p=p+1; store8(b+p, ';'); p=p+1;
+            store8(b+p, '\n'); p=p+1;
+            store8(b+p, 'p'); p=p+1; store8(b+p, 'r'); p=p+1;
+            store8(b+p, 'i'); p=p+1; store8(b+p, 'n'); p=p+1;
+            store8(b+p, 't'); p=p+1; store8(b+p, '('); p=p+1;
+            store8(b+p, 'n'); p=p+1; store8(b+p, ' '); p=p+1;
+            store8(b+p, '+'); p=p+1; store8(b+p, ' '); p=p+1;
+            store8(b+p, '9'); p=p+1; store8(b+p, '9'); p=p+1;
+            store8(b+p, '9'); p=p+1; store8(b+p, ')'); p=p+1;
+            store8(b+p, ';'); p=p+1; store8(b+p, '\n'); p=p+1;
+            jakel_write(demo, 0, b, p);
+            store64(jakel_size_base + demo * 8, p);
+        }
+    }
+    // Persist the initial filesystem so the next boot finds it.
+    jakel_sync();
+    return;
+}

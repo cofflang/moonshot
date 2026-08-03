@@ -1,0 +1,771 @@
+// punkt.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// punkt.c0 -- the pixel-framebuffer subsystem: detecting and mapping the
+// real VBE linear framebuffer GRUB grants (or doesn't), and a custom 8x8
+// bitmap font renderer drawn directly onto it. This is Moonshot's real
+// step toward a graphical interface, not just serial logs -- text mode
+// (vga.c0) is now the fallback for when this isn't available, not the
+// primary path.
+
+// Multiboot framebuffer info -- populated by fb_probe() (called from
+// knekt.c0's main(), right after mem_lower/upper). Whether pixel graphics
+// can actually be used depends on what GRUB granted in response to
+// boot.s's Multiboot header request, not the request itself -- see
+// fb_probe. fb_red_pos/green_pos/blue_pos are read back too (not assumed)
+// so fb_rgb() packs colors correctly regardless of the exact channel
+// layout GRUB/QEMU actually granted.
+int fb_addr = 0;
+int fb_pitch = 0;
+int fb_width = 0;
+int fb_height = 0;
+int fb_bpp = 0;
+int fb_type = 0;
+int fb_red_pos = 0;
+int fb_green_pos = 0;
+int fb_blue_pos = 0;
+int fb_available = 0;
+
+// Pixel-framebuffer text cursor (in FONT_W x FONT_H character CELLS, same
+// role as vga_row/vga_col played for VGA text mode -- see fb_putc).
+int fb_row = 0;
+int fb_col = 0;
+int FONT_W = 8;
+int FONT_H = 8;
+// Where the cursor glyph was last drawn, so it can be erased before the
+// next one is drawn -- a linear framebuffer has no hardware cursor to
+// move, unlike VGA text mode's real one (vga_move_cursor), so this has to
+// be tracked and redrawn by hand. -1 means "not drawn yet" (see fb_clear).
+int fb_cursor_row = -1;
+int fb_cursor_col = -1;
+// Colors, built once in knekt.c0's main() via fb_rgb() once the real
+// channel positions are known -- can't be compile-time constants like
+// VGA_DEFAULT_ATTR was, since they depend on what GRUB actually granted.
+int FB_FG = 0;
+int FB_BG = 0;
+
+// Reads back whatever video mode GRUB actually granted in response to
+// boot.s's Multiboot header request (flags bit 2, mode_type 0,
+// 1024x768x32) -- flags bit 12 of the INFO structure (a different flags
+// field than the header's request flags) indicates whether framebuffer_*
+// fields are present at all, and GRUB is free to grant a different
+// width/height/depth/type than requested, or none at all, so every value
+// is read back rather than assumed. fb_available only ends up true for
+// type 1 (direct RGB color) at 32bpp -- the one combination fb_rgb/
+// fb_put_pixel below actually handle; anything else (indexed/palette
+// color, a different bpp) leaves pixel graphics off and VGA text mode
+// untouched, a graceful "didn't get what we wanted" fallback rather than
+// writing pixels with wrong assumptions. Field offsets (88 addr/96 pitch/
+// 100 width/104 height/108 bpp/109 type/110-115 the RGB field positions)
+// per the Multiboot1 info struct layout -- cross-checked against jenna.c0's
+// own mmap_length/mmap_addr offsets (44/48), already proven correct
+// elsewhere.
+void fb_probe(int mb_info) {
+    int flags = load32(mb_info);
+    int has_fb = (flags / 4096) - (flags / 8192) * 2; // bit 12
+    if (has_fb != 1) {
+        serial_print("No framebuffer info from bootloader\n");
+        return;
+    }
+    fb_addr = load64(mb_info + 88);
+    fb_pitch = load32(mb_info + 96);
+    fb_width = load32(mb_info + 100);
+    fb_height = load32(mb_info + 104);
+    fb_bpp = load8(mb_info + 108);
+    fb_type = load8(mb_info + 109);
+    fb_red_pos = load8(mb_info + 110);
+    fb_green_pos = load8(mb_info + 112);
+    fb_blue_pos = load8(mb_info + 114);
+    serial_print("Framebuffer: addr=");
+    serial_print_int(fb_addr);
+    serial_print(" pitch=");
+    serial_print_int(fb_pitch);
+    serial_print(" width=");
+    serial_print_int(fb_width);
+    serial_print(" height=");
+    serial_print_int(fb_height);
+    serial_print(" bpp=");
+    serial_print_int(fb_bpp);
+    serial_print(" type=");
+    serial_print_int(fb_type);
+    serial_print(" red_pos=");
+    serial_print_int(fb_red_pos);
+    serial_print(" green_pos=");
+    serial_print_int(fb_green_pos);
+    serial_print(" blue_pos=");
+    serial_print_int(fb_blue_pos);
+    serial_print("\n");
+
+    if (fb_type == 1 && fb_bpp == 32) {
+        fb_available = 1;
+        // The channel positions GRUB reports here are unreliable under
+        // QEMU: it hands back red=0/green=16/blue=8, but the framebuffer
+        // actually behaves as standard XRGB8888 (red bits 16-23, green
+        // 8-15, blue 0-7 -- i.e. byte0=blue, byte1=green, byte2=red). This
+        // went unnoticed until the first NON-gray color was drawn (the
+        // panic screen): every earlier fb_rgb use was gray (r==g==b), which
+        // is identical under any channel permutation. Since fb_available is
+        // only ever true for exactly this one format (type 1, 32bpp), we
+        // pin the known-correct positions rather than trust the bogus
+        // reported ones -- fb_rgb then packs real colors correctly. The
+        // reported values are still logged above for the record.
+        fb_red_pos = 16;
+        fb_green_pos = 8;
+        fb_blue_pos = 0;
+    } else {
+        serial_print("Framebuffer: unsupported type/bpp, staying with VGA text only\n");
+    }
+    return;
+}
+
+// 2^n via repeated multiplication -- c0 has no shift operator, so this is
+// how fb_rgb turns a channel's bit *position* into the multiplier that
+// packs it there. n is always small (a bit position within a 32bpp pixel,
+// so well under 32) -- no overflow concern.
+int pow2(int n) {
+    int r = 1;
+    int i = 0;
+    while (i < n) {
+        r = r * 2;
+        i = i + 1;
+    }
+    return r;
+}
+
+// Packs an 8-bit r/g/b triple into a pixel value using the REAL channel
+// bit positions fb_probe read back (not an assumed byte order) -- since
+// direct-color channels are disjoint bit ranges, `r*2^red_pos +
+// g*2^green_pos + b*2^blue_pos` packs them with plain arithmetic, same
+// "addition instead of OR" idiom as every other flag-packing in this
+// codebase.
+int fb_rgb(int r, int g, int b) {
+    return r * pow2(fb_red_pos) + g * pow2(fb_green_pos) + b * pow2(fb_blue_pos);
+}
+
+// Identity-maps the framebuffer's real physical range into the SAME page
+// tables jenna.c0's paging_init() built (must run after it, since it
+// needs pml4_phys) -- fb_addr is very likely far outside the 16MB range
+// paging_init identity-maps by default (real VBE framebuffers sit at a
+// high physical address; QEMU granted ~4GB here), so without this every
+// pixel write would fault. Rounds the range to whole 4KB pages (fb_addr
+// itself is page-aligned in practice, but this doesn't assume that).
+// Reuses map_page() exactly as paging_init's own identity-map loop does --
+// an identity map (virt == phys) is the simplest correct choice for MMIO
+// that nothing else needs a different virtual address for. Deliberately
+// NOT marked cache-disabled (a real driver would want that for MMIO, to
+// avoid the CPU caching stale framebuffer reads/delaying writes) -- c0 has
+// no bitwise ops to build a richer entry flag cheaply, and QEMU's
+// emulation doesn't make caching visibly wrong here; a documented
+// simplification, not an oversight, revisit if it ever causes real tearing.
+void fb_map() {
+    int start = (fb_addr / 4096) * 4096;
+    int end_addr = fb_addr + fb_pitch * fb_height;
+    int end = ((end_addr + 4095) / 4096) * 4096;
+    int p = start;
+    while (p < end) {
+        map_page(pml4_phys, p, p);
+        p = p + 4096;
+    }
+    return;
+}
+
+// Writes one pixel -- store32_le already exists (built for IDT entries)
+// and is exactly the right shape for a 32bpp write, no new primitive
+// needed. No bounds check: every caller in this file goes through
+// fb_draw_char/fb_putc, which already clamp via cell wrapping/scrolling.
+void fb_put_pixel(int x, int y, int color) {
+    store32_le(fb_addr + y * fb_pitch + x * 4, color);
+    return;
+}
+
+// Fills the axis-aligned rectangle [x, x+w) x [y, y+h) with `color`. Unlike
+// fb_put_pixel this CLAMPS to the framebuffer bounds, so a caller can pass a
+// rect that runs off any edge (or covers the whole screen) without faulting
+// -- the point of having a real primitive rather than open-coding pixel
+// loops per feature. Row-by-row via fb_put_pixel; no load64/store64 block
+// write like fb_scroll's, since the panic/UI paths that use this aren't
+// megabyte-scale and clarity wins here.
+void fb_fill_rect(int x, int y, int w, int h, int color) {
+    int x0 = x;
+    int y0 = y;
+    int x1 = x + w;
+    int y1 = y + h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > fb_width) { x1 = fb_width; }
+    if (y1 > fb_height) { y1 = fb_height; }
+    int yy = y0;
+    while (yy < y1) {
+        int xx = x0;
+        while (xx < x1) {
+            fb_put_pixel(xx, yy, color);
+            xx = xx + 1;
+        }
+        yy = yy + 1;
+    }
+    return;
+}
+
+// 1px horizontal / vertical line -- thin wrappers over fb_fill_rect (a line
+// is just a 1-tall / 1-wide fill), so they inherit its bounds clamping. A
+// general diagonal line (Bresenham) is deliberately NOT here yet: nothing
+// needs a non-rectilinear line, and this codebase builds primitives when a
+// real feature calls for them, not ahead of time -- add it alongside the
+// first feature that draws a slope.
+void fb_draw_hline(int x, int y, int w, int color) {
+    fb_fill_rect(x, y, w, 1, color);
+    return;
+}
+void fb_draw_vline(int x, int y, int h, int color) {
+    fb_fill_rect(x, y, 1, h, color);
+    return;
+}
+
+// 1px outline of the rectangle [x, x+w) x [y, y+h): four edges via the
+// hline/vline primitives above. w/h are the full size, so the right/bottom
+// edges sit at x+w-1 / y+h-1 and a w x h outline exactly bounds a w x h
+// fb_fill_rect of the same x/y/w/h -- the two compose cleanly for a
+// filled-panel-with-border look (see the panic screen).
+void fb_draw_rect(int x, int y, int w, int h, int color) {
+    fb_draw_hline(x, y, w, color);
+    fb_draw_hline(x, y + h - 1, w, color);
+    fb_draw_vline(x, y, h, color);
+    fb_draw_vline(x + w - 1, y, h, color);
+    return;
+}
+
+// Returns the TOP half (rows 0-3) of a character's 8x8 glyph, packed as a
+// 32-bit value (row 0 in the highest byte .. row 3 in the lowest, each
+// row's bit 7 the leftmost pixel) -- font_lo below is the bottom half
+// (rows 4-7). Split into two 32-bit halves rather than one packed 64-bit
+// value deliberately, not for style: c0 ints are signed 64-bit with no
+// unsigned type, and a glyph whose row 0 has its leftmost pixel lit (most
+// letters) sets bit 63 of the naive single-value packing, making it
+// NEGATIVE -- and `/` is signed truncating division, not a logical shift,
+// so the byte/bit-extraction arithmetic fb_draw_char needs silently breaks
+// for exactly those glyphs. A 32-bit value is always representable as a
+// positive 64-bit `long` (max 0xFFFFFFFF is nowhere near the 64-bit sign
+// bit), so splitting into two halves sidesteps the problem entirely rather
+// than working around it with sign-bit special-casing. Found by a real,
+// visible bug: `fg_count` (see knekt.c0's kernel_post_init) came back as
+// 63 out of a possible 64 instead of 'M's actual 18 lit pixels -- the
+// corrupted division was effectively drawing foreground almost everywhere.
+//
+// Designed and visually rendered as an image (every glyph eyeballed for
+// correctness before any of it touched this file, given how easy it'd be
+// to silently transcribe a wrong bitmap and never notice) rather than
+// hand-derived from memory of some existing font. Covers uppercase A-Z,
+// lowercase a-z, digits, and common punctuation -- large/legible/simple
+// block shapes.
+// Lowercase glyphs sit on the same row-6 baseline as uppercase, with a
+// ~5px x-height (rows 2-6), ascenders reaching row 0 (b/d/f/h/i/j/k/l/t)
+// and descenders reaching row 7 (g/j/p/q/y). Extend when something real
+// needs wider coverage, same "don't pre-build" discipline as everywhere
+// else in this codebase. Unmapped characters (including
+// space) return 0, an all-blank glyph -- correct for space, a reasonable
+// fallback for anything else.
+int font_hi(int ch) {
+    if (ch == '!') { return 0x30303030; }
+    if (ch == '"') { return 0x50505000; }
+    if (ch == '\'') { return 0x30304000; }
+    if (ch == '(') { return 0x10204040; }
+    if (ch == ')') { return 0x40201010; }
+    if (ch == '*') { return 0x00105438; }
+    if (ch == '+') { return 0x0010107E; }
+    if (ch == ',') { return 0x00000000; }
+    if (ch == '-') { return 0x000000FC; }
+    if (ch == '.') { return 0x00000000; }
+    if (ch == 47) { return 0x01020408; }
+    if (ch == '0') { return 0x788C94A4; }
+    if (ch == '1') { return 0x30703030; }
+    if (ch == '2') { return 0x78840408; }
+    if (ch == '3') { return 0x78840438; }
+    if (ch == '4') { return 0x08182848; }
+    if (ch == '5') { return 0xFC80F804; }
+    if (ch == '6') { return 0x788480F8; }
+    if (ch == '7') { return 0xFC040810; }
+    if (ch == '8') { return 0x78848478; }
+    if (ch == '9') { return 0x7884847C; }
+    if (ch == ':') { return 0x00303000; }
+    if (ch == ';') { return 0x00303000; }
+    if (ch == '<') { return 0x20408000; }
+    if (ch == '=') { return 0x00007E00; }
+    if (ch == '>') { return 0x04020100; }
+    if (ch == '?') { return 0x78840408; }
+    if (ch == 'A') { return 0x30488484; }
+    if (ch == 'B') { return 0xF88484F8; }
+    if (ch == 'C') { return 0x78848080; }
+    if (ch == 'D') { return 0xF8848484; }
+    if (ch == 'E') { return 0xFC8080F8; }
+    if (ch == 'F') { return 0xFC8080F8; }
+    if (ch == 'G') { return 0x7884809C; }
+    if (ch == 'H') { return 0x848484FC; }
+    if (ch == 'I') { return 0x78303030; }
+    if (ch == 'J') { return 0x1C080808; }
+    if (ch == 'K') { return 0x848890E0; }
+    if (ch == 'L') { return 0x80808080; }
+    if (ch == 'M') { return 0x84CCB484; }
+    if (ch == 'N') { return 0x84C4A494; }
+    if (ch == 'O') { return 0x78848484; }
+    if (ch == 'P') { return 0xF88484F8; }
+    if (ch == 'Q') { return 0x78848484; }
+    if (ch == 'R') { return 0xF88484F8; }
+    if (ch == 'S') { return 0x78848078; }
+    if (ch == 'T') { return 0xFC303030; }
+    if (ch == 'U') { return 0x84848484; }
+    if (ch == 'V') { return 0x84848484; }
+    if (ch == 'W') { return 0x848484B4; }
+    if (ch == 'X') { return 0x84483030; }
+    if (ch == 'Y') { return 0x84844830; }
+    if (ch == 'Z') { return 0xFC040830; }
+    if (ch == 'a') { return 0x00007808; }
+    if (ch == 'b') { return 0x40404078; }
+    if (ch == 'c') { return 0x00003C40; }
+    if (ch == 'd') { return 0x0808083C; }
+    if (ch == 'e') { return 0x00003844; }
+    if (ch == 'f') { return 0x384040F0; }
+    if (ch == 'g') { return 0x00003C44; }
+    if (ch == 'h') { return 0x40404078; }
+    if (ch == 'i') { return 0x10003010; }
+    if (ch == 'j') { return 0x08001808; }
+    if (ch == 'k') { return 0x40404850; }
+    if (ch == 'l') { return 0x30101010; }
+    if (ch == 'm') { return 0x0000D8A8; }
+    if (ch == 'n') { return 0x00007844; }
+    if (ch == 'o') { return 0x00003844; }
+    if (ch == 'p') { return 0x00007844; }
+    if (ch == 'q') { return 0x00003C48; }
+    if (ch == 'r') { return 0x00005C60; }
+    if (ch == 's') { return 0x00003C40; }
+    if (ch == 't') { return 0x2020F820; }
+    if (ch == 'u') { return 0x00004444; }
+    if (ch == 'v') { return 0x00004444; }
+    if (ch == 'w') { return 0x000088A8; }
+    if (ch == 'x') { return 0x00004428; }
+    if (ch == 'y') { return 0x00004444; }
+    if (ch == 'z') { return 0x00007C08; }
+    if (ch == '{') { return 0x306060C0; }
+    if (ch == '}') { return 0xC0606030; }
+    if (ch == '#') { return 0x2828FC28; }
+    if (ch == '$') { return 0x107C9078; }
+    if (ch == '%') { return 0xC0C81020; }
+    if (ch == '&') { return 0x70889060; }
+    if (ch == '@') { return 0x78849EA2; }
+    if (ch == '[') { return 0xFC808080; }
+    if (ch == 92)  { return 0x80402010; }
+    if (ch == ']') { return 0x3F010101; }
+    if (ch == '^') { return 0x10284400; }
+    if (ch == '_') { return 0x00000000; }
+    if (ch == '`') { return 0x40300000; }
+    if (ch == '|') { return 0x10101010; }
+    if (ch == '~') { return 0x68900000; }
+    return 0;
+}
+
+// Bottom half (rows 4-7) of the same glyph set -- see font_hi.
+int font_lo(int ch) {
+    if (ch == '!') { return 0x30003000; }
+    if (ch == '"') { return 0x00000000; }
+    if (ch == '\'') { return 0x00000000; }
+    if (ch == '(') { return 0x40201000; }
+    if (ch == ')') { return 0x10204000; }
+    if (ch == '*') { return 0x54100000; }
+    if (ch == '+') { return 0x10100000; }
+    if (ch == ',') { return 0x00606020; }
+    if (ch == '-') { return 0x00000000; }
+    if (ch == '.') { return 0x00606000; }
+    if (ch == 47) { return 0x10204080; }
+    if (ch == '0') { return 0xC4847800; }
+    if (ch == '1') { return 0x30307800; }
+    if (ch == '2') { return 0x1020FC00; }
+    if (ch == '3') { return 0x04847800; }
+    if (ch == '4') { return 0xFC080800; }
+    if (ch == '5') { return 0x04847800; }
+    if (ch == '6') { return 0x84847800; }
+    if (ch == '7') { return 0x20202000; }
+    if (ch == '8') { return 0x84847800; }
+    if (ch == '9') { return 0x04847800; }
+    if (ch == ':') { return 0x30300000; }
+    if (ch == ';') { return 0x30304000; }
+    if (ch == '<') { return 0x80402010; }
+    if (ch == '=') { return 0x7E000000; }
+    if (ch == '>') { return 0x01020408; }
+    if (ch == '?') { return 0x30003000; }
+    if (ch == 'A') { return 0xFC848400; }
+    if (ch == 'B') { return 0x8484F800; }
+    if (ch == 'C') { return 0x80847800; }
+    if (ch == 'D') { return 0x8484F800; }
+    if (ch == 'E') { return 0x8080FC00; }
+    if (ch == 'F') { return 0x80808000; }
+    if (ch == 'G') { return 0x84847800; }
+    if (ch == 'H') { return 0x84848400; }
+    if (ch == 'I') { return 0x30307800; }
+    if (ch == 'J') { return 0x08887000; }
+    if (ch == 'K') { return 0x90888400; }
+    if (ch == 'L') { return 0x8080FC00; }
+    if (ch == 'M') { return 0x84848400; }
+    if (ch == 'N') { return 0x8C848400; }
+    if (ch == 'O') { return 0x84847800; }
+    if (ch == 'P') { return 0x80808000; }
+    if (ch == 'Q') { return 0x94887400; }
+    if (ch == 'R') { return 0x90888400; }
+    if (ch == 'S') { return 0x08847800; }
+    if (ch == 'T') { return 0x30303000; }
+    if (ch == 'U') { return 0x84847800; }
+    if (ch == 'V') { return 0x48483000; }
+    if (ch == 'W') { return 0xB4CC8400; }
+    if (ch == 'X') { return 0x30488400; }
+    if (ch == 'Y') { return 0x30303000; }
+    if (ch == 'Z') { return 0x4080FC00; }
+    if (ch == 'a') { return 0x78487800; }
+    if (ch == 'b') { return 0x44447800; }
+    if (ch == 'c') { return 0x40403C00; }
+    if (ch == 'd') { return 0x48483C00; }
+    if (ch == 'e') { return 0x7C403C00; }
+    if (ch == 'f') { return 0x40404000; }
+    if (ch == 'g') { return 0x443C0438; }
+    if (ch == 'h') { return 0x44444400; }
+    if (ch == 'i') { return 0x10103800; }
+    if (ch == 'j') { return 0x08084830; }
+    if (ch == 'k') { return 0x60504800; }
+    if (ch == 'l') { return 0x10100C00; }
+    if (ch == 'm') { return 0xA8A8A800; }
+    if (ch == 'n') { return 0x44444400; }
+    if (ch == 'o') { return 0x44443800; }
+    if (ch == 'p') { return 0x44784040; }
+    if (ch == 'q') { return 0x483C0808; }
+    if (ch == 'r') { return 0x40404000; }
+    if (ch == 's') { return 0x38047800; }
+    if (ch == 't') { return 0x20201800; }
+    if (ch == 'u') { return 0x44443C00; }
+    if (ch == 'v') { return 0x44281000; }
+    if (ch == 'w') { return 0xA8A85000; }
+    if (ch == 'x') { return 0x10284400; }
+    if (ch == 'y') { return 0x443C0438; }
+    if (ch == 'z') { return 0x10207C00; }
+    if (ch == '{') { return 0x60603000; }
+    if (ch == '}') { return 0x6060C000; }
+    if (ch == '#') { return 0x28FC2828; }
+    if (ch == '$') { return 0x14147C10; }
+    if (ch == '%') { return 0x20430300; }
+    if (ch == '&') { return 0x98887400; }
+    if (ch == '@') { return 0xA29E8078; }
+    if (ch == '[') { return 0x808080FC; }
+    if (ch == 92)  { return 0x08040201; }
+    if (ch == ']') { return 0x0101013F; }
+    if (ch == '^') { return 0x00000000; }
+    if (ch == '_') { return 0x000000FC; }
+    if (ch == '`') { return 0x00000000; }
+    if (ch == '|') { return 0x10101010; }
+    if (ch == '~') { return 0x00000000; }
+    return 0;
+}
+
+// Draws one character's 8x8 glyph with its top-left pixel at (x, y).
+// Unpacks font_lo (rows 4-7) then font_hi (rows 0-3) one byte at a time
+// from the LOW end of each 32-bit half (`v - (v/256)*256` peels the
+// lowest byte then `v = v/256` shifts to the next one, matching
+// store16_le's own digit-extraction idiom elsewhere in this codebase --
+// safe here since both halves are always non-negative, see font_hi's
+// comment). `lo`'s lowest byte is row 7 (packing put row 4 in the highest
+// byte, row 7 in the lowest -- see font_hi), so peeling it 4 times in a
+// row visits 7,6,5,4 in that order; switching to `hi` (untouched, its own
+// lowest byte is row 3) continues the SAME peel-and-shift pattern for
+// 3,2,1,0 -- together an unbroken 7-down-to-0 sweep across both halves
+// with no separate offset/shift-count bookkeeping needed. Each row's bits
+// are unpacked the same way (lowest bit first = rightmost column, since a
+// row's bit 7 is the LEFTMOST pixel). Draws every cell, background
+// included (an opaque glyph, not a transparent one), so text always fully
+// overwrites whatever was there before -- needed for both scrolling and
+// simply typing over old content.
+void fb_draw_char(int x, int y, int ch, int fg, int bg) {
+    int hi = font_hi(ch);
+    int v = font_lo(ch);
+    int row = 7;
+    while (row >= 0) {
+        if (row == 3) { v = hi; }
+        int rowbyte = v - (v / 256) * 256;
+        v = v / 256;
+        int b = rowbyte;
+        int col = 7;
+        while (col >= 0) {
+            int bit = b - (b / 2) * 2;
+            b = b / 2;
+            int color = bg;
+            if (bit == 1) { color = fg; }
+            fb_put_pixel(x + col, y + row, color);
+            col = col - 1;
+        }
+        row = row - 1;
+    }
+    return;
+}
+
+// Fills the whole framebuffer with `bg` and resets the text cursor --
+// pixel-graphics equivalent of vga_clear. Row-by-row rather than one huge
+// loop so the "one row" shape matches fb_scroll's own row-copy loop below.
+void fb_clear(int bg) {
+    int y = 0;
+    int x = 0;
+    while (y < fb_height) {
+        x = 0;
+        while (x < fb_width) {
+            fb_put_pixel(x, y, bg);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    fb_row = 0;
+    fb_col = 0;
+    fb_cursor_row = -1;
+    fb_cursor_col = -1;
+    return;
+}
+
+// Draws (or, called with color == the current background, erases) a 2px
+// underline at the bottom of one character cell -- the pixel-graphics
+// cursor glyph. An underline rather than a solid block: matches VGA text
+// mode's own default hardware cursor shape (a few scanlines at the bottom
+// of the cell, see vga_move_cursor), and doesn't visually clash with the
+// character about to be drawn into that cell next.
+void fb_draw_cursor(int row, int col, int color) {
+    int x = col * FONT_W;
+    int y = row * FONT_H + FONT_H - 2;
+    int i = 0;
+    while (i < FONT_W) {
+        fb_put_pixel(x + i, y, color);
+        fb_put_pixel(x + i, y + 1, color);
+        i = i + 1;
+    }
+    return;
+}
+
+// Moves every pixel row up by FONT_H (8) real pixel rows and blanks the
+// new bottom FONT_H rows -- called when fb_putc runs off the bottom of the
+// screen. Copies 8 bytes at a time (load64/store64), not 1 (unlike
+// vga_scroll's load8/store8): fb_pitch is a clean multiple of 8 here
+// (4096), and the sheer size of a real pixel-mode scroll (megabytes, not
+// vga_scroll's few hundred bytes) makes the 8x fewer iterations a real
+// difference, not just tidiness.
+void fb_scroll(int bg) {
+    int y = 0;
+    int x = 0;
+    int src = 0;
+    while (y < fb_height - FONT_H) {
+        x = 0;
+        while (x < fb_pitch) {
+            src = fb_addr + (y + FONT_H) * fb_pitch + x;
+            store64(fb_addr + y * fb_pitch + x, load64(src));
+            x = x + 8;
+        }
+        y = y + 1;
+    }
+    y = fb_height - FONT_H;
+    while (y < fb_height) {
+        x = 0;
+        while (x < fb_width) {
+            fb_put_pixel(x, y, bg);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return;
+}
+
+// Draws one character at the text cursor and advances it, handling
+// newline, line-wrap, and scrolling off the bottom -- the pixel-graphics
+// counterpart to vga_putc, in character CELLS (FONT_W x FONT_H pixels
+// each) the same way vga_row/vga_col were in VGA text-mode cells. Also
+// erases the cursor glyph at its old position and redraws it at the new
+// one, bracketing everything else: the cursor only ever sits on a
+// not-yet-written cell, so erasing it first (with `bg`) never destroys
+// real character content, no matter whether this call ends up wrapping,
+// newlining, or scrolling.
+void fb_putc(int ch, int fg, int bg) {
+    if (fb_cursor_row >= 0) {
+        fb_draw_cursor(fb_cursor_row, fb_cursor_col, bg);
+    }
+    if (ch == '\n') {
+        fb_row = fb_row + 1;
+        fb_col = 0;
+    } else {
+        fb_draw_char(fb_col * FONT_W, fb_row * FONT_H, ch, fg, bg);
+        fb_col = fb_col + 1;
+        if (fb_col * FONT_W >= fb_width) {
+            fb_col = 0;
+            fb_row = fb_row + 1;
+        }
+    }
+    if (fb_row * FONT_H >= fb_height) {
+        fb_scroll(bg);
+        fb_row = fb_row - 1;
+    }
+    fb_cursor_row = fb_row;
+    fb_cursor_col = fb_col;
+    fb_draw_cursor(fb_cursor_row, fb_cursor_col, fg);
+    return;
+}
+
+// Erases the previous character -- same deliberate simplification as
+// vga_backspace (only within the current row, doesn't unwind a previous
+// newline/wrap). Moves the cursor glyph back along with it.
+void fb_backspace(int fg, int bg) {
+    if (fb_col > 0) {
+        if (fb_cursor_row >= 0) {
+            fb_draw_cursor(fb_cursor_row, fb_cursor_col, bg);
+        }
+        fb_col = fb_col - 1;
+        fb_draw_char(fb_col * FONT_W, fb_row * FONT_H, ' ', fg, bg);
+        fb_cursor_row = fb_row;
+        fb_cursor_col = fb_col;
+        fb_draw_cursor(fb_cursor_row, fb_cursor_col, fg);
+    }
+    return;
+}
+
+// Prints a null-terminated string -- same runtime-strlen-free-standing
+// shape as serial_print/vga_print.
+void fb_print(int msg, int fg, int bg) {
+    int i = 0;
+    while (load8(msg + i) != 0) {
+        fb_putc(load8(msg + i), fg, bg);
+        i = i + 1;
+    }
+    return;
+}
+
+// Framebuffer counterpart to serial_print_int: identical digit-extraction
+// idiom and shared kscratch buffer, but emits through fb_putc so
+// numbers can appear in pixel-mode UI (the panic screen's vector/errcode/
+// cr2). It only ever runs sequentially with serial_print_int (never
+// interleaved), so sharing the one scratch buffer is safe.
+void fb_print_int(int v, int fg, int bg) {
+    int tmp = kscratch_start;
+    int neg = 0;
+    int i = 31;
+    if (v == 0) { fb_putc('0', fg, bg); return; }
+    if (v < 0) { neg = 1; v = 0 - v; }
+    while (v > 0) {
+        i = i - 1;
+        store8(tmp + i, '0' + (v - (v / 10) * 10));
+        v = v / 10;
+    }
+    if (neg == 1) { i = i - 1; store8(tmp + i, '-'); }
+    while (i < 31) {
+        fb_putc(load8(tmp + i), fg, bg);
+        i = i + 1;
+    }
+    return;
+}
+
+// Same shape as fb_print_int but base 16 -- for printing the faulting RIP
+// (and any future hex value) to the pixel framebuffer. No 0x prefix.
+void fb_print_hex(int v, int fg, int bg) {
+    int tmp = kscratch_start;
+    int i = 31;
+    int d = 0;
+    if (v == 0) { fb_putc('0', fg, bg); return; }
+    while (v > 0) {
+        i = i - 1;
+        d = v - (v / 16) * 16;
+        if (d < 10) {
+            store8(tmp + i, '0' + d);
+        } else {
+            store8(tmp + i, 'a' + d - 10);
+        }
+        v = v / 16;
+    }
+    while (i < 31) {
+        fb_putc(load8(tmp + i), fg, bg);
+        i = i + 1;
+    }
+    return;
+}
+
+// Test-only scroll proof for test_fb_scroll.sh. Dead code in normal boots.
+void fb_test_scroll() {
+    fb_putc('\n', FB_FG, FB_BG);
+    fb_putc('M', FB_FG, FB_BG);
+    fb_putc('\n', FB_FG, FB_BG);
+    int i = 0;
+    while (i < 94) {
+        fb_putc('\n', FB_FG, FB_BG);
+        i = i + 1;
+    }
+    int moved_count = 0;
+    int cleared_count = 0;
+    int py = 0;
+    int px = 0;
+    while (py < 8) {
+        px = 0;
+        while (px < 8) {
+            if (load32(fb_addr + (0 + py) * fb_pitch + px * 4) == FB_FG) {
+                moved_count = moved_count + 1;
+            }
+            if (load32(fb_addr + (8 + py) * fb_pitch + px * 4) == FB_FG) {
+                cleared_count = cleared_count + 1;
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    serial_print("fb scroll: moved_count=");
+    serial_print_int(moved_count);
+    serial_print(" cleared_count=");
+    serial_print_int(cleared_count);
+    serial_print("\n");
+    return;
+}
+
+// Full-screen fatal-error display, drawn once by panic_handler
+// (interrupts.c0) right before the CPU is halted for good -- the pixel-
+// graphics counterpart to the serial "KERNEL PANIC" line, so a fatal fault
+// is visible on the actual screen, not only over the serial cable. Uses the
+// draw primitives above (a deep-blue fill + a red inset border) and the
+// font renderer for the message; the vector/error-code/CR2 the handler was
+// given are printed as real digits via fb_print_int/fb_print_hex. Each line positions
+// the text cursor by hand (fb_row/fb_col in cells) rather than using '\n',
+// since fb_putc's newline resets the column to the screen's left edge --
+// which would run text under the border -- and re-indents to sit inside the
+// panel. fb_cursor_row/col are reset to -1 first so the first fb_putc does
+// not try to erase a stale cursor left by whatever text was on screen when
+// the fault hit. Colors are built inline via fb_rgb (not FB_FG/FB_BG, which
+// are the normal white-on-black scheme) so a panic looks unmistakably
+// different from ordinary output.
+void fb_panic_screen(int vector, int errcode, int cr2, int rip) {
+    int bg = fb_rgb(0, 0, 140);
+    int fg = fb_rgb(230, 230, 230);
+    int accent = fb_rgb(255, 90, 90);
+
+    fb_fill_rect(0, 0, fb_width, fb_height, bg);
+    fb_draw_rect(8, 8, fb_width - 16, fb_height - 16, accent);
+    fb_cursor_row = -1;
+    fb_cursor_col = -1;
+
+    fb_row = 3; fb_col = 3;
+    fb_print("KERNEL PANIC", accent, bg);
+    fb_row = 5; fb_col = 3;
+    fb_print("a fatal cpu exception stopped the system.", fg, bg);
+
+    fb_row = 7; fb_col = 3;
+    fb_print("vector: ", fg, bg);
+    fb_print_int(vector, fg, bg);
+    fb_row = 8; fb_col = 3;
+    fb_print("error code: ", fg, bg);
+    fb_print_int(errcode, fg, bg);
+    fb_row = 9; fb_col = 3;
+    fb_print("cr2 (fault address): ", fg, bg);
+    fb_print_int(cr2, fg, bg);
+    fb_row = 10; fb_col = 3;
+    fb_print("rip (faulting insn): ", fg, bg);
+    fb_print_hex(rip, fg, bg);
+
+    fb_row = 12; fb_col = 3;
+    fb_print("the machine is halted. reboot to continue.", fg, bg);
+    return;
+}

@@ -1,0 +1,160 @@
+// interrupts.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// interrupts.c0 -- the IDT, the 8259 PIC, the PIT, and the shared
+// dispatch table every interrupt handler is looked up through, plus the
+// generic panic handler every fatal, non-individually-recoverable CPU
+// exception routes to. See knekt.c0's main() for how these get wired
+// together at boot (idt_set/dispatch_set calls, pic_remap/pit_configure).
+
+int ticks = 0;
+
+// Writes one 64-bit interrupt-gate IDT entry (16 bytes) for `vector`,
+// pointing at `handler_addr`. Splitting the address into offset_low(16)/
+// offset_mid(16)/offset_high(32) is pure arithmetic (successive division
+// by 65536, the same "no bitwise ops" idiom as everywhere else in this
+// codebase) rather than needing real >>/& operators. type_attr 0x8E:
+// present | ring 0 | 64-bit interrupt gate.
+void idt_set(int vector, int handler_addr) {
+    int entry = idt_start + vector * 16;
+    int lo16 = handler_addr - (handler_addr / 65536) * 65536;
+    int rest = handler_addr / 65536;
+    int mid16 = rest - (rest / 65536) * 65536;
+    int hi32 = rest / 65536;
+    store16_le(entry, lo16);
+    store16_le(entry + 2, 0x08); // selector: code segment 0x08 (see boot.s's GDT)
+    store8(entry + 4, 0);        // IST: none
+    store8(entry + 5, 0x8e);
+    store16_le(entry + 6, mid16);
+    store32_le(entry + 8, hi32);
+    store32_le(entry + 12, 0); // reserved
+    return;
+}
+
+// The c0-level interrupt dispatch table: one function-reference slot per
+// vector, indexed by the RAW vector number (0..255) in the fixed .dispatch
+// buffer (linker.ld). Raw-vector indexing (not the old vector-32) so CPU
+// exception vectors 0..31 -- the page-fault handler at 14 -- share the same
+// table as the hardware IRQs (32/33). This is the load-bearing use of the
+// address-of/indirect-call feature: dispatching between handlers by a
+// runtime vector value.
+void dispatch_set(int vector, int handler) {
+    store64(dispatch_start + vector * 8, handler);
+    return;
+}
+
+// Called from boot.s's isr_common trampoline with the vector that fired plus
+// its CPU error code (a real one for exceptions like #PF, a dummy 0 pushed
+// by the stub for hardware IRQs), CR2 (the faulting address, meaningful
+// only for #PF), and the faulting RIP (from the CPU-pushed frame at
+// [rsp+136], meaningful for every exception). Looks the real handler up
+// and calls through it -- `h(...)`
+// is an indirect call through a variable. Every handler is passed
+// (vector, errcode, cr2, rip) uniformly; handlers that don't need all of
+// them (timer/keyboard declare no params; page_fault_handler ignores
+// vector/rip) simply ignore the extra registers, which c0's no-arity-
+// checking indirect calls allow. Passing the vector lets one generic
+// panic_handler serve many exception vectors and still report which one
+// fired; passing the RIP lets it report WHERE the fault occurred.
+void int_dispatch(int vector, int errcode, int cr2, int rip) {
+    int h = load64(dispatch_start + vector * 8);
+    h(vector, errcode, cr2, rip);
+    return;
+}
+
+// Classic 8259 PIC remap: IRQ0-7 default to interrupt vectors 0x08-0x0F,
+// colliding with CPU exception vectors -- remaps master to 0x20-0x27
+// (matching isr_timer_entry/isr_keyboard_entry's IDT vectors, 32/33 --
+// vector numbers stay decimal throughout this file, matching idt_set's own
+// calls below; only the port addresses and ICW/mask *byte values* below are
+// hex) and slave to 0x28-0x2F. Masks every IRQ except IRQ0 (PIT timer) and
+// IRQ1 (keyboard) -- nothing else has a handler yet. Ports: 0x20/0x21
+// master command/data, 0xA0/0xA1 slave command/data.
+void pic_remap() {
+    outb(0x20, 0x11); outb(0xA0, 0x11); // ICW1: init, cascade mode
+    outb(0x21, 0x20); outb(0xA1, 0x28); // ICW2: vector offsets
+    outb(0x21, 0x04); outb(0xA1, 0x02); // ICW3: master/slave cascade wiring
+    outb(0x21, 0x01); outb(0xA1, 0x01); // ICW4: 8086 mode
+    outb(0x21, 0xFC); outb(0xA1, 0xFF); // mask: IRQ0+IRQ1 unmasked (all-but-bits0-1)
+    return;
+}
+
+// Programs PIT channel 0 (ports 0x43 command, 0x40 data) for a periodic
+// (mode 3) interrupt at roughly 1193182/divisor Hz.
+void pit_configure(int divisor) {
+    int lo = divisor - (divisor / 256) * 256;
+    int hi = divisor / 256;
+    outb(0x43, 0x36); // command: channel 0, lobyte/hibyte, mode 3, binary
+    outb(0x40, lo);
+    outb(0x40, hi);
+    return;
+}
+
+// Dispatched via int_dispatch(32) on every PIT tick (~100/sec). Prints
+// every 20th tick (~5/sec) so run_qemu.sh can see several over a short
+// boot window, then sends EOI to the master PIC (port 0x20, value 0x20) --
+// without this the PIC withholds all further IRQ0s, believing one is still
+// being serviced.
+void timer_tick() {
+    ticks = ticks + 1;
+    if (ticks - (ticks / 20) * 20 == 0) {
+        serial_print("tick ");
+        serial_print_int(ticks);
+        serial_print("\n");
+    }
+    sched_tick();
+    outb(0x20, 0x20);
+    return;
+}
+
+// Generic handler for every FATAL CPU exception that isn't individually
+// recoverable (#0 divide, #6 invalid opcode, #13 GPF, and the remaining
+// vectors #1-5, #7, #10-12, #16-19 -- see knekt.c0's main(); only #14 #PF
+// has its own recovering handler, jenna.c0's page_fault_handler). Unlike
+// that one this does NOT recover: it prints which vector fired plus its
+// error code and CR2, then halts. Returning would just re-execute the
+// faulting instruction and fault forever, so a fatal fault must stop
+// here. c0 can't emit `hlt` itself, so this loops calling boot.s's
+// halt_cpu indirectly (see knekt.c0's halt()) instead of busy-spinning --
+// a real difference under QEMU/TCG (and on real hardware): `hlt` actually
+// blocks the CPU until the next interrupt rather than burning cycles
+// re-checking a loop condition. Reached through an interrupt gate (IF
+// cleared), so nothing preempts it (including chrone's preemptive
+// scheduler: since this never returns, isr_common's post-dispatch
+// switch-check is simply never reached for these vectors); the kernel is
+// intentionally frozen -- looping on halt() rather than trusting one hlt
+// to never wake matters here specifically because a non-maskable
+// interrupt (NMI) can still fire even with IF cleared, and a woken single
+// hlt would just fall through back into isr_common's epilogue and resume
+// the faulted task otherwise (see halt_cpu's own comment in boot.s). Most
+// of these vectors aren't practically triggerable from c0 source at all
+// (e.g. #10 needs a bad far call/TSS selector, #4 needs `into`); #0
+// (divide-by-zero) is the one exercised by test_panic.sh.
+void panic_handler(int vector, int errcode, int cr2, int rip) {
+    serial_print("KERNEL PANIC: exception vector=");
+    serial_print_int(vector);
+    serial_print(" errcode=");
+    serial_print_int(errcode);
+    serial_print(" cr2=");
+    serial_print_int(cr2);
+    serial_print(" rip=0x");
+    serial_print_hex(rip);
+    serial_print("\n");
+    // Also show it on the real screen when pixel graphics are live (see
+    // punkt.c0's fb_panic_screen) -- serial stays the source of truth for
+    // the automated tests, this is the human-visible half. Guarded on
+    // fb_available for the VGA-text-fallback boot, where there's no
+    // framebuffer to draw into.
+    if (fb_available == 1) {
+        fb_panic_screen(vector, errcode, cr2, rip);
+    }
+    while (1) {
+        halt();
+    }
+    return;
+}
