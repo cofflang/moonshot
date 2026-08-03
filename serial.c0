@@ -1,0 +1,94 @@
+// serial.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// serial.c0 -- COM1 output, one byte at a time via outb. No UART
+// initialization: QEMU's emulated 16550 accepts writes to the transmit
+// register without it for `-serial file:`/`-serial stdio` redirection.
+// Real hardware would need the real init sequence -- deferred until
+// Moonshot actually needs to run there. Automated testing reads the
+// serial log, so this stays the verification channel even now that
+// there's real graphical output too (see vga.c0/punkt.c0).
+
+int SERIAL_PORT = 0x3f8;
+
+void serial_putc(int c) {
+    outb(SERIAL_PORT, c);
+    return;
+}
+
+void serial_print(int msg) {
+    int i = 0;
+    while (load8(msg + i) != 0) {
+        serial_putc(load8(msg + i));
+        i = i + 1;
+    }
+    return;
+}
+
+// Same digit-extraction idiom as serial_print_int, but base 16 -- prints
+// an unsigned hex string (no 0x prefix). No % operator in c0, so
+// v - (v/16)*16 extracts the low hex digit. Uses the fixed .kscratch
+// buffer instead of alloc() -- see linker.ld for why alloc() can't be
+// used here. 64-bit values need at most 16 hex digits, so this fits
+// easily inside the same .kscratch buffer.
+void serial_print_hex(int v) {
+    int tmp = kscratch_start;
+    int i = 31;
+    int d = 0;
+    if (v == 0) { serial_putc('0'); return; }
+    // Process all 16 hex digits. For negative v (bit 63 set), c0's / and *
+    // truncate toward zero, so v - (v/16)*16 produces a remainder in [-15,0]
+    // and v/16 is the ceiling rather than the floor. We correct both:
+    // remainder in [-15,-1] → adjust with +16, quotient -= 1.
+    int n = 0;
+    while (n < 16) {
+        i = i - 1;
+        int t = v / 16;
+        d = v - t * 16;
+        if (d < 0) {
+            d = d + 16;  // remainder in [1, 15]
+            v = t - 1;   // floor quotient
+        } else {
+            v = t;       // floor quotient (already correct for d >= 0)
+        }
+        if (d < 10) {
+            store8(tmp + i, '0' + d);
+        } else {
+            store8(tmp + i, 'a' + d - 10);
+        }
+        n = n + 1;
+    }
+    // Skip leading zeros.
+    while (i < 31 && load8(tmp + i) == '0') {
+        i = i + 1;
+    }
+    while (i < 31) {
+        serial_putc(load8(tmp + i));
+        i = i + 1;
+    }
+    return;
+}
+
+void serial_print_int(int v) {
+    int tmp = kscratch_start;
+    int neg = 0;
+    int i = 31;
+    if (v == 0) { serial_putc('0'); return; }
+    if (v < 0) { neg = 1; v = 0 - v; }
+    while (v > 0) {
+        i = i - 1;
+        store8(tmp + i, '0' + (v - (v / 10) * 10));
+        v = v / 10;
+    }
+    if (neg == 1) { i = i - 1; store8(tmp + i, '-'); }
+    while (i < 31) {
+        serial_putc(load8(tmp + i));
+        i = i + 1;
+    }
+    return;
+}

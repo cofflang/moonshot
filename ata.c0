@@ -1,0 +1,183 @@
+// ata.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// ata.c0 -- ATA PIO mode block driver for Moonshot.
+// Talks to an ATA drive on the primary bus (fixed I/O ports 0x1F0-0x1F7).
+// No PCI enumeration, no IRQ handling, no DMA -- the simplest possible
+// block device. Requires inw/outw builtins (added to both coff0.c and
+// c0/coff.c0) for 16-bit data-port transfers; 8-bit registers use the
+// existing outb/inb.
+
+// Primary bus I/O ports
+int ATA_DATA    = 0x1F0;  // 16-bit data register (inw/outw)
+int ATA_ERROR   = 0x1F1;  // read: error register
+int ATA_NSECT   = 0x1F2;  // sector count
+int ATA_LBA_LO  = 0x1F3;  // LBA bits 7:0
+int ATA_LBA_MID = 0x1F4;  // LBA bits 15:8
+int ATA_LBA_HI  = 0x1F5;  // LBA bits 23:16
+int ATA_DRIVE   = 0x1F6;  // drive/head select (0xE0 = master, LBA mode)
+int ATA_STATUS  = 0x1F7;  // read: status; write: command
+int ATA_COMMAND = 0x1F7;  // same port as STATUS
+
+// Status register bits
+int STAT_BSY  = 128;  // 0x80 -- drive is busy
+int STAT_DRDY = 64;   // 0x40 -- drive is ready
+int STAT_DRQ  = 8;    // 0x08 -- data request (ready for PIO transfer)
+int STAT_ERR  = 1;    // 0x01 -- error
+
+// ATA commands
+int CMD_READ        = 0x20;  // READ SECTORS (LBA28)
+int CMD_WRITE       = 0x30;  // WRITE SECTORS (LBA28)
+int CMD_FLUSH       = 0xE7;  // FLUSH CACHE
+
+int ata_present = 0;  // 1 if a drive was detected at init
+
+// Extracts a single bit from an 8-bit status value. `bit` must be a
+// power of 2 (1, 2, 4, 8, 16, 32, 64, 128). Uses pure arithmetic
+// (no bitwise ops in c0): (v/bit) - ((v/(bit*2))*2) isolates the bit.
+// Example: v=88 (0x58 = DRDY|DRQ|SERV), bit=8 → 88/8=11, 88/16=5*2=10,
+// 11-10=1 → DRQ is set.
+int ata_bit(int v, int bit) {
+    return (v / bit) - ((v / (bit * 2)) * 2);
+}
+
+// Poll until BSY clears (or timeout). Returns 1 on success, 0 on timeout.
+int ata_wait_not_busy() {
+    int i = 0;
+    while (i < 100000) {
+        if (ata_bit(inb(ATA_STATUS), STAT_BSY) == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Poll until the drive is ready for a data transfer: BSY must be clear
+// and DRQ must be set. Returns 0 on timeout or error, 1 on success.
+int ata_wait_drq() {
+    int i = 0;
+    while (i < 100000) {
+        int st = inb(ATA_STATUS);
+        if (ata_bit(st, STAT_ERR) == 1) { return 0; }
+        if (ata_bit(st, STAT_BSY) == 0) {
+            if (ata_bit(st, STAT_DRQ) == 1) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Initialise the ATA driver: detect whether a drive is present on the
+// primary bus. Writes 0xE0 to the drive register (select master, LBA
+// mode), then reads status. 0xFF means the bus is floating (no drive
+// at all); 0x00 means no drive responded. Anything else means a drive
+// is present. Returns 1 if a drive was found, 0 otherwise.
+int ata_init() {
+    outb(ATA_DRIVE, 0xE0);
+    // Brief delay for the drive to respond.
+    int d = 0;
+    while (d < 1000) { d = d + 1; }
+    int st = inb(ATA_STATUS);
+    if (st == 0xFF) {
+        serial_print("[ata] no drive (floating bus)\n");
+        return 0;
+    }
+    if (st == 0) {
+        serial_print("[ata] no drive (no response)\n");
+        return 0;
+    }
+    ata_present = 1;
+    serial_print("[ata] drive detected\n");
+    return 1;
+}
+
+// Read one 512-byte sector at 28-bit LBA address into buffer `buf`,
+// which must point to at least 512 bytes of writable memory. Safe to
+// call when ata_present == 0 (silently returns).
+void ata_read(int lba, int buf) {
+    if (ata_present == 0) { return; }
+    if (lba < 0) { return; }
+    if (ata_wait_not_busy() == 0) { return; }
+
+    // Sector count = 1
+    outb(ATA_NSECT, 1);
+
+    // LBA bits 7:0
+    outb(ATA_LBA_LO, lba - (lba / 256) * 256);
+
+    // LBA bits 15:8
+    outb(ATA_LBA_MID, (lba / 256) - ((lba / 65536) * 256));
+
+    // LBA bits 23:16
+    outb(ATA_LBA_HI, (lba / 65536) - ((lba / 16777216) * 256));
+
+    // Drive select: master (0xE0) | LBA mode (0x40) | top nibble
+    // 0xE0 already includes the LBA-mode bit, so: 0xE0 + (lba >> 24 & 0x0F)
+    outb(ATA_DRIVE, 0xE0 + lba / 16777216);
+
+    // Issue READ SECTORS
+    outb(ATA_COMMAND, CMD_READ);
+
+    // Wait for data
+    if (ata_wait_not_busy() == 0) { return; }
+    if (ata_wait_drq() == 0) { return; }
+
+    // Read 256 16-bit words from the data port.
+    // Each 16-bit word is split into two little-endian bytes.
+    int i = 0;
+    while (i < 256) {
+        int w = inw(ATA_DATA);
+        store8(buf + i * 2,       w - (w / 256) * 256);  // low byte
+        store8(buf + i * 2 + 1,   w / 256);               // high byte
+        i = i + 1;
+    }
+    return;
+}
+
+// Write one 512-byte sector from buffer `buf` to 28-bit LBA address.
+// Safe to call when ata_present == 0 (silently returns).
+void ata_write(int lba, int buf) {
+    if (ata_present == 0) { return; }
+    if (lba < 0) { return; }
+    if (ata_wait_not_busy() == 0) { return; }
+
+    // Sector count = 1
+    outb(ATA_NSECT, 1);
+
+    // LBA bytes
+    outb(ATA_LBA_LO,  lba - (lba / 256) * 256);
+    outb(ATA_LBA_MID, (lba / 256) - ((lba / 65536) * 256));
+    outb(ATA_LBA_HI,  (lba / 65536) - ((lba / 16777216) * 256));
+
+    // Drive select
+    outb(ATA_DRIVE, 0xE0 + lba / 16777216);
+
+    // Issue WRITE SECTORS
+    outb(ATA_COMMAND, CMD_WRITE);
+
+    // Wait for the drive to be ready to accept data
+    if (ata_wait_drq() == 0) { return; }
+
+    // Write 256 16-bit words to the data port.
+    // Each 16-bit word is reconstructed from two little-endian bytes.
+    int i = 0;
+    while (i < 256) {
+        int lo = load8(buf + i * 2);
+        int hi = load8(buf + i * 2 + 1);
+        outw(ATA_DATA, lo + hi * 256);
+        i = i + 1;
+    }
+
+    // Wait for the write to complete, then flush the drive's cache so
+    // the data is committed to the medium (not just the drive's internal
+    // buffer).
+    if (ata_wait_not_busy() == 0) { return; }
+    outb(ATA_COMMAND, CMD_FLUSH);
+    if (ata_wait_not_busy() == 0) { return; }
+
+    return;
+}

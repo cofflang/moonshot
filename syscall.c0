@@ -1,0 +1,220 @@
+// syscall.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// syscall.c0 -- SYSCALL/SYSRET dispatch and ring-3 entry.
+
+int SYS_EXIT       = 0;
+int SYS_DEBUG_PRINT = 1;
+
+int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
+    if (num == 0) {
+        int tid = sched_current;
+        store64(task_state_base + tid * 8, TASK_EXITED);
+        serial_print("[syscall] exit code=");
+        serial_print_int(a1);
+        serial_print("\n");
+        // Loop-halt: the timer ISR's scheduler will swap away from this
+        // EXITED task on the next tick. An NMI can wake hlt, so looping
+        // ensures we never accidentally sysretq back to ring 3.
+        while (1 == 1) {
+            halt();
+        }
+        return 0;
+    }
+    if (num == 1) {
+        // sys_write(str, len) — write to serial and screen.
+        int i = 0;
+        while (i < a2) {
+            int ch = load8(a1 + i);
+            serial_putc(ch);
+            sk_putc(ch);
+            i = i + 1;
+        }
+        return a2;
+    }
+    serial_print("[syscall] unknown syscall ");
+    serial_print_int(num);
+    serial_print("\n");
+    return -1;
+}
+
+int page_set_user(int vaddr) {
+    int page = vaddr / 4096;
+    int pml4_idx = page / (512 * 512 * 512);
+    int pdpt_idx = (page / (512 * 512)) - pml4_idx * 512;
+    int pd_idx   = (page / 512) - (pml4_idx * 512 * 512) - (pdpt_idx * 512);
+    int verify = 0;
+
+    // The CPU checks U/S at EVERY level of the page-table walk for
+    // user-mode access. Set U/S (bit 2 = 4) on PML4, PDPT, PD, and PT
+    // entries. All entries must pass the check; one kernel-only entry
+    // anywhere in the chain causes a protection fault.
+
+    // PML4 — set U/S if not already set.
+    int pml4_entry = load64(pml4_phys + pml4_idx * 8);
+    if (pml4_entry - (pml4_entry / 2) * 2 == 0) { return 0; }
+    int pml4_us = (pml4_entry / 4) - ((pml4_entry / 4) / 2) * 2;
+    if (pml4_us == 0) { store64(pml4_phys + pml4_idx * 8, pml4_entry + 4); }
+    int pdpt = (pml4_entry / 4096) * 4096;
+
+    // PDPT — set U/S if not already set.
+    int pdpt_entry = load64(pdpt + pdpt_idx * 8);
+    if (pdpt_entry - (pdpt_entry / 2) * 2 == 0) { return 0; }
+    int pdpt_us = (pdpt_entry / 4) - ((pdpt_entry / 4) / 2) * 2;
+    if (pdpt_us == 0) { store64(pdpt + pdpt_idx * 8, pdpt_entry + 4); }
+    int pd = (pdpt_entry / 4096) * 4096;
+
+    // PD — set U/S if not already set.
+    int pd_entry = load64(pd + pd_idx * 8);
+    if (pd_entry - (pd_entry / 2) * 2 == 0) { return 0; }
+    int pd_us = (pd_entry / 4) - ((pd_entry / 4) / 2) * 2;
+    if (pd_us == 0 && (pd_entry / 128) - ((pd_entry / 128) / 2) * 2 == 0) {
+        // Only set U/S on non-PS (4KB) PD entries. 2MB pages handle U/S below.
+        store64(pd + pd_idx * 8, pd_entry + 4);
+    }
+
+    // PT level — set U/S on the PTE (4 KB page) or PD entry (2 MB page).
+    int ps_shifted = pd_entry / 128;
+    int is_2mb = ps_shifted - (ps_shifted / 2) * 2;
+
+    if (is_2mb == 0) {
+        // 4 KB page — set U/S on the PTE.
+        int pt = (pd_entry / 4096) * 4096;
+        int pt_idx = page - (pml4_idx * 512 * 512 * 512)
+                         - (pdpt_idx * 512 * 512) - (pd_idx * 512);
+        int pte = load64(pt + pt_idx * 8);
+        if (pte - (pte / 2) * 2 == 0) { return 0; }
+        int pte_us = (pte / 4) - ((pte / 4) / 2) * 2;
+        if (pte_us == 0) { store64(pt + pt_idx * 8, pte + 4); }
+        return 1;
+    }
+
+    // 2 MB page — U/S on the PD entry.
+    int pd_us_final = (pd_entry / 4) - ((pd_entry / 4) / 2) * 2;
+    if (pd_us_final == 0) { store64(pd + pd_idx * 8, pd_entry + 4); }
+    return 1;
+}
+
+// Load a flat binary from `code` (length `code_len` bytes) into a fresh
+// user-accessible page and execute it in ring 3. Returns only on error.
+void run_ring3_binary(int code, int code_len) {
+    if (code_len > 4096) {
+        serial_print("[ring3] binary too large\n");
+        return;
+    }
+    int code_page = pmm_alloc_page();
+    if (code_page == 0) { serial_print("[ring3] no code page\n"); return; }
+    int stack_page = pmm_alloc_page();
+    if (stack_page == 0) { serial_print("[ring3] no stack page\n"); return; }
+
+    serial_print("[ring3] loading ");
+    serial_print_int(code_len);
+    serial_print(" bytes\n");
+
+    // Copy the code into the user page.
+    int i = 0;
+    while (i < code_len) {
+        store8(code_page + i, load8(code + i));
+        i = i + 1;
+    }
+
+    // Patch the string address immediate if this is the built-in test binary.
+    // The test binary has a mov edi, imm32 at offset 5; the immediate (4 bytes
+    // at offset 6) should be set to code_page + MSG_OFFSET.
+    if (code_len == RING3_TEST_LEN && load8(code) == 0xB8 && load8(code + 1) == 1) {
+        int str_addr = code_page + RING3_TEST_MSG_OFF;
+        int off = RING3_TEST_STRADDR_OFF;
+        store8(code_page + off,     str_addr - (str_addr / 256) * 256);
+        store8(code_page + off + 1, (str_addr / 256) - (str_addr / 65536) * 256);
+        store8(code_page + off + 2, (str_addr / 65536) - (str_addr / 16777216) * 256);
+        store8(code_page + off + 3, (str_addr / 16777216) - (str_addr / 16777216 / 256) * 256);
+    }
+
+    if (page_set_user(code_page) == 0) {
+        serial_print("[ring3] code page not mapped\n"); return;
+    }
+    if (page_set_user(stack_page) == 0) {
+        serial_print("[ring3] stack page not mapped\n"); return;
+    }
+
+    int tid = sched_current;
+    int kstack = load64(task_stack_base + tid * 8);
+    int fn = load64(RING3INFO_ADDR);
+    fn(code_page, stack_page + 4096, kstack + 4096);
+    serial_print("[ring3] ERROR: returned from enter_ring3\n");
+    return;
+}
+
+// --- spawn3: run a ring-3 binary as an independent task -----------------------
+// Global variables set by the shell's spawn3 command, read by spawn3_entry.
+int spawn3_code = 0;
+int spawn3_len  = 0;
+
+// Entry point for a spawned ring-3 task. Reads the globals above and calls
+// the loader. Never returns (enters ring 3, then sys_exit halts the task).
+void spawn3_entry() {
+    int code = spawn3_code;
+    int len  = spawn3_len;
+    spawn3_code = 0;  // consume the data so it can't be re-spawned by accident
+    spawn3_len  = 0;
+    if (code == 0 || len == 0) {
+        serial_print("[spawn3] no binary loaded\n");
+        return;
+    }
+    run_ring3_binary(code, len);
+    // Unreachable — run_ring3_binary calls enter_ring3 which does IRETQ.
+}
+
+// Built-in ring-3 test: sys_debug_print("hello from ring 3\n", 18) + sys_exit(0).
+// The string address is patched at runtime (load time) by c0 code, since the
+// binary doesn't know its final load address until run_ring3_binary allocates
+// the code page.
+// Binary layout:
+//   0-1:   mov eax, imm32 (syscall number)
+//   5-9:   mov edi, imm32 (string address — patched at load time)
+//   10-14: mov esi, imm32 (string length)
+//   15-16: syscall
+//   ... same for sys_exit
+//   ... msg bytes
+
+int RING3_TEST_LEN = 48;
+int ring3_test_code() {
+    int p = kscratch_start + 1536;
+    int i = 0;
+    while (i < RING3_TEST_LEN) { store8(p + i, 0); i = i + 1; }
+
+    // sys_debug_print(msg, 18)
+    store8(p+0,0xB8);store8(p+1,0x01);store8(p+2,0x00);store8(p+3,0x00);store8(p+4,0x00);
+    // mov edi, <placeholder> — patched to code_page+29 at load time
+    store8(p+5,0xBF);store8(p+6,0x00);store8(p+7,0x00);store8(p+8,0x00);store8(p+9,0x00);
+    store8(p+10,0xBE);store8(p+11,0x12);store8(p+12,0x00);store8(p+13,0x00);store8(p+14,0x00);
+    store8(p+15,0x0F);store8(p+16,0x05);
+
+    // sys_exit(0)
+    store8(p+17,0xB8);store8(p+18,0x00);store8(p+19,0x00);store8(p+20,0x00);store8(p+21,0x00);
+    store8(p+22,0x31);store8(p+23,0xFF);
+    store8(p+24,0x0F);store8(p+25,0x05);
+    store8(p+26,0xF4);
+
+    // msg at offset 27: "hello from ring 3\n" (18 bytes)
+    store8(p+27,'h');store8(p+28,'e');store8(p+29,'l');store8(p+30,'l');store8(p+31,'o');
+    store8(p+32,' ');store8(p+33,'f');store8(p+34,'r');store8(p+35,'o');store8(p+36,'m');
+    store8(p+37,' ');store8(p+38,'r');store8(p+39,'i');store8(p+40,'n');store8(p+41,'g');
+    store8(p+42,' ');store8(p+43,'3');store8(p+44,'\n');
+    return p;
+}
+
+// Offset within the binary where the string address immediate is stored.
+int RING3_TEST_STRADDR_OFF = 6;
+int RING3_TEST_MSG_OFF = 27;
+int RING3_TEST_MSG_LEN = 18;
+
+void run_ring3_test() {
+    int code = ring3_test_code();
+    run_ring3_binary(code, RING3_TEST_LEN);
+}

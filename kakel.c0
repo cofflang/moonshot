@@ -1,0 +1,900 @@
+// kakel.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// kakel.c0 -- the windowing layer, v1 (Swedish for "tile": a fixed set of
+// non-overlapping rectangular regions tiling the screen). This is NOT a
+// window manager yet -- no overlap, no z-order, no dragging/resizing, no
+// borders or title bars, and keyboard-only (no mouse driver exists at
+// all). What it genuinely adds over punkt's single full-screen terminal
+// are the two mechanics a real windowing layer is built from: CLIPPING
+// (each window's text wraps and scrolls inside its own rectangle, never
+// touching a neighbour's pixels) and MULTIPLE SIMULTANEOUS CURSOR STATES
+// (each window keeps its own cursor position; punkt's fb_row/fb_col were
+// screen-global). Input goes to whichever window has FOCUS, cycled from
+// the keyboard (Alt+Tab -- see keyboard.c0); the focused window's cursor
+// is drawn bright, unfocused ones dim, so focus is visible on screen.
+//
+// A "window" is represented the same way chrone's task table represents a
+// task -- parallel fixed-size arrays indexed by a small window id, each
+// kmalloc'd from the kernel heap in kakel_init (c0 has no structs; this
+// is the established idiom, see .sctable and task_rsp_base). Geometry is
+// stored in character CELLS (FONT_W x FONT_H pixels), not pixels: every
+// window is cell-aligned, which keeps kakel_scroll's 8-bytes-at-a-time
+// row copy legal (a cell row is 8 pixels = 32 bytes, always a multiple
+// of 8) and lets kakel_draw_cursor reuse punkt's fb_draw_cursor
+// (absolute-cell interface) directly.
+//
+// punkt stays the single owner of the real hardware framebuffer
+// (fb_addr/fb_pitch/fb_width/fb_height stay global -- there is still only
+// one device underneath); kakel draws exclusively through punkt's
+// primitives (fb_draw_char/fb_fill_rect/fb_draw_cursor) plus direct
+// load64/store64 row copies in kakel_scroll, punkt's own fb_scroll idiom
+// bounded to a sub-rectangle. The full-screen punkt terminal path still
+// exists and still works (the boot banner uses it before kakel_init runs,
+// and fb_panic_screen deliberately takes over the WHOLE screen on a
+// panic, ignoring windows) -- kakel sits above it, it does not replace it.
+
+int KAKEL_MAX_WIN = 12;
+int KAKEL_MAX_RING = 8;
+
+// Height of the status bar at the bottom of the screen, in character rows.
+// Changing this requires updating knekt.c0's readback check (which uses
+// KAKEL_LOG_ROWS directly to locate the shell-window bottom boundary).
+int KAKEL_LOG_ROWS = 1;
+
+// 0 until kakel_init has run (and stays 0 when GRUB granted no usable
+// framebuffer -- the VGA text fallback has no windowing; keyboard.c0 and
+// skalman.c0 branch on this the same way they branch on fb_available).
+int kakel_active = 0;
+int kakel_count = 0;
+int kakel_focus = 0;
+int kakel_prompt_col_base = 0;
+
+// Id of the status-bar tile (-1 = not created). A 1-row strip at the very
+// bottom of the screen showing live system info (uptime, task count, memory).
+// NOT a shell session and NOT focusable — kakel_focus_next skips it.
+int kakel_stats_win = -1;
+
+// Number of focusable (shell) windows. Equals kakel_count minus the
+// non-shell windows (stats bar). skalman.c0's shell_init uses this to
+// allocate only as many line buffers as there are real interactive
+// sessions.
+int kakel_shell_wins = 0;
+
+// Parallel per-window arrays (heap, allocated in kakel_init), all indexed
+// by window id at stride 8:
+//   cx/cy      window origin, in cells (absolute screen cell coordinates)
+//   cols/rows  window size, in cells
+//   row/col    text cursor position, RELATIVE to the window's own origin
+//   crow/ccol  where the cursor glyph was last drawn (window-relative);
+//              -1 = not drawn yet, same convention as fb_cursor_row
+//   bg         per-window background color -- windows get slightly
+//              different backgrounds so the tiling (and any clipping bug)
+//              is visible to the eye, not only to readback checks
+int kakel_cx_base = 0;
+int kakel_cy_base = 0;
+int kakel_cols_base = 0;
+int kakel_rows_base = 0;
+int kakel_row_base = 0;
+int kakel_col_base = 0;
+int kakel_crow_base = 0;
+int kakel_ccol_base = 0;
+int kakel_bg_base = 0;
+
+// --- Ring state ---
+// Each row (0..1) has a ring of window ids: ring_ids[row*MAX_RING + i].
+// ring_head[row] is the index of the first VISIBLE window (left/top slot).
+// ring_vis[row] is how many windows are visible (1 or 2). The visible
+// windows occupy slots head and (head+1)%ring_cnt.
+// ring_cnt[row] is total windows in the ring (visible + hidden).
+// kakel_rows is 1 or 2 active rows. Row 0 is the top, row 1 the bottom.
+int kakel_ring_ids = 0;    // kmalloc(2 * KAKEL_MAX_RING * 8)
+int kakel_ring_cnt = 0;    // kmalloc(2 * 8)
+int kakel_ring_head = 0;   // kmalloc(2 * 8)
+int kakel_ring_vis = 0;    // kmalloc(2 * 8)
+int kakel_rows = 0;
+
+// Background colours for dynamically-created windows, cycled through so
+// each window is visually distinct. Six colours chosen for contrast.
+int kakel_bg_palette = 0;  // kmalloc(6 * 8), populated in kakel_init
+
+// Unfocused windows' cursor color (focused windows use FB_FG) -- built in
+// kakel_init via fb_rgb, same reason FB_FG/FB_BG are built at runtime.
+int KAKEL_DIM = 0;
+
+// Small readers for other subsystems (keyboard.c0's serial echo logs, the
+// Tab column-stop loop) -- the window-relative cursor cell.
+int kakel_get_row(int id) {
+    return load64(kakel_row_base + id * 8);
+}
+int kakel_get_col(int id) {
+    return load64(kakel_col_base + id * 8);
+}
+
+// Draws (or erases, when called with the window's bg) the cursor underline
+// at a window-RELATIVE cell -- a thin wrapper translating to the absolute
+// cell fb_draw_cursor expects. Legal because windows are cell-aligned.
+void kakel_draw_cursor(int id, int row, int col, int color) {
+    fb_draw_cursor(load64(kakel_cy_base + id * 8) + row,
+                   load64(kakel_cx_base + id * 8) + col, color);
+    return;
+}
+
+// The color this window's cursor should currently be drawn in -- bright
+// for the focused window, dim otherwise, so focus is visible on screen
+// without borders or any other decoration (v1 has none).
+int kakel_cursor_color(int id) {
+    if (id == kakel_focus) { return FB_FG; }
+    return KAKEL_DIM;
+}
+
+// Scrolls ONE window's contents up by one cell row and blanks its bottom
+// row -- fb_scroll's exact idiom (load64/store64, 8 bytes = 2 pixels at a
+// time) bounded to the window's rectangle instead of the whole
+// framebuffer. The byte quantities are always multiples of 8 because
+// geometry is in cells: the window's left-edge byte offset is
+// cx*FONT_W*4 (cx cells of 8 pixels of 4 bytes) and its width in bytes is
+// cols*FONT_W*4. This per-window scroll is what makes the windows real
+// tiles rather than viewports onto one shared console: window 1 can
+// scroll a hundred times while window 0's pixels stay untouched (proven
+// by test_kakel_scroll.sh's readback, not just asserted here).
+void kakel_scroll(int id) {
+    int cx = load64(kakel_cx_base + id * 8);
+    int cy = load64(kakel_cy_base + id * 8);
+    int cols = load64(kakel_cols_base + id * 8);
+    int rows = load64(kakel_rows_base + id * 8);
+    int bg = load64(kakel_bg_base + id * 8);
+    int x0 = cx * FONT_W * 4;
+    int wbytes = cols * FONT_W * 4;
+    int ybot = (cy + rows) * FONT_H;
+    int y = cy * FONT_H;
+    while (y < ybot - FONT_H) {
+        int x = 0;
+        while (x < wbytes) {
+            store64(fb_addr + y * fb_pitch + x0 + x,
+                    load64(fb_addr + (y + FONT_H) * fb_pitch + x0 + x));
+            x = x + 8;
+        }
+        y = y + 1;
+    }
+    fb_fill_rect(cx * FONT_W, ybot - FONT_H, cols * FONT_W, FONT_H, bg);
+    return;
+}
+
+// Draws one character at a window's cursor and advances it -- fb_putc's
+// shape (erase old cursor glyph / draw+advance / handle newline, wrap,
+// scroll / redraw cursor), but against the window's OWN cursor state and
+// clipped to its own rectangle: the wrap check is against the window's
+// cols (not the screen edge) and running off the window's bottom scrolls
+// only that window. The foreground color is the shared FB_FG; the
+// background is the window's own.
+void kakel_putc(int id, int ch) {
+    int bg = load64(kakel_bg_base + id * 8);
+    int crow = load64(kakel_crow_base + id * 8);
+    if (crow >= 0) {
+        kakel_draw_cursor(id, crow, load64(kakel_ccol_base + id * 8), bg);
+    }
+    int row = load64(kakel_row_base + id * 8);
+    int col = load64(kakel_col_base + id * 8);
+    if (ch == '\n') {
+        row = row + 1;
+        col = 0;
+    } else {
+        fb_draw_char((load64(kakel_cx_base + id * 8) + col) * FONT_W,
+                     (load64(kakel_cy_base + id * 8) + row) * FONT_H,
+                     ch, FB_FG, bg);
+        col = col + 1;
+        if (col >= load64(kakel_cols_base + id * 8)) {
+            col = 0;
+            row = row + 1;
+        }
+    }
+    if (row >= load64(kakel_rows_base + id * 8)) {
+        kakel_scroll(id);
+        row = row - 1;
+    }
+    store64(kakel_row_base + id * 8, row);
+    store64(kakel_col_base + id * 8, col);
+    // No cursor in the status bar (it flickers and serves no purpose).
+    if (id != kakel_stats_win) {
+        store64(kakel_crow_base + id * 8, row);
+        store64(kakel_ccol_base + id * 8, col);
+        kakel_draw_cursor(id, row, col, kakel_cursor_color(id));
+    }
+    return;
+}
+
+// Like kakel_putc but with a caller-specified foreground colour. Used by
+// skalman's sk_putc to support coloured REPL output through kakel windows.
+void kakel_putc_fg(int id, int ch, int fg) {
+    int bg = load64(kakel_bg_base + id * 8);
+    int crow = load64(kakel_crow_base + id * 8);
+    if (crow >= 0) {
+        kakel_draw_cursor(id, crow, load64(kakel_ccol_base + id * 8), bg);
+    }
+    int row = load64(kakel_row_base + id * 8);
+    int col = load64(kakel_col_base + id * 8);
+    if (ch == '\n') {
+        row = row + 1;
+        col = 0;
+    } else {
+        fb_draw_char((load64(kakel_cx_base + id * 8) + col) * FONT_W,
+                     (load64(kakel_cy_base + id * 8) + row) * FONT_H,
+                     ch, fg, bg);
+        col = col + 1;
+        if (col >= load64(kakel_cols_base + id * 8)) {
+            col = 0;
+            row = row + 1;
+        }
+    }
+    if (row >= load64(kakel_rows_base + id * 8)) {
+        kakel_scroll(id);
+        row = row - 1;
+    }
+    store64(kakel_row_base + id * 8, row);
+    store64(kakel_col_base + id * 8, col);
+    if (id != kakel_stats_win) {
+        store64(kakel_crow_base + id * 8, row);
+        store64(kakel_ccol_base + id * 8, col);
+        kakel_draw_cursor(id, row, col, kakel_cursor_color(id));
+    }
+    return;
+}
+
+// Erases the previous character in a window -- fb_backspace's shape and
+// its same deliberate limitation (only within the current row; a previous
+// newline/wrap is not unwound), window-relative.
+void kakel_backspace(int id) {
+    int col = load64(kakel_col_base + id * 8);
+    if (col > 0) {
+        int bg = load64(kakel_bg_base + id * 8);
+        int crow = load64(kakel_crow_base + id * 8);
+        if (crow >= 0) {
+            kakel_draw_cursor(id, crow, load64(kakel_ccol_base + id * 8), bg);
+        }
+        int row = load64(kakel_row_base + id * 8);
+        col = col - 1;
+        fb_draw_char((load64(kakel_cx_base + id * 8) + col) * FONT_W,
+                     (load64(kakel_cy_base + id * 8) + row) * FONT_H,
+                     ' ', FB_FG, bg);
+        store64(kakel_col_base + id * 8, col);
+        store64(kakel_crow_base + id * 8, row);
+        store64(kakel_ccol_base + id * 8, col);
+        kakel_draw_cursor(id, row, col, kakel_cursor_color(id));
+    }
+    return;
+}
+
+// Like kakel_putc but draws in dim grey (KAKEL_DIM) instead of FB_FG.
+// Used for the shell prompt so it is visually distinct from typed text.
+void kakel_putc_dim(int id, int ch) {
+    int bg = load64(kakel_bg_base + id * 8);
+    int crow = load64(kakel_crow_base + id * 8);
+    if (crow >= 0 && id != kakel_stats_win) {
+        kakel_draw_cursor(id, crow, load64(kakel_ccol_base + id * 8), bg);
+    }
+    int row = load64(kakel_row_base + id * 8);
+    int col = load64(kakel_col_base + id * 8);
+    if (ch == '\n') {
+        row = row + 1;
+        col = 0;
+    } else {
+        fb_draw_char((load64(kakel_cx_base + id * 8) + col) * FONT_W,
+                     (load64(kakel_cy_base + id * 8) + row) * FONT_H,
+                     ch, KAKEL_DIM, bg);
+        col = col + 1;
+        if (col >= load64(kakel_cols_base + id * 8)) {
+            col = 0;
+            row = row + 1;
+        }
+    }
+    if (row >= load64(kakel_rows_base + id * 8)) {
+        kakel_scroll(id);
+        row = row - 1;
+    }
+    store64(kakel_row_base + id * 8, row);
+    store64(kakel_col_base + id * 8, col);
+    if (id != kakel_stats_win) {
+        store64(kakel_crow_base + id * 8, row);
+        store64(kakel_ccol_base + id * 8, col);
+        kakel_draw_cursor(id, row, col, kakel_cursor_color(id));
+    }
+    return;
+}
+
+void kakel_print(int id, int s) {
+    int i = 0;
+    while (load8(s + i) != 0) {
+        kakel_putc(id, load8(s + i));
+        i = i + 1;
+    }
+    return;
+}
+
+// Dim variant — prints a string with dimmed foreground.
+void kakel_print_dim(int id, int s) {
+    int i = 0;
+    while (load8(s + i) != 0) {
+        kakel_putc_dim(id, load8(s + i));
+        i = i + 1;
+    }
+    return;
+}
+
+// Fills one window's rectangle with its background and resets its cursor
+// to the window's top-left -- fb_clear bounded to the window. The cursor
+// glyph is left undrawn (crow -1), same as fb_clear; the next kakel_putc
+// draws it.
+void kakel_clear(int id) {
+    fb_fill_rect(load64(kakel_cx_base + id * 8) * FONT_W,
+                 load64(kakel_cy_base + id * 8) * FONT_H,
+                 load64(kakel_cols_base + id * 8) * FONT_W,
+                 load64(kakel_rows_base + id * 8) * FONT_H,
+                 load64(kakel_bg_base + id * 8));
+    store64(kakel_row_base + id * 8, 0);
+    store64(kakel_col_base + id * 8, 0);
+    store64(kakel_crow_base + id * 8, 0 - 1);
+    store64(kakel_ccol_base + id * 8, 0 - 1);
+    return;
+}
+
+// Wraps val to [0, limit) when val < 2*limit — only used for advancing
+// ring indices by 1, where the wrap is always at most one subtraction.
+int kakel_wrap_inc(int val, int limit) {
+    if (val >= limit) { return val - limit; }
+    return val;
+}
+
+// Finds which row a given window id belongs to. Returns 0 or 1, or -1 if
+// the window is not in any ring (should not happen for shell windows).
+int kakel_find_row(int wid) {
+    int r = 0;
+    while (r < kakel_rows) {
+        int cnt = load64(kakel_ring_cnt + r * 8);
+        int i = 0;
+        while (i < cnt) {
+            if (load64(kakel_ring_ids + (r * KAKEL_MAX_RING + i) * 8) == wid) {
+                return r;
+            }
+            i = i + 1;
+        }
+        r = r + 1;
+    }
+    return -1;
+}
+
+// Finds a window's position in its row's ring. Returns the ring index, or -1.
+int kakel_ring_pos(int row, int wid) {
+    int cnt = load64(kakel_ring_cnt + row * 8);
+    int i = 0;
+    while (i < cnt) {
+        if (load64(kakel_ring_ids + (row * KAKEL_MAX_RING + i) * 8) == wid) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Moves focus to the next window in reading order (top row left-to-right,
+// then bottom row left-to-right, then wrap). If the next window is beyond
+// the visible ones in its ring, the ring is rotated (head advanced) to
+// bring it into view. Called from keyboard_handler on Alt+Tab.
+void kakel_focus_next() {
+    int old = kakel_focus;
+    int row = kakel_find_row(old);
+    if (row < 0) { return; }
+    int pos = kakel_ring_pos(row, old);
+    if (pos < 0) { return; }
+    int cnt = load64(kakel_ring_cnt + row * 8);
+    int vis = load64(kakel_ring_vis + row * 8);
+    int head = load64(kakel_ring_head + row * 8);
+
+    // Next position in this row's ring
+    int next_pos = pos + 1;
+    int next_row = row;
+    if (next_pos >= cnt) {
+        // End of this row's ring: move to next row
+        next_row = row + 1;
+        if (next_row >= kakel_rows) { next_row = 0; }
+        next_pos = 0;
+        cnt = load64(kakel_ring_cnt + next_row * 8);
+        if (cnt == 0) { return; }  // should not happen
+    }
+
+    // If the next window is not currently visible, rotate the row's ring
+    // so it becomes the leftmost visible slot.
+    vis = load64(kakel_ring_vis + next_row * 8);
+    head = load64(kakel_ring_head + next_row * 8);
+    if (next_pos >= vis) {
+        head = head + 1;
+        if (head >= cnt) { head = head - cnt; }
+        store64(kakel_ring_head + next_row * 8, head);
+        kakel_reflow();
+    }
+
+    int nf = load64(kakel_ring_ids + (next_row * KAKEL_MAX_RING + next_pos) * 8);
+    kakel_focus = nf;
+
+    // Retint cursors
+    int crow = load64(kakel_crow_base + old * 8);
+    if (crow >= 0) {
+        kakel_draw_cursor(old, crow, load64(kakel_ccol_base + old * 8), KAKEL_DIM);
+    }
+    crow = load64(kakel_crow_base + nf * 8);
+    if (crow >= 0) {
+        kakel_draw_cursor(nf, crow, load64(kakel_ccol_base + nf * 8), FB_FG);
+    }
+    return;
+}
+
+// Allocates a window slot (first with rows == 0, i.e. unused) and sets its
+// geometry. Returns the id, or -1 if the table is full.
+int kakel_win_new(int cx, int cy, int cols, int rows, int bg) {
+    int id = 0;
+    while (id < KAKEL_MAX_WIN) {
+        if (load64(kakel_rows_base + id * 8) == 0 && id != kakel_stats_win) {
+            break;
+        }
+        id = id + 1;
+    }
+    if (id >= KAKEL_MAX_WIN) { return -1; }
+    store64(kakel_cx_base + id * 8, cx);
+    store64(kakel_cy_base + id * 8, cy);
+    store64(kakel_cols_base + id * 8, cols);
+    store64(kakel_rows_base + id * 8, rows);
+    store64(kakel_row_base + id * 8, 0);
+    store64(kakel_col_base + id * 8, 0);
+    store64(kakel_crow_base + id * 8, 0 - 1);
+    store64(kakel_ccol_base + id * 8, 0 - 1);
+    store64(kakel_bg_base + id * 8, bg);
+    return id;
+}
+
+// Marks a window slot as free so kakel_win_new can reuse it.
+void kakel_win_free(int id) {
+    store64(kakel_rows_base + id * 8, 0);
+    store64(kakel_cols_base + id * 8, 0);
+    store64(kakel_cx_base + id * 8, 0);
+    store64(kakel_cy_base + id * 8, 0);
+    store64(kakel_cols_base + id * 8, 0);
+    store64(kakel_row_base + id * 8, 0);
+    store64(kakel_crow_base + id * 8, 0 - 1);
+    store64(kakel_ccol_base + id * 8, 0 - 1);
+    return;
+}
+
+// Updates a window's cell geometry and clamps its cursor if it now falls
+// outside the new bounds.
+void kakel_resize(int id, int cx, int cy, int cols, int rows) {
+    store64(kakel_cx_base + id * 8, cx);
+    store64(kakel_cy_base + id * 8, cy);
+    store64(kakel_cols_base + id * 8, cols);
+    store64(kakel_rows_base + id * 8, rows);
+    int row = load64(kakel_row_base + id * 8);
+    int col = load64(kakel_col_base + id * 8);
+    if (row >= rows) { row = rows - 1; }
+    if (col >= cols) { col = 0; }
+    store64(kakel_row_base + id * 8, row);
+    store64(kakel_col_base + id * 8, col);
+    return;
+}
+
+// Recalculates the cell geometry of every visible window from the ring
+// state. Called after split, close, or a ring rotation. Also updates
+// kakel_shell_wins to reflect the total number of visible shell windows.
+void kakel_reflow() {
+    int all_cols = fb_width / FONT_W;
+    int all_rows = fb_height / FONT_H;
+    int shell_rows = all_rows - KAKEL_LOG_ROWS;
+    int total_vis = 0;
+
+    if (kakel_rows == 1) {
+        int vis0 = load64(kakel_ring_vis);
+        int cnt0 = load64(kakel_ring_cnt);
+        int head0 = load64(kakel_ring_head);
+        if (vis0 == 1) {
+            int w = load64(kakel_ring_ids + (0 * KAKEL_MAX_RING + head0) * 8);
+            kakel_resize(w, 0, 0, all_cols, shell_rows);
+            total_vis = 1;
+        } else {
+            int half = all_cols / 2;
+            int w0 = load64(kakel_ring_ids + (0 * KAKEL_MAX_RING + head0) * 8);
+            int w1i = kakel_wrap_inc(head0 + 1, cnt0);
+            int w1 = load64(kakel_ring_ids + (0 * KAKEL_MAX_RING + w1i) * 8);
+            kakel_resize(w0, 0, 0, half, shell_rows);
+            kakel_resize(w1, half, 0, all_cols - half, shell_rows);
+            total_vis = 2;
+        }
+    } else {
+        int row_h = shell_rows / 2;
+        // Row 0 (top)
+        int vis0 = load64(kakel_ring_vis);
+        int cnt0 = load64(kakel_ring_cnt);
+        int head0 = load64(kakel_ring_head);
+        if (vis0 == 1) {
+            int w = load64(kakel_ring_ids + (0 * KAKEL_MAX_RING + head0) * 8);
+            kakel_resize(w, 0, 0, all_cols, row_h);
+            total_vis = total_vis + 1;
+        } else {
+            int half = all_cols / 2;
+            int w0 = load64(kakel_ring_ids + (0 * KAKEL_MAX_RING + head0) * 8);
+            int w1i = kakel_wrap_inc(head0 + 1, cnt0);
+            int w1 = load64(kakel_ring_ids + (0 * KAKEL_MAX_RING + w1i) * 8);
+            kakel_resize(w0, 0, 0, half, row_h);
+            kakel_resize(w1, half, 0, all_cols - half, row_h);
+            total_vis = total_vis + 2;
+        }
+        // Row 1 (bottom)
+        int vis1 = load64(kakel_ring_vis + 8);
+        int cnt1 = load64(kakel_ring_cnt + 8);
+        int head1 = load64(kakel_ring_head + 8);
+        if (vis1 == 1) {
+            int w = load64(kakel_ring_ids + (1 * KAKEL_MAX_RING + head1) * 8);
+            kakel_resize(w, 0, row_h, all_cols, shell_rows - row_h);
+            total_vis = total_vis + 1;
+        } else {
+            int half = all_cols / 2;
+            int w0 = load64(kakel_ring_ids + (1 * KAKEL_MAX_RING + head1) * 8);
+            int w1i = kakel_wrap_inc(head1 + 1, cnt1);
+            int w1 = load64(kakel_ring_ids + (1 * KAKEL_MAX_RING + w1i) * 8);
+            kakel_resize(w0, 0, row_h, half, shell_rows - row_h);
+            kakel_resize(w1, half, row_h, all_cols - half, shell_rows - row_h);
+            total_vis = total_vis + 2;
+        }
+    }
+    kakel_shell_wins = total_vis;
+
+    // Repaint every visible window (clear + redraw would lose content, but
+    // clearing is the safest way to avoid stale pixels from old geometries).
+    // The shell will re-prompt on the next Enter anyway.
+    int r = 0;
+    while (r < kakel_rows) {
+        int cnt = load64(kakel_ring_cnt + r * 8);
+        int vis = load64(kakel_ring_vis + r * 8);
+        int head = load64(kakel_ring_head + r * 8);
+        int i = 0;
+        while (i < vis) {
+            int wid = load64(kakel_ring_ids + (r * KAKEL_MAX_RING + kakel_wrap_inc(head + i, cnt)) * 8);
+            kakel_clear(wid);
+            i = i + 1;
+        }
+        r = r + 1;
+    }
+    return;
+}
+
+// Adds a window to a row's ring after a given position. If after_pos < 0,
+// appends to the end of the ring. Returns 0 on success, -1 if the ring is
+// full (KAKEL_MAX_RING windows already in this row).
+int kakel_ring_add(int row, int wid, int after_pos) {
+    int cnt = load64(kakel_ring_cnt + row * 8);
+    if (cnt >= KAKEL_MAX_RING) { return -1; }
+    // Shift everything after the insertion point right by one
+    int i = cnt;
+    while (i > after_pos + 1) {
+        int prev = load64(kakel_ring_ids + (row * KAKEL_MAX_RING + i - 1) * 8);
+        store64(kakel_ring_ids + (row * KAKEL_MAX_RING + i) * 8, prev);
+        i = i - 1;
+    }
+    store64(kakel_ring_ids + (row * KAKEL_MAX_RING + after_pos + 1) * 8, wid);
+    store64(kakel_ring_cnt + row * 8, cnt + 1);
+    return 0;
+}
+
+// Removes a window from a row's ring by compacting. Returns 0 on success.
+void kakel_ring_remove(int row, int wid) {
+    int cnt = load64(kakel_ring_cnt + row * 8);
+    int head = load64(kakel_ring_head + row * 8);
+    int vis = load64(kakel_ring_vis + row * 8);
+    int w = 0;
+    int found = -1;
+    int i = 0;
+    while (i < cnt) {
+        if (load64(kakel_ring_ids + (row * KAKEL_MAX_RING + i) * 8) == wid) {
+            found = i;
+        }
+        i = i + 1;
+    }
+    if (found < 0) { return; }
+    // Compact
+    i = found;
+    while (i < cnt - 1) {
+        int next = load64(kakel_ring_ids + (row * KAKEL_MAX_RING + i + 1) * 8);
+        store64(kakel_ring_ids + (row * KAKEL_MAX_RING + i) * 8, next);
+        i = i + 1;
+    }
+    store64(kakel_ring_cnt + row * 8, cnt - 1);
+    // Adjust head if we removed something before or at the head
+    if (found < head) {
+        store64(kakel_ring_head + row * 8, head - 1);
+    } else if (found == head && cnt > 1) {
+        // Head removed: new head is the next one, wrapping
+        int new_cnt = cnt - 1;
+        if (head >= new_cnt) { store64(kakel_ring_head + row * 8, 0); }
+    }
+    return;
+}
+
+// Splits the focused window's row: if 1 visible, becomes 2 columns. If 2
+// visible and only 1 row, splits into 2 rows (creating a new row with 2
+// windows — taking total visible from 2 to 4). Otherwise adds a hidden
+// window to the focused row's ring.
+void kakel_split() {
+    int row = kakel_find_row(kakel_focus);
+    if (row < 0) { return; }
+    int vis = load64(kakel_ring_vis + row * 8);
+    int cnt = load64(kakel_ring_cnt + row * 8);
+    int head = load64(kakel_ring_head + row * 8);
+    int pos = kakel_ring_pos(row, kakel_focus);
+
+    if (vis == 1) {
+        // Split 1 column → 2 columns in the same row.
+        int nid = kakel_win_new(0, 0, 1, 1,
+            load64(kakel_bg_palette + ((kakel_shell_wins - (kakel_shell_wins / 6) * 6) * 8)));
+        if (nid < 0) { return; }
+        kakel_ring_add(row, nid, head);
+        store64(kakel_ring_vis + row * 8, 2);
+        kakel_reflow();
+    } else if (vis == 2 && kakel_rows == 1) {
+        // Split 1 row → 2 rows. Create a new row 1 with one new window.
+        store64(kakel_ring_cnt + 8, 0);
+        store64(kakel_ring_head + 8, 0);
+        store64(kakel_ring_vis + 8, 1);
+        int nid = kakel_win_new(0, 0, 1, 1,
+            load64(kakel_bg_palette + ((kakel_shell_wins - (kakel_shell_wins / 6) * 6) * 8)));
+        if (nid >= 0) { kakel_ring_add(1, nid, -1); }
+        kakel_rows = 2;
+        kakel_reflow();
+    } else if (vis == 2 && kakel_rows == 2) {
+        // Focused row is full. If the other row has room, split that one.
+        int other = 1 - row;
+        int other_vis = load64(kakel_ring_vis + other * 8);
+        if (other_vis == 1) {
+            int nid = kakel_win_new(0, 0, 1, 1,
+                load64(kakel_bg_palette + ((kakel_shell_wins - (kakel_shell_wins / 6) * 6) * 8)));
+            if (nid >= 0) {
+                int ohead = load64(kakel_ring_head + other * 8);
+                kakel_ring_add(other, nid, ohead);
+                store64(kakel_ring_vis + other * 8, 2);
+                kakel_reflow();
+            }
+        } else {
+            sk_print("split: all 4 slots are full\n");
+        }
+    } else {
+        sk_print("split: all 4 slots are full\n");
+    }
+    return;
+}
+
+// Removes the focused window. If its row had 2 visible, drops to 1 (full
+// width). If it had 1 visible, the entire row is removed and the other row
+// expands to fill the space. The window's shell session is abandoned (its
+// line buffer stays allocated — leak is bounded by KAKEL_MAX_WIN).
+// If this is the last window (1 row, 1 visible), it is closed and a single
+// fresh window replaces it so the screen is never windowless.
+void kakel_close() {
+    int wid = kakel_focus;
+    int row = kakel_find_row(wid);
+    if (row < 0) { return; }
+    int vis = load64(kakel_ring_vis + row * 8);
+
+    if (vis == 2) {
+        // Drop to 1 visible in this row.
+        kakel_ring_remove(row, wid);
+        kakel_win_free(wid);
+        store64(kakel_ring_vis + row * 8, 1);
+        if (load64(kakel_ring_cnt + row * 8) > 0) {
+            int head = load64(kakel_ring_head + row * 8);
+            kakel_focus = load64(kakel_ring_ids + (row * KAKEL_MAX_RING + head) * 8);
+        }
+        kakel_reflow();
+        return;
+    }
+    if (vis == 1 && kakel_rows == 2) {
+        // Remove this entire row. The other row expands to fill the screen.
+        kakel_ring_remove(row, wid);
+        kakel_win_free(wid);
+        if (row == 0) {
+            // Row 0 removed: shift row 1's ring up to row 0.
+            int i = 0;
+            int cnt1 = load64(kakel_ring_cnt + 8);
+            while (i < cnt1) {
+                int w = load64(kakel_ring_ids + (1 * KAKEL_MAX_RING + i) * 8);
+                store64(kakel_ring_ids + (0 * KAKEL_MAX_RING + i) * 8, w);
+                i = i + 1;
+            }
+            store64(kakel_ring_cnt, cnt1);
+            store64(kakel_ring_head, load64(kakel_ring_head + 8));
+            store64(kakel_ring_vis, load64(kakel_ring_vis + 8));
+        }
+        // Row 1 ring state is stale but ignored once kakel_rows == 1.
+        kakel_rows = 1;
+        store64(kakel_ring_cnt + 8, 0);
+        if (load64(kakel_ring_cnt) > 0) {
+            kakel_focus = load64(kakel_ring_ids + (0 * KAKEL_MAX_RING + 0) * 8);
+        }
+        kakel_reflow();
+        return;
+    }
+    // Last window (1 row, 1 visible). Replace it with a fresh window so the
+    // screen is never windowless — the old session is abandoned.
+    if (vis == 1 && kakel_rows == 1) {
+        int old = wid;
+        // Pick a bg colour that cycles past the just-freed window's palette
+        // slot so the new window looks distinct.
+        int new_bg = load64(kakel_bg_palette + ((kakel_count - (kakel_count / 6) * 6) * 8));
+        kakel_ring_remove(row, old);
+        kakel_win_free(old);
+        // The ring is now empty — add one fresh window.
+        int nid = kakel_win_new(0, 0, 1, 1, new_bg);
+        if (nid >= 0) {
+            kakel_ring_add(0, nid, -1);
+        }
+        store64(kakel_ring_vis, 1);
+        if (load64(kakel_ring_cnt) > 0) {
+            kakel_focus = load64(kakel_ring_ids + (0 * KAKEL_MAX_RING + 0) * 8);
+        }
+        kakel_reflow();
+        kakel_print(nid, "\ntype 'help' for commands.\n");
+        return;
+    }
+    return;
+}
+
+// --- Status bar helpers (kakel_stats_win) ---
+// The stats bar is a 1-row window at the top of the log strip, refreshed
+// each scheduler tick with live system info. These thin wrappers guard
+// against the window not existing (VGA fallback, pre-init).
+
+void kakel_stats_putc(int c) {
+    if (kakel_stats_win < 0) { return; }
+    kakel_putc(kakel_stats_win, c);
+    return;
+}
+
+void kakel_stats_print(int s) {
+    if (kakel_stats_win < 0) { return; }
+    kakel_print(kakel_stats_win, s);
+    return;
+}
+
+void kakel_stats_clear() {
+    if (kakel_stats_win < 0) { return; }
+    kakel_clear(kakel_stats_win);
+    return;
+}
+
+// Writes an unsigned integer into the stats bar, one character at a time,
+// using the same digit-extraction shape as serial_print_int.
+void kakel_stats_int(int v) {
+    if (kakel_stats_win < 0) { return; }
+    int tmp = kscratch_start;
+    int i = 31;
+    if (v == 0) { kakel_putc(kakel_stats_win, '0'); return; }
+    while (v > 0) {
+        i = i - 1;
+        store8(tmp + i, '0' + (v - (v / 10) * 10));
+        v = v / 10;
+    }
+    while (i < 31) {
+        kakel_putc(kakel_stats_win, load8(tmp + i));
+        i = i + 1;
+    }
+    return;
+}
+
+// Brings up the initial window layout: one full-screen shell window (minus
+// the 1-row status bar at the very bottom). The user can split it into
+// more windows at runtime via the `split` command in skalman. The ring
+// state tracks which windows are visible and in what order. Runs in
+// kernel_post_init AFTER the full-screen boot banner and BEFORE
+// shell_init.
+void kakel_init() {
+    if (fb_available != 1) { return; }
+    kakel_cx_base = kmalloc(KAKEL_MAX_WIN * 8);
+    kakel_cy_base = kmalloc(KAKEL_MAX_WIN * 8);
+    kakel_cols_base = kmalloc(KAKEL_MAX_WIN * 8);
+    kakel_rows_base = kmalloc(KAKEL_MAX_WIN * 8);
+    kakel_row_base = kmalloc(KAKEL_MAX_WIN * 8);
+    kakel_col_base = kmalloc(KAKEL_MAX_WIN * 8);
+    kakel_crow_base = kmalloc(KAKEL_MAX_WIN * 8);
+    kakel_ccol_base = kmalloc(KAKEL_MAX_WIN * 8);
+    kakel_bg_base = kmalloc(KAKEL_MAX_WIN * 8);
+    kakel_prompt_col_base = kmalloc(KAKEL_MAX_WIN * 8);
+    KAKEL_DIM = fb_rgb(100, 100, 100);
+
+    // Ring state: two rows, each with KAKEL_MAX_RING slots
+    kakel_ring_ids = kmalloc(2 * KAKEL_MAX_RING * 8);
+    kakel_ring_cnt = kmalloc(2 * 8);
+    kakel_ring_head = kmalloc(2 * 8);
+    kakel_ring_vis = kmalloc(2 * 8);
+
+    // Background palette for dynamically-created windows
+    kakel_bg_palette = kmalloc(6 * 8);
+    store64(kakel_bg_palette, FB_BG);                         // black
+    store64(kakel_bg_palette + 8, fb_rgb(16, 16, 48));       // navy
+    store64(kakel_bg_palette + 16, fb_rgb(16, 48, 16));      // dark green
+    store64(kakel_bg_palette + 24, fb_rgb(48, 16, 16));      // dark red
+    store64(kakel_bg_palette + 32, fb_rgb(48, 48, 16));      // dark yellow
+    store64(kakel_bg_palette + 40, fb_rgb(48, 16, 48));      // dark magenta
+
+    int all_cols = fb_width / FONT_W;
+    int all_rows = fb_height / FONT_H;
+    int shell_rows = all_rows - KAKEL_LOG_ROWS;
+
+    // One full-screen shell window
+    int w0 = kakel_win_new(0, 0, all_cols, shell_rows, FB_BG);
+    kakel_focus = w0;
+
+    // Status bar at the very bottom -- not focusable
+    kakel_stats_win = kakel_win_new(0, shell_rows, all_cols, 1,
+                                     fb_rgb(12, 12, 48));
+
+    // Initialize ring: row 0 has 1 visible window (w0)
+    store64(kakel_ring_cnt, 1);
+    store64(kakel_ring_head, 0);
+    store64(kakel_ring_vis, 1);
+    store64(kakel_ring_ids, w0);
+    store64(kakel_ring_cnt + 8, 0);
+    store64(kakel_ring_head + 8, 0);
+    store64(kakel_ring_vis + 8, 0);
+    kakel_rows = 1;
+    kakel_shell_wins = 1;
+
+    kakel_clear(w0);
+    kakel_clear(kakel_stats_win);
+    kakel_active = 1;
+    return;
+}
+
+// Test-only scroll proof for test_kakel_scroll.sh. Dead code in normal
+// boots — called only when the test injects a call in kernel_post_init
+// (same pattern as trigger_doublefault in boot.s). Writes a marker 'M' at
+// the current cursor (row 3 after the boot banner), floods newlines to
+// trigger exactly one scroll, then reads back pixel rows 16 (where the
+// marker should have moved to) and 24 (where it used to be, which should
+// now be background).
+void kakel_test_scroll() {
+    // Put marker at row 1 (pixel row 8), then flood newlines to trigger
+    // one scroll. shell_rows = 95, starting from row 2 after the first
+    // NL, 94 more NLs → row 96 → scroll at 95. After scroll the marker
+    // moves from pixel row 8 to pixel row 0.
+    kakel_putc(0, '\n');
+    kakel_putc(0, 'M');
+    kakel_putc(0, '\n');
+    int i = 0;
+    while (i < 93) {
+        kakel_putc(0, '\n');
+        i = i + 1;
+    }
+    int moved = 0;
+    int cleared = 0;
+    int py = 0;
+    int px = 0;
+    while (py < 8) {
+        px = 0;
+        while (px < 8) {
+            if (load32(fb_addr + (0 + py) * fb_pitch + px * 4) == FB_FG) {
+                moved = moved + 1;
+            }
+            if (load32(fb_addr + (8 + py) * fb_pitch + px * 4) == FB_FG) {
+                cleared = cleared + 1;
+            }
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    serial_print("kakel scroll: moved=");
+    serial_print_int(moved);
+    serial_print(" cleared=");
+    serial_print_int(cleared);
+    serial_print("\n");
+    return;
+}

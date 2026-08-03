@@ -1,0 +1,150 @@
+// kmain.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// kmain.c0 -- Moonshot's entry point, compiled by coff1 (see build.sh).
+// This file is now deliberately thin: the fixed hand-off slot addresses
+// every subsystem shares (below), and a set of `include` directives
+// pulling in the actual kernel code -- knekt (core/entry), serial,
+// interrupts, jenna (memory/paging + kernel heap), chrone (scheduler), vga
+// (text-mode fallback), punkt (pixel framebuffer + font renderer), kakel
+// (the tiled windowing layer), keyboard, skalman (the interactive shell).
+//
+// Why split at all: this used to be one 1700+ line file, and Moonshot is
+// meant to be worked on indefinitely -- staying organized as it grows
+// matters more here than in a short-lived project. Why textual `include`
+// rather than real separate compilation: see c0-coff's own notes on the
+// feature (added specifically for this) -- real separate compilation would
+// need "how does one translation unit call another by name," a wall this
+// project has already worked around with indirect calls several times
+// because nothing has needed it; the actual problem was file organization,
+// not a compilation-model one. Include order below doesn't affect
+// correctness (c0's two-pass resolve makes forward references across the
+// whole expanded program work regardless of which file a name was written
+// in), just reading order.
+//
+// `main` can't take parameters (coff0.c requires zero), so the Multiboot
+// info pointer GRUB leaves in EBX at boot doesn't arrive as an argument:
+// boot.s stashes it into a fixed memory slot (linker.ld pins .mbinfo's
+// address at exactly 1048576 = 0x100000 = 1M) as its very first
+// instruction, and main() (knekt.c0) reads it back from that literal
+// address with load8 -- no new compiler builtin needed, just the same
+// "everything is bytes at an address" approach c0 already uses everywhere
+// else. The same fixed-slot technique, in reverse, is how other files
+// learn the ISR trampoline entry addresses (externally-defined
+// hand-written-asm symbols c0 has no way to reference directly) and how
+// boot.s learns where to find the IDTR structure knekt.c0 builds -- see
+// linker.ld for every fixed address.
+//
+// Every fixed hand-off slot address lives HERE, centralized, regardless of
+// which subsystem file actually consumes it -- these are the boot.s<->c0
+// ABI contract, not any one subsystem's own state. The NOBITS section
+// addresses (kscratch, idt, dispatch, _kernel_end) are linker-resolved via
+// extern declarations below — no more sync_addrs.sh patching for those.
+// Only the JIT helper addresses still need patching after a size change.
+
+int MBINFO_ADDR = 0x100000;
+int ISRINFO_TIMER_ADDR = 0x100008;
+int ISRINFO_KEYBOARD_ADDR = 0x100010;
+int IDTR_ADDR = 0x100018;
+int CR3INFO_ADDR = 0x100028;
+// .excinfo slots -- boot.s stashes each exception ISR trampoline's address
+// here, knekt.c0 reads them back to fill the IDT (same hand-off as .isrinfo).
+int EXCINFO_PF_ADDR = 0x100030;
+int EXCINFO_DIV_ADDR = 0x100038;
+int EXCINFO_INVOP_ADDR = 0x100040;
+int EXCINFO_GPF_ADDR = 0x100048;
+// .sched slots (chrone). See linker.ld for the full rationale; briefly:
+// [2] the address isr_common should save the outgoing task's rsp into
+// (SCHED_SAVE_SLOT_ADDR); [3] the incoming task's saved rsp for isr_common
+// to load (SCHED_NEXT_RSP); [4] switch-requested flag, set by sched_tick,
+// cleared by isr_common (SCHED_SWITCH_PENDING); [5] boot.s's sched_launch
+// address, called indirectly exactly once. sched_current (which task is
+// running) is pure c0-side bookkeeping asm never touches, so it's an
+// ordinary global in chrone.c0 rather than a slot.
+//
+// SCHED_TASK0_RSP/TASK1_RSP held the two hardcoded tasks' saved rsps under
+// the old fixed 2-task layout; that layout was replaced with a
+// heap-allocated N-task table (chrone.c0's task_rsp_base etc.), so these two
+// slots are now UNUSED -- retained only so no fixed address after them has to
+// shift (isr_common never referenced them; it reads rsp slots via the
+// SCHED_SAVE_SLOT_ADDR/SCHED_NEXT_RSP hand-off, which still work unchanged).
+int SCHED_TASK0_RSP = 0x100070;
+int SCHED_TASK1_RSP = 0x100078;
+int SCHED_SAVE_SLOT_ADDR = 0x100080;
+int SCHED_NEXT_RSP = 0x100088;
+int SCHED_SWITCH_PENDING = 0x100090;
+int SCHED_LAUNCH_ADDR = 0x100098;
+// .excinfo2 slots -- second batch of exception ISR trampoline hand-offs,
+// same pattern as .excinfo above, added when the remaining CPU exception
+// vectors got pointed at panic_handler. Placed after .sched (not by growing
+// .excinfo) specifically so no address above this line had to change.
+int EXCINFO_DEBUG_ADDR = 0x1000B0;        // #1
+int EXCINFO_NMI_ADDR = 0x1000B8;          // #2
+int EXCINFO_BREAKPOINT_ADDR = 0x1000C0;   // #3
+int EXCINFO_OVERFLOW_ADDR = 0x1000C8;     // #4
+int EXCINFO_BOUNDRANGE_ADDR = 0x1000D0;   // #5
+int EXCINFO_DEVNOTAVAIL_ADDR = 0x1000D8;  // #7
+int EXCINFO_INVALIDTSS_ADDR = 0x1000E0;   // #10
+int EXCINFO_SEGNOTPRESENT_ADDR = 0x1000E8; // #11
+int EXCINFO_STACKFAULT_ADDR = 0x1000F0;   // #12
+int EXCINFO_FPUERROR_ADDR = 0x1000F8;     // #16
+int EXCINFO_ALIGNMENT_ADDR = 0x100100;    // #17
+int EXCINFO_MACHINECHECK_ADDR = 0x100108; // #18
+int EXCINFO_SIMDFP_ADDR = 0x100110;       // #19
+// .haltinfo slot -- boot.s's halt_cpu (hlt; ret) address, called indirectly
+// (see knekt.c0's halt()) so panic_handler can idle instead of busy-spinning.
+int HALTINFO_ADDR = 0x100130;
+// .sctable slots -- flat 256-byte scancode(make code)->ASCII lookup
+// tables, unshifted then shifted, populated once by scancode_init() (see
+// keyboard.c0). See linker.ld for why these need a real fixed buffer
+// instead of alloc().
+int SCANCODE_TABLE_ADDR = 0x100138;
+int SCANCODE_SHIFT_TABLE_ADDR = 0x100238;
+// .dfinfo slot -- boot.s stashes isr_doublefault_entry (#8) here, knekt.c0
+// reads it back to install vector 8. Placed after .sctable (0x100138 + 512 =
+// 0x100338) so adding it shifted no earlier fixed address, same discipline as
+// .excinfo2. NOT covered by sync_addrs.sh (like the SCANCODE literals above) --
+// a fixed-slot addition before .dfinfo would need this updated by hand.
+int EXCINFO_DF_ADDR = 0x100338;
+int RING3INFO_ADDR = 0x100340;
+// Linker-resolved extern symbols for the NOBITS sections (see linker.ld).
+// kscratch_start / idt_start / dispatch_start / _kernel_end are defined by
+// the linker script. An extern name in expression context evaluates to its
+// address (lea rax, [name]), so e.g. `store64(kscratch_start + 1800, 0)`
+// writes directly to the kscratch buffer without needing a hardcoded
+// literal or sync_addrs.sh patching.
+extern int kscratch_start;
+extern int idt_start;
+extern int dispatch_start;
+extern int _kernel_end;
+
+// JIT helper addresses — still patched by sync_addrs.sh for now. These
+// must remain plain integer globals (not externs) because the function
+// names would collide with extern declarations in the same translation
+// unit. The values are the runtime addresses of jit_print_helper /
+// jit_print_str_helper / jit_assign_helper, patched after the ELF is linked.
+int JIT_PRINT_ADDR = 1176322;
+int JIT_PRINT_STR_ADDR = 1176371;
+int JIT_ASSIGN_ADDR = 1176446;
+
+include "serial.c0";
+include "interrupts.c0";
+include "jenna.c0";
+include "chrone.c0";
+include "vga.c0";
+include "punkt.c0";
+include "kakel.c0";
+include "skalman.c0";
+include "keyboard.c0";
+include "ata.c0";
+include "jakel.c0";
+include "jit.c0";
+include "repl.c0";
+include "skrift.c0";
+include "syscall.c0";
+include "knekt.c0";

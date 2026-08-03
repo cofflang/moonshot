@@ -1,0 +1,1154 @@
+// repl.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// repl.c0 — c0 expression evaluator (interpret mode) for the skalman shell.
+// Parses a subset of c0, builds an AST in kernel heap memory, walks the tree
+// to compute a 64-bit result, and prints it. No machine code emission — pure
+// interpretation. Supports if/else, while loops, and blocks.
+// Deferred: function calls, strings, indexing.
+//
+// Entry point: repl_eval(src) — called from skalman's `eval <expr>` builtin.
+
+// --- token kinds -----------------------------------------------------------
+int TK_NUM   = 1;
+int TK_IDENT = 2;
+int TK_PLUS  = 3;
+int TK_MINUS = 4;
+int TK_STAR  = 5;
+int TK_SLASH = 6;
+int TK_LPAREN = 7;
+int TK_RPAREN = 8;
+int TK_ASSIGN = 9;
+int TK_EQ    = 10;
+int TK_NE    = 11;
+int TK_LT    = 12;
+int TK_LE    = 13;
+int TK_GT    = 14;
+int TK_GE    = 15;
+int TK_PRINT = 16;
+int TK_EOF   = 17;
+int TK_IF    = 18;
+int TK_ELSE  = 19;
+int TK_WHILE = 20;
+int TK_LBRACE = 21;
+int TK_RBRACE = 22;
+int TK_SEMI  = 23;
+int TK_FOR   = 24;
+int TK_BREAK    = 25;
+int TK_CONTINUE = 26;
+int TK_STR    = 27;
+int TK_COMMA  = 28;
+
+// --- AST node kinds --------------------------------------------------------
+int ND_NUM   = 1;
+int ND_VAR   = 2;
+int ND_ASSIGN = 3;
+int ND_ADD   = 4;
+int ND_SUB   = 5;
+int ND_MUL   = 6;
+int ND_DIV   = 7;
+int ND_NEG   = 8;
+int ND_EQ    = 9;
+int ND_NE    = 10;
+int ND_LT    = 11;
+int ND_LE    = 12;
+int ND_GT    = 13;
+int ND_GE    = 14;
+int ND_PRINT = 15;
+int ND_EXPR_STMT = 16;
+int ND_IF    = 17;
+int ND_WHILE = 18;
+int ND_BLOCK = 19;
+int ND_FOR   = 20;
+int ND_BREAK    = 21;
+int ND_CONTINUE = 22;
+int ND_STR   = 23;
+int ND_CALL  = 24;
+
+// --- break/continue state (global flags for non-local control flow) ---------
+// The evaluator is a recursive tree-walker; break/continue signal across
+// stack frames via these globals. Each loop (ND_WHILE/ND_FOR) clears them
+// before evaluating its body and checks them afterward. ND_BLOCK and other
+// compound statements propagate them by stopping iteration when either is set.
+int repl_break_flag    = 0;
+int repl_continue_flag = 0;
+int repl_loop_depth    = 0;   // incremented while inside a loop body
+
+// --- symbol table (session-persistent) -------------------------------------
+int REPL_MAX_VARS = 32;
+int repl_var_names = 0;   // kmalloc'd array of 32 name pointers (lazy init)
+int repl_var_values = 0;  // kmalloc'd array of 32 ints (lazy init)
+int repl_var_count = 0;   // number of live variables
+int repl_last_result = 0; // result of most recent repl_eval_ret call
+int repl_last_ok     = 0; // 1 = success, 0 = error (lex/parse/runtime)
+
+// Soft colour palette for REPL output (screen only, serial is unaffected).
+int REPL_CLR_OK  = 0; // green for [repl]/[jit] results
+int REPL_CLR_JIT = 0; // cyan for [jit] prefix
+int REPL_CLR_ERR = 0; // red for errors
+int repl_colors_ready = 0;
+
+// Returns the index of the variable whose name matches the `len` bytes at
+// `name`, or -1 if not found.
+int repl_lookup(int name, int len) {
+    if (repl_var_names == 0) { return -1; }
+    int i = 0;
+    while (i < repl_var_count) {
+        int vname = load64(repl_var_names + i * 8);
+        // Compare name lengths and bytes.
+        int j = 0;
+        int match = 1;
+        while (j < len) {
+            if (load8(vname + j) != load8(name + j)) { match = 0; break; }
+            j = j + 1;
+        }
+        if (match == 1 && load8(vname + len) == 0) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Assign `value` to the variable named by the `len` bytes at `name`.
+// Creates a new variable if one does not already exist; updates otherwise.
+// Returns the assigned value. Silently drops assignments when the table
+// is full.
+int repl_assign(int name, int len, int value) {
+    // Lazy-init the symbol table on first use.
+    if (repl_var_names == 0) {
+        repl_var_names = kmalloc(REPL_MAX_VARS * 8);
+        repl_var_values = kmalloc(REPL_MAX_VARS * 8);
+        repl_var_count = 0;
+    }
+    int idx = repl_lookup(name, len);
+    if (idx >= 0) {
+        store64(repl_var_values + idx * 8, value);
+        return value;
+    }
+    if (repl_var_count >= REPL_MAX_VARS) { return value; }
+    // Allocate and copy the name.
+    int name_buf = kmalloc(len + 1);
+    int j = 0;
+    while (j < len) {
+        store8(name_buf + j, load8(name + j));
+        j = j + 1;
+    }
+    store8(name_buf + len, 0);
+    store64(repl_var_names + repl_var_count * 8, name_buf);
+    store64(repl_var_values + repl_var_count * 8, value);
+    repl_var_count = repl_var_count + 1;
+    return value;
+}
+
+// --- lexer -----------------------------------------------------------------
+// Character classification (same as coff's lexer).
+int repl_is_digit(int c) {
+    if (c >= '0' && c <= '9') { return 1; }
+    return 0;
+}
+int repl_is_hex_digit(int c) {
+    if (repl_is_digit(c) == 1) { return 1; }
+    if (c >= 'a' && c <= 'f') { return 1; }
+    if (c >= 'A' && c <= 'F') { return 1; }
+    return 0;
+}
+int repl_hex_value(int c) {
+    if (c >= '0' && c <= '9') { return c - '0'; }
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+    return 0;
+}
+int repl_is_ident_start(int c) {
+    if (c >= 'a' && c <= 'z') { return 1; }
+    if (c >= 'A' && c <= 'Z') { return 1; }
+    if (c == '_') { return 1; }
+    return 0;
+}
+int repl_is_ident_char(int c) {
+    if (repl_is_ident_start(c) == 1) { return 1; }
+    if (repl_is_digit(c) == 1) { return 1; }
+    return 0;
+}
+
+// Matches the `len` bytes starting at `start` against the NUL-terminated
+// keyword `kw`. Returns 1 on exact match, 0 otherwise.
+int repl_word_is(int start, int len, int kw) {
+    int i = 0;
+    while (i < len && load8(kw + i) != 0) {
+        if (load8(start + i) != load8(kw + i)) { return 0; }
+        i = i + 1;
+    }
+    if (i == len && load8(kw + i) == 0) { return 1; }
+    return 0;
+}
+
+// Allocates room for up to `max_tok` tokens and fills them from `src`.
+// Sets `*count` to the number of tokens produced. Returns the token array
+// pointer (kmalloc'd). On any lex error, prints a message, sets *count to 0,
+// and returns 0.
+int repl_tokenize(int src, int count_ptr) {
+    int max_tok = 64;
+    int toks = kmalloc(max_tok * 32);  // 32 bytes per token
+    if (toks == 0) { store64(count_ptr, 0); return 0; }
+    int n = 0;
+    int p = 0;
+    while (load8(src + p) != 0) {
+        int c = load8(src + p);
+        // Skip whitespace.
+        if (c == ' ' || c == '\t' || c == '\n' || c == 13) { p = p + 1; continue; }
+        if (n >= max_tok) { break; }
+        int off = n * 32;
+        // Digit: parse integer literal (decimal or hex).
+        if (repl_is_digit(c) == 1) {
+            int v = 0;
+            int base = 10;
+            if (c == '0') {
+                int nxt = load8(src + p + 1);
+                if (nxt == 'x' || nxt == 'X') {
+                    if (repl_is_hex_digit(load8(src + p + 2)) == 1) {
+                        base = 16; p = p + 2;
+                    }
+                }
+            }
+            while (1) {
+                int ch = load8(src + p);
+                if (ch == 0) { break; }
+                if (base == 16) {
+                    if (repl_is_hex_digit(ch) == 0) { break; }
+                    v = v * 16 + repl_hex_value(ch);
+                } else {
+                    if (repl_is_digit(ch) == 0) { break; }
+                    v = v * 10 + (ch - '0');
+                }
+                p = p + 1;
+            }
+            store64(toks + off, TK_NUM);
+            store64(toks + off + 8, v);
+            store64(toks + off + 16, 0);
+            store64(toks + off + 24, 0);
+            n = n + 1;
+            continue;
+        }
+        // String literal: " ... "
+        if (c == '"') {
+            p = p + 1;  // skip opening quote
+            int str_start = src + p;
+            int str_len = 0;
+            while (load8(src + p) != 0 && load8(src + p) != '"') {
+                p = p + 1; str_len = str_len + 1;
+            }
+            // NUL-terminate in-place (the source buffer is kmalloc'd and
+            // will be freed after eval — safe to modify).
+            store8(src + p, 0);
+            if (load8(src + p) == '"') { p = p + 1; }  // skip closing quote
+            else { p = p + 0; }  // missing closing quote — use what we have
+            store64(toks + off, TK_STR);
+            store64(toks + off + 8, 0);
+            store64(toks + off + 16, str_start);
+            store64(toks + off + 24, str_len);
+            n = n + 1;
+            continue;
+        }
+        // Identifier or keyword.
+        if (repl_is_ident_start(c) == 1) {
+            int start = src + p;
+            int len = 0;
+            while (load8(src + p) != 0 && repl_is_ident_char(load8(src + p)) == 1) {
+                p = p + 1; len = len + 1;
+            }
+            // Check for keywords.
+            int is_kw = 0;
+            // print
+            int kw = kscratch_start;
+            store8(kw, 'p'); store8(kw + 1, 'r'); store8(kw + 2, 'i');
+            store8(kw + 3, 'n'); store8(kw + 4, 't'); store8(kw + 5, 0);
+            if (repl_word_is(start, len, kw) == 1) {
+                store64(toks + off, TK_PRINT); is_kw = 1;
+            }
+            // if
+            store8(kw, 'i'); store8(kw + 1, 'f'); store8(kw + 2, 0);
+            if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
+                store64(toks + off, TK_IF); is_kw = 1;
+            }
+            // else
+            store8(kw, 'e'); store8(kw + 1, 'l'); store8(kw + 2, 's');
+            store8(kw + 3, 'e'); store8(kw + 4, 0);
+            if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
+                store64(toks + off, TK_ELSE); is_kw = 1;
+            }
+            // while
+            store8(kw, 'w'); store8(kw + 1, 'h'); store8(kw + 2, 'i');
+            store8(kw + 3, 'l'); store8(kw + 4, 'e'); store8(kw + 5, 0);
+            if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
+                store64(toks + off, TK_WHILE); is_kw = 1;
+            }
+            // for
+            store8(kw, 'f'); store8(kw + 1, 'o'); store8(kw + 2, 'r');
+            store8(kw + 3, 0);
+            if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
+                store64(toks + off, TK_FOR); is_kw = 1;
+            }
+            // break
+            store8(kw, 'b'); store8(kw + 1, 'r'); store8(kw + 2, 'e');
+            store8(kw + 3, 'a'); store8(kw + 4, 'k'); store8(kw + 5, 0);
+            if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
+                store64(toks + off, TK_BREAK); is_kw = 1;
+            }
+            // continue
+            store8(kw, 'c'); store8(kw + 1, 'o'); store8(kw + 2, 'n');
+            store8(kw + 3, 't'); store8(kw + 4, 'i'); store8(kw + 5, 'n');
+            store8(kw + 6, 'u'); store8(kw + 7, 'e'); store8(kw + 8, 0);
+            if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
+                store64(toks + off, TK_CONTINUE); is_kw = 1;
+            }
+            if (is_kw == 0) {
+                store64(toks + off, TK_IDENT);
+            }
+            store64(toks + off + 8, 0);
+            store64(toks + off + 16, start);  // name pointer into source
+            store64(toks + off + 24, len);
+            n = n + 1;
+            continue;
+        }
+        // Single-character operators.
+        if (c == '+') { store64(toks + off, TK_PLUS); p = p + 1; n = n + 1; continue; }
+        if (c == '*') { store64(toks + off, TK_STAR); p = p + 1; n = n + 1; continue; }
+        if (c == '(') { store64(toks + off, TK_LPAREN); p = p + 1; n = n + 1; continue; }
+        if (c == ')') { store64(toks + off, TK_RPAREN); p = p + 1; n = n + 1; continue; }
+        if (c == '{') { store64(toks + off, TK_LBRACE); p = p + 1; n = n + 1; continue; }
+        if (c == '}') { store64(toks + off, TK_RBRACE); p = p + 1; n = n + 1; continue; }
+        if (c == ';') { store64(toks + off, TK_SEMI); p = p + 1; n = n + 1; continue; }
+        if (c == ',') { store64(toks + off, TK_COMMA); p = p + 1; n = n + 1; continue; }
+        // '-' : could be MINUS or part of a two-char token (no two-char '-' tokens exist).
+        if (c == '-') { store64(toks + off, TK_MINUS); p = p + 1; n = n + 1; continue; }
+        // '/' : division only (no comments in eval mode — the line is the whole input).
+        if (c == '/') { store64(toks + off, TK_SLASH); p = p + 1; n = n + 1; continue; }
+        // '=' : could be ASSIGN or EQ.
+        if (c == '=') {
+            if (load8(src + p + 1) == '=') {
+                store64(toks + off, TK_EQ); p = p + 2;
+            } else {
+                store64(toks + off, TK_ASSIGN); p = p + 1;
+            }
+            n = n + 1; continue;
+        }
+        // '!' : must be followed by '=' for NE.
+        if (c == '!') {
+            if (load8(src + p + 1) == '=') {
+                store64(toks + off, TK_NE); p = p + 2; n = n + 1; continue;
+            }
+            // Invalid token — skip it (error recovery for REPL).
+            p = p + 1; continue;
+        }
+        // '<' : LT or LE.
+        if (c == '<') {
+            if (load8(src + p + 1) == '=') {
+                store64(toks + off, TK_LE); p = p + 2;
+            } else {
+                store64(toks + off, TK_LT); p = p + 1;
+            }
+            n = n + 1; continue;
+        }
+        // '>' : GT or GE.
+        if (c == '>') {
+            if (load8(src + p + 1) == '=') {
+                store64(toks + off, TK_GE); p = p + 2;
+            } else {
+                store64(toks + off, TK_GT); p = p + 1;
+            }
+            n = n + 1; continue;
+        }
+        // Unrecognized character — skip it.
+        p = p + 1;
+    }
+    // Append EOF token.
+    if (n < max_tok) {
+        int off = n * 32;
+        store64(toks + off, TK_EOF);
+        store64(toks + off + 8, 0);
+        store64(toks + off + 16, 0);
+        store64(toks + off + 24, 0);
+        n = n + 1;
+    }
+    store64(count_ptr, n);
+    return toks;
+}
+
+// --- AST node helpers -------------------------------------------------------
+// Allocates a 40-byte AST node (5 × 8-byte slots) and sets its kind.
+// Slots: [0]=kind, [8]=left/ival, [16]=right, [24]=extra, [32]=next.
+// `next` chains statements in a block; unused by expression nodes.
+int repl_node(int kind) {
+    int nd = kmalloc(40);
+    if (nd == 0) { return 0; }
+    store64(nd, kind);
+    store64(nd + 8, 0);
+    store64(nd + 16, 0);
+    store64(nd + 24, 0);
+    store64(nd + 32, 0);
+    return nd;
+}
+
+// Read a token field from the token array at position `pos`.
+int repl_tok_kind(int toks, int pos) { return load64(toks + pos * 32); }
+int repl_tok_ival(int toks, int pos) { return load64(toks + pos * 32 + 8); }
+int repl_tok_name(int toks, int pos) { return load64(toks + pos * 32 + 16); }
+int repl_tok_len(int toks, int pos)  { return load64(toks + pos * 32 + 24); }
+
+// --- parser ----------------------------------------------------------------
+// tpos is a global so every parsing function can advance it. The parser is
+// single-threaded (runs inside shell_task), so no locking is needed.
+int repl_tpos = 0;
+
+// p_primary: NUM | IDENT | print(expr) | ( expr ) | - primary
+int repl_p_primary(int toks) {
+    int k = repl_tok_kind(toks, repl_tpos);
+    if (k == TK_NUM) {
+        int nd = repl_node(ND_NUM);
+        store64(nd + 8, repl_tok_ival(toks, repl_tpos));
+        repl_tpos = repl_tpos + 1;
+        return nd;
+    }
+    if (k == TK_STR) {
+        int nd = repl_node(ND_STR);
+        store64(nd + 8, repl_tok_name(toks, repl_tpos));
+        store64(nd + 24, repl_tok_len(toks, repl_tpos));
+        repl_tpos = repl_tpos + 1;
+        return nd;
+    }
+    if (k == TK_IDENT) {
+        int name_ptr = repl_tok_name(toks, repl_tpos);
+        int name_len = repl_tok_len(toks, repl_tpos);
+        repl_tpos = repl_tpos + 1;
+        // Check for function call: name '(' expr [',' expr]* ')'
+        if (repl_tok_kind(toks, repl_tpos) == TK_LPAREN) {
+            repl_tpos = repl_tpos + 1;  // skip '('
+            int nd = repl_node(ND_CALL);
+            store64(nd + 8, name_ptr);
+            store64(nd + 24, name_len);
+            // Parse first argument.
+            store64(nd + 16, repl_p_expr(toks));
+            // Parse additional arguments (comma-separated), chained via sibling ptr.
+            int arg_tail = load64(nd + 16);
+            while (repl_tok_kind(toks, repl_tpos) == TK_COMMA) {
+                repl_tpos = repl_tpos + 1;  // skip ','
+                int next_arg = repl_p_expr(toks);
+                store64(arg_tail + 32, next_arg);  // chain via sibling
+                arg_tail = next_arg;
+            }
+            if (repl_tok_kind(toks, repl_tpos) == TK_RPAREN) {
+                repl_tpos = repl_tpos + 1;
+            }
+            return nd;
+        }
+        // Plain variable reference.
+        int nd = repl_node(ND_VAR);
+        store64(nd + 8, name_ptr);
+        store64(nd + 24, name_len);
+        return nd;
+    }
+    if (k == TK_PRINT) {
+        repl_tpos = repl_tpos + 1;
+        if (repl_tok_kind(toks, repl_tpos) != TK_LPAREN) {
+            // Expected '(' after print — return a dummy NUM node.
+            return repl_node(ND_NUM);
+        }
+        repl_tpos = repl_tpos + 1;  // skip '('
+        int nd = repl_node(ND_PRINT);
+        store64(nd + 8, repl_p_expr(toks));
+        if (repl_tok_kind(toks, repl_tpos) == TK_RPAREN) {
+            repl_tpos = repl_tpos + 1;
+        }
+        return nd;
+    }
+    if (k == TK_LPAREN) {
+        repl_tpos = repl_tpos + 1;
+        int nd = repl_p_expr(toks);
+        if (repl_tok_kind(toks, repl_tpos) == TK_RPAREN) {
+            repl_tpos = repl_tpos + 1;
+        }
+        return nd;
+    }
+    if (k == TK_MINUS) {
+        repl_tpos = repl_tpos + 1;
+        int nd = repl_node(ND_NEG);
+        store64(nd + 8, repl_p_primary(toks));
+        return nd;
+    }
+    // Unexpected token — return 0.
+    return 0;
+}
+
+// p_unary: '-'? primary
+int repl_p_unary(int toks) {
+    if (repl_tok_kind(toks, repl_tpos) == TK_MINUS) {
+        repl_tpos = repl_tpos + 1;
+        int nd = repl_node(ND_NEG);
+        store64(nd + 8, repl_p_unary(toks));
+        return nd;
+    }
+    return repl_p_primary(toks);
+}
+
+// p_term: unary ( (*|/) unary )*
+int repl_p_term(int toks) {
+    int left = repl_p_unary(toks);
+    while (1) {
+        int k = repl_tok_kind(toks, repl_tpos);
+        if (k == TK_STAR) {
+            repl_tpos = repl_tpos + 1;
+            int nd = repl_node(ND_MUL);
+            store64(nd + 8, left);
+            store64(nd + 16, repl_p_unary(toks));
+            left = nd;
+        } else if (k == TK_SLASH) {
+            repl_tpos = repl_tpos + 1;
+            int nd = repl_node(ND_DIV);
+            store64(nd + 8, left);
+            store64(nd + 16, repl_p_unary(toks));
+            left = nd;
+        } else { break; }
+    }
+    return left;
+}
+
+// p_add: term ( (+|-) term )*
+int repl_p_add(int toks) {
+    int left = repl_p_term(toks);
+    while (1) {
+        int k = repl_tok_kind(toks, repl_tpos);
+        if (k == TK_PLUS) {
+            repl_tpos = repl_tpos + 1;
+            int nd = repl_node(ND_ADD);
+            store64(nd + 8, left);
+            store64(nd + 16, repl_p_term(toks));
+            left = nd;
+        } else if (k == TK_MINUS) {
+            repl_tpos = repl_tpos + 1;
+            int nd = repl_node(ND_SUB);
+            store64(nd + 8, left);
+            store64(nd + 16, repl_p_term(toks));
+            left = nd;
+        } else { break; }
+    }
+    return left;
+}
+
+// p_compare: add ( (<|>|<=|>=) add )*
+int repl_p_compare(int toks) {
+    int left = repl_p_add(toks);
+    while (1) {
+        int k = repl_tok_kind(toks, repl_tpos);
+        int kind = 0;
+        if (k == TK_LT) { kind = ND_LT; }
+        else if (k == TK_GT) { kind = ND_GT; }
+        else if (k == TK_LE) { kind = ND_LE; }
+        else if (k == TK_GE) { kind = ND_GE; }
+        else { break; }
+        repl_tpos = repl_tpos + 1;
+        int nd = repl_node(kind);
+        store64(nd + 8, left);
+        store64(nd + 16, repl_p_add(toks));
+        left = nd;
+    }
+    return left;
+}
+
+// p_eq: compare ( (==|!=) compare )*
+int repl_p_eq(int toks) {
+    int left = repl_p_compare(toks);
+    while (1) {
+        int k = repl_tok_kind(toks, repl_tpos);
+        int kind = 0;
+        if (k == TK_EQ) { kind = ND_EQ; }
+        else if (k == TK_NE) { kind = ND_NE; }
+        else { break; }
+        repl_tpos = repl_tpos + 1;
+        int nd = repl_node(kind);
+        store64(nd + 8, left);
+        store64(nd + 16, repl_p_compare(toks));
+        left = nd;
+    }
+    return left;
+}
+
+// p_assign: eq ( '=' assign )?  — right-associative.
+int repl_p_assign(int toks) {
+    int left = repl_p_eq(toks);
+    if (repl_tok_kind(toks, repl_tpos) == TK_ASSIGN) {
+        repl_tpos = repl_tpos + 1;
+        // left must be a VAR node.
+        if (load64(left) != ND_VAR) {
+            // Invalid assignment target — return the right side anyway.
+            return repl_p_assign(toks);
+        }
+        int nd = repl_node(ND_ASSIGN);
+        store64(nd + 8, load64(left + 8));   // name ptr
+        store64(nd + 24, load64(left + 24)); // name len
+        kfree(left);
+        store64(nd + 16, repl_p_assign(toks));  // rhs
+        return nd;
+    }
+    return left;
+}
+
+// p_expr: assign
+int repl_p_expr(int toks) {
+    return repl_p_assign(toks);
+}
+
+// --- statement parsers -----------------------------------------------------
+
+// Forward reference for mutual recursion (p_stmt ↔ p_block ↔ p_if, etc.).
+// c0's two-pass resolve handles this; these are just documentation.
+// p_stmt dispatches to the appropriate statement parser based on the next token.
+
+// p_stmt: if | while | for | break | continue | { block } | expr [;]
+int repl_p_stmt(int toks) {
+    int k = repl_tok_kind(toks, repl_tpos);
+    if (k == TK_BREAK) {
+        repl_tpos = repl_tpos + 1;
+        int nd = repl_node(ND_BREAK);
+        if (repl_tok_kind(toks, repl_tpos) == TK_SEMI) {
+            repl_tpos = repl_tpos + 1;
+        }
+        return nd;
+    }
+    if (k == TK_CONTINUE) {
+        repl_tpos = repl_tpos + 1;
+        int nd = repl_node(ND_CONTINUE);
+        if (repl_tok_kind(toks, repl_tpos) == TK_SEMI) {
+            repl_tpos = repl_tpos + 1;
+        }
+        return nd;
+    }
+    if (k == TK_IF) {
+        // if (expr) stmt [else stmt]
+        repl_tpos = repl_tpos + 1;
+        int nd = repl_node(ND_IF);
+        if (repl_tok_kind(toks, repl_tpos) != TK_LPAREN) {
+            // Expected '(' — try to recover.
+            store64(nd + 8, repl_node(ND_NUM));  // cond = 0
+            store64(nd + 16, repl_node(ND_NUM)); // then = 0
+            return nd;
+        }
+        repl_tpos = repl_tpos + 1;  // skip '('
+        store64(nd + 8, repl_p_expr(toks));  // condition
+        if (repl_tok_kind(toks, repl_tpos) == TK_RPAREN) {
+            repl_tpos = repl_tpos + 1;
+        }
+        store64(nd + 16, repl_p_stmt(toks));  // then-branch
+        if (repl_tok_kind(toks, repl_tpos) == TK_ELSE) {
+            repl_tpos = repl_tpos + 1;
+            store64(nd + 24, repl_p_stmt(toks));  // else-branch
+        }
+        return nd;
+    }
+    if (k == TK_WHILE) {
+        // while (expr) stmt
+        repl_tpos = repl_tpos + 1;
+        int nd = repl_node(ND_WHILE);
+        if (repl_tok_kind(toks, repl_tpos) != TK_LPAREN) {
+            store64(nd + 8, repl_node(ND_NUM));
+            store64(nd + 16, repl_node(ND_NUM));
+            return nd;
+        }
+        repl_tpos = repl_tpos + 1;
+        store64(nd + 8, repl_p_expr(toks));  // condition
+        if (repl_tok_kind(toks, repl_tpos) == TK_RPAREN) {
+            repl_tpos = repl_tpos + 1;
+        }
+        store64(nd + 16, repl_p_stmt(toks));  // body
+        return nd;
+    }
+    if (k == TK_FOR) {
+        // for (init; cond; incr) stmt  — all three parts optional.
+        repl_tpos = repl_tpos + 1;
+        int nd = repl_node(ND_FOR);
+        if (repl_tok_kind(toks, repl_tpos) != TK_LPAREN) {
+            store64(nd + 8, 0); store64(nd + 16, 0);
+            store64(nd + 24, 0); store64(nd + 32, repl_node(ND_NUM));
+            return nd;
+        }
+        repl_tpos = repl_tpos + 1;  // skip '('
+        // Init (optional — skip if the next token is already ;).
+        if (repl_tok_kind(toks, repl_tpos) != TK_SEMI) {
+            store64(nd + 8, repl_p_expr(toks));
+        }
+        if (repl_tok_kind(toks, repl_tpos) == TK_SEMI) {
+            repl_tpos = repl_tpos + 1;
+        }
+        // Condition (optional — 0 means always true).
+        if (repl_tok_kind(toks, repl_tpos) != TK_SEMI) {
+            store64(nd + 16, repl_p_expr(toks));
+        }
+        if (repl_tok_kind(toks, repl_tpos) == TK_SEMI) {
+            repl_tpos = repl_tpos + 1;
+        }
+        // Increment (optional).
+        if (repl_tok_kind(toks, repl_tpos) != TK_RPAREN) {
+            store64(nd + 24, repl_p_expr(toks));
+        }
+        if (repl_tok_kind(toks, repl_tpos) == TK_RPAREN) {
+            repl_tpos = repl_tpos + 1;
+        }
+        store64(nd + 32, repl_p_stmt(toks));  // body
+        return nd;
+    }
+    if (k == TK_LBRACE) {
+        // { stmt* }
+        repl_tpos = repl_tpos + 1;
+        int block = repl_node(ND_BLOCK);
+        int tail = 0;
+        while (repl_tok_kind(toks, repl_tpos) != TK_RBRACE
+               && repl_tok_kind(toks, repl_tpos) != TK_EOF) {
+            int stmt = repl_p_stmt(toks);
+            if (tail == 0) {
+                store64(block + 8, stmt);  // first statement
+            } else {
+                store64(tail + 32, stmt);  // chain via next
+            }
+            tail = stmt;
+        }
+        if (repl_tok_kind(toks, repl_tpos) == TK_RBRACE) {
+            repl_tpos = repl_tpos + 1;
+        }
+        return block;
+    }
+    // Expression statement: expr [;]
+    int expr = repl_p_expr(toks);
+    if (repl_tok_kind(toks, repl_tpos) == TK_SEMI) {
+        repl_tpos = repl_tpos + 1;
+    }
+    int nd = repl_node(ND_EXPR_STMT);
+    store64(nd + 8, expr);
+    return nd;
+}
+
+// p_stmts: stmt*  (sequence of statements until EOF)
+int repl_p_stmts(int toks) {
+    int block = repl_node(ND_BLOCK);
+    int tail = 0;
+    while (repl_tok_kind(toks, repl_tpos) != TK_EOF) {
+        int stmt = repl_p_stmt(toks);
+        if (stmt == 0) { break; }
+        if (tail == 0) {
+            store64(block + 8, stmt);
+        } else {
+            store64(tail + 32, stmt);
+        }
+        tail = stmt;
+    }
+    return block;
+}
+
+// --- evaluator -------------------------------------------------------------
+
+// Walks the AST rooted at `nd` and returns its 64-bit integer value.
+// On undefined variable or division by zero, prints an error and returns 0.
+int repl_eval_node(int nd) {
+    if (nd == 0) { return 0; }
+    int kind = load64(nd);
+    int left = load64(nd + 8);
+    int right = load64(nd + 16);
+
+    if (kind == ND_NUM) {
+        return left;  // ival stored in left slot
+    }
+    if (kind == ND_STR) {
+        return left;  // string pointer stored in left slot
+    }
+    if (kind == ND_CALL) {
+        int fname = left;     // function name pointer
+        int flen  = load64(nd + 24);
+        int arg   = repl_eval_node(right);  // evaluate argument
+        // Dispatch known builtins.
+        // load8
+        int kw = kscratch_start;
+        store8(kw,'l');store8(kw+1,'o');store8(kw+2,'a');store8(kw+3,'d');store8(kw+4,'8');store8(kw+5,0);
+        if (repl_word_is(fname, flen, kw) == 1) {
+            return load8(arg);
+        }
+        // store8(addr, val)
+        store8(kw,'s');store8(kw+1,'t');store8(kw+2,'o');store8(kw+3,'r');store8(kw+4,'e');store8(kw+5,'8');store8(kw+6,0);
+        if (repl_word_is(fname, flen, kw) == 1) {
+            int addr_arg = arg;
+            int val_arg  = load64(addr_arg + 32);  // second arg via sibling
+            if (val_arg == 0) { serial_print("[repl] store8 needs two arguments\n"); return 0; }
+            store8(repl_eval_node(addr_arg), repl_eval_node(val_arg));
+            return 0;
+        }
+        // load64
+        store8(kw,'l');store8(kw+1,'o');store8(kw+2,'a');store8(kw+3,'d');store8(kw+4,'6');store8(kw+5,'4');store8(kw+6,0);
+        if (repl_word_is(fname, flen, kw) == 1) {
+            return load64(arg);
+        }
+        // store64(addr, val)
+        store8(kw,'s');store8(kw+1,'t');store8(kw+2,'o');store8(kw+3,'r');store8(kw+4,'e');store8(kw+5,'6');store8(kw+6,'4');store8(kw+7,0);
+        if (repl_word_is(fname, flen, kw) == 1) {
+            int addr_arg = arg;
+            int val_arg  = load64(addr_arg + 32);
+            if (val_arg == 0) { serial_print("[repl] store64 needs two arguments\n"); return 0; }
+            store64(repl_eval_node(addr_arg), repl_eval_node(val_arg));
+            return 0;
+        }
+        serial_print("[repl] unknown function '");
+        int ci = 0;
+        while (ci < flen) { serial_putc(load8(fname + ci)); ci = ci + 1; }
+        serial_print("'\n");
+        return 0;
+    }
+    if (kind == ND_VAR) {
+        int name = left;
+        int len = load64(nd + 24);
+        int idx = repl_lookup(name, len);
+        if (idx < 0) {
+            serial_print("[repl] unknown variable '");
+            // Print the variable name to serial byte by byte.
+            int j = 0;
+            while (j < len) { serial_putc(load8(name + j)); j = j + 1; }
+            serial_print("'\n");
+            return 0;
+        }
+        return load64(repl_var_values + idx * 8);
+    }
+    if (kind == ND_ASSIGN) {
+        int val = repl_eval_node(right);
+        return repl_assign(left, load64(nd + 24), val);
+    }
+    if (kind == ND_ADD) {
+        return repl_eval_node(left) + repl_eval_node(right);
+    }
+    if (kind == ND_SUB) {
+        return repl_eval_node(left) - repl_eval_node(right);
+    }
+    if (kind == ND_MUL) {
+        return repl_eval_node(left) * repl_eval_node(right);
+    }
+    if (kind == ND_DIV) {
+        int rv = repl_eval_node(right);
+        if (rv == 0) {
+            serial_print("[repl] division by zero\n");
+            return 0;
+        }
+        return repl_eval_node(left) / rv;
+    }
+    if (kind == ND_NEG) {
+        return 0 - repl_eval_node(left);
+    }
+    if (kind == ND_EQ) {
+        if (repl_eval_node(left) == repl_eval_node(right)) { return 1; }
+        return 0;
+    }
+    if (kind == ND_NE) {
+        if (repl_eval_node(left) != repl_eval_node(right)) { return 1; }
+        return 0;
+    }
+    if (kind == ND_LT) {
+        if (repl_eval_node(left) < repl_eval_node(right)) { return 1; }
+        return 0;
+    }
+    if (kind == ND_LE) {
+        if (repl_eval_node(left) <= repl_eval_node(right)) { return 1; }
+        return 0;
+    }
+    if (kind == ND_GT) {
+        if (repl_eval_node(left) > repl_eval_node(right)) { return 1; }
+        return 0;
+    }
+    if (kind == ND_GE) {
+        if (repl_eval_node(left) >= repl_eval_node(right)) { return 1; }
+        return 0;
+    }
+    if (kind == ND_PRINT) {
+        if (left != 0 && load64(left) == ND_STR) {
+            // String argument — print it directly.
+            int str = load64(left + 8);
+            serial_print("[repl] ");
+            serial_print(str);
+            serial_print("\n");
+            sk_print(str);
+            sk_print("\n");
+        } else {
+            int val = repl_eval_node(left);
+            serial_print("[repl] ");
+            serial_print_int(val);
+            serial_print("\n");
+            sk_print_int(val);
+            sk_print("\n");
+        }
+        return 0;
+    }
+    if (kind == ND_EXPR_STMT) {
+        return repl_eval_node(left);
+    }
+    if (kind == ND_IF) {
+        int cond = repl_eval_node(left);
+        if (cond != 0) {
+            return repl_eval_node(right);  // then-branch
+        }
+        int else_br = load64(nd + 24);
+        if (else_br != 0) {
+            return repl_eval_node(else_br);
+        }
+        return 0;
+    }
+    if (kind == ND_WHILE) {
+        int result = 0;
+        repl_loop_depth = repl_loop_depth + 1;
+        while (repl_eval_node(left) != 0) {
+            result = repl_eval_node(right);
+            if (repl_break_flag == 1) { repl_break_flag = 0; break; }
+            repl_continue_flag = 0;
+        }
+        repl_loop_depth = repl_loop_depth - 1;
+        return result;
+    }
+    if (kind == ND_FOR) {
+        int init = left;
+        int cond = right;
+        int incr = load64(nd + 24);
+        int body = load64(nd + 32);
+        int result = 0;
+        repl_loop_depth = repl_loop_depth + 1;
+        if (init != 0) { repl_eval_node(init); }
+        while (1) {
+            if (cond != 0 && repl_eval_node(cond) == 0) { break; }
+            result = repl_eval_node(body);
+            if (repl_break_flag == 1) { repl_break_flag = 0; break; }
+            repl_continue_flag = 0;
+            if (incr != 0) { repl_eval_node(incr); }
+        }
+        repl_loop_depth = repl_loop_depth - 1;
+        return result;
+    }
+    if (kind == ND_BLOCK) {
+        int result = 0;
+        int stmt = left;  // left slot holds the first statement
+        while (stmt != 0) {
+            result = repl_eval_node(stmt);
+            if (repl_break_flag == 1 || repl_continue_flag == 1) { break; }
+            stmt = load64(stmt + 32);  // chain via next slot
+        }
+        return result;
+    }
+    if (kind == ND_BREAK) {
+        if (repl_loop_depth == 0) {
+            serial_print("[repl] break outside loop\n");
+        } else {
+            repl_break_flag = 1;
+        }
+        return 0;
+    }
+    if (kind == ND_CONTINUE) {
+        if (repl_loop_depth == 0) {
+            serial_print("[repl] continue outside loop\n");
+        } else {
+            repl_continue_flag = 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// Recursively free every node in the AST rooted at `nd`.
+void repl_free_tree(int nd) {
+    if (nd == 0) { return; }
+    int kind = load64(nd);
+    int left  = load64(nd + 8);
+    int right = load64(nd + 16);
+    int extra = load64(nd + 24);
+    int next  = load64(nd + 32);
+    // Free children based on node kind.
+    if (kind == ND_NUM) {
+        // no children — ival stored in left slot
+    } else if (kind == ND_VAR || kind == ND_STR) {
+        // no children — name/string ptr in left, len in extra
+    } else if (kind == ND_NEG || kind == ND_PRINT || kind == ND_EXPR_STMT) {
+        repl_free_tree(left);
+    } else if (kind == ND_CALL) {
+        // left = function name pointer (in source buffer, don't free)
+        repl_free_tree(right);  // first argument + its sibling chain
+    } else if (kind == ND_IF) {
+        repl_free_tree(left);   // cond
+        repl_free_tree(right);  // then
+        repl_free_tree(extra);  // else (may be 0)
+    } else if (kind == ND_WHILE) {
+        repl_free_tree(left);
+        repl_free_tree(right);
+    } else if (kind == ND_FOR) {
+        repl_free_tree(left);   // init (may be 0)
+        repl_free_tree(right);  // cond (may be 0)
+        repl_free_tree(extra);  // incr (may be 0)
+        repl_free_tree(next);   // body
+    } else if (kind == ND_BLOCK) {
+        // Free each statement in the chain.
+        int stmt = left;
+        while (stmt != 0) {
+            int nxt = load64(stmt + 32);
+            repl_free_tree(stmt);
+            stmt = nxt;
+        }
+    } else if (kind == ND_ASSIGN) {
+        // left is a name pointer into the source string (not a heap node);
+        // only the RHS expression is an AST child.
+        repl_free_tree(right);
+    } else if (kind == ND_BREAK || kind == ND_CONTINUE) {
+        // no children — just kfree below
+    } else {
+        // Binary ops (ADD, SUB, MUL, DIV, EQ, NE, LT, LE, GT, GE)
+        repl_free_tree(left);
+        repl_free_tree(right);
+    }
+    kfree(nd);
+    return;
+}
+
+// --- entry point -----------------------------------------------------------
+// Parse and evaluate the NUL-terminated c0 expression or statement sequence
+// in `src`. Prints the result (both to serial for testability and to the
+// console) for expression statements and assignments; if/while/blocks are
+// evaluated for their side effects and return 0.
+void repl_eval(int src) {
+    repl_break_flag = 0;
+    repl_continue_flag = 0;
+    repl_loop_depth = 0;
+    int tok_count_ptr = kscratch_start;
+    int toks = repl_tokenize(src, tok_count_ptr);
+    int ntok = load64(tok_count_ptr);
+    if (toks == 0 || ntok == 0) {
+        serial_print("[repl] lex error\n");
+        if (toks != 0) { kfree(toks); }
+        return;
+    }
+    repl_tpos = 0;
+    int ast = repl_p_stmts(toks);
+    if (ast == 0) {
+        serial_print("[repl] parse error\n");
+        kfree(toks);
+        return;
+    }
+    int result = repl_eval_node(ast);
+    // Auto-print the result for the outermost expression statement or
+    // assignment. ND_BLOCK returns its last statement's result. We print
+    // unless the effective last action was a print() call (already printed)
+    // or an if/while (only useful for side effects; always return 0).
+    int top_kind = load64(ast);
+    if (top_kind == ND_BLOCK) {
+        // Find the last statement in the block chain.
+        int stmt = load64(ast + 8);
+        int last = stmt;
+        while (stmt != 0) {
+            last = stmt;
+            stmt = load64(stmt + 32);
+        }
+        if (last != 0) {
+            top_kind = load64(last);
+            // Unwrap ND_EXPR_STMT to check the inner expression.
+            if (top_kind == ND_EXPR_STMT) {
+                top_kind = load64(load64(last + 8));  // inner expr kind
+            }
+        }
+    } else if (top_kind == ND_EXPR_STMT) {
+        // Single expression statement at top level.
+        top_kind = load64(load64(ast + 8));
+    }
+    if (top_kind != ND_PRINT && top_kind != ND_IF && top_kind != ND_WHILE && top_kind != ND_FOR
+        && top_kind != ND_BREAK && top_kind != ND_CONTINUE) {
+        serial_print("[repl] ");
+        serial_print_int(result);
+        serial_print("\n");
+        sk_color(fb_rgb(100, 255, 100));  // soft green
+        if (result == 0) {
+            sk_print("0\n");
+        } else {
+            sk_print_int(result);
+            sk_print("\n");
+        }
+        sk_color(FB_FG);  // reset to default
+    }
+    repl_free_tree(ast);
+    kfree(toks);
+    return;
+}
+
+// Screen-silent variant of repl_eval — tokenizes, parses, and evaluates the
+// expression in `src`, but does NOT auto-print to the screen (serial still
+// logs errors). Stores the result in repl_last_result and sets repl_last_ok
+// to 1 on success (0 on lex error, parse error, or runtime error). Callers
+// that live in IRQ context (like the editor eval-from-buffer) use this to
+// capture a result without corrupting the window content.
+void repl_eval_ret(int src) {
+    repl_last_ok = 0;
+    repl_last_result = 0;
+    repl_break_flag = 0;
+    repl_continue_flag = 0;
+    repl_loop_depth = 0;
+    int tok_count_ptr = kscratch_start;
+    int toks = repl_tokenize(src, tok_count_ptr);
+    int ntok = load64(tok_count_ptr);
+    if (toks == 0 || ntok == 0) {
+        serial_print("[repl] lex error\n");
+        if (toks != 0) { kfree(toks); }
+        return;
+    }
+    repl_tpos = 0;
+    int ast = repl_p_stmts(toks);
+    if (ast == 0) {
+        serial_print("[repl] parse error\n");
+        kfree(toks);
+        return;
+    }
+    int result = repl_eval_node(ast);
+    repl_last_result = result;
+    repl_last_ok = 1;
+    repl_free_tree(ast);
+    kfree(toks);
+    return;
+}
+
+// JIT-compiled variant of repl_eval. Same tokenize + parse, but instead of
+// tree-walking the AST with repl_eval_node, emits x86-64 machine code into the
+// JIT page and calls it. The result comes back from RAX via c0's indirect-call
+// mechanism. Falls back to the interpreter if the JIT is not initialized or if
+// the expression contains nodes the JIT does not support (variables, print,
+// assignments, control flow).
+void repl_eval_jit(int src) {
+    repl_break_flag = 0;
+    repl_continue_flag = 0;
+    repl_loop_depth = 0;
+    int tok_count_ptr = kscratch_start;
+    int toks = repl_tokenize(src, tok_count_ptr);
+    int ntok = load64(tok_count_ptr);
+    if (toks == 0 || ntok == 0) {
+        serial_print("[jit] lex error\n");
+        if (toks != 0) { kfree(toks); }
+        return;
+    }
+    repl_tpos = 0;
+    int ast = repl_p_stmts(toks);
+    if (ast == 0) {
+        serial_print("[jit] parse error\n");
+        kfree(toks);
+        return;
+    }
+    // Pass the full AST to the JIT, which handles ND_BLOCK, ND_EXPR_STMT,
+    // and loop control flow (break/continue) so multi-statement programs
+    // compile correctly. Single-expression unwrapping is handled inside
+    // jit_compile_node via ND_EXPR_STMT.
+    int result = jit_compile_and_run(ast);
+    serial_print("[jit] ");
+    serial_print_int(result);
+    serial_print("\n");
+    sk_color(fb_rgb(100, 200, 255));  // soft cyan
+    sk_print_int(result);
+    sk_print("\n");
+    sk_color(FB_FG);  // reset
+    repl_free_tree(ast);
+    kfree(toks);
+    return;
+}

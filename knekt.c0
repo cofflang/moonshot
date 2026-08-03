@@ -1,0 +1,402 @@
+// knekt.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// knekt.c0 -- the kernel core: main() (the actual entry point boot.s
+// calls), the post-paging-switch init step, the halt primitive, and the
+// generic byte-manipulation helpers (load32/store16_le/store32_le) every
+// other subsystem builds on.
+
+// Reassembles a little-endian 32-bit field from four bytes -- Multiboot's
+// info structure is all u32 fields, and c0 only has load8/load64 (no
+// load32); this is a plain c0 helper, not a new compiler builtin, same
+// spirit as everything else being "just bytes" until proven otherwise.
+int load32(int addr) {
+    return load8(addr) + load8(addr + 1) * 256 + load8(addr + 2) * 65536 + load8(addr + 3) * 16777216;
+}
+
+// Inverse of load32 for 16/32-bit little-endian writes -- needed for IDT
+// entries and the IDTR, since c0 only has store8/store64 natively. Pure
+// arithmetic (v/256, no bitwise shift/mask) since c0 has neither -- v is
+// always guaranteed < 65536 by the caller (see interrupts.c0's idt_set),
+// so v/256 alone (no re-masking) is already < 256.
+void store16_le(int addr, int v) {
+    store8(addr, v - (v / 256) * 256);
+    store8(addr + 1, v / 256);
+    return;
+}
+
+void store32_le(int addr, int v) {
+    store16_le(addr, v - (v / 65536) * 65536);
+    store16_le(addr + 2, v / 65536);
+    return;
+}
+
+// Calls boot.s's halt_cpu (hlt; ret) indirectly -- same "c0 can't call an
+// externally-defined asm symbol by name" wall as sched_launch_call in
+// chrone.c0, solved the same way. Genuinely idles the CPU for one
+// interrupt's worth of time, unlike a busy-spin loop -- see
+// interrupts.c0's panic_handler, its only caller, for why it's called in
+// a loop rather than trusted to never return.
+void halt() {
+    int h = load64(HALTINFO_ADDR);
+    h();
+    return;
+}
+
+// Run by boot.s AFTER lidt (so the #PF handler is installed) but BEFORE sti
+// (so no hardware IRQ can race this code's serial output on the shared
+// .kscratch buffer -- CPU exceptions like #PF fire regardless of the
+// interrupt flag, so demand paging still works with IRQs masked). Touches a
+// deliberately-unmapped address to trigger a real page fault; if the
+// handler recovers correctly, this read returns FAULT_SENTINEL.
+void kernel_post_init() {
+    // Clears the screen and prints a greeting -- requires the CR3 switch
+    // (done by boot.s right before calling this) to have made punkt.c0's
+    // fb_map mapping of the real framebuffer physical range live. The
+    // uppercase banner plus a lowercase tagline exercise both cases of the
+    // font (font_hi/font_lo cover A-Z and a-z -- see their own comment).
+    if (fb_available == 1) {
+        fb_clear(FB_BG);
+        int corner = load32(fb_addr + (fb_height - 1) * fb_pitch + (fb_width - 1) * 4);
+        int corner_bg_match = 0;
+        if (corner == FB_BG) { corner_bg_match = 1; }
+        serial_print("fb: corner_bg_match=");
+        serial_print_int(corner_bg_match);
+        serial_print("\n");
+    }
+
+    serial_print("demand-paging test: touching unmapped 5GB\n");
+    int v = load64(FAULT_TEST_VIRT);
+    if (v == FAULT_SENTINEL) {
+        serial_print("demand paging OK: fault recovered, sentinel read back\n");
+    } else {
+        serial_print("demand paging FAIL: unexpected value\n");
+    }
+
+    // Carve the screen into kakel's windows (two side-by-side tiles)
+    // and give each a banner. This deliberately runs AFTER the full-screen
+    // banner + readback above: that block keeps proving punkt's own
+    // full-screen path exactly as before, then kakel paints over it and
+    // the checks below prove the windowed path on top. Window 1's banner
+    // starts with 'M' on purpose: its cell has never been drawn by
+    // anything else (the full-screen banner's M sits in window 0's
+    // territory), so its fg count is a genuine first write through
+    // kakel_putc's clipped coordinates.
+    if (fb_available == 1) {
+        kakel_init();
+        // Draw one 'M' for verification then read it back. The window is
+        // cleared after the check so the shell starts with a clean screen.
+        kakel_putc(0, 'M');
+
+        // Readback proof: the 'M' at the window's origin must read
+        // back exactly 18 lit pixels, and a pixel far from any text must
+        // show the window's background. The very last screen row must show
+        // the status bar's own distinct background.
+        int w0_fg = 0;
+        int py = 0;
+        int px = 0;
+        while (py < 8) {
+            px = 0;
+            while (px < 8) {
+                if (load32(fb_addr + py * fb_pitch + px * 4) == FB_FG) {
+                    w0_fg = w0_fg + 1;
+                }
+                px = px + 1;
+            }
+            py = py + 1;
+        }
+        // Bottom-right corner of the shell area (above the status bar).
+        int shell_bot = fb_height - KAKEL_LOG_ROWS * FONT_H - 1;
+        int corner_bg = 0;
+        if (load32(fb_addr + shell_bot * fb_pitch + (fb_width - 1) * 4) == FB_BG) {
+            corner_bg = 1;
+        }
+        // Status bar at the very last screen row.
+        int stats_bg = 0;
+        if (load32(fb_addr + (fb_height - 1) * fb_pitch + 0) == load64(kakel_bg_base + 8)) {
+            stats_bg = 1;
+        }
+        serial_print("kakel: win0_fg=");
+        serial_print_int(w0_fg);
+        serial_print(" corner_bg=");
+        serial_print_int(corner_bg);
+        serial_print(" stats_bg=");
+        serial_print_int(stats_bg);
+        serial_print("\n");
+
+        // Clear the verification marker so the shell starts clean.
+        kakel_clear(0);
+    }
+
+    // Allocate the JIT code page before the shell comes up, so eval -c
+    // works from the very first command. Must run after pmm_init (done
+    // earlier in main) but before any shell input.
+    jit_init();
+
+    // Bring up the interactive shell last, so each window's greeting +
+    // prompt land just below its banner (one shell session per kakel
+    // window -- see skalman.c0). From here on, typed keys drive skalman
+    // via keyboard_handler -> shell_input; this call runs in normal
+    // context (pre-scheduler), so its kmallocs are off the interrupt path.
+    shell_init();
+
+    // Probe the ATA disk before the filesystem tries to load from it --
+    // jakel_init calls jakel_load, which calls ata_read, so the drive
+    // must already be detected.
+    ata_init();
+
+    // Bring up the in-memory filesystem after the shell, so any filesystem
+    // errors print through the shell's output path (already live).
+    jakel_init();
+    return;
+}
+
+int main() {
+    serial_print("Hello from Moonshot\n");
+
+    int mb_info = load32(MBINFO_ADDR);
+    fb_probe(mb_info);
+
+    if (fb_available == 1) {
+        // Light grey text on black, same look VGA_DEFAULT_ATTR aimed for --
+        // computed via fb_rgb (not a literal) since it depends on
+        // fb_probe's real, just-read channel positions, not an assumption.
+        // Can't actually DRAW yet: fb_addr is far outside both the low
+        // 16MB c0's own tables will cover AND boot.s's original static 1GB
+        // map, so pixel writes only become safe after boot.s's CR3 switch
+        // and fb_map (see kernel_post_init, where the real drawing and
+        // readback verification happen).
+        FB_FG = fb_rgb(200, 200, 200);
+        FB_BG = fb_rgb(0, 0, 0);
+    } else {
+        // No usable framebuffer granted -- fall back to VGA text mode,
+        // which (unlike the pixel framebuffer) IS safe to use immediately:
+        // 0xB8000 sits inside boot.s's original static identity map.
+        // VGA_DEFAULT_ATTR (7 = VGA_COLOR_BLACK*16 + VGA_COLOR_LIGHTGREY,
+        // the classic default text-mode look) is a global, not a local, so
+        // keyboard_handler's interactive typing below draws in the same
+        // style.
+        vga_clear(VGA_DEFAULT_ATTR);
+        vga_print("Moonshot\nOS\n", VGA_DEFAULT_ATTR);
+
+        // Prove the writes actually landed in the real framebuffer, not
+        // just "the calls didn't crash" -- read specific cells back and
+        // print them over serial for run_qemu.sh to check by arithmetic,
+        // same discipline as pmm/paging/every other subsystem here.
+        // Exercises both the plain write path (char0/attr0/char7, all on
+        // row 0) and the newline-wrap path (char_row1_0, on row 1 after
+        // vga_putc's '\n' handling).
+        serial_print("vga: char0=");
+        serial_print_int(load8(VGA_BUFFER));
+        serial_print(" attr0=");
+        serial_print_int(load8(VGA_BUFFER + 1));
+        serial_print(" char7=");
+        serial_print_int(load8(VGA_BUFFER + 7 * 2));
+        serial_print(" char_row1_0=");
+        serial_print_int(load8(VGA_BUFFER + VGA_WIDTH * 2));
+        serial_print("\n");
+    }
+
+    // Populate the scancode->ASCII tables before interrupts are enabled,
+    // so keyboard_handler has real lookup data from the very first keypress.
+    scancode_init();
+
+    int flags = load32(mb_info);
+    // bit 0 of flags: mem_lower/mem_upper are valid. No bitwise & in c0
+    // yet -- flags - (flags/2)*2 isolates the low bit the same way the
+    // rest of this codebase avoids needing % (see serial_print_int above).
+    int has_mem = flags - (flags / 2) * 2;
+    if (has_mem == 1) {
+        int mem_lower = load32(mb_info + 4);
+        int mem_upper = load32(mb_info + 8);
+        serial_print("Lower memory (KB): ");
+        serial_print_int(mem_lower);
+        serial_print("\nUpper memory (KB): ");
+        serial_print_int(mem_upper);
+        serial_print("\n");
+    } else {
+        serial_print("No memory info from bootloader\n");
+    }
+
+    pmm_init(mb_info);
+    // Verification, in three parts, each printed so run_qemu.sh can check
+    // the arithmetic directly rather than just "some numbers that didn't
+    // crash":
+    //   1. bump: four fresh pages, strictly increasing and exactly 4096
+    //      bytes apart (the original allocator's whole behavior).
+    //   2. reuse: free two of them (a1 then a2), then allocate two more --
+    //      they must come back LIFO (a2 first, then a1), proving the
+    //      free-list actually recycles freed pages instead of always
+    //      bumping upward.
+    //   3. bump2: with the free-list empty again, the next allocation must
+    //      resume bumping past a3 (a3 + 4096), proving the fallback still
+    //      works after reuse.
+    int a0 = pmm_alloc_page();
+    int a1 = pmm_alloc_page();
+    int a2 = pmm_alloc_page();
+    int a3 = pmm_alloc_page();
+    serial_print("pmm bump: ");
+    serial_print_int(a0);
+    serial_print(" ");
+    serial_print_int(a1);
+    serial_print(" ");
+    serial_print_int(a2);
+    serial_print(" ");
+    serial_print_int(a3);
+    serial_print("\n");
+
+    pmm_free_page(a1);
+    pmm_free_page(a2);
+
+    int r0 = pmm_alloc_page();
+    int r1 = pmm_alloc_page();
+    serial_print("pmm reuse: ");
+    serial_print_int(r0);
+    serial_print(" ");
+    serial_print_int(r1);
+    serial_print("\n");
+
+    int a4 = pmm_alloc_page();
+    serial_print("pmm bump2: ");
+    serial_print_int(a4);
+    serial_print("\n");
+
+    // Build page tables BEFORE the heap so page-table frames sit at lower
+    // physical addresses than heap pages. If a heap buffer overflows past
+    // the last heap page, it hits unused PMM pages rather than corrupting a
+    // PTE, avoiding a layout-sensitive #GP crash in kakel_putc.
+    paging_init();
+
+    // Extends the SAME tables (not yet live -- boot.s switches CR3 after
+    // main() returns) with the framebuffer's real physical range, so pixel
+    // writes work the moment anything runs after that switch.
+    if (fb_available == 1) {
+        fb_map();
+    }
+
+    // Kernel heap (kmalloc/kfree, jenna.c0) verification -- same "print real
+    // addresses, let run_qemu.sh check the arithmetic" discipline as the pmm
+    // test above, proving three real behaviours, not just "it returned
+    // non-zero":
+    //   alloc:    three 64-byte blocks, each exactly 80 bytes apart (64
+    //             payload + the 16-byte header), proving sequential packing.
+    //   reuse:    free the middle one, re-request 64 -- first-fit must return
+    //             the exact same address, proving freed blocks are recycled.
+    //   coalesce: free that block AND its neighbour, then request 128 -- too
+    //             big for either freed 64-byte block alone, so landing back
+    //             at the lower address proves the two merged into one.
+    heap_init(6);
+    int h0 = kmalloc(64);
+    int h1 = kmalloc(64);
+    int h2 = kmalloc(64);
+    serial_print("heap alloc: ");
+    serial_print_int(h0);
+    serial_print(" ");
+    serial_print_int(h1);
+    serial_print(" ");
+    serial_print_int(h2);
+    serial_print("\n");
+
+    kfree(h1);
+    int h3 = kmalloc(64);
+    serial_print("heap reuse: ");
+    serial_print_int(h3);
+    serial_print("\n");
+
+    kfree(h3);
+    kfree(h2);
+    int h4 = kmalloc(128);
+    serial_print("heap coalesce: ");
+    serial_print_int(h4);
+    serial_print("\n");
+    // Return the test's still-live blocks so the heap is pristine (one big
+    // free block) before the shell allocates its line buffer below.
+    kfree(h0);
+    kfree(h4);
+
+    int timer_stub = load64(ISRINFO_TIMER_ADDR);
+    int keyboard_stub = load64(ISRINFO_KEYBOARD_ADDR);
+    int pagefault_stub = load64(EXCINFO_PF_ADDR);
+    int divide_stub = load64(EXCINFO_DIV_ADDR);
+    int invop_stub = load64(EXCINFO_INVOP_ADDR);
+    int gpf_stub = load64(EXCINFO_GPF_ADDR);
+    idt_set(0, divide_stub);     // #DE divide error (no error code)
+    idt_set(6, invop_stub);      // #UD invalid opcode (no error code)
+    idt_set(13, gpf_stub);       // #GP general protection (error code)
+    idt_set(14, pagefault_stub); // #PF page fault (error code + CR2)
+    idt_set(32, timer_stub);
+    idt_set(33, keyboard_stub);
+
+    // Remaining CPU exception vectors, all routed to the same generic
+    // panic_handler as #0/#6/#13 below -- a generic handler is enough since
+    // none of these need custom recovery the way #14's page-fault path
+    // does. #8 (double fault) needs special IST handling, set up separately
+    // below; #9/#15 are reserved/obsolete vectors Intel says not to use, so
+    // 0-31 is complete.
+    idt_set(1, load64(EXCINFO_DEBUG_ADDR));         // #DB debug (no error code)
+    idt_set(2, load64(EXCINFO_NMI_ADDR));            // NMI (no error code)
+    idt_set(3, load64(EXCINFO_BREAKPOINT_ADDR));     // #BP breakpoint (no error code)
+    idt_set(4, load64(EXCINFO_OVERFLOW_ADDR));       // #OF overflow (no error code)
+    idt_set(5, load64(EXCINFO_BOUNDRANGE_ADDR));     // #BR bound range exceeded (no error code)
+    idt_set(7, load64(EXCINFO_DEVNOTAVAIL_ADDR));    // #NM device not available (no error code)
+    idt_set(10, load64(EXCINFO_INVALIDTSS_ADDR));    // #TS invalid TSS (error code)
+    idt_set(11, load64(EXCINFO_SEGNOTPRESENT_ADDR)); // #NP segment not present (error code)
+    idt_set(12, load64(EXCINFO_STACKFAULT_ADDR));    // #SS stack-segment fault (error code)
+    idt_set(16, load64(EXCINFO_FPUERROR_ADDR));      // #MF x87 FPU error (no error code)
+    idt_set(17, load64(EXCINFO_ALIGNMENT_ADDR));     // #AC alignment check (error code, always 0)
+    idt_set(18, load64(EXCINFO_MACHINECHECK_ADDR));  // #MC machine check (no error code)
+    idt_set(19, load64(EXCINFO_SIMDFP_ADDR));        // #XF SIMD FP exception (no error code)
+
+    // #8 double fault (error code, always 0). Unlike every vector above, #8
+    // must run on a dedicated stack: a double fault typically means the
+    // interrupted stack is unusable, so a same-stack handler would just
+    // re-fault into a triple fault (silent CPU reset). idt_set installs it
+    // normally, then we set that entry's IST field to 1 -- the IST byte is at
+    // offset 4 within the 16-byte IDT entry, which idt_set wrote as 0 (no IST).
+    // boot.s set up TSS.IST1 -> a dedicated 4KB stack and loaded the task
+    // register, so IST index 1 makes the CPU switch to that stack on #8 entry.
+    idt_set(8, load64(EXCINFO_DF_ADDR));
+    store8(idt_start + 8 * 16 + 4, 1);
+
+    store16_le(IDTR_ADDR, 4095); // limit = 256 entries * 16 bytes - 1
+    store64(IDTR_ADDR + 2, idt_start);
+
+    // #0/#6/#13 (and the 13 vectors above) share one generic panic_handler
+    // (prints vector+errcode+CR2, then halts); #14 has its own recovering
+    // demand-paging handler.
+    dispatch_set(0, panic_handler);
+    dispatch_set(6, panic_handler);
+    dispatch_set(13, panic_handler);
+    dispatch_set(1, panic_handler);
+    dispatch_set(2, panic_handler);
+    dispatch_set(3, panic_handler);
+    dispatch_set(4, panic_handler);
+    dispatch_set(5, panic_handler);
+    dispatch_set(7, panic_handler);
+    dispatch_set(10, panic_handler);
+    dispatch_set(11, panic_handler);
+    dispatch_set(12, panic_handler);
+    dispatch_set(16, panic_handler);
+    dispatch_set(17, panic_handler);
+    dispatch_set(18, panic_handler);
+    dispatch_set(19, panic_handler);
+    dispatch_set(8, panic_handler);
+    dispatch_set(14, page_fault_handler);
+    dispatch_set(32, timer_tick);
+    dispatch_set(33, keyboard_handler);
+
+    pic_remap();
+    pit_configure(1193182 / 100); // ~100 Hz
+
+    // boot.s reads the IDTR this just built and does `lidt`/`sti` itself
+    // right after this returns -- see boot.s for why (c0 can't execute
+    // those instructions, and exposing them as separate asm functions
+    // callable from c0 would need coff0's resolve() to support calling an
+    // externally-defined symbol, which nothing else in this codebase does).
+    return 0;
+}

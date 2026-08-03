@@ -1,0 +1,171 @@
+// vga.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// vga.c0 -- VGA text-mode driver. Moonshot's original graphical output,
+// predating punkt.c0's pixel framebuffer; now the FALLBACK path for when
+// GRUB can't grant a usable linear framebuffer (wrong type/bpp, or none
+// at all -- see punkt.c0's fb_probe) rather than the primary one. Text
+// mode is the one video mode guaranteed present with zero mode-setting
+// (no VBE calls, no GPU driver), needs nothing beyond memory writes + two
+// I/O ports.
+
+// VGA text-mode framebuffer: a fixed, well-known physical address (not a
+// boot.s hand-off slot -- nothing places it, it's just where the hardware
+// puts it) inside the 16MB identity map, so no paging changes were needed.
+// 80x25 characters, 2 bytes/cell ([char][attribute]). Attribute nibbles:
+// low = foreground color, high = background color -- since they're disjoint
+// nibbles, `bg * 16 + fg` packs them with plain arithmetic (no bitwise
+// ops), same idiom as every other flag-packing in this codebase. CRT
+// controller ports 0x3D4 (index)/0x3D5 (data) move the blinking hardware
+// cursor to match.
+int VGA_BUFFER = 0xB8000;
+int VGA_WIDTH = 80;
+int VGA_HEIGHT = 25;
+int VGA_COLOR_BLACK = 0;
+int VGA_COLOR_LIGHTGREY = 7;
+int VGA_CRT_INDEX = 0x3D4;
+int VGA_CRT_DATA = 0x3D5;
+
+// VGA text-mode cursor position (in characters, not pixels) -- vga_putc
+// advances these and wraps/scrolls; vga_move_cursor mirrors them to the
+// real hardware cursor.
+int vga_row = 0;
+int vga_col = 0;
+// Light grey on black (VGA_COLOR_BLACK*16 + VGA_COLOR_LIGHTGREY), computed
+// once as a literal since c0 global initializers must be constants, not
+// expressions -- shared by knekt.c0's boot-time printing and
+// keyboard_handler's interactive typing so both draw in the same style.
+int VGA_DEFAULT_ATTR = 7;
+
+// One VGA cell (2 bytes: [char][attribute]) at (row, col). No bounds
+// checking -- every caller in this file goes through vga_putc, which
+// already clamps row/col via wrapping/scrolling.
+void vga_write_cell(int row, int col, int ch, int attr) {
+    int off = VGA_BUFFER + (row * VGA_WIDTH + col) * 2;
+    store8(off, ch);
+    store8(off + 1, attr);
+    return;
+}
+
+// Fills the whole screen with blank (space) cells of `attr` and resets the
+// cursor to the top-left -- called once at boot, and could be called again
+// for a real "clear screen" operation later.
+void vga_clear(int attr) {
+    int row = 0;
+    int col = 0;
+    while (row < VGA_HEIGHT) {
+        col = 0;
+        while (col < VGA_WIDTH) {
+            vga_write_cell(row, col, ' ', attr);
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    vga_row = 0;
+    vga_col = 0;
+    return;
+}
+
+// Moves every row up by one (row i takes row i+1's bytes, byte for byte)
+// and blanks the new bottom row -- called when vga_putc runs off the
+// bottom of the screen. VGA_WIDTH * 2 bytes per row, copied with
+// load8/store8 like everywhere else in this codebase that isn't
+// 8-byte-aligned (a text row is 160 bytes, not a multiple of 8 counted
+// from an odd starting cell in general, so store64 isn't a natural fit
+// here the way it is for zero_page's whole-aligned-page loop).
+void vga_scroll(int attr) {
+    int row = 0;
+    int col = 0;
+    int src = 0;
+    while (row < VGA_HEIGHT - 1) {
+        col = 0;
+        while (col < VGA_WIDTH * 2) {
+            src = VGA_BUFFER + (row + 1) * VGA_WIDTH * 2 + col;
+            store8(VGA_BUFFER + row * VGA_WIDTH * 2 + col, load8(src));
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    col = 0;
+    while (col < VGA_WIDTH) {
+        vga_write_cell(VGA_HEIGHT - 1, col, ' ', attr);
+        col = col + 1;
+    }
+    return;
+}
+
+// Moves the blinking hardware cursor to (vga_row, vga_col) -- purely
+// cosmetic (nothing reads the cursor position back), but a real terminal
+// feel needs the visible cursor to track where text actually goes, not
+// just the text itself. Cursor location is a 16-bit value (linear offset =
+// row*80+col) written 8 bits at a time through the CRT controller's
+// index/data port pair: index 0x0E selects the high byte register, 0x0F
+// the low byte -- same "no bitwise ops" split as store16_le elsewhere in
+// this codebase (v/256 for the high byte, v - (v/256)*256 for the low one).
+void vga_move_cursor() {
+    int pos = vga_row * VGA_WIDTH + vga_col;
+    outb(VGA_CRT_INDEX, 0x0E);
+    outb(VGA_CRT_DATA, pos / 256);
+    outb(VGA_CRT_INDEX, 0x0F);
+    outb(VGA_CRT_DATA, pos - (pos / 256) * 256);
+    return;
+}
+
+// Writes one character at the cursor and advances it, handling newline,
+// line-wrap at column 80, and scrolling off the bottom -- the visual
+// counterpart to serial_putc, with cursor-tracking state serial output
+// never needed. Doesn't move the hardware cursor itself (see vga_print) --
+// batches that to once per string instead of once per character, since
+// vga_move_cursor's 4 outb calls are real port I/O, not free.
+void vga_putc(int ch, int attr) {
+    if (ch == '\n') {
+        vga_row = vga_row + 1;
+        vga_col = 0;
+    } else {
+        vga_write_cell(vga_row, vga_col, ch, attr);
+        vga_col = vga_col + 1;
+        if (vga_col >= VGA_WIDTH) {
+            vga_col = 0;
+            vga_row = vga_row + 1;
+        }
+    }
+    if (vga_row >= VGA_HEIGHT) {
+        vga_scroll(attr);
+        vga_row = VGA_HEIGHT - 1;
+    }
+    return;
+}
+
+// Prints a null-terminated string to the screen at `attr`, same runtime-
+// strlen-free-standing shape as serial_print (works on any string address,
+// not just literals -- see serial_print's own comment), then syncs the
+// real hardware cursor once at the end.
+void vga_print(int msg, int attr) {
+    int i = 0;
+    while (load8(msg + i) != 0) {
+        vga_putc(load8(msg + i), attr);
+        i = i + 1;
+    }
+    vga_move_cursor();
+    return;
+}
+
+// Erases the previous character for interactive typing (see
+// keyboard_handler). Deliberately simple: only erases within the current
+// row (col > 0) -- it doesn't unwind across a previous newline or a
+// wrapped line, since there's no per-row "was this a wrap or an explicit
+// newline" tracking to know how far back is safe to go. Good enough for a
+// first interactive typing loop; a real line-editing backspace is a later
+// step if multi-line editing is ever needed.
+void vga_backspace(int attr) {
+    if (vga_col > 0) {
+        vga_col = vga_col - 1;
+        vga_write_cell(vga_row, vga_col, ' ', attr);
+    }
+    return;
+}

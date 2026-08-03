@@ -1,0 +1,9 @@
+# build artifacts -- everything in the repo is source; the kernel binary
+# and ISO are rebuilt from it (see README)
+kmain.s
+*.o
+moonshot.elf
+moonshot.iso
+isoroot/
+*.log
+disk.img
