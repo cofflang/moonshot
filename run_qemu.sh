@@ -230,7 +230,7 @@ fi
 ata_ok=0
 jakel_ok=0
 if grep -qE "^\[ata\] drive detected$" serial.log; then ata_ok=1; fi
-if grep -qE "^\[jakel\] (filesystem ready|loaded) " serial.log \
+if grep -qE "^\[jakel\] (filesystem ready|loaded)" serial.log \
    && grep -qE "^\[jakel\] synced " serial.log; then jakel_ok=1; fi
 
 if grep -q "Hello from Moonshot" serial.log \
