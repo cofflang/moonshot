@@ -1,0 +1,30 @@
+// expect: 42
+// exit() from deep inside nested loops and conditionals.
+//
+// Written after Infecteria printed a death message 253 times and never
+// terminated: print() at that exact spot reached serial, exit() at the same
+// spot produced no [syscall] exit code line at all. Both are builtins
+// compiled by the same backend, so the difference is worth pinning down.
+int main() {
+    int i;
+    int j;
+    i = 0;
+    while (i < 10) {
+        if (i > 2) {
+            if (i > 3) {
+                j = 0;
+                while (j < 10) {
+                    if (j == 4) {
+                        if (i == 4) {
+                            exit(42);
+                        }
+                    }
+                    j = j + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    // Reaching here at all means the exit above did not take.
+    return 99;
+}

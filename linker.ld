@@ -10,7 +10,7 @@
 
 /* Places the kernel at 1MiB, the conventional Multiboot load address.
  * ENTRY(_boot_start) sets the ELF entry point QEMU's multiboot loader
- * jumps to -- see boot.s for why it's not `_start` (coff-compiled object
+ * jumps to -- see boot.s for why it is not `_start` (coff-compiled object
  * files always define their own unused one).
  *
  * Section order below is deliberate: all PROGBITS (real file content)
@@ -19,7 +19,7 @@
  * this file did -- makes the linker pad the FILE to preserve the
  * address-vs-offset relationship across each NOBITS gap, which silently
  * reinflates file offsets even though NOBITS sections are supposed to be
- * free. That's exactly what pushed .multiboot's file offset past the
+ * free. That is exactly what pushed .multiboot's file offset past the
  * Multiboot spec's 8192-byte limit a second time (the first time was a
  * plain `. = ` jump creating a gap; this was the same symptom from a
  * different cause) -- GRUB silently failed to find the header, zero
@@ -35,7 +35,7 @@ SECTIONS
      * size. boot.s writes the Multiboot info pointer (from EBX at kernel
      * entry) here as its very first instruction; kmain.c0 reads it back
      * via that hardcoded literal address, since c0 has no way to
-     * reference a linker-defined symbol by name and `main` can't take
+     * reference a linker-defined symbol by name and `main` cannot take
      * parameters (coff0.c requires zero) -- see kmain.c0. */
     .mbinfo :
     {
@@ -69,7 +69,7 @@ SECTIONS
      * also uses .kscratch, and if anything printed *after* this got built
      * but *before* boot.s's lidt ran, it would silently overwrite the
      * IDTR's bytes out from under it -- a real hazard worth a whole
-     * section to avoid rather than a "just don't print after this point"
+     * section to avoid rather than a "just do not print after this point"
      * convention someone could violate accidentally later. */
     .idtr :
     {
@@ -83,7 +83,7 @@ SECTIONS
      * kmain.c0 builds (paging_init). Same problem/solution as .idtr, in the
      * same direction: c0 constructs the PML4 hierarchy in memory and writes
      * its root address here; boot.s reads it back and does the actual
-     * `mov cr3` (c0 can't execute that instruction) after main() returns.
+     * `mov cr3` (c0 cannot execute that instruction) after main() returns.
      * One quad (8 bytes) -- only the PML4 physical address. */
     .cr3info :
     {
@@ -94,7 +94,7 @@ SECTIONS
     /* Fixed hand-off slots for the addresses of the CPU-exception ISR
      * trampolines that live in boot.s. Same problem/solution as .isrinfo --
      * kmain.c0 needs each hand-written-asm stub's address as a data value to
-     * write into the IDT, but c0 can't reference an externally-defined
+     * write into the IDT, but c0 cannot reference an externally-defined
      * symbol; boot.s `lea`s each and stashes it here, kmain.c0 reads them
      * back via hardcoded literals. Slots (8 bytes each): [0]
      * isr_pagefault_entry, [1] isr_divide_entry, [2] isr_invalidop_entry,
@@ -112,16 +112,20 @@ SECTIONS
      * SCHED_NEXT_RSP -- the incoming task's saved rsp, for isr_common to
      * load; [4] SCHED_SWITCH_PENDING -- 1 when a switch is requested,
      * cleared by isr_common once performed; [5] the address of boot.s's
-     * `sched_launch` routine (c0 can't call an externally-defined asm
+     * `sched_launch` routine (c0 cannot call an externally-defined asm
      * symbol by name, only indirectly through a value -- same wall as
      * lidt/sti -- so boot.s `lea`s it here and c0 calls through it once, to
      * launch the first task). These live at fixed addresses rather than as
      * c0 globals because isr_common (asm) needs to read/write them by a
      * literal address, and c0 has no address-of for variables -- same
      * reasoning as every other hand-off here. `sched_current` (which task
-     * is running) is pure c0-side bookkeeping asm never touches, so it's an
-     * ordinary c0 global instead, not a slot here. 64 bytes (8 slots)
-     * leaves 2 free for more tasks later. */
+     * is running) is pure c0-side bookkeeping asm never touches, so it is an
+     * ordinary c0 global instead, not a slot here. 64 bytes (8 slots): [6]
+     * SCHED_NEXT_CR3 (the incoming task's saved CR3, loaded by isr_common
+     * right after the rsp swap -- see chrone.c0's task_cr3_base) and [7]
+     * SCHED_NEXT_RSP0 (the incoming task's kernel-stack top, loaded into
+     * TSS.RSP0 -- see chrone.c0's task_stack_base and ring3_handlers.s)
+     * claimed the former headroom; none free now. */
     .sched :
     {
         . = . + 64;
@@ -143,19 +147,19 @@ SECTIONS
      * SIMD FP Exception. 128 bytes (16 slots) leaves 3 free -- #8 (double
      * fault, needs a dedicated IST stack, deliberately not installed yet),
      * #9 and #15 are reserved/obsolete vectors Intel says not to use, so
-     * there's nothing left in 0-31 to add here. */
+     * there is nothing left in 0-31 to add here. */
     .excinfo2 :
     {
         . = . + 128;
     }
 
     /* Fixed hand-off slot for boot.s's `halt_cpu` (hlt; ret) routine's
-     * address -- same "c0 can't call an externally-defined asm symbol by
+     * address -- same "c0 cannot call an externally-defined asm symbol by
      * name" wall as .sched's sched_launch/context_switch slots, solved the
      * same way: boot.s `lea`s it here, kmain.c0 reads it back and calls it
      * indirectly (see kmain.c0's halt()). Lets panic_handler genuinely idle
      * the CPU instead of busy-spinning while intentionally frozen. One quad
-     * (8 bytes) -- there's only ever the one halt routine. */
+     * (8 bytes) -- there is only ever the one halt routine. */
     .haltinfo :
     {
         . = . + 8;
@@ -164,7 +168,7 @@ SECTIONS
     /* Scancode-to-ASCII lookup tables (PS/2 scancode set 1, US QWERTY),
      * populated once at boot by kmain.c0's scancode_init(). Two flat
      * 256-byte byte arrays, unshifted then shifted (index = make code, 0 =
-     * "no printable character" for keys that aren't letters/digits/
+     * "no printable character" for keys that are not letters/digits/
      * punctuation) -- a genuine fixed-address buffer, not a .kscratch reuse
      * or alloc(), for the same reason every other kernel-side buffer here
      * is: alloc() is syscall-backed and unusable in ring 0, and c0 has no
@@ -193,6 +197,33 @@ SECTIONS
     .ring3info :
     {
         . = . + 16;
+    }
+
+    /* Fixed hand-off slot for boot.s's `enable_interrupts` (sti; ret)
+     * routine's address -- same "c0 cannot execute a privileged instruction
+     * directly" wall as .haltinfo's halt_cpu, solved the same way. Needed by
+     * sys_dispatch's SYS_EXIT handler (syscall.c0): the SYSCALL instruction's
+     * SFMASK clears RFLAGS.IF on entry (see boot.s's MSR setup), and that
+     * handler deliberately never reaches SYSRET (the only other place IF
+     * would get restored) -- it loops on `hlt` forever by design. Without
+     * explicitly re-enabling interrupts first, IF stays clear permanently
+     * and the timer can never fire again, freezing the whole single-core
+     * kernel the instant any ring-3 process calls sys_exit -- caught by
+     * actually running a second command after the first ring-3 process
+     * exited, not by inspection. One quad (8 bytes). */
+    .stiinfo :
+    {
+        . = . + 8;
+    }
+
+    /* Fixed hand-off slot for boot.s's isr_mouse_entry (IRQ12 / vector 44),
+     * read back by knekt.c0 to install the IDT entry -- exactly the same
+     * problem and solution as .isrinfo's timer/keyboard stubs, just placed
+     * here rather than by growing .isrinfo, so no address above this line
+     * moves. Same discipline as .excinfo2 and .dfinfo. One quad (8 bytes). */
+    .mouseinfo :
+    {
+        . = . + 8;
     }
 
     .multiboot :

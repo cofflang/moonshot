@@ -1,0 +1,9 @@
+et01 01_control_flow.c0 107
+et02 02_short_circuit.c0 31
+et03 03_args.c0 71
+et04 04_arithmetic.c0 255
+et05 05_recursion.c0 41
+et06 06_layout_alloc.c0 90
+et07 07_loops_nested.c0 51
+et08 08_readfile.c0 111
+et09 09_nested_exit.c0 42

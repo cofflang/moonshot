@@ -1,0 +1,15 @@
+// expect: 71
+// Argument passing, including the 4th and beyond. The SYSCALL ABI bug put
+// arg4 in rcx (clobbered by the syscall instruction) instead of r10, and
+// fill()'s 4th argument silently arrived as garbage. Ordinary calls use the
+// function ABI rather than the syscall one, but arg position is exactly what
+// broke, so it is worth pinning down here where a wrong value is visible as
+// a wrong exit code.
+int five(int a, int b, int c, int d, int e) {
+    return a * 10000 + b * 1000 + c * 100 + d * 10 + e;
+}
+int main() {
+    int r = five(1, 2, 3, 4, 5);
+    if (r != 12345) { return 200; }
+    return 71;
+}

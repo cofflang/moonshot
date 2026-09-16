@@ -65,6 +65,14 @@ def typ(word_keys, gap=0.3):
         time.sleep(gap)
         s.recv(4096)
 
+# Log in as root (raket's boot-time login gate) before any shell command
+# can reach shell_run -- root has no password set at boot, so an empty
+# password line logs in. See raket.c0.
+typ(["r", "o", "o", "t", "ret"])
+time.sleep(0.5)
+typ(["ret"])
+time.sleep(1.0)
+
 # "spawn" + Enter, then give the new task ~1.5s to actually get scheduled.
 typ(["s", "p", "a", "w", "n", "ret"])
 time.sleep(1.5)
@@ -94,7 +102,7 @@ sleep 3
 ok=1
 
 # Read the dynamically-detected spawned task id (written by the Python above).
-# Falls back to 4 if the file isn't there (shouldn't happen in normal runs).
+# Falls back to 4 if the file is not there (should not happen in normal runs).
 shell_id=$(cat shell_spawn_id.txt 2>/dev/null || echo 4)
 
 # spawn: the shell-initiated task must have appeared in the scheduler log.

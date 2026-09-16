@@ -1,0 +1,22 @@
+// expect: 51
+// Nested loops with an early return out of the middle of both. The label
+// bug's worst symptom was a jump landing in a function epilogue, which a
+// deliberate mid-loop return is the most direct way to catch.
+int find(int target) {
+    int i = 0;
+    while (i < 10) {
+        int j = 0;
+        while (j < 10) {
+            if (i * 10 + j == target) { return i + j; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+int main() {
+    if (find(37) != 10) { return 207; }
+    if (find(99) != 18) { return 208; }
+    if (find(500) != 0 - 1) { return 209; }
+    return 51;
+}

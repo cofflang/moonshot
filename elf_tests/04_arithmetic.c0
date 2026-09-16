@@ -1,0 +1,18 @@
+// expect: 255
+// Arithmetic and comparison operators, each contributing a distinct bit so a
+// single wrong opcode shows up as a specific missing amount rather than a
+// vague wrong answer. Division and modulo-by-subtraction are included because
+// they are the operators with the most register-allocation constraints on
+// x86-64 (idiv fixes rax/rdx).
+int main() {
+    int t = 0;
+    if (7 + 3 == 10) { t = t + 1; }
+    if (7 - 3 == 4) { t = t + 2; }
+    if (7 * 3 == 21) { t = t + 4; }
+    if (7 / 3 == 2) { t = t + 8; }
+    if (7 - (7 / 3) * 3 == 1) { t = t + 16; }
+    if (0 - 7 + 10 == 3) { t = t + 32; }
+    if (7 > 3) { t = t + 64; }
+    if (3 <= 3) { t = t + 128; }
+    return t;
+}

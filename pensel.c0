@@ -1,0 +1,483 @@
+// pensel.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// pensel -- the pixel art editor. Swedish for "brush", and the drawing
+// counterpart to skrift, which it is deliberately shaped like: it takes over
+// one kakel window, owns the keyboard while it is focused, writes its file
+// back to jakel on quit, and hands the window back to the shell afterwards.
+//
+// It exists so sprites can be drawn ON Moonshot rather than baked in by a
+// host script. Until SYS_READFILE landed, a ring-3 program could not read a
+// file at all, so every sprite was compiled into the ELF and changing one
+// pixel meant a rebuild. pensel writes a sprite file; a game reads it with
+// readfile(). That is the whole loop, and it closes on the machine itself.
+//
+// This is also klick's first real consumer. Nothing reacted to the mouse
+// before -- the pointer moved and that was all.
+//
+// FILE FORMAT (little-endian, and deliberately the shape gnista's `Sprite`
+// layout already expects, so loading is three reads and a pointer):
+//     0..7    width in pixels
+//     8..15   height
+//    16..23   frame count
+//    24..     frames * width * height * 4 bytes, BGR0 per pixel
+//             (blue, green, red, 0 -- SYS_BLIT's own pixel order)
+// Colour 0 means transparent, matching SYS_BLIT, which skips it.
+
+// Sprite size, in pixels, for the CURRENT session -- `draw (file) (size)`
+// sets it, it defaults to PENSEL_DEF_DIM, and opening an existing file adopts
+// whatever that file was drawn at. Not a constant: a sprite sheet and a
+// 16x16 character want different canvases, and the file format carries its
+// own dimensions anyway.
+int pensel_dim = 16;
+int PENSEL_DEF_DIM = 16;
+int PENSEL_MIN_DIM = 4;
+// 64x64 is 32KB of in-editor pixel state and 16KB on disk. The real limit is
+// the canvas having to fit on screen at a zoom of at least PENSEL_MIN_ZOOM.
+int PENSEL_MAX_DIM = 64;
+
+// Screen pixels per sprite pixel, recomputed from pensel_dim so the canvas
+// fills a consistent area regardless of size -- a 64x64 sprite would run off
+// the window at the 16x16 zoom.
+int pensel_zoom = 14;
+int PENSEL_MIN_ZOOM = 2;
+int PENSEL_MAX_ZOOM = 24;
+// Roughly how many pixels wide the canvas should aim to be.
+int PENSEL_CANVAS_PX = 224;
+int PENSEL_MARGIN = 12;    // gap from the window's top-left corner
+int PENSEL_SWATCH = 20;    // palette swatch size, in screen pixels
+int PENSEL_HEADER = 24;    // bytes of header before the pixel data
+
+// In-editor marker for "no paint here". Cannot be 0 -- see pensel_pixels.
+int PENSEL_EMPTY = -1;
+
+int pensel_active = 0;
+int pensel_win = 0;
+
+// The sprite being edited: pensel_dim*pensel_dim ints, one per pixel, each a
+// packed 0xRRGGBB, or PENSEL_EMPTY for transparent. Converted to BGR0 bytes
+// on save -- kept unpacked in memory because every comparison and every fill
+// wants the packed form, and the conversion only happens twice per session.
+//
+// Transparent is -1, NOT 0, because 0 is a perfectly good colour: black. The
+// first version used 0 for both and black was simply unpaintable -- selecting
+// it painted holes, and its palette swatch rendered as the transparent one.
+int pensel_pixels = 0;
+int pensel_filename = 0;
+
+// Palette: PENSEL_COLORS entries, kmalloc'd. Slot 0 is transparent.
+int PENSEL_COLORS = 16;
+int pensel_palette = 0;
+int pensel_color = 1;      // index of the currently selected colour
+
+// Set once anything is painted, so quitting an untouched file does not
+// rewrite it (and so a mis-typed filename does not create an empty sprite).
+int pensel_modified = 0;
+
+// Where the canvas sits on screen, in absolute pixels. Recomputed by
+// pensel_render, since a reflow can move the window under us.
+int pensel_ox = 0;
+int pensel_oy = 0;
+
+// Picks a zoom that keeps the canvas near PENSEL_CANVAS_PX across on wide
+// range of sizes: big pixels for a small sprite, small ones for a large one.
+// Clamped at both ends -- below PENSEL_MIN_ZOOM the grid is unclickable, and
+// above PENSEL_MAX_ZOOM a tiny sprite would swallow the window.
+void pensel_set_zoom() {
+    int z = PENSEL_CANVAS_PX / pensel_dim;
+    if (z < PENSEL_MIN_ZOOM) { z = PENSEL_MIN_ZOOM; }
+    if (z > PENSEL_MAX_ZOOM) { z = PENSEL_MAX_ZOOM; }
+    pensel_zoom = z;
+    return;
+}
+
+int pensel_pixel_at(int px, int py) {
+    return load64(pensel_pixels + (py * pensel_dim + px) * 8);
+}
+
+void pensel_set_pixel(int px, int py, int color) {
+    store64(pensel_pixels + (py * pensel_dim + px) * 8, color);
+    return;
+}
+
+// The checkerboard shown under a transparent pixel, so "nothing here" is
+// visibly different from "black paint" -- they are the same colour otherwise,
+// and black is a colour a sprite legitimately wants.
+int pensel_empty_shade(int px, int py) {
+    int odd = (px + py) - ((px + py) / 2) * 2;
+    if (odd == 1) { return fb_rgb(60, 60, 60); }
+    return fb_rgb(40, 40, 40);
+}
+
+// --- rendering ------------------------------------------------------------
+
+void pensel_draw_cell(int px, int py) {
+    int x = pensel_ox + px * pensel_zoom;
+    int y = pensel_oy + py * pensel_zoom;
+    int c = pensel_pixel_at(px, py);
+    if (c == PENSEL_EMPTY) {
+        fb_fill_rect(x, y, pensel_zoom, pensel_zoom, pensel_empty_shade(px, py));
+    } else {
+        fb_fill_rect(x, y, pensel_zoom, pensel_zoom, c);
+    }
+    // A one-pixel gap on the right and bottom edges keeps the grid readable
+    // at this zoom without drawing separate grid lines.
+    fb_fill_rect(x + pensel_zoom - 1, y, 1, pensel_zoom, fb_rgb(20, 20, 20));
+    fb_fill_rect(x, y + pensel_zoom - 1, pensel_zoom, 1, fb_rgb(20, 20, 20));
+    return;
+}
+
+// Draws ONE palette swatch. Split out of the full repaint because changing
+// colour happens inside the mouse interrupt handler, and repainting all
+// sixteen there is genuinely too slow: each swatch is five filled rects, and
+// every one of those lifts and restores klick's pointer. The controller kept
+// delivering bytes while the ISR was busy, the packet stream lost framing,
+// and a click landed on the wrong swatch -- which is exactly how this was
+// found. Two swatches per selection instead of sixteen keeps the handler
+// short enough for the next packet to arrive intact.
+void pensel_draw_swatch(int i) {
+    int px = pensel_ox + pensel_dim * pensel_zoom + PENSEL_MARGIN;
+    int col = i - (i / 2) * 2;
+    int row = i / 2;
+    int x = px + col * PENSEL_SWATCH;
+    int y = pensel_oy + row * PENSEL_SWATCH;
+    int c = load64(pensel_palette + i * 8);
+    if (c == PENSEL_EMPTY) {
+        fb_fill_rect(x, y, PENSEL_SWATCH - 2, PENSEL_SWATCH - 2, fb_rgb(50, 50, 50));
+        // A diagonal slash marks the transparent slot.
+        int d = 0;
+        while (d < PENSEL_SWATCH - 2) {
+            fb_put_pixel(x + d, y + d, fb_rgb(200, 80, 80));
+            d = d + 1;
+        }
+    } else {
+        fb_fill_rect(x, y, PENSEL_SWATCH - 2, PENSEL_SWATCH - 2, c);
+    }
+    // Selection ring around the active colour.
+    int ring = fb_rgb(30, 30, 30);
+    if (i == pensel_color) { ring = fb_rgb(255, 255, 255); }
+    fb_fill_rect(x - 2, y - 2, PENSEL_SWATCH + 2, 2, ring);
+    fb_fill_rect(x - 2, y + PENSEL_SWATCH - 2, PENSEL_SWATCH + 2, 2, ring);
+    fb_fill_rect(x - 2, y - 2, 2, PENSEL_SWATCH + 2, ring);
+    fb_fill_rect(x + PENSEL_SWATCH - 2, y - 2, 2, PENSEL_SWATCH + 2, ring);
+    return;
+}
+
+void pensel_draw_palette() {
+    int i = 0;
+    while (i < PENSEL_COLORS) {
+        pensel_draw_swatch(i);
+        i = i + 1;
+    }
+    return;
+}
+
+// Full repaint: the whole window, the grid, the palette and the help line.
+void pensel_render() {
+    if (pensel_active != 1 || kakel_active != 1) { return; }
+    int wid = pensel_win;
+    kakel_clear(wid);
+    pensel_ox = load64(kakel_cx_base + wid * 8) * FONT_W + PENSEL_MARGIN;
+    pensel_oy = load64(kakel_cy_base + wid * 8) * FONT_H + PENSEL_MARGIN + FONT_H;
+
+    // Title line, drawn through kakel so it lands inside the window and
+    // scrolls/clips like any other text.
+    kakel_print(wid, "pensel: ");
+    if (pensel_filename != 0) { kakel_print(wid, pensel_filename); }
+    kakel_print(wid, " ");
+    kakel_print_int(wid, pensel_dim);
+    kakel_print(wid, "x");
+    kakel_print_int(wid, pensel_dim);
+    kakel_print(wid, "  [s]ave [c]lear [q]uit\n");
+
+    int py = 0;
+    while (py < pensel_dim) {
+        int px = 0;
+        while (px < pensel_dim) {
+            pensel_draw_cell(px, py);
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    pensel_draw_palette();
+    return;
+}
+
+// --- input ----------------------------------------------------------------
+
+// Called from klick_handler on every packet while a button is held, so a
+// press and a drag are the same code path -- dragging across the canvas
+// paints a stroke, which is the whole point of having a mouse.
+//
+// Coordinates are absolute screen pixels; everything outside the canvas and
+// the palette is simply ignored, so the pointer can leave the window without
+// the editor having to track that.
+void pensel_mouse(int sx, int sy, int left, int right) {
+    if (pensel_active != 1) { return; }
+    if (left == 0 && right == 0) { return; }
+
+    // Palette first: it sits to the right of the canvas.
+    int palx = pensel_ox + pensel_dim * pensel_zoom + PENSEL_MARGIN;
+    if (sx >= palx) {
+        int col = (sx - palx) / PENSEL_SWATCH;
+        int row = (sy - pensel_oy) / PENSEL_SWATCH;
+        if (col >= 0 && col < 2 && row >= 0) {
+            int idx = row * 2 + col;
+            if (idx >= 0 && idx < PENSEL_COLORS && idx != pensel_color) {
+                int prev = pensel_color;
+                pensel_color = idx;
+                pensel_draw_swatch(prev);
+                pensel_draw_swatch(idx);
+            }
+        }
+        return;
+    }
+
+    int px = (sx - pensel_ox) / pensel_zoom;
+    int py = (sy - pensel_oy) / pensel_zoom;
+    if (sx < pensel_ox || sy < pensel_oy) { return; }
+    if (px < 0 || px >= pensel_dim || py < 0 || py >= pensel_dim) { return; }
+
+    // Right button erases -- the same gesture as painting, so there is no
+    // separate eraser mode to be in and forget about.
+    int c = load64(pensel_palette + pensel_color * 8);
+    if (right == 1) { c = PENSEL_EMPTY; }
+    if (pensel_pixel_at(px, py) == c) { return; }
+    pensel_set_pixel(px, py, c);
+    pensel_modified = 1;
+    // One lift around the whole cell: pensel_draw_cell is three filled rects
+    // (the cell and two grid edges), and letting each lift and restore the
+    // pointer separately means three chances to interleave badly with a
+    // pointer move, for no benefit.
+    klick_lift();
+    pensel_draw_cell(px, py);
+    klick_drop();
+    return;
+}
+
+// Serialises the sprite and writes it to jakel. Returns 1 on success.
+int pensel_save() {
+    if (pensel_filename == 0) { return 0; }
+    int n = pensel_dim * pensel_dim;
+    int total = PENSEL_HEADER + n * 4;
+    int buf = kmalloc(total);
+    if (buf == 0) { return 0; }
+    store64(buf, pensel_dim);
+    store64(buf + 8, pensel_dim);
+    store64(buf + 16, 1);  // one frame for now
+    int i = 0;
+    while (i < n) {
+        int c = load64(pensel_pixels + i * 8);
+        int off = PENSEL_HEADER + i * 4;
+        // Packed 0xRRGGBB out to BGR0, the order SYS_BLIT reads. Transparent
+        // becomes all-zero, which is exactly how SYS_BLIT recognises a hole.
+        if (c == PENSEL_EMPTY) { c = 0; }
+        store8(buf + off, c - (c / 256) * 256);
+        store8(buf + off + 1, (c / 256) - (c / 65536) * 256);
+        store8(buf + off + 2, (c / 65536) - (c / 16777216) * 256);
+        store8(buf + off + 3, 0);
+        i = i + 1;
+    }
+    int cwd = 0;
+    if (kakel_active == 1) { cwd = load64(sk_cwd_base + pensel_win * 8); }
+    int fid = jakel_lookup(cwd, pensel_filename);
+    if (fid < 0) { fid = jakel_make_file(cwd, pensel_filename); }
+    if (fid < 0) { kfree(buf); return 0; }
+    jakel_write(fid, 0, buf, total);
+    store64(jakel_size_base + fid * 8, total);
+    kfree(buf);
+    serial_print("[pensel] saved ");
+    serial_print(pensel_filename);
+    serial_print(" (");
+    serial_print_int(total);
+    serial_print(" bytes)\n");
+    return 1;
+}
+
+// Called from kakel_close_id when the window pensel is editing in is about to
+// be destroyed. Same teardown as a normal quit, minus every use of the window:
+// its id is freed a few lines later and kakel_win_new hands ids out lowest
+// first, so it is very likely to come straight back as an unrelated window.
+//
+// Without this, closing pensel's window left pensel_active == 1 pointing at
+// that id, and two things followed. keyboard.c0 routes keys to pensel whenever
+// `kakel_focus == pensel_win`, so the new tenant's keystrokes were eaten by an
+// editor that was no longer on screen. And pensel_mouse paints in ABSOLUTE
+// screen pixels from pensel_ox/pensel_oy, cached at render time, so the next
+// drag painted a stroke over whatever now occupied that rectangle.
+void pensel_window_closed(int win) {
+    if (pensel_active != 1 || pensel_win != win) { return; }
+    if (pensel_modified == 1) { pensel_save(); }
+    if (pensel_pixels != 0) { kfree(pensel_pixels); pensel_pixels = 0; }
+    if (pensel_palette != 0) { kfree(pensel_palette); pensel_palette = 0; }
+    if (pensel_filename != 0) { kfree(pensel_filename); pensel_filename = 0; }
+    pensel_active = 0;
+    pensel_modified = 0;
+    serial_print("[pensel] window closed, editor torn down\n");
+    return;
+}
+
+void pensel_quit() {
+    if (pensel_modified == 1) { pensel_save(); }
+    if (pensel_pixels != 0) { kfree(pensel_pixels); pensel_pixels = 0; }
+    if (pensel_palette != 0) { kfree(pensel_palette); pensel_palette = 0; }
+    if (pensel_filename != 0) { kfree(pensel_filename); pensel_filename = 0; }
+    pensel_active = 0;
+    pensel_modified = 0;
+    if (kakel_active == 1) {
+        kakel_clear(pensel_win);
+        shell_prompt_win(pensel_win);
+    } else {
+        shell_prompt();
+    }
+    return;
+}
+
+// Runs in the keyboard IRQ, same as skrift_handle_key.
+void pensel_handle_key(int make_code, int ascii) {
+    if (pensel_active != 1) { return; }
+    if (make_code == 1) { pensel_quit(); return; }   // Esc
+    if (ascii == 'q') { pensel_quit(); return; }
+    if (ascii == 's') {
+        if (pensel_save() == 1) { pensel_modified = 0; }
+        return;
+    }
+    if (ascii == 'c') {
+        int i = 0;
+        while (i < pensel_dim * pensel_dim) {
+            store64(pensel_pixels + i * 8, PENSEL_EMPTY);
+            i = i + 1;
+        }
+        pensel_modified = 1;
+        pensel_render();
+        return;
+    }
+    return;
+}
+
+// --- startup --------------------------------------------------------------
+
+void pensel_palette_init() {
+    store64(pensel_palette, PENSEL_EMPTY);                 // transparent
+    // Near-black, not fb_rgb(0,0,0): colour 0 is SYS_BLIT's transparency
+    // marker, so a pure-black pixel would be skipped when a game drew it.
+    store64(pensel_palette + 8, fb_rgb(10, 10, 10));       // black
+    store64(pensel_palette + 16, fb_rgb(255, 255, 255));   // white
+    store64(pensel_palette + 24, fb_rgb(140, 140, 140));   // grey
+    store64(pensel_palette + 32, fb_rgb(200, 40, 40));     // red
+    store64(pensel_palette + 40, fb_rgb(255, 140, 0));     // orange
+    store64(pensel_palette + 48, fb_rgb(255, 220, 0));     // yellow
+    store64(pensel_palette + 56, fb_rgb(60, 180, 60));     // green
+    store64(pensel_palette + 64, fb_rgb(0, 130, 90));      // teal
+    store64(pensel_palette + 72, fb_rgb(60, 120, 220));    // blue
+    store64(pensel_palette + 80, fb_rgb(30, 40, 120));     // navy
+    store64(pensel_palette + 88, fb_rgb(150, 70, 200));    // purple
+    store64(pensel_palette + 96, fb_rgb(230, 130, 180));   // pink
+    store64(pensel_palette + 104, fb_rgb(140, 90, 40));    // brown
+    store64(pensel_palette + 112, fb_rgb(220, 190, 150));  // skin
+    store64(pensel_palette + 120, fb_rgb(90, 200, 220));   // sky
+    return;
+}
+
+// Loads an existing sprite file if one is there. Anything that does not match
+// this editor's dimensions is left alone rather than half-loaded -- pensel
+// only edits 16x16 for now, and silently truncating someone's larger sprite
+// would be worse than refusing it.
+int pensel_load(int cwd) {
+    int fid = jakel_open(cwd, pensel_filename);
+    if (fid < 0) { return 0; }
+    if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) { return 0; }
+    int fsz = load64(jakel_size_base + fid * 8);
+    int want = PENSEL_HEADER + pensel_dim * pensel_dim * 4;
+    if (fsz < want) { return 0; }
+    int buf = kmalloc(fsz);
+    if (buf == 0) { return 0; }
+    jakel_read(fid, 0, buf, fsz);
+    // Adopt the file's OWN size rather than refusing anything that is not
+    // the current one -- the format carries width and height precisely so an
+    // editor does not have to be told. Only squares are handled for now, and
+    // only within the limits the canvas can actually display.
+    int fw = load64(buf);
+    int fh = load64(buf + 8);
+    if (fw != fh || fw < PENSEL_MIN_DIM || fw > PENSEL_MAX_DIM) {
+        kfree(buf);
+        return 0;
+    }
+    if (PENSEL_HEADER + fw * fh * 4 > fsz) {
+        kfree(buf);
+        return 0;
+    }
+    pensel_dim = fw;
+    pensel_set_zoom();
+    int i = 0;
+    while (i < pensel_dim * pensel_dim) {
+        int off = PENSEL_HEADER + i * 4;
+        int b = load8(buf + off);
+        int g = load8(buf + off + 1);
+        int r = load8(buf + off + 2);
+        // All-zero means transparent in the file format, so it comes back
+        // as empty rather than black. That round trip is lossy for pure
+        // black by design -- SYS_BLIT skips colour 0, so a truly black pixel
+        // would be invisible in a game anyway, which is why the palette's
+        // "black" is a near-black instead.
+        int c = PENSEL_EMPTY;
+        if (b != 0 || g != 0 || r != 0) { c = fb_rgb(r, g, b); }
+        store64(pensel_pixels + i * 8, c);
+        i = i + 1;
+    }
+    kfree(buf);
+    return 1;
+}
+
+// Opens the editor on `filename` in window `win`. Mirrors skrift_start.
+void pensel_start(int win, int filename_str, int dim) {
+    if (kakel_active != 1) {
+        sk_print("draw: needs the pixel framebuffer (not available in VGA text mode)\n");
+        return;
+    }
+    if (klick_active != 1) {
+        sk_print("draw: needs the mouse (klick is not active)\n");
+        return;
+    }
+    pensel_win = win;
+    pensel_filename = sk_strdup(filename_str);
+    if (dim < PENSEL_MIN_DIM || dim > PENSEL_MAX_DIM) { dim = PENSEL_DEF_DIM; }
+    pensel_dim = dim;
+    pensel_set_zoom();
+    // Sized for the LARGEST canvas, not the current one: loading a file
+    // adopts that file's dimensions, which may be bigger than the size this
+    // session was opened with, and reallocating mid-load would be one more
+    // failure path for no benefit.
+    pensel_pixels = kmalloc(PENSEL_MAX_DIM * PENSEL_MAX_DIM * 8);
+    pensel_palette = kmalloc(PENSEL_COLORS * 8);
+    if (pensel_pixels == 0 || pensel_palette == 0) {
+        sk_print("draw: out of memory\n");
+        return;
+    }
+    int i = 0;
+    while (i < pensel_dim * pensel_dim) {
+        store64(pensel_pixels + i * 8, PENSEL_EMPTY);
+        i = i + 1;
+    }
+    pensel_palette_init();
+    pensel_color = 1;
+    pensel_modified = 0;
+
+    int cwd = load64(sk_cwd_base + win * 8);
+    int loaded = pensel_load(cwd);
+    serial_print("[pensel] editing ");
+    serial_print(pensel_filename);
+    serial_print(" loaded=");
+    serial_print_int(loaded);
+    serial_print("\n");
+
+    pensel_active = 1;
+    pensel_render();
+    return;
+}

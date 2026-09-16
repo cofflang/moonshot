@@ -1,0 +1,27 @@
+// ticks_test.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// Verifies ticks() (SYS_TICKS) end to end from ring 3: reads the counter,
+// spins long enough for the timer to fire, reads it again, and exits 1 if the
+// second read is strictly greater. verify_ticks.sh looks for that exit code
+// and for the line printed below. Baked into the kernel as ticks_test_data.c0
+// by gen_programs.sh; the original of this file was lost and this is a
+// rewrite from the shipped machine code.
+int main() {
+    int t0 = 0;
+    int t1 = 0;
+    int i = 0;
+    t0 = ticks();
+    i = 0;
+    while (i < 20000000) { i = i + 1; }
+    t1 = ticks();
+    print("ticks test ok\n");
+    if (t1 > t0) { return 1; }
+    return 0;
+}

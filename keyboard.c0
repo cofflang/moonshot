@@ -45,6 +45,89 @@ int e0_prefix = 0;
 // columns") a keyboard/input-layer decision, same as Backspace already is.
 int TAB_WIDTH = 8;
 
+// --- Ring-3 key event queue (SYS_KEY_POLL) --------------------------------
+// A simple ring buffer that captures every key make/break as a packed int:
+// make_code * 2 + is_break.  SYS_KEY_POLL dequeues from the head; the
+// keyboard ISR pushes to the tail.  No overflow protection (32 slots is
+// generous for a single game loop polling a few times per frame).
+// 128, not 32. The ring drops events once full, and for a game tracking keys
+// as HELD state a dropped RELEASE is a key that never comes back up -- the
+// player moves on its own until the direction is pressed and released again.
+// A ring-3 game descheduled for a moment can easily bank more than 32 events.
+int KEY_RING_CAP = 128;
+
+// PER-TASK key queues. One ring per task slot, carved from a single
+// allocation: ring i occupies [i*KEY_RING_CAP, (i+1)*KEY_RING_CAP).
+//
+// There used to be ONE ring shared by every ring-3 task, which was wrong the
+// moment two graphical programs could run at once: whichever task happened to
+// poll first drained events meant for the other. Each task already gets its
+// own window (task_win_base) and its own heap; input is the same kind of
+// per-task resource.
+//
+// Events are pushed to the OWNER of the focused tavla, so a program only ever
+// receives keys that were typed while its own window had focus.
+int key_rings = 0;        // kmalloc(MAX_TASKS * KEY_RING_CAP * 8)
+int key_head_base = 0;    // kmalloc(MAX_TASKS * 8)
+int key_tail_base = 0;
+int key_count_base = 0;
+
+void key_rings_init() {
+    key_rings = kmalloc(MAX_TASKS * KEY_RING_CAP * 8);
+    key_head_base = kmalloc(MAX_TASKS * 8);
+    key_tail_base = kmalloc(MAX_TASKS * 8);
+    key_count_base = kmalloc(MAX_TASKS * 8);
+    int i = 0;
+    while (i < MAX_TASKS) {
+        store64(key_head_base + i * 8, 0);
+        store64(key_tail_base + i * 8, 0);
+        store64(key_count_base + i * 8, 0);
+        i = i + 1;
+    }
+    return;
+}
+
+// Drops the event when that task's queue is full, rather than the oldest: a
+// program that is not draining is already behind, and discarding what it has
+// not seen yet would desync make/break pairs worse than dropping the newest.
+void key_task_push(int tid, int make_code, int is_break) {
+    if (key_rings == 0 || tid < 0 || tid >= MAX_TASKS) { return; }
+    int n = load64(key_count_base + tid * 8);
+    if (n >= KEY_RING_CAP) { return; }
+    int tail = load64(key_tail_base + tid * 8);
+    store64(key_rings + (tid * KEY_RING_CAP + tail) * 8, make_code * 2 + is_break);
+    tail = tail + 1;
+    if (tail >= KEY_RING_CAP) { tail = 0; }
+    store64(key_tail_base + tid * 8, tail);
+    store64(key_count_base + tid * 8, n + 1);
+    return;
+}
+
+int key_task_poll(int tid) {
+    if (key_rings == 0 || tid < 0 || tid >= MAX_TASKS) { return 0 - 1; }
+    int n = load64(key_count_base + tid * 8);
+    if (n <= 0) { return 0 - 1; }
+    int head = load64(key_head_base + tid * 8);
+    int ev = load64(key_rings + (tid * KEY_RING_CAP + head) * 8);
+    head = head + 1;
+    if (head >= KEY_RING_CAP) { head = 0; }
+    store64(key_head_base + tid * 8, head);
+    store64(key_count_base + tid * 8, n - 1);
+    return ev;
+}
+
+// Called when a task slot is reused or reaped, so a new process never
+// inherits keystrokes typed at its predecessor.
+void key_task_reset(int tid) {
+    if (key_rings == 0 || tid < 0 || tid >= MAX_TASKS) { return; }
+    store64(key_head_base + tid * 8, 0);
+    store64(key_tail_base + tid * 8, 0);
+    store64(key_count_base + tid * 8, 0);
+    return;
+}
+// The old single shared ring lived here. Replaced by the per-task queues
+// above -- see key_rings for why one ring stopped being correct.
+
 // Fills in one scancode's unshifted/shifted ASCII pair in both lookup
 // tables at once -- halves the call count scancode_init() would otherwise
 // need (one call per key instead of two).
@@ -62,8 +145,8 @@ void scmap(int code, int lo, int hi) {
 // space, enter, backspace, and Tab (ASCII 9, same both shifted/unshifted --
 // keyboard_handler gives it dedicated column-advance handling, not a drawn
 // glyph); no arrow keys/F-keys/keypad, nothing needs them yet. CapsLock has
-// no ASCII of its own (it's a toggle, not a character -- see
-// caps_lock/keyboard_handler), so it's intercepted by scancode alone, not
+// no ASCII of its own (it is a toggle, not a character -- see
+// caps_lock/keyboard_handler), so it is intercepted by scancode alone, not
 // looked up here.
 void scancode_init() {
     int i = 0;
@@ -142,8 +225,8 @@ void scancode_init() {
 // (is_break == 0) -- looks its make code up in the unshifted or shifted
 // table depending on shift_down, and either erases (ASCII backspace, 8) or
 // draws (anything else nonzero) on the real screen. Draws via the pixel
-// framebuffer (fb_putc/fb_backspace) when one's available, since VGA text
-// mode isn't usable at the same time as a real VESA graphics mode is
+// framebuffer (fb_putc/fb_backspace) when one is available, since VGA text
+// mode is not usable at the same time as a real VESA graphics mode is
 // active -- see punkt.c0's fb_probe.
 void keyboard_handler() {
     int scancode = inb(0x60);
@@ -173,6 +256,22 @@ void keyboard_handler() {
     // and this keeps a stale prefix from leaking into a later keypress.
     int was_e0 = e0_prefix;
     e0_prefix = 0;
+
+    // Push key events into the ring-3 poll queue ONLY when a tavla has focus.
+    //
+    // This used to be unconditional, and that was the whole "two windows
+    // respond at once" bug: the focus check further down stops the SHELL from
+    // also processing a key, but nothing stopped a ring-3 program from
+    // seeing it, because the program reads this ring rather than going
+    // through the focus path at all. So with skalman focused, typing drove
+    // the shell AND drove the game underneath it.
+    //
+    // The VGA fallback keeps the old behaviour: with no windowing there is no
+    // focus to consult, and a non-windowed ring-3 program has nowhere else to
+    // get input from.
+    if (kakel_active == 1 && kakel_is_tavla(kakel_focus) == 1) {
+        key_task_push(load64(kakel_owner_base + kakel_focus * 8), make_code, is_break);
+    }
 
     if (make_code == 0x2A || make_code == 0x36) {
         shift_down = 1 - is_break;
@@ -210,6 +309,60 @@ void keyboard_handler() {
                 skrift_show_cursor();
             }
             ascii = 0 - 1;
+        }
+        // --- Alt+W: close the focused tavla ---
+        // Checked here, alongside Alt+Tab and BEFORE any routing, so it works
+        // no matter what the focused window is doing with keys. A graphical
+        // program owns every keystroke sent to its tavla, so without a route
+        // kakel reserves for itself there is no way to shut one down from the
+        // keyboard -- which is exactly how closing skalman's own window while
+        // a graphical program was running used to leave the machine with no
+        // reachable shell. Only acts on a tavla: shell windows keep `close`.
+        if (ascii == 'w' && alt_down == 1 && kakel_active == 1) {
+            if (kakel_is_tavla(kakel_focus) == 1) {
+                if (kakel_close() == 1) {
+                    shell_reprompt_others(0 - 1);
+                    // ...and the newly focused window, which
+                    // shell_reprompt_others deliberately skips. On the `close`
+                    // command that skip is right -- shell_input prompts the
+                    // focused window as soon as shell_run returns. Nothing
+                    // does that here: alt+w runs in the keyboard ISR, not
+                    // through shell_input. Closing the LAST window is where it
+                    // showed: kakel_close_id replaces it with a fresh one and
+                    // prints the greeting, and then that window sat there with
+                    // no prompt of any kind, silently waiting at raket's login
+                    // gate for a username.
+                    shell_prompt_session(kakel_focus);
+                }
+            }
+            outb(0x20, 0x20);
+            return;
+        }
+        // --- tavla routing ---
+        // Keys go exclusively to the owner of the focused tavla, which reads
+        // them from the ring buffer pushed above via SYS_KEY_POLL. The shell
+        // and editor must not also process them, so stop here.
+        //
+        // This drops keys rather than falling through even for an orphaned
+        // tavla (owner exited): there is no shell session behind a tavla to
+        // receive them, and treating one as a console would prompt into a
+        // window skalman does not own. What makes that safe is Alt+Tab and
+        // Alt+W above -- both are checked before this point, so a tavla can
+        // always be left or closed no matter what it does with input.
+        if (kakel_active == 1) {
+            if (kakel_is_tavla(kakel_focus) == 1) {
+                outb(0x20, 0x20);
+                return;
+            }
+        }
+        // --- pensel routing ---
+        // Same shape as the editor routing below: while pensel owns the
+        // focused window it owns the keyboard too, so its own s/c/q/Esc are
+        // not also run as shell commands.
+        if (pensel_active == 1 && kakel_focus == pensel_win) {
+            pensel_handle_key(make_code, ascii);
+            outb(0x20, 0x20);
+            return;
         }
         // --- editor routing ---
         // When the editor is active AND its window has focus, keys go to the
@@ -363,8 +516,21 @@ void keyboard_handler() {
             }
             serial_print("\n");
         } else if (ascii > 0) {
+            // While the focused session is at raket's password prompt, echo
+            // '*' instead of the real character -- the actual keystroke
+            // still reaches shell_input/raket_login_line unmasked via the
+            // input queue below, only the on-screen glyph is substituted.
+            // Enter reaches this branch too (scmap maps 0x1C to '\n'), and
+            // masking every character alike turned the newline itself into a
+            // '*' -- so submitting a password printed a stray asterisk
+            // instead of breaking the line, most visibly on an empty one.
+            // Only real typed glyphs get masked; the newline stays a newline.
+            int echo_ch = ascii;
+            if (ascii != '\n') {
+                if (raket_should_mask(sk_console()) == 1) { echo_ch = '*'; }
+            }
             if (kakel_active == 1) {
-                kakel_putc(kakel_focus, ascii);
+                kakel_putc(kakel_focus, echo_ch);
                 serial_print("kakel typed: win=");
                 serial_print_int(kakel_focus);
                 serial_print(" char=");
@@ -374,7 +540,7 @@ void keyboard_handler() {
                 serial_print(" col=");
                 serial_print_int(kakel_get_col(kakel_focus));
             } else if (fb_available == 1) {
-                fb_putc(ascii, FB_FG, FB_BG);
+                fb_putc(echo_ch, FB_FG, FB_BG);
                 serial_print("fb typed: char=");
                 serial_print_int(ascii);
                 serial_print(" row=");
@@ -382,7 +548,7 @@ void keyboard_handler() {
                 serial_print(" col=");
                 serial_print_int(fb_col);
             } else {
-                vga_putc(ascii, VGA_DEFAULT_ATTR);
+                vga_putc(echo_ch, VGA_DEFAULT_ATTR);
                 vga_move_cursor();
                 serial_print("vga typed: char=");
                 serial_print_int(ascii);

@@ -12,7 +12,7 @@
 // Real hardware would need the real init sequence -- deferred until
 // Moonshot actually needs to run there. Automated testing reads the
 // serial log, so this stays the verification channel even now that
-// there's real graphical output too (see vga.c0/punkt.c0).
+// there is real graphical output too (see vga.c0/punkt.c0).
 
 int SERIAL_PORT = 0x3f8;
 
@@ -33,7 +33,7 @@ void serial_print(int msg) {
 // Same digit-extraction idiom as serial_print_int, but base 16 -- prints
 // an unsigned hex string (no 0x prefix). No % operator in c0, so
 // v - (v/16)*16 extracts the low hex digit. Uses the fixed .kscratch
-// buffer instead of alloc() -- see linker.ld for why alloc() can't be
+// buffer instead of alloc() -- see linker.ld for why alloc() cannot be
 // used here. 64-bit values need at most 16 hex digits, so this fits
 // easily inside the same .kscratch buffer.
 void serial_print_hex(int v) {

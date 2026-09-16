@@ -47,7 +47,7 @@ for c in '$1':
     name = {
         ' ': 'spc', '\n': 'ret', '/': 'slash', '.': 'dot', '-': 'minus',
         '+': 'shift-equal', '(': 'shift-9', ')': 'shift-0',
-        '=': 'equal', '!': 'shift-1',
+        '=': 'equal', '!': 'shift-1', '_': 'shift-minus',
         '<': 'shift-comma', '>': 'shift-dot', '*': 'shift-8',
         ';': 'semicolon', '{': 'shift-bracket_left', '}': 'shift-bracket_right',
         'A': 'shift-a', 'B': 'shift-b', 'C': 'shift-c', 'D': 'shift-d',
@@ -62,21 +62,115 @@ time.sleep(0.5)
 " 2>/dev/null
 }
 
+# Byte offset into serial.log taken just before the current command was sent,
+# so a check only ever looks at output that command produced.
+#
+# check() used to grep the whole cumulative log, which means a test could pass
+# on a value some EARLIER test had printed -- `check '\[repl] 5'` is satisfied
+# by any of the several earlier expressions that also produce 5. Nothing was
+# known to be passing spuriously, but the suite could not have told us.
+mark=0
+serial_size() { if [ -f serial.log ]; then wc -c < serial.log; else echo 0; fi; }
+
+# The serial log has several writers going at once -- the keyboard isr, the
+# scheduler, the timer -- and the repl prints its prefix, its value and its
+# newline as three separate calls. So a correct `[jit] -8` genuinely arrives as
+# `[jit] key scancode 156` followed by `-8` on the next line, and a plain grep
+# for '\[jit] -8' misses it.
+#
+# The kernel could print atomically instead, but only by disabling interrupts
+# around every debug print, which is a real cost to pay for a test's
+# convenience. Normalising here is the cheaper half of that trade: delete the
+# async messages wherever they land, INCLUDING mid-line, drop what that leaves
+# empty, then glue a dangling `[repl] `/`[jit] ` prefix back onto the value
+# below it.
+normalize() {
+  python3 -c '
+import re, sys
+text = sys.stdin.read()
+
+# Each async message is removed together with the newline it printed itself.
+# That is the whole trick, and it is why this is not a line-based filter.
+#
+# serial_print writes a byte at a time, so an interrupt can land between ANY
+# two bytes -- not politely between records. A real failure showed the message
+# "[jit] unknown variable" arriving as "[jit] unkn" / "own variable", split
+# mid-word by an isr message that had inserted itself there and ended with a
+# newline. Deleting only the text leaves that stray newline behind and the
+# record stays broken in two; deleting the message AND its newline restores
+# the byte stream exactly as the writer intended it.
+#
+# This is safe for a message that did occupy its own line, because the line
+# before it ended with its own newline, which is not the one being removed.
+for pattern in (
+    r"key scancode \d+\n?",
+    r"\[sched\] -> task \d+ \(counter=\d+\)\n?",
+    r"kakel typed: win=\d+ char=\d+(?: row=\d+ col=\d+)?\n?",
+    r"tick \d+\n?",
+):
+    text = re.sub(pattern, "", text)
+sys.stdout.write(text)
+'
+}
+
+# Only the output the current command produced, normalised.
+window() { tail -c "+$((mark + 1))" serial.log 2>/dev/null | normalize; }
+
+# What the guest ACTUALLY received, rebuilt from the kernel's own per-character
+# echo. This is the check that would have saved a session: when `-(5 + 3)` came
+# back as -6, the natural reading was a compiler bug, and the first thing that
+# had to be ruled out was the harness dropping or mis-shifting a keystroke.
+# Now the harness answers that question itself, every command, instead of
+# leaving it to be reconstructed by hand afterwards.
+typed_since() {
+  tail -c "+$((mark + 1))" serial.log 2>/dev/null \
+    | grep -oE 'kakel typed: win=[0-9]+ char=[0-9]+' \
+    | grep -oE 'char=[0-9]+$' | cut -d= -f2 \
+    | python3 -c "
+import sys
+out = ''.join(chr(int(l)) for l in sys.stdin if l.strip())
+print(out.replace('\n', ''), end='')
+" 2>/dev/null
+}
+
+failures=0
+last_cmd=""
+
 type_cmd() {
+  mark=$(serial_size)
+  last_cmd="$1"
   sendkey "$1"
   sendkey "\n"
   sleep 1
 }
 
-failures=0
+# Reports a garbled command as a HARNESS problem rather than a wrong value,
+# because those need completely different responses and look identical in a
+# bare grep failure.
 check() {
-  if grep -q "$2" serial.log; then
+  local got
+  got=$(typed_since)
+  if [ -n "$last_cmd" ] && [ "$got" != "$last_cmd" ]; then
+    echo "  FAIL: $1 (INPUT GARBLED -- sent '$last_cmd', guest received '$got')"
+    failures=$((failures + 1))
+    return
+  fi
+  if window | grep -q "$2"; then
     echo "  OK: $1"
   else
     echo "  FAIL: $1 (missing '$2')"
+    echo "        guest received: '$got'"
+    echo "        output for this command was:"
+    window | sed 's/^/          /'
     failures=$((failures + 1))
   fi
 }
+
+# Log in as root (raket's boot-time login gate) before any shell command can
+# reach shell_run -- root has no password set at boot, so an empty password
+# line is what logs in. See raket.c0.
+type_cmd "root"
+type_cmd ""
 
 # Arithmetic
 type_cmd "eval 2 + 3 * 4"
@@ -95,7 +189,7 @@ check "-5+10 = 5" '\[repl] 5'
 type_cmd "eval 0x10 + 1"
 check "0x10+1 = 17" '\[repl] 17'
 
-# Comparisons (use simple ones that don't need complex shift combos)
+# Comparisons (use simple ones that do not need complex shift combos)
 type_cmd "eval 3 == 3"
 check "3==3 = 1" '\[repl] 1'
 
@@ -252,7 +346,10 @@ check "jit print 77" '\[jit] 77'
 # --- run from file ---
 
 # Write a file and run it through the interpreter.
-# Use unique values (9947+53=10000) so grep doesn't match earlier eval output.
+# The unique values (9947+53=10000) were chosen so a cumulative grep could not
+# match some earlier eval's output. check() is windowed to the current command
+# now, so that is belt and braces rather than the only defence -- kept because
+# a distinctive value still makes a failure easier to read.
 type_cmd "write runtest.c0 9947 + 53"
 sleep 3
 type_cmd "run runtest.c0"

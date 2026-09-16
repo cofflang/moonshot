@@ -1,0 +1,211 @@
+// raket.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// raket.c0 -- the init system. Gates every shell session behind a login
+// prompt (username, then password) before handing control to skalman's
+// interactive shell, instead of booting straight into an already-logged-in
+// root shell. Named for the boot sequence's own "moonshot" theme -- raket
+// (Swedish for "rocket") is what launches everything else.
+//
+// Deliberately NOT a separate task: shell_task (skalman.c0) already owns
+// the per-session input loop (block on empty queue, dequeue a char, hand it
+// to a line-buffer-driven handler on Enter), and every character's
+// echo/backspace/history/tab-complete mechanics are identical whether the
+// line being typed is a login field or a shell command. Rather than
+// duplicating that machinery in a second task, shell_input (skalman.c0)
+// checks raket_authed_base and routes a completed line to raket_login_line
+// below instead of shell_run, right up until the session authenticates.
+
+// Per-session state, KAKEL_MAX_WIN-sized parallel arrays -- same idiom as
+// skalman's sk_uid_base/sk_cwd_base. raket_authed_base: 0 while still at
+// the login prompt, 1 once authenticated and handed off to the shell.
+// raket_stage_base: which field is currently being typed (username or
+// password). raket_pending_uid_base: the uid matched from the typed
+// username, kept around across the username->password exchange so the
+// password stage does not need a second lookup, and reset to -1 on any
+// failure so a stale match can never leak into the next attempt.
+int raket_authed_base = 0;
+int raket_stage_base = 0;
+int raket_pending_uid_base = 0;
+
+int RAKET_STAGE_USER = 0;
+int RAKET_STAGE_PASS = 1;
+
+void raket_init() {
+    raket_authed_base = kmalloc(KAKEL_MAX_WIN * 8);
+    raket_stage_base = kmalloc(KAKEL_MAX_WIN * 8);
+    raket_pending_uid_base = kmalloc(KAKEL_MAX_WIN * 8);
+    int i = 0;
+    while (i < KAKEL_MAX_WIN) {
+        store64(raket_authed_base + i * 8, 0);
+        store64(raket_stage_base + i * 8, RAKET_STAGE_USER);
+        store64(raket_pending_uid_base + i * 8, 0 - 1);
+        i = i + 1;
+    }
+    return;
+}
+
+// Returns session f to a fresh, unauthenticated state. Called from
+// kakel_win_new, so every newly allocated window slot starts at the login
+// prompt.
+//
+// This exists because window ids are REUSED. Closing the last window frees
+// its slot and immediately allocates a replacement, which gets the same id
+// back -- and every per-session array here is indexed by window id. Without
+// this reset the replacement inherited `authed = 1` from the session that was
+// just closed, so `close` on the last window handed back a shell that was
+// already logged in, straight past the gate raket exists to be.
+//
+// skalman's own per-session state is reset to the same defaults shell_init
+// uses (uid 0, cwd at root) rather than left alone. A successful login always
+// writes sk_uid_base, so uid would be corrected anyway -- but nothing rewrites
+// sk_cwd_base, and a stale cwd is a jakel node id that the previous session
+// may since have removed.
+//
+// Guarded the same way raket_authed is: kakel_init allocates window 0 before
+// raket_init and shell_init have allocated any of these arrays, and storing
+// through a null base would write straight to physical address 0.
+void raket_reset_session(int f) {
+    if (raket_authed_base != 0) {
+        store64(raket_authed_base + f * 8, 0);
+        store64(raket_stage_base + f * 8, RAKET_STAGE_USER);
+        store64(raket_pending_uid_base + f * 8, 0 - 1);
+    }
+    if (sk_uid_base != 0) { store64(sk_uid_base + f * 8, 0); }
+    if (sk_cwd_base != 0) { store64(sk_cwd_base + f * 8, 0); }
+    return;
+}
+
+// True once session f has logged in -- shell_input (skalman.c0) checks
+// this on every completed line to decide whether it goes to raket or to
+// the real shell. Guards against calls before raket_init() has allocated
+// the arrays (a stray keypress right at boot, before shell_init has run --
+// the same early-key race shell_enqueue already guards against).
+int raket_authed(int f) {
+    if (raket_authed_base == 0) { return 0; }
+    return load64(raket_authed_base + f * 8);
+}
+
+// Whether session f's next typed character should be masked ('*' instead
+// of the real glyph) as it echoes to the screen -- true only while at
+// raket's password stage. keyboard_handler (keyboard.c0) checks this at
+// echo time; the real character still reaches shell_input/raket_login_line
+// unmasked via the ordinary input queue, only the ON-SCREEN glyph differs.
+int raket_should_mask(int f) {
+    if (raket_authed_base == 0) { return 0; }
+    if (load64(raket_authed_base + f * 8) == 1) { return 0; }
+    if (load64(raket_stage_base + f * 8) != RAKET_STAGE_PASS) { return 0; }
+    return 1;
+}
+
+// Prints the login prompt appropriate to session f's current stage. Called
+// once when raket takes over a fresh session and again after every failed
+// or partial attempt.
+void raket_prompt(int f) {
+    int stage = load64(raket_stage_base + f * 8);
+    if (kakel_active == 1) {
+        if (stage == RAKET_STAGE_USER) {
+            kakel_print(f, "moonshot login: ");
+        } else {
+            kakel_print(f, "password: ");
+        }
+        // Record where typed input begins, exactly as shell_prompt_win does.
+        // Without this the login and password prompts inherited whatever
+        // column the previous prompt left behind, and the keyboard ISR's
+        // backspace guard (keyboard.c0, "col > prompt col") let backspace
+        // chew straight through "moonshot login: " / "password: " itself.
+        store64(kakel_prompt_col_base + f * 8,
+                load64(kakel_col_base + f * 8));
+    } else {
+        if (stage == RAKET_STAGE_USER) {
+            sk_print("moonshot login: ");
+        } else {
+            sk_print("password: ");
+        }
+    }
+    return;
+}
+
+// Called from shell_input's Enter handler (skalman.c0), instead of
+// shell_run, while session f is not yet authenticated. `line` is the
+// just-typed field: a username at RAKET_STAGE_USER, a password at
+// RAKET_STAGE_PASS. Deliberately does not touch sk_hist_buf -- a typed
+// password has no business sitting in shell command history.
+void raket_login_line(int f, int line) {
+    int stage = load64(raket_stage_base + f * 8);
+
+    if (stage == RAKET_STAGE_USER) {
+        // An unknown username still advances to the password stage (rather
+        // than failing immediately) so a failed login cannot be used to
+        // enumerate which usernames exist -- the SAME timing/shape of
+        // interaction either way. raket_pending_uid_base stays -1 for an
+        // unknown name, so the password stage below always rejects it,
+        // regardless of what gets typed.
+        int uid = sk_user_lookup(line);
+        serial_print("[raket] session ");
+        serial_print_int(f);
+        serial_print(" username='");
+        serial_print(line);
+        serial_print("' uid=");
+        serial_print_int(uid);
+        serial_print("\n");
+        store64(raket_pending_uid_base + f * 8, uid);
+        store64(raket_stage_base + f * 8, RAKET_STAGE_PASS);
+        if (kakel_active == 1) { kakel_print(f, "\n"); } else { sk_print("\n"); }
+        raket_prompt(f);
+        return;
+    }
+
+    // Password stage. An account with NO password set (sk_user_has_pass ==
+    // 0 -- true for root/guest on a fresh boot, since nothing has ever
+    // called `passwd`) logs in on an EMPTY password line only: there is
+    // nothing to check, so the trivial response is what is accepted, not
+    // "any string works." This is also what makes first boot possible at
+    // all -- `passwd` itself is a shell command, unreachable before login.
+    int uid = load64(raket_pending_uid_base + f * 8);
+    int ok = 0;
+    if (uid >= 0) {
+        if (sk_user_has_pass(uid) == 0) {
+            if (load8(line) == 0) { ok = 1; }
+        } else {
+            ok = sk_user_check_pass(uid, line);
+        }
+    }
+
+    serial_print("[raket] session ");
+    serial_print_int(f);
+    serial_print(" password check uid=");
+    serial_print_int(uid);
+    serial_print(" ok=");
+    serial_print_int(ok);
+    serial_print("\n");
+    if (ok == 1) {
+        store64(sk_uid_base + f * 8, uid);
+        jakel_current_uid = uid;
+        store64(raket_authed_base + f * 8, 1);
+        store64(raket_stage_base + f * 8, RAKET_STAGE_USER);
+        store64(raket_pending_uid_base + f * 8, 0 - 1);
+        if (kakel_active == 1) {
+            kakel_print(f, "\nlogin correct.\n\ntype 'help' for commands.\n");
+        } else {
+            sk_print("\nlogin correct.\n\ntype 'help' for commands.\n");
+        }
+        shell_prompt_win(f);
+        if (kakel_active == 0) { shell_prompt(); }
+    } else {
+        store64(raket_stage_base + f * 8, RAKET_STAGE_USER);
+        store64(raket_pending_uid_base + f * 8, 0 - 1);
+        if (kakel_active == 1) {
+            kakel_print(f, "\nlogin incorrect\n\n");
+        } else {
+            sk_print("\nlogin incorrect\n\n");
+        }
+        raket_prompt(f);
+    }
+    return;
+}

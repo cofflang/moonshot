@@ -1,0 +1,379 @@
+// engine.c0 — part of gnista, a game engine for the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of gnista, a game engine written in c0 for moonshot.
+// gnista is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// engine -- Gnista's engine layer for full-frame, scrolling games.
+//
+// The first Gnista demo (gnista.c0) redraws only the small bounding box each
+// entity moved through, which works because its view never moves. This file
+// is the other model: a camera, a world larger than the screen, and a whole
+// frame composited each tick and handed over in one call. A scrolling game
+// needs it -- when the view moves, every pixel changes, so incremental
+// redraw saves nothing.
+//
+// Measured on real Moonshot before any of this was written (see
+// fps_probe.c0): a full tavla-sized frame costs ~22ms with the two fast
+// paths below and ~81ms without them. Both matter, and neither is worth
+// anything without the other:
+//
+//   * SPANS ARE WRITTEN TWO PIXELS AT A TIME. One store64 per pixel pair
+//     instead of four store8 per pixel. c0 has no optimizer, so per-pixel
+//     work is genuinely expensive; per-pixel code belongs only where sprites
+//     actually are, never across a background.
+//   * PRESENTING USES present(), NOT blit(). blit() checks every pixel
+//     against colour 0 so sprites can have holes, and rebuilds each pixel
+//     from four bytes to do it. A full frame has no holes, so present()
+//     copies whole rows and skips all of it.
+//
+// c0 has no shift operator, so packing two pixels into one 64-bit word is a
+// multiply by 2^32.
+
+layout Entity {
+    int x;          // world coordinates, top-left
+    int y;
+    int w;
+    int h;
+    int vx;
+    int vy;
+    int kind;       // game-defined; the engine only checks `alive`
+    int alive;      // 0 = free slot, reusable by pool_spawn
+    int color;
+    int a1;         // game-defined scratch (infection, cooldown, ...)
+    int a2;
+    int a3;
+}
+
+// The frame being built, plus where in the world it is looking.
+layout View {
+    int buf;        // vw * vh pixels, framebuffer order
+    int vw;
+    int vh;
+    int cam_x;      // world coordinate at the view's left edge
+    int cam_y;
+}
+
+// --- the entity pool ------------------------------------------------------
+//
+// A flat allocation of `cap` Entity records addressed by index. c0 has no
+// arrays and no pointer types, so an entity reference is just the address of
+// its record -- which is exactly what `layout` field access wants -- and the
+// pool is one alloc and a multiply.
+//
+// Unlike the first demo's pool, slots are RECYCLED: `alive` marks a slot free
+// and pool_spawn hands the first free one back. Infecteria needs it, because
+// factories emit mini-bacteria continuously and each one dies on contact. The
+// ring-3 heap is bump-only with no free at all, so without slot reuse a
+// long game would exhaust it no matter how large it is.
+
+int pool_alloc(int cap) {
+    return alloc(cap * sizeof(Entity));
+}
+
+int pool_at(int pool, int i) {
+    return pool + i * sizeof(Entity);
+}
+
+void pool_clear(int pool, int cap) {
+    int i = 0;
+    while (i < cap) {
+        int e = pool_at(pool, i);
+        e.alive = 0;
+        i = i + 1;
+    }
+    return;
+}
+
+// Returns a fresh entity, or 0 when the pool is full. Callers must cope with
+// 0 rather than assume -- a game that spawns on a timer will hit a full pool
+// eventually, and that is normal, not an error.
+int pool_spawn(int pool, int cap) {
+    int i = 0;
+    while (i < cap) {
+        int e = pool_at(pool, i);
+        if (e.alive == 0) {
+            e.alive = 1;
+            e.x = 0; e.y = 0; e.w = 0; e.h = 0;
+            e.vx = 0; e.vy = 0;
+            e.kind = 0; e.color = 0;
+            e.a1 = 0; e.a2 = 0; e.a3 = 0;
+            return e;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+void pool_kill(int e) {
+    e.alive = 0;
+    return;
+}
+
+// --- collision ------------------------------------------------------------
+
+// Axis-aligned overlap between any two entities. Touching edges do not count
+// (strict <), so two things resting exactly against each other are not
+// reported as colliding forever.
+int aabb_hit(int a, int b) {
+    if (a.x + a.w <= b.x) { return 0; }
+    if (b.x + b.w <= a.x) { return 0; }
+    if (a.y + a.h <= b.y) { return 0; }
+    if (b.y + b.h <= a.y) { return 0; }
+    return 1;
+}
+
+// True when b's centre is inside a. Used for "am I inside this cell", which
+// wants the mover's middle rather than any overlap at all -- clipping a
+// corner of a cell should not count as being in it.
+int centre_inside(int a, int b) {
+    int cx = b.x + b.w / 2;
+    int cy = b.y + b.h / 2;
+    if (cx < a.x || cx >= a.x + a.w) { return 0; }
+    if (cy < a.y || cy >= a.y + a.h) { return 0; }
+    return 1;
+}
+
+// Squared distance between two entities' centres. Squared, because c0 has no
+// square root and comparisons against a squared threshold work identically.
+int dist2(int a, int b) {
+    int ax = a.x + a.w / 2;
+    int ay = a.y + a.h / 2;
+    int bx = b.x + b.w / 2;
+    int by = b.y + b.h / 2;
+    int dx = ax - bx;
+    int dy = ay - by;
+    return dx * dx + dy * dy;
+}
+
+// --- rendering ------------------------------------------------------------
+
+// --- surviving a resize ---------------------------------------------------
+//
+// A kakel tile is not a fixed size. Every `split`, `close` and `spawn3`
+// reflows the layout, and a window a program is drawing into can get wider,
+// narrower, taller or shorter while it runs. Nothing tells the program; it has
+// to look. win_info() reports the CURRENT size on every call, so looking is
+// one syscall per frame -- nothing next to a full-frame present().
+//
+// What a program cannot do is grow its buffer. alloc() is bump-only with no
+// free, so a view that reallocated on every resize would exhaust the heap
+// after a couple of them. That is what win_max() is for: allocate once for the
+// largest window this machine can ever give out, then treat vw/vh as a
+// sub-rectangle of that allocation. Every renderer in this file already reads
+// vw/vh for its clipping and strides, so moving those two numbers is the whole
+// of the adaptation -- nothing else has to know a resize happened.
+//
+// Returns 1 if the size changed (a caller may want to re-derive anything it
+// cached from the view's dimensions), 0 if it did not.
+int view_alloc_max(int v) {
+    int m = win_max();
+    if (m == 0) { return 0; }
+    int mw = m / 65536;
+    int mh = m - mw * 65536;
+    v.buf = alloc(mw * mh * 4);
+    return v.buf;
+}
+
+int view_poll_resize(int v) {
+    int wi = win_info();
+    if (wi == 0) { return 0; }
+    int w = wi / 65536;
+    int h = wi - w * 65536;
+    if (w == v.vw && h == v.vh) { return 0; }
+    v.vw = w;
+    v.vh = h;
+    return 1;
+}
+
+// Fills the WHOLE frame with one colour, two pixels per store64. This is the
+// single most important loop in the renderer: it touches every pixel every
+// frame, and doing it per-pixel measured 3.6x slower overall.
+// Safe to write in 8-byte pairs without a remainder check: kakel geometry is
+// cell-aligned, so vw and vh are both multiples of FONT_W/FONT_H (8) and the
+// pixel count is always even.
+void view_clear(int v, int color) {
+    int buf = v.buf;
+    int nbytes = v.vw * v.vh * 4;
+    int pair = color * 4294967296 + color;
+    int off = 0;
+    while (off < nbytes) {
+        store64(buf + off, pair);
+        off = off + 8;
+    }
+    return;
+}
+
+// One horizontal run of pixels in VIEW coordinates, clipped. Pairs writes
+// where it can and falls back to single pixels only at unaligned ends.
+void view_span(int v, int x, int y, int len, int color) {
+    if (y < 0 || y >= v.vh) { return; }
+    int x0 = x;
+    int x1 = x + len;
+    if (x0 < 0) { x0 = 0; }
+    if (x1 > v.vw) { x1 = v.vw; }
+    if (x0 >= x1) { return; }
+    int base = v.buf + (y * v.vw + x0) * 4;
+    int n = x1 - x0;
+    int i = 0;
+    int pair = color * 4294967296 + color;
+    // No alignment dance: x86 permits unaligned 64-bit stores, so pairing can
+    // start anywhere. Only the odd LAST pixel needs the slow path.
+    while (i + 1 < n) {
+        store64(base + i * 4, pair);
+        i = i + 2;
+    }
+    while (i < n) {
+        store32_le_px(base + i * 4, color);
+        i = i + 1;
+    }
+    return;
+}
+
+// One pixel, unpacked into the four bytes the framebuffer expects. c0 has no
+// 32-bit store, and store64 would clobber the neighbour.
+void store32_le_px(int addr, int color) {
+    store8(addr, color - (color / 256) * 256);
+    store8(addr + 1, (color / 256) - (color / 65536) * 256);
+    store8(addr + 2, (color / 65536) - (color / 16777216) * 256);
+    store8(addr + 3, 0);
+    return;
+}
+
+int load_px(int addr) {
+    return load8(addr)
+        + load8(addr + 1) * 256
+        + load8(addr + 2) * 65536;
+}
+
+// Filled rectangle in WORLD coordinates -- the camera offset is applied here,
+// so game code never converts by hand.
+void view_rect(int v, int wx, int wy, int w, int h, int color) {
+    int sx = wx - v.cam_x;
+    int sy = wy - v.cam_y;
+    int r = 0;
+    while (r < h) {
+        view_span(v, sx, sy + r, w, color);
+        r = r + 1;
+    }
+    return;
+}
+
+// Filled circle in WORLD coordinates. Per-pixel, but only across the
+// circle's own bounding box, which is the rule: per-pixel work belongs where
+// the shape is, never across the background.
+//
+// No square root anywhere -- a pixel is inside when dx*dx + dy*dy <= r*r.
+void view_circle(int v, int wx, int wy, int d, int color) {
+    int r = d / 2;
+    int cx = wx - v.cam_x + r;
+    int cy = wy - v.cam_y + r;
+    int rr = r * r;
+    int dy = 0 - r;
+    while (dy <= r) {
+        int y = cy + dy;
+        if (y >= 0 && y < v.vh) {
+            // Widest x at this row, found by walking in rather than by a
+            // square root. The circles here are small, so this is cheap.
+            int dx = 0 - r;
+            while (dx <= r) {
+                if (dx * dx + dy * dy <= rr) { break; }
+                dx = dx + 1;
+            }
+            if (dx <= 0) {
+                view_span(v, cx + dx, y, (0 - dx) * 2 + 1, color);
+            }
+        }
+        dy = dy + 1;
+    }
+    return;
+}
+
+// Half-transparent filled circle: each covered pixel becomes the average of
+// what is already there and `color`. This is how Infecteria's cells let you
+// see yourself underneath them.
+//
+// Done here in the game's own frame buffer rather than in the kernel: SYS_BLIT
+// only knows fully transparent (colour 0) and fully opaque, and teaching it
+// blending would put per-pixel arithmetic back in the syscall that
+// SYS_PRESENT exists to avoid. Blending a handful of small circles costs far
+// less than blending everything.
+void view_circle_blend(int v, int wx, int wy, int d, int color) {
+    int r = d / 2;
+    int cx = wx - v.cam_x + r;
+    int cy = wy - v.cam_y + r;
+    int rr = r * r;
+    int sb = color - (color / 256) * 256;
+    int sg = (color / 256) - (color / 65536) * 256;
+    int sr = (color / 65536) - (color / 16777216) * 256;
+    int dy = 0 - r;
+    while (dy <= r) {
+        int y = cy + dy;
+        if (y >= 0 && y < v.vh) {
+            int dx = 0 - r;
+            while (dx <= r) {
+                int x = cx + dx;
+                if (x >= 0 && x < v.vw && dx * dx + dy * dy <= rr) {
+                    int addr = v.buf + (y * v.vw + x) * 4;
+                    int db = load8(addr);
+                    int dg = load8(addr + 1);
+                    int dr = load8(addr + 2);
+                    store8(addr, (db + sb) / 2);
+                    store8(addr + 1, (dg + sg) / 2);
+                    store8(addr + 2, (dr + sr) / 2);
+                }
+                dx = dx + 1;
+            }
+        }
+        dy = dy + 1;
+    }
+    return;
+}
+
+// A progress bar above a world rectangle: dark trough, bright fill, 0..100.
+void view_bar(int v, int wx, int wy, int w, int pct, int color) {
+    int h = 4;
+    view_rect(v, wx, wy - h - 2, w, h, 0x202020);
+    int fill = w * pct / 100;
+    if (fill > 0) { view_rect(v, wx, wy - h - 2, fill, h, color); }
+    return;
+}
+
+// Centres the camera on an entity and clamps it so the view never runs off
+// the world. Clamping is what makes the edges feel solid rather than showing
+// emptiness beyond them.
+void view_follow(int v, int e, int world_w, int world_h) {
+    int cx = e.x + e.w / 2 - v.vw / 2;
+    int cy = e.y + e.h / 2 - v.vh / 2;
+    if (cx < 0) { cx = 0; }
+    if (cy < 0) { cy = 0; }
+    if (cx > world_w - v.vw) { cx = world_w - v.vw; }
+    if (cy > world_h - v.vh) { cy = world_h - v.vh; }
+    v.cam_x = cx;
+    v.cam_y = cy;
+    return;
+}
+
+// --- misc -----------------------------------------------------------------
+
+// A linear congruential generator, because c0 has no random(). The constants
+// are the usual Numerical Recipes ones; the values only need to look
+// scattered, nothing here is cryptographic.
+int rng_next(int state_addr) {
+    int s = load64(state_addr);
+    s = (s * 1664525 + 1013904223) - ((s * 1664525 + 1013904223) / 2147483648) * 2147483648;
+    store64(state_addr, s);
+    return s;
+}
+
+int rng_range(int state_addr, int lo, int hi) {
+    int span = hi - lo;
+    if (span <= 0) { return lo; }
+    // One draw, held in a local: calling rng_next twice would advance the
+    // state between the two uses and give a value outside [lo, hi).
+    int r = rng_next(state_addr);
+    return lo + r - (r / span) * span;
+}

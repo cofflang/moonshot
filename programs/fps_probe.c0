@@ -1,0 +1,108 @@
+// fps_probe.c0 — part of gnista, a game engine for the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of gnista, a game engine written in c0 for moonshot.
+// gnista is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// fps_probe -- how fast can a ring-3 program actually composite and
+// present a WHOLE window?
+//
+// This exists to answer one question before Infecteria is built on the
+// assumption. A scrolling game has a camera, so every pixel of the view
+// moves every frame: the incremental bounding-box redraw Gnista's first demo
+// used buys nothing, and the game must composite a full frame into its own
+// buffer and present it in one call. That is ~380k pixels written in c0
+// -- which has no optimizer at all -- plus the same again inside the kernel's
+// SYS_BLIT loop, every frame.
+//
+// So: fill the buffer, blit it, repeat, and return how many ticks 30 frames
+// took AS THE EXIT CODE -- the kernel logs that, and print() only accepts
+// string literals so a computed number cannot be printed from ring 3.
+// ticks are ~100Hz, so ms/frame = code * 10 / 30.
+//
+// Deliberately does the SAME work a real frame would: it writes every pixel
+// individually rather than memset-style, because that is what compositing a
+// tilemap and sprites actually costs.
+
+int main() {
+    int winfo;
+    int ww;
+    int wh;
+    int buf;
+    int frames;
+    int t0;
+    int t1;
+    int i;
+    int n;
+    int off;
+    int shade;
+    int pix;
+    int pair;
+    int nbytes;
+    int winmax;
+
+    winfo = win_info();
+    ww = winfo / 65536;
+    wh = winfo - ww * 65536;
+    if (ww <= 0 || wh <= 0) { return 200; }
+
+    print("fps_probe: start\n");
+
+    // Sized for the biggest window this machine can hand out, not for the one
+    // this probe was given. A tile can be resized under a running program by
+    // anything that reflows the layout, and present() copies whatever the
+    // window measures NOW -- so a buffer cut to the startup size is a buffer
+    // that can be read past. alloc() cannot grow one afterwards, so the only
+    // safe size is the maximum. Costs address space, not accuracy: the timed
+    // loop below still writes exactly the current window's worth of pixels.
+    winmax = win_max();
+    if (winmax == 0) { return 202; }
+    buf = alloc((winmax / 65536) * (winmax - (winmax / 65536) * 65536) * 4);
+    if (buf == 0) {
+        print("fps_probe: alloc failed -- heap too small for a full frame\n");
+        return 201;
+    }
+
+    n = ww * wh;
+    nbytes = n * 4;
+    frames = 0;
+    t0 = ticks();
+    while (frames < 30) {
+        // Write every pixel, the way a real composite would. The shade
+        // changes per frame so nothing can be optimised away and so the
+        // screen visibly moves.
+        shade = frames * 8;
+        // Two pixels per store64 rather than four store8 per pixel.
+        //
+        // The per-pixel version measured identically whether the kernel used
+        // SYS_BLIT's per-pixel loop or SYS_PRESENT's row copy, which is how
+        // it became clear the kernel side was never the bottleneck: THIS loop
+        // is. Per pixel it costs a compare, a multiply, four stores and an
+        // increment, and c0 has no optimizer, so each of those is several
+        // machine instructions against a stack slot.
+        //
+        // Packing two pixels into one 64-bit word costs a compare, a store
+        // and an add per PAIR. c0 has no shift operator, so the high pixel is
+        // placed by multiplying by 2^32.
+        pix = shade + 40 * 256 + 80 * 65536;
+        pair = pix * 4294967296 + pix;
+        off = 0;
+        while (off < nbytes) {
+            store64(buf + off, pair);
+            off = off + 8;
+        }
+        present(buf);
+        frames = frames + 1;
+    }
+    t1 = ticks();
+
+    // The tick count comes back as the EXIT CODE -- the kernel prints that
+    // already ("[syscall] exit code=N"), and print() only takes literals, so
+    // there is no way to print a computed number from ring 3 yet.
+    // ticks are ~100Hz, so ms/frame = code * 10 / 30.
+    print("fps_probe: done\n");
+    return t1 - t0;
+}

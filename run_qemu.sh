@@ -14,9 +14,9 @@
 #
 # Boots via a GRUB-built ISO (-cdrom), not QEMU's own `-kernel` multiboot
 # loader: that loader flatly refuses ELF64 images ("give a 32bit one"),
-# and forcing coff-compiled code into a 32-bit ELF container doesn't work
+# and forcing coff-compiled code into a 32-bit ELF container does not work
 # (its instructions unconditionally use 64-bit registers, which need
-# relocation types a 32-bit ELF container can't represent). GRUB's own
+# relocation types a 32-bit ELF container cannot represent). GRUB's own
 # multiboot loader handles ELF64 kernels directly, which is the standard
 # way real long-mode hobby kernels get booted -- boot.s/kmain.c0 needed no
 # changes for this, only the packaging step did.
@@ -51,7 +51,7 @@ timeout 5 qemu-system-x86_64 -cdrom moonshot.iso \
   -serial file:serial.log -display none -no-reboot -m 128 \
   -drive file=disk.img,format=raw,if=ide,index=0,media=disk
 
-# Exact KB values aren't checked (they depend on QEMU's default memory
+# Exact KB values are not checked (they depend on QEMU's default memory
 # layout / -m value, not on anything this kernel controls) -- what matters
 # is that the Multiboot info structure was actually read and parsed into
 # real digits, not that mem_lower/mem_upper equal a specific number.
@@ -184,7 +184,7 @@ grep -qE "^\[sched\] task 3 exited$" serial.log || sched_ok=0
 # Reaper: after task 3 (the boot exiter) exits, sched_reap must free its stack
 # page from another task's context -- proving the 4KB-per-task leak that exit/
 # kill left behind is now reclaimed. The freed address must match the page
-# task 3 was spawned on (same "stack=" value), i.e. it's really task 3's stack
+# task 3 was spawned on (same "stack=" value), i.e. it is really task 3's stack
 # going back to pmm, not some unrelated free.
 spawn3=$(grep -oE "^\[sched\] spawned task 3 stack=[0-9]+$" serial.log | head -1 | grep -oE "[0-9]+$")
 reap3=$(grep -oE "^\[sched\] reaped task 3 stack=[0-9]+$" serial.log | head -1 | grep -oE "[0-9]+$")
@@ -199,7 +199,7 @@ if [ -z "$reap3" ] || [ "$reap3" != "$spawn3" ]; then sched_ok=0; fi
 # eyeballed), proving the glyph actually rendered correctly, not just
 # "some pixels changed". corner_bg_match=1 confirms fb_clear filled the
 # WHOLE screen (a corner far from any text still reads back as background),
-# not just the area text landed on. If GRUB didn't grant a usable
+# not just the area text landed on. If GRUB did not grant a usable
 # framebuffer, kmain.c0 falls back to VGA text mode instead (see main()) --
 # not separately checked here, since every real run so far has gotten the
 # framebuffer.

@@ -12,7 +12,11 @@
 // exception routes to. See knekt.c0's main() for how these get wired
 // together at boot (idt_set/dispatch_set calls, pic_remap/pit_configure).
 
-int ticks = 0;
+// Named pit_ticks, not the bare `ticks` its own timer_tick's comments once
+// used, so it does not collide with c0's ticks() builtin (SYS_TICKS) -- a
+// user-facing ring-3 program calls ticks(), the kernel's own internal PIT
+// counter underneath it needs a name of its own.
+int pit_ticks = 0;
 
 // Writes one 64-bit interrupt-gate IDT entry (16 bytes) for `vector`,
 // pointing at `handler_addr`. Splitting the address into offset_low(16)/
@@ -55,7 +59,7 @@ void dispatch_set(int vector, int handler) {
 // [rsp+136], meaningful for every exception). Looks the real handler up
 // and calls through it -- `h(...)`
 // is an indirect call through a variable. Every handler is passed
-// (vector, errcode, cr2, rip) uniformly; handlers that don't need all of
+// (vector, errcode, cr2, rip) uniformly; handlers that do not need all of
 // them (timer/keyboard declare no params; page_fault_handler ignores
 // vector/rip) simply ignore the extra registers, which c0's no-arity-
 // checking indirect calls allow. Passing the vector lets one generic
@@ -101,25 +105,28 @@ void pit_configure(int divisor) {
 // without this the PIC withholds all further IRQ0s, believing one is still
 // being serviced.
 void timer_tick() {
-    ticks = ticks + 1;
-    if (ticks - (ticks / 20) * 20 == 0) {
+    pit_ticks = pit_ticks + 1;
+    if (pit_ticks - (pit_ticks / 20) * 20 == 0) {
         serial_print("tick ");
-        serial_print_int(ticks);
+        serial_print_int(pit_ticks);
         serial_print("\n");
     }
+    // Drain queued mouse events here rather than in the mouse interrupt
+    // itself -- see klick_drain. Cheap when nothing is listening.
+    klick_drain();
     sched_tick();
     outb(0x20, 0x20);
     return;
 }
 
-// Generic handler for every FATAL CPU exception that isn't individually
+// Generic handler for every FATAL CPU exception that is not individually
 // recoverable (#0 divide, #6 invalid opcode, #13 GPF, and the remaining
 // vectors #1-5, #7, #10-12, #16-19 -- see knekt.c0's main(); only #14 #PF
 // has its own recovering handler, jenna.c0's page_fault_handler). Unlike
 // that one this does NOT recover: it prints which vector fired plus its
 // error code and CR2, then halts. Returning would just re-execute the
 // faulting instruction and fault forever, so a fatal fault must stop
-// here. c0 can't emit `hlt` itself, so this loops calling boot.s's
+// here. c0 cannot emit `hlt` itself, so this loops calling boot.s's
 // halt_cpu indirectly (see knekt.c0's halt()) instead of busy-spinning --
 // a real difference under QEMU/TCG (and on real hardware): `hlt` actually
 // blocks the CPU until the next interrupt rather than burning cycles
@@ -132,7 +139,7 @@ void timer_tick() {
 // interrupt (NMI) can still fire even with IF cleared, and a woken single
 // hlt would just fall through back into isr_common's epilogue and resume
 // the faulted task otherwise (see halt_cpu's own comment in boot.s). Most
-// of these vectors aren't practically triggerable from c0 source at all
+// of these vectors are not practically triggerable from c0 source at all
 // (e.g. #10 needs a bad far call/TSS selector, #4 needs `into`); #0
 // (divide-by-zero) is the one exercised by test_panic.sh.
 void panic_handler(int vector, int errcode, int cr2, int rip) {
@@ -148,7 +155,7 @@ void panic_handler(int vector, int errcode, int cr2, int rip) {
     // Also show it on the real screen when pixel graphics are live (see
     // punkt.c0's fb_panic_screen) -- serial stays the source of truth for
     // the automated tests, this is the human-visible half. Guarded on
-    // fb_available for the VGA-text-fallback boot, where there's no
+    // fb_available for the VGA-text-fallback boot, where there is no
     // framebuffer to draw into.
     if (fb_available == 1) {
         fb_panic_screen(vector, errcode, cr2, rip);

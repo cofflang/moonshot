@@ -3,31 +3,38 @@
 moonshot is an operating system I am building from scratch for x86_64. It
 boots via Multiboot + GRUB in QEMU, has preemptive multitasking with a
 round-robin scheduler, its own pixel framebuffer and font renderer, a tiled
-windowing layer, an interactive shell with a built-in editor, a REPL with a
-JIT compiler, a disk-backed filesystem, and ring-3 userspace with syscall
-support. The kernel is written in **c0**, a small systems language whose
+windowing layer, a login gate, an interactive shell with a built-in text
+editor and pixel-art editor, a REPL with a JIT compiler, a disk-backed
+filesystem, a PS/2 mouse driver, and ring-3 userspace: real ELF64 programs
+with their own page tables, loaded from the filesystem and given a window of
+their own. The kernel is written in **c0**, a small systems language whose
 compiler, coff, is a separate project in the same stack.
 
 The end goal is an OS with a real graphical interface and its own windowing
-system, not a serial-only kernel. Right now it runs headless in QEMU for
-automated testing; there is also a graphical mode you can interact with by
-hand.
+system, not a serial-only kernel. Every test runs headless in QEMU and reads
+the serial log or the framebuffer; there is also a graphical mode you can sit
+in front of.
 
 ## What is in the repository
 
 | Path | What it is |
 |------|------------|
 | `kmain.c0` | The kernel entry point. It `include`s every other `.c0` subsystem file, so coff compiles one flat translation unit. |
-| `*.c0` | The kernel subsystems: knekt (core), jenna (memory/paging), chrone (scheduler), jakel (filesystem), kakel (windowing), punkt (framebuffer + font), skalman (shell), skrift (editor), jit (JIT compiler), repl (REPL), serial, interrupts, keyboard, syscall, vga (text-mode fallback), ata (disk). |
+| `*.c0` | The kernel subsystems: knekt (core), jenna (memory/paging), chrone (scheduler), jakel (filesystem), kakel (windowing), punkt (framebuffer + font), raket (init and login), skalman (shell), skrift (editor), pensel (pixel-art editor), klick (mouse), jit (JIT compiler), repl (REPL), syscall (ring-3 syscalls and the ELF loader), serial, interrupts, keyboard, vga (text-mode fallback), ata (disk). |
+| `*_data.c0` | Generated. The ring-3 programs the kernel seeds onto the filesystem at first boot, as byte arrays. Every one is rebuilt from source by `gen_programs.sh`; see [Baked-in programs](#baked-in-programs). |
+| `programs/` | The sources of those programs: two syscall probes, Gnista's engine demo, the Infecteria game and a frame-rate probe. |
+| `elf_tests/` | Nine small c0 programs compiled with `coff --elf` and run inside the OS by `verify_elf_backend.sh`, so the machine-code backend is tested where it matters. `gen_elf_tests.py` bakes them into `elf_tests_data.c0`. |
 | `boot.s` | The hand-written Multiboot entry stub that gets the CPU into 64-bit long mode before calling into c0-compiled code. |
 | `ring3_handlers.s` | Ring-3 entry and exit trampolines (syscall/sysret and iretq). |
 | `linker.ld` | The linker script that places the kernel at 1 MiB. |
-| `build.sh` | Builds `moonshot.elf` from all of the above. |
+| `build.sh` | Verifies the compiler, then builds `moonshot.elf`. |
 | `sync_addrs.sh` | Patches the JIT helper function addresses into `kmain.c0` after linking. Needed when any code changes size. |
+| `gen_seed.py`, `gen_programs.sh`, `gen_elf_tests.py` | Turn compiled programs into the `*_data.c0` byte arrays. |
 | `run_qemu.sh` | The main regression gate. Builds, boots headlessly, and asserts invariants on the serial log. |
-| `test_*.sh` | Nine test scripts that cover the keyboard, shell, panic, double fault, disk, REPL, and three scroll paths. |
+| `test_*.sh`, `verify_*.sh` | Eighteen more test scripts; see [Testing](#testing). |
+| `run_graphical.sh` | Boots the kernel in a real QEMU window you can type and click in. |
+| `screenshot.sh` | Boots headlessly and dumps the framebuffer to `screenshots/` as a PNG. |
 | `grub.cfg` | The GRUB menu entry. |
-| `moonshot.iso` | Pre-built bootable ISO. Included temporarily while the released coff lacks the `extern` keyword needed to build from source. |
 | `LICENSE` | GPL-3.0. |
 
 ## Building
@@ -36,99 +43,112 @@ You need Linux on x86_64, and these packages on Arch (`apt` names vary):
 
 - `qemu-system-x86` — for booting the kernel
 - `grub`, `libisoburn`, `mtools` — for `grub-mkrescue` (building the bootable ISO)
-- `as` and `ld` from binutils
-- `python3` — for the QEMU monitor `sendkey` scripts the tests use
-- `bash`, `sed`, `awk`, `dd`, `timeout` — standard system tools
+- `as` and `ld` from binutils — the kernel is still assembled and linked by them
+- `tcc` or `gcc` — for coff's one-time bootstrap only
+- `python3` — for the seed generators and the QEMU monitor scripts the tests use
+- `bash`, `sed`, `awk`, `dd`, `sha256sum`, `timeout` — standard system tools
 
 The kernel is compiled by `coff1`, the self-hosted c0 compiler. That compiler
 lives in its own repository, and this one expects to find it at `../c0-coff/`
-next to the moonshot directory.
-
-**Important:** the latest release of coff on GitHub does not yet include the
-`extern` keyword that Moonshot needs to resolve linker symbols. Until coff's
-next release, you cannot build Moonshot from source using the released coff.
-A pre-built `moonshot.iso` is included in this repository so you can boot the
-OS right away.
+next to the moonshot directory. This release builds from source with the
+released coff; no pre-built image is needed.
 
 ```sh
 # 1. clone both repositories side by side
 git clone git@github.com:cofflang/coff.git c0-coff
 git clone git@github.com:cofflang/moonshot.git moonshot
 
-# 2. bootstrap coff (one-time, needs gcc)
-cd c0-coff
-gcc -Wall -Wextra -o coff0 coff0.c
-./coff0 c0/coff.c0 coff1.s
-as coff1.s -o coff1.o
-ld coff1.o -o coff1
-
-# 3. build moonshot
-cd ../moonshot
+# 2. build moonshot
+cd moonshot
 ./build.sh
 ./sync_addrs.sh
 ```
 
-After step 2 you do not need gcc anymore. `build.sh` checks whether
-`coff1` is stale and rebuilds it automatically if it is, so you normally
-only need `./build.sh && ./sync_addrs.sh`.
+`build.sh` bootstraps `coff1` itself if it is missing or older than its
+source, using tcc when present and gcc otherwise, and then runs coff's full
+bootstrap audit before letting the new compiler build anything. If you have
+already bootstrapped coff by hand following its README, `build.sh` runs that
+audit once and records the result. Either way the first build takes a few
+minutes and every build after it is seconds.
 
 ## Running
 
-If you cannot build from source yet (see the note above about coff's
-`extern` keyword), boot the pre-built ISO directly:
-
 ```sh
-# headless (serial console only)
-qemu-system-x86_64 -cdrom moonshot.iso -display none -no-reboot \
-  -serial file:serial.log -m 128 -drive file=disk.img,format=raw,if=ide,index=0,media=disk
-
-# interactive graphical window (needs qemu-ui-gtk on Arch)
-qemu-system-x86_64 -cdrom moonshot.iso -display gtk -m 128 \
-  -drive file=disk.img,format=raw,if=ide,index=0,media=disk
+./run_qemu.sh        # headless: boots, checks the serial log, exits
+./run_graphical.sh   # a real QEMU window (needs qemu-ui-gtk on Arch)
 ```
 
-Create the disk image first if it does not exist:
+Both create `disk.img` if it does not exist. Log in as `root` with an empty
+password; `help` lists the shell commands, `help (command)` explains one.
+Some things to try: `edit notes.txt`, `draw hero.spr`, `spawn3 gnista.elf`
+or `spawn3 infecteria.elf` for a graphical program in its own window, `split` and
+`Alt+Tab` for more windows, `Alt+W` to close a program's window, `mouse` to
+watch the pointer, `eval 6 * 7` for the REPL.
 
-```sh
-dd if=/dev/zero of=disk.img bs=512 count=20480
-```
-
-Once you have a working coff with `extern`, the full build-and-test flow is:
-
-```sh
-# headless boot with invariant checks (the main regression gate)
-./run_qemu.sh
-```
-
-`run_qemu.sh` builds the kernel, creates a disk image if one does not exist,
-makes a bootable ISO with grub-mkrescue, boots it in QEMU headlessly for 5
-seconds, and then checks the serial log for about 40 invariants: the boot
-banner, memory map, physical page allocator correctness, heap behaviour,
-page tables, demand paging, scheduler round-robin fairness, framebuffer
-pixel readback, windowing layer layout, ATA detection, filesystem load, and
-timer ticks. On any failure it dumps the full serial log and exits non-zero.
+`run_graphical.sh` forces QEMU's GTK window through XWayland. Under native
+Wayland, GTK delivers clicks to a relative-pointer guest but almost no motion,
+which looks exactly like a broken mouse driver and is not one.
 
 ## Testing
 
 ```sh
-./run_qemu.sh          # the main gate: boot + invariant check
-./test_keyboard.sh     # typing, caps lock, tab, alt-tab window switching
-./test_shell.sh        # spawn, kill, task lifecycle
-./test_repl.sh         # REPL expressions, JIT compilation, run-file
-./test_disk.sh         # filesystem write, sync, reload, read-back
-./test_panic.sh        # divide-by-zero panic with correct vector
-./test_doublefault.sh  # double fault caught on the IST1 stack
-./test_fb_scroll.sh    # framebuffer scroll correctness
-./test_kakel_scroll.sh # window scroll clipping
-./test_vga_scroll.sh   # VGA text-mode fallback scroll
+./run_qemu.sh                 # the main gate: boot + about 40 serial-log invariants
+./test_keyboard.sh            # typing, caps lock, tab, alt-tab window switching
+./test_shell.sh               # spawn, kill, task lifecycle
+./test_repl.sh                # REPL expressions, JIT compilation, run-file
+./test_disk.sh                # filesystem write, sync, reload, read-back
+./test_panic.sh               # divide-by-zero panic with correct vector
+./test_doublefault.sh         # double fault caught on the IST1 stack
+./test_fb_scroll.sh           # framebuffer scroll correctness
+./test_kakel_scroll.sh        # window scroll clipping
+./test_vga_scroll.sh          # VGA text-mode fallback scroll
+./verify_elf_backend.sh       # the nine elf_tests/ programs run in ring 3, exit codes checked
+./verify_alloc.sh             # layout + sizeof + alloc() from ring 3
+./verify_ticks.sh             # ticks() from ring 3
+./verify_windowed_ring3.sh    # a ring-3 program printing into its own window
+./verify_gnista.sh            # the engine demo drawing real pixels
+./verify_tavla.sh             # graphical windows: focus strip, Alt+W, recovery
+./verify_resize.sh            # a graphical program surviving a window resize
+./verify_klick.sh             # the mouse driver, packet decoding, pointer drawing
+./verify_login_reset.sh       # a fresh window never inherits a login
 ```
 
-The test scripts that inject code into the kernel (panic, double fault, and
-the three scroll tests) restore the original sources via a trap handler, so
-the tree is always clean after they finish, pass or fail.
+Every script boots the kernel in QEMU and passes or fails on what the serial
+log or the framebuffer actually contains. The scripts that inject code into
+the kernel (panic, double fault, the three scroll tests) restore the original
+sources via a trap handler, so the tree is clean after they finish, pass or
+fail. Several tests assume `disk.img` exists; run `run_qemu.sh` first.
 
-Several tests assume `disk.img` already exists. Run `run_qemu.sh` or
-`test_disk.sh` first to create it.
+## Baked-in programs
+
+moonshot has no way to receive a file from the host, so every ring-3 program
+it ships is compiled with `coff --elf`, turned into a c0 function that writes
+the bytes into a buffer, and written onto the filesystem at first boot. Those
+byte arrays are the `*_data.c0` files, and a byte array nobody can regenerate
+is a binary blob with a c0 extension, so their sources are in `programs/` and
+
+```sh
+./gen_programs.sh
+```
+
+rebuilds all of them with the same `coff1` that builds the kernel. After it
+runs, `git diff` on the `*_data.c0` files is empty. If it is not, either a
+program changed or the compiler's output did, and either way you want to
+know. `gen_elf_tests.py` does the same for `elf_tests/`.
+
+Gnista, the game engine the demo and Infecteria are built on, is its own
+project; the copies in `programs/` are what these seeds were built from.
+
+## Trust
+
+The kernel is compiled by a binary, and a binary is where a Thompson-style
+compiler backdoor would live. `build.sh` therefore never trusts `coff1` on a
+timestamp: it hashes the binary on every build against the hash recorded when
+coff's bootstrap audit last passed (`coff1.sha256`, written by `build.sh` and
+by nothing else), and refuses to produce a kernel on a mismatch. A `coff1`
+with no recorded hash is audited before it compiles anything. The details,
+the threat model and what is still trusted blind (GNU `as` and `ld`, python3)
+are in coff's `TRUST.md`.
 
 ## Contributing
 
@@ -137,12 +157,13 @@ request:
 
 - The kernel is compiled exclusively through `coff1`, the self-hosted c0
   compiler. Any new c0 language feature or builtin needed here must land in
-  coff first (in `coff0.c`, then mirrored into `c0/coff.c0`, differentially
-  verified).
-- `./run_qemu.sh` and the test scripts must stay green.
+  coff first.
+- `./run_qemu.sh` and every test script must stay green.
 - After any change that shifts code size, run `./sync_addrs.sh` before
   booting. The kernel will silently crash at boot with stale JIT helper
   addresses.
+- After changing anything in `programs/` or `elf_tests/`, regenerate the
+  seeds and commit the result.
 - Keep it minimal. No new dependencies, no third-party code.
 
 ## License

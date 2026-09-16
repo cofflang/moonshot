@@ -8,17 +8,17 @@
 // WARRANTY; see the LICENSE file for the full text.
 // vga.c0 -- VGA text-mode driver. Moonshot's original graphical output,
 // predating punkt.c0's pixel framebuffer; now the FALLBACK path for when
-// GRUB can't grant a usable linear framebuffer (wrong type/bpp, or none
+// GRUB cannot grant a usable linear framebuffer (wrong type/bpp, or none
 // at all -- see punkt.c0's fb_probe) rather than the primary one. Text
 // mode is the one video mode guaranteed present with zero mode-setting
 // (no VBE calls, no GPU driver), needs nothing beyond memory writes + two
 // I/O ports.
 
 // VGA text-mode framebuffer: a fixed, well-known physical address (not a
-// boot.s hand-off slot -- nothing places it, it's just where the hardware
+// boot.s hand-off slot -- nothing places it, it is just where the hardware
 // puts it) inside the 16MB identity map, so no paging changes were needed.
 // 80x25 characters, 2 bytes/cell ([char][attribute]). Attribute nibbles:
-// low = foreground color, high = background color -- since they're disjoint
+// low = foreground color, high = background color -- since they are disjoint
 // nibbles, `bg * 16 + fg` packs them with plain arithmetic (no bitwise
 // ops), same idiom as every other flag-packing in this codebase. CRT
 // controller ports 0x3D4 (index)/0x3D5 (data) move the blinking hardware
@@ -74,9 +74,9 @@ void vga_clear(int attr) {
 // Moves every row up by one (row i takes row i+1's bytes, byte for byte)
 // and blanks the new bottom row -- called when vga_putc runs off the
 // bottom of the screen. VGA_WIDTH * 2 bytes per row, copied with
-// load8/store8 like everywhere else in this codebase that isn't
+// load8/store8 like everywhere else in this codebase that is not
 // 8-byte-aligned (a text row is 160 bytes, not a multiple of 8 counted
-// from an odd starting cell in general, so store64 isn't a natural fit
+// from an odd starting cell in general, so store64 is not a natural fit
 // here the way it is for zero_page's whole-aligned-page loop).
 void vga_scroll(int attr) {
     int row = 0;
@@ -119,7 +119,7 @@ void vga_move_cursor() {
 // Writes one character at the cursor and advances it, handling newline,
 // line-wrap at column 80, and scrolling off the bottom -- the visual
 // counterpart to serial_putc, with cursor-tracking state serial output
-// never needed. Doesn't move the hardware cursor itself (see vga_print) --
+// never needed. Does not move the hardware cursor itself (see vga_print) --
 // batches that to once per string instead of once per character, since
 // vga_move_cursor's 4 outb calls are real port I/O, not free.
 void vga_putc(int ch, int attr) {
@@ -157,8 +157,8 @@ void vga_print(int msg, int attr) {
 
 // Erases the previous character for interactive typing (see
 // keyboard_handler). Deliberately simple: only erases within the current
-// row (col > 0) -- it doesn't unwind across a previous newline or a
-// wrapped line, since there's no per-row "was this a wrap or an explicit
+// row (col > 0) -- it does not unwind across a previous newline or a
+// wrapped line, since there is no per-row "was this a wrap or an explicit
 // newline" tracking to know how far back is safe to go. Good enough for a
 // first interactive typing loop; a real line-editing backspace is a later
 // step if multi-line editing is ever needed.

@@ -14,9 +14,9 @@
 #
 # Why this exists separately from run_qemu.sh: the timer interrupt alone
 # already proves the IDT/PIC/isr_common/dispatch-table machinery works end
-# to end (run_qemu.sh's tick count check). What it *can't* prove is that
+# to end (run_qemu.sh's tick count check). What it *cannot* prove is that
 # IRQ1 specifically reaches keyboard_handler, since nothing external ever
-# triggers a real key event in a plain `-display none` boot -- there's
+# triggers a real key event in a plain `-display none` boot -- there is
 # no keyboard input to see. `sendkey` is QEMU's own mechanism for
 # injecting a real PS/2 key event into the emulated hardware, so this is
 # still "run the real thing and check the real output," not a simulation
@@ -56,6 +56,18 @@ s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.connect("keyboard_test.sock")
 time.sleep(0.2)
 s.recv(4096)  # discard QEMU monitor banner
+# Log in as root (raket's boot-time login gate) before any shell command
+# can reach shell_run -- root has no password set at boot, so an empty
+# password line logs in. See raket.c0.
+for k in ["r", "o", "o", "t", "ret"]:
+    s.sendall(("sendkey %s\n" % k).encode())
+    time.sleep(0.25)
+    s.recv(4096)
+time.sleep(0.5)
+s.sendall(b"sendkey ret\n")
+time.sleep(0.25)
+s.recv(4096)
+time.sleep(0.5)
 # 'a' proves the base typing path; caps_lock (toggle on) + 'a' again proves
 # CapsLock inverts a LETTER's case; tab proves the dedicated column-advance
 # path. Then alt-tab must cycle kakel's window focus 0 -> 1, 'b' must land
@@ -107,7 +119,7 @@ sleep 0.5
 #   "kakel focus: win=0"                       -- the second Alt+Tab wrapped
 #       focus back around to window 0.
 #
-# (If GRUB didn't grant a framebuffer, kakel never activates and
+# (If GRUB did not grant a framebuffer, kakel never activates and
 # keyboard_handler falls back to VGA text mode; not separately checked --
 # every real run gets the framebuffer.)
 a_line=$(grep -oE "^kakel typed: win=0 char=97 row=[0-9]+ col=[0-9]+$" serial.log | head -1)

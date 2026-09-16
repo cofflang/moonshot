@@ -1,0 +1,16 @@
+// expect: 90
+// layout + sizeof + alloc() together, the combination Gnista's entity data
+// depends on. Two allocations must be distinct, non-overlapping, and have
+// correctly offset fields -- the sum only comes out right if all three hold.
+layout Point { int x; int y; }
+int main() {
+    int a = alloc(sizeof(Point));
+    int b = alloc(sizeof(Point));
+    if (a == 0 || b == 0) { return 203; }
+    if (a == b) { return 204; }
+    a.x = 3; a.y = 5;
+    b.x = 7; b.y = 11;
+    if (a.x != 3 || a.y != 5) { return 205; }
+    if (b.x != 7 || b.y != 11) { return 206; }
+    return a.x + a.y + b.x + b.y + 64;
+}

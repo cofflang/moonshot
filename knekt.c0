@@ -36,11 +36,11 @@ void store32_le(int addr, int v) {
     return;
 }
 
-// Calls boot.s's halt_cpu (hlt; ret) indirectly -- same "c0 can't call an
+// Calls boot.s's halt_cpu (hlt; ret) indirectly -- same "c0 cannot call an
 // externally-defined asm symbol by name" wall as sched_launch_call in
 // chrone.c0, solved the same way. Genuinely idles the CPU for one
 // interrupt's worth of time, unlike a busy-spin loop -- see
-// interrupts.c0's panic_handler, its only caller, for why it's called in
+// interrupts.c0's panic_handler, its only caller, for why it is called in
 // a loop rather than trusted to never return.
 void halt() {
     int h = load64(HALTINFO_ADDR);
@@ -138,6 +138,10 @@ void kernel_post_init() {
     // earlier in main) but before any shell input.
     jit_init();
 
+    // Initialise the ring-3 key event queue before the shell, so any
+    // keypress during boot (unlikely but harmless) has somewhere to land.
+    key_rings_init();
+
     // Bring up the interactive shell last, so each window's greeting +
     // prompt land just below its banner (one shell session per kakel
     // window -- see skalman.c0). From here on, typed keys drive skalman
@@ -153,6 +157,13 @@ void kernel_post_init() {
     // Bring up the in-memory filesystem after the shell, so any filesystem
     // errors print through the shell's output path (already live).
     jakel_init();
+
+    // klick last: it draws the pointer as soon as it comes up, so everything
+    // that paints the initial screen -- the window layout, each session's
+    // banner and prompt -- has to have happened first, or the pointer's
+    // backing store would capture pixels that are about to be overwritten
+    // and put stale ones back on the first move.
+    klick_init();
     return;
 }
 
@@ -166,7 +177,7 @@ int main() {
         // Light grey text on black, same look VGA_DEFAULT_ATTR aimed for --
         // computed via fb_rgb (not a literal) since it depends on
         // fb_probe's real, just-read channel positions, not an assumption.
-        // Can't actually DRAW yet: fb_addr is far outside both the low
+        // Cannot actually DRAW yet: fb_addr is far outside both the low
         // 16MB c0's own tables will cover AND boot.s's original static 1GB
         // map, so pixel writes only become safe after boot.s's CR3 switch
         // and fb_map (see kernel_post_init, where the real drawing and
@@ -185,7 +196,7 @@ int main() {
         vga_print("Moonshot\nOS\n", VGA_DEFAULT_ATTR);
 
         // Prove the writes actually landed in the real framebuffer, not
-        // just "the calls didn't crash" -- read specific cells back and
+        // just "the calls did not crash" -- read specific cells back and
         // print them over serial for run_qemu.sh to check by arithmetic,
         // same discipline as pmm/paging/every other subsystem here.
         // Exercises both the plain write path (char0/attr0/char7, all on
@@ -225,7 +236,7 @@ int main() {
 
     pmm_init(mb_info);
     // Verification, in three parts, each printed so run_qemu.sh can check
-    // the arithmetic directly rather than just "some numbers that didn't
+    // the arithmetic directly rather than just "some numbers that did not
     // crash":
     //   1. bump: four fresh pages, strictly increasing and exactly 4096
     //      bytes apart (the original allocator's whole behavior).
@@ -290,7 +301,19 @@ int main() {
     //   coalesce: free that block AND its neighbour, then request 128 -- too
     //             big for either freed 64-byte block alone, so landing back
     //             at the lower address proves the two merged into one.
-    heap_init(6);
+    // 256 pages (1MB), not the original 6 (24KB) -- that was sized for the
+    // three-block alloc/reuse/coalesce test right below and never revisited
+    // as real content landed on top of it (compiled ELF demos with embedded
+    // sprite data, each needing its own temp buffer AND jakel_write's own
+    // persistent-copy buffer at the same time). kmalloc fails silently
+    // (returns 0, no error) when the heap is exhausted, and most callers
+    // do not check for it -- jakel_write's own new_data buffer does not, so
+    // real world found this the hard way: Gnista's first demo (~13.6KB,
+    // twice over) silently corrupted low memory instead of erroring, no
+    // crash, no message, just wrong. Generous headroom past current need,
+    // same sizing philosophy used everywhere else in this codebase (still
+    // a small fraction of the ~132MB this kernel already sees as usable).
+    heap_init(256);
     int h0 = kmalloc(64);
     int h1 = kmalloc(64);
     int h2 = kmalloc(64);
@@ -331,6 +354,7 @@ int main() {
     idt_set(14, pagefault_stub); // #PF page fault (error code + CR2)
     idt_set(32, timer_stub);
     idt_set(33, keyboard_stub);
+    idt_set(44, load64(MOUSEINFO_ADDR));  // IRQ12, klick
 
     // Remaining CPU exception vectors, all routed to the same generic
     // panic_handler as #0/#6/#13 below -- a generic handler is enough since
@@ -389,12 +413,13 @@ int main() {
     dispatch_set(14, page_fault_handler);
     dispatch_set(32, timer_tick);
     dispatch_set(33, keyboard_handler);
+    dispatch_set(44, klick_handler);
 
     pic_remap();
     pit_configure(1193182 / 100); // ~100 Hz
 
     // boot.s reads the IDTR this just built and does `lidt`/`sti` itself
-    // right after this returns -- see boot.s for why (c0 can't execute
+    // right after this returns -- see boot.s for why (c0 cannot execute
     // those instructions, and exposing them as separate asm functions
     // callable from c0 would need coff0's resolve() to support calling an
     // externally-defined symbol, which nothing else in this codebase does).

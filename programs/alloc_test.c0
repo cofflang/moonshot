@@ -1,0 +1,28 @@
+// alloc_test.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// Verifies layout + sizeof + alloc() (SYS_ALLOC) end to end from ring 3:
+// allocates two Entity records, writes distinct fields on each and exits with
+// their sum, 114, which only comes out right if the two allocations are
+// distinct and every field offset is correct. verify_alloc.sh looks for that
+// exit code and for the line printed below. Baked into the kernel as
+// alloc_test_data.c0 by gen_programs.sh; the original of this file was lost
+// and this is a rewrite from the shipped machine code.
+layout Entity { int x; int y; int vx; int vy; }
+int main() {
+    int a = 0;
+    int b = 0;
+    a = alloc(sizeof(Entity));
+    b = alloc(sizeof(Entity));
+    a.x = 5; a.y = 6; a.vx = 1; a.vy = 2;
+    b.x = 100; b.y = 0; b.vx = 0; b.vy = 0;
+    print("alloc test ok\n");
+    if (a == b) { return 0; }
+    return a.x + a.y + a.vx + a.vy + b.x;
+}

@@ -22,13 +22,13 @@
 // need "how does one translation unit call another by name," a wall this
 // project has already worked around with indirect calls several times
 // because nothing has needed it; the actual problem was file organization,
-// not a compilation-model one. Include order below doesn't affect
+// not a compilation-model one. Include order below does not affect
 // correctness (c0's two-pass resolve makes forward references across the
 // whole expanded program work regardless of which file a name was written
 // in), just reading order.
 //
-// `main` can't take parameters (coff0.c requires zero), so the Multiboot
-// info pointer GRUB leaves in EBX at boot doesn't arrive as an argument:
+// `main` cannot take parameters (coff0.c requires zero), so the Multiboot
+// info pointer GRUB leaves in EBX at boot does not arrive as an argument:
 // boot.s stashes it into a fixed memory slot (linker.ld pins .mbinfo's
 // address at exactly 1048576 = 0x100000 = 1M) as its very first
 // instruction, and main() (knekt.c0) reads it back from that literal
@@ -64,7 +64,7 @@ int EXCINFO_GPF_ADDR = 0x100048;
 // to load (SCHED_NEXT_RSP); [4] switch-requested flag, set by sched_tick,
 // cleared by isr_common (SCHED_SWITCH_PENDING); [5] boot.s's sched_launch
 // address, called indirectly exactly once. sched_current (which task is
-// running) is pure c0-side bookkeeping asm never touches, so it's an
+// running) is pure c0-side bookkeeping asm never touches, so it is an
 // ordinary global in chrone.c0 rather than a slot.
 //
 // SCHED_TASK0_RSP/TASK1_RSP held the two hardcoded tasks' saved rsps under
@@ -79,6 +79,22 @@ int SCHED_SAVE_SLOT_ADDR = 0x100080;
 int SCHED_NEXT_RSP = 0x100088;
 int SCHED_SWITCH_PENDING = 0x100090;
 int SCHED_LAUNCH_ADDR = 0x100098;
+// Slot [6] of .sched (0x1000A0), previously unused headroom. The incoming
+// task's saved CR3 (its process-private pml4_phys, or the kernel's own for
+// kernel-context tasks), written by sched_tick alongside SCHED_NEXT_RSP and
+// loaded by isr_common right after the rsp swap -- see chrone.c0's
+// task_cr3_base.
+int SCHED_NEXT_CR3 = 0x1000A0;
+// Slot [7] of .sched (0x1000A8), the last free slot. The incoming task's
+// kernel-stack top (task_stack_base[next] + 4096), written by sched_tick
+// alongside SCHED_NEXT_RSP/SCHED_NEXT_CR3 and loaded into TSS.RSP0 by
+// isr_common right after the CR3 reload. Keeps TSS.RSP0 -- which
+// enter_ring3 also sets, see ring3_handlers.s -- correct for WHICHEVER
+// task is current, not just whichever one most recently entered ring 3:
+// needed the moment two ring-3 processes exist and the scheduler switches
+// between them, since a stale RSP0 would hand a ring-3→ring-0 transition
+// (interrupt OR syscall_entry's own stack switch) someone else's stack.
+int SCHED_NEXT_RSP0 = 0x1000A8;
 // .excinfo2 slots -- second batch of exception ISR trampoline hand-offs,
 // same pattern as .excinfo above, added when the remaining CPU exception
 // vectors got pointed at panic_handler. Placed after .sched (not by growing
@@ -112,6 +128,17 @@ int SCANCODE_SHIFT_TABLE_ADDR = 0x100238;
 // a fixed-slot addition before .dfinfo would need this updated by hand.
 int EXCINFO_DF_ADDR = 0x100338;
 int RING3INFO_ADDR = 0x100340;
+// .stiinfo slot -- boot.s's enable_interrupts (sti; ret) address, called
+// indirectly by sys_dispatch's SYS_EXIT handler (syscall.c0) so a ring-3
+// process exiting does not leave RFLAGS.IF permanently cleared (SYSCALL's
+// SFMASK clears it on entry; that handler never reaches SYSRET, the only
+// other place it would get restored). See linker.ld for the full story.
+int STIINFO_ADDR = 0x100350;
+// .mouseinfo slot -- boot.s's isr_mouse_entry (IRQ12 / vector 44) address,
+// read back by knekt.c0 to install klick's IDT entry. Same hand-off as
+// .isrinfo's timer/keyboard stubs; placed after .stiinfo rather than as a
+// third .isrinfo quad so no address above it shifts.
+int MOUSEINFO_ADDR = 0x100358;
 // Linker-resolved extern symbols for the NOBITS sections (see linker.ld).
 // kscratch_start / idt_start / dispatch_start / _kernel_end are defined by
 // the linker script. An extern name in expression context evaluates to its
@@ -128,9 +155,9 @@ extern int _kernel_end;
 // names would collide with extern declarations in the same translation
 // unit. The values are the runtime addresses of jit_print_helper /
 // jit_print_str_helper / jit_assign_helper, patched after the ELF is linked.
-int JIT_PRINT_ADDR = 1176322;
-int JIT_PRINT_STR_ADDR = 1176371;
-int JIT_ASSIGN_ADDR = 1176446;
+int JIT_PRINT_ADDR = 1571456;
+int JIT_PRINT_STR_ADDR = 1571505;
+int JIT_ASSIGN_ADDR = 1571580;
 
 include "serial.c0";
 include "interrupts.c0";
@@ -140,11 +167,20 @@ include "vga.c0";
 include "punkt.c0";
 include "kakel.c0";
 include "skalman.c0";
+include "raket.c0";
 include "keyboard.c0";
+include "klick.c0";
 include "ata.c0";
 include "jakel.c0";
+include "alloc_test_data.c0";
+include "ticks_test_data.c0";
+include "gnista_demo_data.c0";
+include "elf_tests_data.c0";
+include "fps_probe_data.c0";
+include "infecteria_data.c0";
 include "jit.c0";
 include "repl.c0";
 include "skrift.c0";
+include "pensel.c0";
 include "syscall.c0";
 include "knekt.c0";
