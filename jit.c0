@@ -419,7 +419,7 @@ void jit_patch_jmp(int pos, int target) {
 
 // Returns 1 if `nd` is ND_NUM with value 0, 0 otherwise.
 int jit_is_zero(int nd) {
-    if (nd != 0 && load64(nd) == ND_NUM && load64(nd + 8) == 0) { return 1; }
+    if (nd != 0 && nd.kind == ND_NUM && nd.child1 == 0) { return 1; }
     return 0;
 }
 
@@ -451,19 +451,19 @@ int jit_break_count   = 0;
 
 int jit_compile_node(int nd, int pos) {
     if (nd == 0) { return pos; }
-    int kind = load64(nd);
+    int kind = nd.kind;
     int left;
     int right;
 
     // ND_NUM: mov eax, <value>
     if (kind == ND_NUM) {
-        return jit_mov_eax_imm(pos, load64(nd + 8));
+        return jit_mov_eax_imm(pos, nd.child1);
     }
 
     // ND_STR: embed string in the page's string area, load its address.
     if (kind == ND_STR) {
-        int str_ptr = load64(nd + 8);
-        int str_len = load64(nd + 24);
+        int str_ptr = nd.child1;
+        int str_len = nd.extra;
         int str_addr = jit_page + jit_str_pos;
         int si = 0;
         while (si <= str_len) {
@@ -481,40 +481,40 @@ int jit_compile_node(int nd, int pos) {
 
     // ND_NEG: compile child, then neg rax
     if (kind == ND_NEG) {
-        pos = jit_compile_node(load64(nd + 8), pos);
+        pos = jit_compile_node(nd.child1, pos);
         if (pos < 0) { return -1; }
         return jit_neg_rax(pos);
     }
 
     // ND_ADD
     if (kind == ND_ADD) {
-        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        pos = jit_compile_binary(nd.child1, nd.child2, pos);
         if (pos < 0) { return -1; }
         return jit_add_rax_rbx(pos);
     }
 
     // ND_SUB
     if (kind == ND_SUB) {
-        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        pos = jit_compile_binary(nd.child1, nd.child2, pos);
         if (pos < 0) { return -1; }
         return jit_sub_rax_rbx(pos);
     }
 
     // ND_MUL
     if (kind == ND_MUL) {
-        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        pos = jit_compile_binary(nd.child1, nd.child2, pos);
         if (pos < 0) { return -1; }
         return jit_imul_rax_rbx(pos);
     }
 
     // ND_DIV
     if (kind == ND_DIV) {
-        right = load64(nd + 16);
+        right = nd.child2;
         if (jit_is_zero(right) == 1) {
             serial_print("[jit] division by zero\n");
             return -1;
         }
-        pos = jit_compile_binary(load64(nd + 8), right, pos);
+        pos = jit_compile_binary(nd.child1, right, pos);
         if (pos < 0) { return -1; }
         pos = jit_cqo(pos);
         return jit_idiv_rbx(pos);
@@ -522,7 +522,7 @@ int jit_compile_node(int nd, int pos) {
 
     // ND_EQ
     if (kind == ND_EQ) {
-        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        pos = jit_compile_binary(nd.child1, nd.child2, pos);
         if (pos < 0) { return -1; }
         pos = jit_cmp_rax_rbx(pos);
         pos = jit_sete_al(pos);
@@ -531,7 +531,7 @@ int jit_compile_node(int nd, int pos) {
 
     // ND_NE
     if (kind == ND_NE) {
-        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        pos = jit_compile_binary(nd.child1, nd.child2, pos);
         if (pos < 0) { return -1; }
         pos = jit_cmp_rax_rbx(pos);
         pos = jit_setne_al(pos);
@@ -540,7 +540,7 @@ int jit_compile_node(int nd, int pos) {
 
     // ND_LT
     if (kind == ND_LT) {
-        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        pos = jit_compile_binary(nd.child1, nd.child2, pos);
         if (pos < 0) { return -1; }
         pos = jit_cmp_rax_rbx(pos);
         pos = jit_setl_al(pos);
@@ -549,7 +549,7 @@ int jit_compile_node(int nd, int pos) {
 
     // ND_LE
     if (kind == ND_LE) {
-        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        pos = jit_compile_binary(nd.child1, nd.child2, pos);
         if (pos < 0) { return -1; }
         pos = jit_cmp_rax_rbx(pos);
         pos = jit_setle_al(pos);
@@ -558,7 +558,7 @@ int jit_compile_node(int nd, int pos) {
 
     // ND_GT
     if (kind == ND_GT) {
-        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        pos = jit_compile_binary(nd.child1, nd.child2, pos);
         if (pos < 0) { return -1; }
         pos = jit_cmp_rax_rbx(pos);
         pos = jit_setg_al(pos);
@@ -567,7 +567,7 @@ int jit_compile_node(int nd, int pos) {
 
     // ND_GE
     if (kind == ND_GE) {
-        pos = jit_compile_binary(load64(nd + 8), load64(nd + 16), pos);
+        pos = jit_compile_binary(nd.child1, nd.child2, pos);
         if (pos < 0) { return -1; }
         pos = jit_cmp_rax_rbx(pos);
         pos = jit_setge_al(pos);
@@ -577,8 +577,8 @@ int jit_compile_node(int nd, int pos) {
     // ND_PRINT: compile the argument, then call the appropriate print helper.
     // String arguments use jit_print_str_helper; integers use jit_print_helper.
     if (kind == ND_PRINT) {
-        int arg = load64(nd + 8);  // argument expression
-        if (arg != 0 && load64(arg) == ND_STR) {
+        int arg = nd.child1;  // argument expression
+        if (arg != 0 && arg.kind == ND_STR) {
             // String argument — compile it (loads string address into rax),
             // then call jit_print_str_helper.
             pos = jit_compile_node(arg, pos);
@@ -604,9 +604,9 @@ int jit_compile_node(int nd, int pos) {
     // ND_ASSIGN: compile the value expression, then call jit_assign_helper to
     // store it in the REPL symbol table at runtime. Same call pattern as print.
     if (kind == ND_ASSIGN) {
-        int name_ptr = load64(nd + 8);
-        int value_expr = load64(nd + 16);
-        int name_len  = load64(nd + 24);
+        int name_ptr = nd.child1;
+        int value_expr = nd.child2;
+        int name_len  = nd.extra;
         pos = jit_compile_node(value_expr, pos);
         if (pos < 0) { return -1; }
         pos = jit_mov_rdx_rax(pos);         // rdx = rax (arg3: value)
@@ -624,8 +624,8 @@ int jit_compile_node(int nd, int pos) {
     // time value is always up to date. Deferred to an actual runtime lookup
     // later (needs function-call support in the JIT).
     if (kind == ND_VAR) {
-        int name_ptr = load64(nd + 8);
-        int name_len = load64(nd + 24);
+        int name_ptr = nd.child1;
+        int name_len = nd.extra;
         int idx = repl_lookup(name_ptr, name_len);
         if (idx < 0) {
             serial_print("[jit] unknown variable '");
@@ -655,9 +655,9 @@ int jit_compile_node(int nd, int pos) {
 
     // ND_IF: if (cond) then_stmt [else else_stmt]
     if (kind == ND_IF) {
-        int cond = load64(nd + 8);
-        int then_body = load64(nd + 16);
-        int else_body = load64(nd + 24);
+        int cond = nd.child1;
+        int then_body = nd.child2;
+        int else_body = nd.extra;
         pos = jit_compile_node(cond, pos);
         if (pos < 0) { return -1; }
         pos = jit_test_rax_rax(pos);
@@ -680,8 +680,8 @@ int jit_compile_node(int nd, int pos) {
 
     // ND_WHILE: while (cond) body. Supports break/continue.
     if (kind == ND_WHILE) {
-        int cond = load64(nd + 8);
-        int body = load64(nd + 16);
+        int cond = nd.child1;
+        int body = nd.child2;
         if (jit_loop_depth >= 8) {
             serial_print("[jit] loop nesting too deep\n");
             return -1;
@@ -715,10 +715,10 @@ int jit_compile_node(int nd, int pos) {
 
     // ND_FOR: for (init; cond; incr) body. Supports break/continue.
     if (kind == ND_FOR) {
-        int init = load64(nd + 8);
-        int cond = load64(nd + 16);
-        int incr = load64(nd + 24);
-        int body = load64(nd + 32);
+        int init = nd.child1;
+        int cond = nd.child2;
+        int incr = nd.extra;
+        int body = nd.next;
         // Compile init (result ignored).
         if (init != 0) {
             pos = jit_compile_node(init, pos);
@@ -765,14 +765,14 @@ int jit_compile_node(int nd, int pos) {
 
     // ND_EXPR_STMT: unwrap the expression and compile it.
     if (kind == ND_EXPR_STMT) {
-        return jit_compile_node(load64(nd + 8), pos);
+        return jit_compile_node(nd.child1, pos);
     }
 
     // ND_CALL: function call — dispatch known single-arg builtins inline.
     if (kind == ND_CALL) {
-        int fname = load64(nd + 8);   // function name pointer
-        int flen  = load64(nd + 24);  // name length
-        int arg   = load64(nd + 16);  // argument expression
+        int fname = nd.child1;   // function name pointer
+        int flen  = nd.extra;  // name length
+        int arg   = nd.child2;  // argument expression
         // load8(addr)
         int kw = kscratch_start;
         store8(kw,'l');store8(kw+1,'o');store8(kw+2,'a');store8(kw+3,'d');store8(kw+4,'8');store8(kw+5,0);
@@ -795,7 +795,7 @@ int jit_compile_node(int nd, int pos) {
         // store8(addr, val)
         store8(kw,'s');store8(kw+1,'t');store8(kw+2,'o');store8(kw+3,'r');store8(kw+4,'e');store8(kw+5,'8');store8(kw+6,0);
         if (repl_word_is(fname, flen, kw) == 1) {
-            int val_arg = load64(arg + 32);
+            int val_arg = arg.next;
             if (val_arg == 0) { return -1; }
             pos = jit_compile_node(val_arg, pos);   // value in rax
             if (pos < 0) { return -1; }
@@ -810,7 +810,7 @@ int jit_compile_node(int nd, int pos) {
         // store64(addr, val)
         store8(kw,'s');store8(kw+1,'t');store8(kw+2,'o');store8(kw+3,'r');store8(kw+4,'e');store8(kw+5,'6');store8(kw+6,'4');store8(kw+7,0);
         if (repl_word_is(fname, flen, kw) == 1) {
-            int val_arg = load64(arg + 32);
+            int val_arg = arg.next;
             if (val_arg == 0) { return -1; }
             pos = jit_compile_node(val_arg, pos);   // value in rax
             if (pos < 0) { return -1; }
@@ -829,11 +829,11 @@ int jit_compile_node(int nd, int pos) {
 
     // ND_BLOCK: compile each statement in sequence.
     if (kind == ND_BLOCK) {
-        int stmt = load64(nd + 8);
+        int stmt = nd.child1;
         while (stmt != 0) {
             pos = jit_compile_node(stmt, pos);
             if (pos < 0) { return -1; }
-            stmt = load64(stmt + 32);
+            stmt = stmt.next;
         }
         return pos;
     }

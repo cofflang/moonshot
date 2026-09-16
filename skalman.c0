@@ -110,7 +110,7 @@ int sk_queue_count = 0; // chars currently in the buffer
 // Task id of the shell task, assigned by sched_start (after task_spawn).
 // -1 before the shell task exists: shell_enqueue's task_wake call is gated
 // on this being >= 0, so early keystrokes (typed before sched_start) are
-// buffered but don't try to wake a nonexistent task.
+// buffered but do not try to wake a nonexistent task.
 int shell_task_id = -1;
 
 // Command history ring buffer — 8 entries of up to 128 bytes each, allocated
@@ -128,7 +128,7 @@ int sk_tab_last_prefix_len  = 0;
 // The session (= window, when kakel is active) that keyboard input and
 // shell output currently belong to. Never returns the log window id (which
 // is not an interactive session) -- falls back to session 0 if focus is
-// somehow on it (shouldn't happen via kakel_focus_next, which wraps at
+// somehow on it (should not happen via kakel_focus_next, which wraps at
 // kakel_shell_wins, but guard anyway).
 int sk_console() {
     if (kakel_active == 1) {
@@ -179,7 +179,7 @@ void sk_print(int s) {
 // counterpart to serial_print_int -- needed by `ps`/`spawn` to show task ids
 // and counters. Same digit-extraction idiom (no % in c0, so v - (v/10)*10) and
 // same fixed .kscratch buffer; safe to share kscratch_start with
-// serial_print_int because interrupts don't nest (see the file header), so the
+// serial_print_int because interrupts do not nest (see the file header), so the
 // two never build a number in that buffer at the same time.
 void sk_print_int(int v) {
     int tmp = kscratch_start;
@@ -225,7 +225,7 @@ int str_starts(int s, int prefix) {
 }
 
 // Parses a NUL-terminated string of ASCII digits into a non-negative int.
-// Returns -1 on anything that isn't purely digits (empty, a stray space, a
+// Returns -1 on anything that is not purely digits (empty, a stray space, a
 // sign, letters) -- used by `kill (id)` to turn its typed argument into a task
 // id. Deliberately strict/minimal, matching the shell's other tiny string
 // helpers; no whitespace trimming, no sign, no overflow guard (task ids are
@@ -247,9 +247,69 @@ int str_to_int(int s) {
 
 // Print the shell prompt to window `f`. The prompt is printed in a dimmer
 // colour so it reads as a prompt, not as command output; the space after
-// ">" stays bright since that's where typed text begins.
+// ">" stays bright since that is where typed text begins.
+// Reprints the shell prompt in every live shell window except `skip` (and the
+// focused one, which its own caller handles).
+//
+// ONLY call this after kakel_reflow has actually run. Reflow repaints by
+// clearing every visible window, which wipes their prompts, so they have to be
+// put back -- but calling it when no reflow happened simply stacks another
+// prompt on top of the existing one. That was a real bug: with all four slots
+// full, `split` refused (kakel_split returns -1 without reflowing) while
+// skalman reprompted anyway, so every failed split added another prompt line
+// to every other window, accumulating the more you tried.
+// Tavlas are skipped: a graphical program owns every pixel of its client
+// area, and skalman has no session behind that window anyway -- prompting
+// into one would just stamp "moonshot>" over whatever it had drawn.
+void shell_reprompt_others(int skip) {
+    int w = 0;
+    while (w < KAKEL_MAX_WIN) {
+        if (load64(kakel_rows_base + w * 8) > 0
+            && w != kakel_stats_win
+            && w != kakel_focus
+            && w != skip
+            && kakel_is_tavla(w) == 0) {
+            // shell_prompt_session, not shell_prompt_win: a window still at
+            // raket's login gate must get its login prompt back, not a shell
+            // prompt it cannot use.
+            shell_prompt_session(w);
+        }
+        w = w + 1;
+    }
+    return;
+}
+
+// Same, but also reprompts the FOCUSED window -- for a windowed spawn, which
+// reflows from the spawned task rather than from shell_input.
+//
+// The distinction is about who else will repaint that window. `split` and
+// `close` reflow inline, and shell_input reprompts the window the command was
+// typed in as soon as it returns, so including it here would double the
+// prompt. A spawn reflows later, from another task, by which point
+// shell_input has already drawn its prompt AND the reflow has erased it
+// again -- so if this does not put it back, nothing does, and the shell
+// window a graphical program was launched from is left blank.
+void shell_reprompt_after_spawn(int skip) {
+    shell_reprompt_others(skip);
+    if (kakel_active == 1
+        && kakel_focus != skip
+        && kakel_is_tavla(kakel_focus) == 0
+        && load64(kakel_rows_base + kakel_focus * 8) > 0) {
+        shell_prompt_session(kakel_focus);
+    }
+    return;
+}
+
+// A tavla belongs to a graphical program, pixel for pixel, and skalman has no
+// session behind it. shell_reprompt_others already knew that; this did not,
+// and it is the one every post-command reprompt goes through. Closing a shell
+// window that sat next to a running game handed focus to the game's tavla, and
+// the prompt shell_input prints afterwards was stamped straight over the frame
+// the game had drawn -- and advanced the tavla's text cursor while it was at
+// it, so the damage was not even confined to one line.
 void shell_prompt_win(int f) {
     if (kakel_active == 1) {
+        if (kakel_is_tavla(f) == 1) { return; }
         kakel_putc_dim(f, 'm'); kakel_putc_dim(f, 'o'); kakel_putc_dim(f, 'o');
         kakel_putc_dim(f, 'n'); kakel_putc_dim(f, 's'); kakel_putc_dim(f, 'h');
         kakel_putc_dim(f, 'o'); kakel_putc_dim(f, 't'); kakel_putc_dim(f, '>');
@@ -260,9 +320,42 @@ void shell_prompt_win(int f) {
     return;
 }
 
+// Prints whichever prompt window `f`'s session is actually WAITING ON: raket's
+// login prompt while it is unauthenticated, the shell prompt once it is not.
+//
+// The two had drifted apart. Closing the last window replaces it with a fresh
+// one, and kakel_win_new calls raket_reset_session on every new window id, so
+// that window starts at the login gate -- but the caller printed a bare
+// "moonshot> ". The session then read the next line as a USERNAME while the
+// screen claimed it was a shell: typing `help` logged you in as a user named
+// help, or failed, with no hint why. Anything that prompts a window it did not
+// just come from should use this rather than shell_prompt_win.
+// True while one of the in-kernel full-window applications owns window `f`.
+// They are not tavlas -- no owning ring-3 task, no title strip -- but for
+// prompting purposes they are the same thing: something other than a shell
+// session owns every cell of that window, and skalman must keep out until it
+// hands the window back.
+int shell_win_taken(int f) {
+    if (pensel_active == 1 && pensel_win == f) { return 1; }
+    if (skrift_active == 1 && skrift_win == f) { return 1; }
+    return 0;
+}
+
+void shell_prompt_session(int f) {
+    if (kakel_active != 1) { return; }
+    if (kakel_is_tavla(f) == 1) { return; }
+    if (shell_win_taken(f) == 1) { return; }
+    if (raket_authed(f) == 0) {
+        raket_prompt(f);
+        return;
+    }
+    shell_prompt_win(f);
+    return;
+}
+
 void shell_prompt() {
     if (kakel_active == 1) {
-        shell_prompt_win(kakel_focus);
+        shell_prompt_session(kakel_focus);
     } else {
         sk_print("moonshot> ");
     }
@@ -277,7 +370,7 @@ void shell_prompt() {
 // interrupt, so the kmallocs here are never on the IRQ path
 // (shell_input/shell_run below never allocate).
 void shell_init() {
-    sk_fg = FB_FG;  // initialise foreground colour (can't cross-ref globals)
+    sk_fg = FB_FG;  // initialise foreground colour (cannot cross-ref globals)
     shell_ncons = 1;
     if (kakel_active == 1) { shell_ncons = kakel_shell_wins; }
     // Pre-allocate up to KAKEL_MAX_WIN line buffers so new windows created
@@ -312,16 +405,13 @@ void shell_init() {
     store8(guest_name,'g');store8(guest_name+1,'u');store8(guest_name+2,'e');store8(guest_name+3,'s');store8(guest_name+4,'t');store8(guest_name+5,0);
     sk_user_add(root_name);
     sk_user_add(guest_name);
-    // Only greet the sessions that are actually visible at boot.
+    // Every session boots to raket's login prompt, not straight into an
+    // already-logged-in shell -- see raket.c0. Only the sessions actually
+    // visible at boot get greeted.
+    raket_init();
     i = 0;
     while (i < shell_ncons) {
-        if (kakel_active == 1) {
-            kakel_print(i, "\ntype 'help' for commands.\n");
-            shell_prompt_win(i);
-        } else {
-            sk_print("\ntype 'help' for commands.\n");
-            shell_prompt();
-        }
+        raket_prompt(i);
         i = i + 1;
     }
     return;
@@ -366,16 +456,17 @@ void shell_run(int f, int cmd) {
     if (str_eq(cmd, "help") == 1) {
         sk_print("commands:\n\n");
         sk_print("  help (command)    clear              chars\n");
-        sk_print("  echo (text)       echo --file (path)\n");
+        sk_print("  echo (text)       whoami             sync\n");
         sk_print("  list (path)       change (path)      make (name)\n");
         sk_print("  remove (name)     copy (src) (dst)   rename (src) (dst)\n");
         sk_print("  count (file)      write (name) (text)\n");
-        sk_print("  mode (path) (lvl) own (path) (user)  whoami\n");
+        sk_print("  mode (path) (lvl) own (path) (user)\n");
         sk_print("  login (name)      passwd (user) (pw) adduser (name)\n");
-        sk_print("  eval (expr)       eval -c (expr)     run (file)\n");
-        sk_print("  edit (file)       run3               spawn3\n");
-        sk_print("  tasks             spawn              kill (id)\n");
-        sk_print("  split             close              sync\n");
+        sk_print("  eval (expr)       run (file)         edit (file)\n");
+        sk_print("  run3 [file]       spawn3 [file]      tasks\n");
+        sk_print("  draw (file)       where              mouse\n");
+        sk_print("  spawn             kill (id)\n");
+        sk_print("  split             close\n");
         sk_print("\ntab: complete commands and filenames\n");
         sk_print("type help (command) for details\n");
         return;
@@ -404,9 +495,11 @@ void shell_run(int f, int cmd) {
         if (str_eq(c, "close") == 1) { sk_print("close: remove the focused window.\n"); return; }
         if (str_eq(c, "where") == 1) { sk_print("where: print the current working directory path.\n"); return; }
         if (str_eq(c, "sync") == 1) { sk_print("sync: persist all files to disk.\n"); return; }
-        if (str_eq(c, "eval") == 1) { sk_print("eval (expr): evaluate a c0 expression.\n"); return; }
+        if (str_eq(c, "eval") == 1) { sk_print("eval (expr): evaluate a c0 expression. eval -c (expr): JIT-compile and run it.\n"); return; }
+        if (str_eq(c, "draw") == 1) { sk_print("draw (file) [size]: draw a sprite in pensel, size 4-64, default 16 (mouse paints, right button erases, s=save c=clear q=quit).\n"); return; }
         if (str_eq(c, "edit") == 1) { sk_print("edit (file): open in skrift text editor (esc=toggle, cmd: c=chg cc=chg-line cw=chg-word dd=del-line yy=yank /search q=quit).\n"); return; }
         if (str_eq(c, "run") == 1) { sk_print("run (file): execute a file through the REPL interpreter.\n"); return; }
+        if (str_eq(c, "mouse") == 1) { sk_print("mouse: print klick's pointer position, buttons and packet count.\n"); return; }
         if (str_eq(c, "help") == 1) { sk_print("help (command): show what a command does.\n"); return; }
         sk_print("help: unknown command '");
         sk_print(c);
@@ -501,8 +594,8 @@ void shell_run(int f, int cmd) {
     // interrupted) is allowed -- it runs until the next tick, then gets skipped
     // -- guarded only against killing the LAST runnable task, which would leave
     // nothing for sched_pick_next to switch to (it would idle on an EXITED
-    // task). Like exit, a killed task's stack page is leaked for now (see the
-    // reaper note in moonshot.md's Next Steps).
+    // task). Like exit, a killed task's stack page is leaked for now; a
+    // reaper that reclaims it is future work.
     if (str_eq(cmd, "kill") == 1) {
         sk_print("usage: kill (id)\n");
         return;
@@ -557,6 +650,80 @@ void shell_run(int f, int cmd) {
         } else {
             sk_print("spawned ring-3 task ");
             sk_print_int(nid);
+            sk_print("\n");
+        }
+        return;
+    }
+    // run3 (file) / spawn3 (file) — load a real ELF64 executable from jakel
+    // and run it in ring 3, through elf_load (syscall.c0) instead of the
+    // built-in flat-binary test. Same current-task-vs-new-task distinction
+    // as bare run3/spawn3 above.
+    int r3fr = str_starts(cmd, "run3 ");
+    if (r3fr >= 0) {
+        int name = cmd + r3fr;
+        if (load8(name) == 0) {
+            sk_print("run3: usage: run3 (filename)\n");
+            return;
+        }
+        int cwd = 0;
+        if (kakel_active == 1) { cwd = load64(sk_cwd_base + f * 8); }
+        int fid = jakel_open(cwd, name);
+        if (fid < 0) {
+            sk_print("run3: file not found: "); sk_print(name); sk_print("\n");
+            return;
+        }
+        if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) {
+            sk_print("run3: not a file\n");
+            return;
+        }
+        int fsize = load64(jakel_size_base + fid * 8);
+        if (fsize == 0 || fsize > 65536) {
+            sk_print("run3: file empty or too large (max 65536 bytes)\n");
+            return;
+        }
+        int buf = kmalloc(fsize);
+        jakel_read(fid, 0, buf, fsize);
+        sk_print("running ELF image in current task...\n");
+        run_elf_binary(buf, fsize, 0);
+        return;
+    }
+    int s3fr = str_starts(cmd, "spawn3 ");
+    if (s3fr >= 0) {
+        int name = cmd + s3fr;
+        if (load8(name) == 0) {
+            sk_print("spawn3: usage: spawn3 (filename)\n");
+            return;
+        }
+        int cwd = 0;
+        if (kakel_active == 1) { cwd = load64(sk_cwd_base + f * 8); }
+        int fid = jakel_open(cwd, name);
+        if (fid < 0) {
+            sk_print("spawn3: file not found: "); sk_print(name); sk_print("\n");
+            return;
+        }
+        if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) {
+            sk_print("spawn3: not a file\n");
+            return;
+        }
+        int fsize = load64(jakel_size_base + fid * 8);
+        if (fsize == 0 || fsize > 65536) {
+            sk_print("spawn3: file empty or too large (max 65536 bytes)\n");
+            return;
+        }
+        int buf = kmalloc(fsize);
+        jakel_read(fid, 0, buf, fsize);
+        spawn_elf_code = buf;
+        spawn_elf_len = fsize;
+        // Name the tavla after the file. An owned copy, not `name` itself:
+        // that points into this session's line buffer, which is overwritten
+        // long before the spawned task reaches kakel_tavla_claim.
+        ring3_win_title = sk_strdup(name);
+        int enid = task_spawn(spawn_elf_entry);
+        if (enid < 0) {
+            sk_print("task table full\n");
+        } else {
+            sk_print("spawned ELF task ");
+            sk_print_int(enid);
             sk_print("\n");
         }
         return;
@@ -760,15 +927,22 @@ void shell_run(int f, int cmd) {
     // split -- split the focused window's row.
     if (str_eq(cmd, "split") == 1) {
         if (kakel_active == 1) {
-            kakel_split();
-            int w = 0;
-            while (w < KAKEL_MAX_WIN) {
-                if (load64(kakel_rows_base + w * 8) > 0
-                    && w != kakel_stats_win
-                    && w != kakel_focus) {
-                    shell_prompt_win(w);
-                }
-                w = w + 1;
+            int nid = kakel_split();
+            // Inherit the current session's authenticated state into the new
+            // window so the user is not asked to log in again in a window
+            // they just opened from an already-authenticated session. Same
+            // user, same working directory, same raket-authed flag.
+            if (nid >= 0) {
+                store64(raket_authed_base + nid * 8,
+                        load64(raket_authed_base + f * 8));
+                store64(sk_uid_base + nid * 8,
+                        load64(sk_uid_base + f * 8));
+                store64(sk_cwd_base + nid * 8,
+                        load64(sk_cwd_base + f * 8));
+                shell_prompt_session(nid);
+                // Gated on the split having actually happened: only then did
+                // kakel_reflow clear the other windows' prompts away.
+                shell_reprompt_others(nid);
             }
         }
         return;
@@ -776,17 +950,34 @@ void shell_run(int f, int cmd) {
     // close -- remove the focused window.
     if (str_eq(cmd, "close") == 1) {
         if (kakel_active == 1) {
-            kakel_close();
-            int w = 0;
-            while (w < KAKEL_MAX_WIN) {
-                if (load64(kakel_rows_base + w * 8) > 0
-                    && w != kakel_stats_win
-                    && w != kakel_focus) {
-                    shell_prompt_win(w);
-                }
-                w = w + 1;
+            if (kakel_close() == 1) {
+                shell_reprompt_others(0 - 1);
             }
         }
+        return;
+    }
+    // mouse -- klick's current pointer position, buttons and packet count.
+    // The packet count is the useful part: it separates "the pointer has not
+    // moved" from "no IRQ12 is arriving at all", which look identical on
+    // screen.
+    if (str_eq(cmd, "mouse") == 1) {
+        if (klick_active != 1) {
+            sk_print("mouse: klick not active\n");
+            return;
+        }
+        sk_print("pointer ");
+        sk_print_int(klick_x);
+        sk_print(",");
+        sk_print_int(klick_y);
+        sk_print("  buttons L");
+        sk_print_int(klick_left);
+        sk_print(" M");
+        sk_print_int(klick_middle);
+        sk_print(" R");
+        sk_print_int(klick_right);
+        sk_print("  packets ");
+        sk_print_int(klick_packets);
+        sk_print("\n");
         return;
     }
     // sync -- persist the filesystem to disk.
@@ -1022,6 +1213,38 @@ void shell_run(int f, int cmd) {
         sk_print_int(fsize);
         sk_print("\n");
         kfree(buf);
+        return;
+    }
+    // draw <filename> [size] — open a sprite in the pensel pixel editor.
+    // The optional size is the canvas edge in pixels (square); opening an
+    // existing file adopts that file's own size regardless.
+    int dwr = str_starts(cmd, "draw ");
+    if (dwr >= 0) {
+        int dname = cmd + dwr;
+        if (load8(dname) == 0) {
+            sk_print("draw: usage: draw (filename) [size]\n");
+            return;
+        }
+        // Split on the last space: everything before it is the filename,
+        // after it the size. No space means no size given.
+        int dsize = 0;
+        int dsp = 0;
+        int di = 0;
+        while (load8(dname + di) != 0) {
+            if (load8(dname + di) == ' ') { dsp = di; }
+            di = di + 1;
+        }
+        if (dsp > 0) {
+            dsize = str_to_int(dname + dsp + 1);
+            store8(dname + dsp, 0);
+        }
+        int dwin = 0;
+        if (kakel_active == 1) { dwin = kakel_focus; }
+        pensel_start(dwin, dname, dsize);
+        return;
+    }
+    if (str_eq(cmd, "draw") == 1) {
+        sk_print("draw: usage: draw (filename) [size]\n");
         return;
     }
     // edit <filename> — open a file in the skrift text editor.
@@ -1466,71 +1689,58 @@ void shell_tab_complete(int f) {
     int mlimit = 32;
 
     if (is_cmd == 1) {
-        // --- command completion: hardcoded list of 30 builtins ---
-        int cmd_ptrs = kscratch_start + 600;
+        // --- command completion: the builtin names ---
+        //
+        // Plain string literals, which live in .rodata and cost no scratch
+        // space at all. They used to be assembled byte by byte into .kscratch
+        // at +700, with the pointer array at +600 -- and thirty pointers is
+        // 240 bytes, so that array ran straight through the first fifteen
+        // names. Each pointer's high half is four zero bytes (kernel addresses
+        // are small), and those zeros landed exactly on the leading byte of a
+        // name written earlier in the same loop, turning `help`, `clear`,
+        // `chars`, `echo`, `list`, `change`, `make`, `remove`, `write`,
+        // `where`, `sync`, `copy`, `rename`, `count` and `eval` into empty
+        // strings that matched nothing. Tab completed only the second half of
+        // the table, and `he`+Tab -- the single most likely thing anyone types
+        // -- was one of the broken ones. Verified by screendump before and
+        // after: `sp` completed, `he` did not.
+        //
+        // Keep this list in sync with `help`'s own listing in shell_run.
+        int cmd_ptrs = kscratch_start + 512;  // past mbase (0..255) and mlens (256..511)
         int cmd_idx = 0;
-
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 700); cmd_idx = cmd_idx + 1;
-        int s0 = kscratch_start + 700; store8(s0+0,'h');store8(s0+1,'e');store8(s0+2,'l');store8(s0+3,'p');store8(s0+4,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 710); cmd_idx = cmd_idx + 1;
-        int s1 = kscratch_start + 710; store8(s1+0,'c');store8(s1+1,'l');store8(s1+2,'e');store8(s1+3,'a');store8(s1+4,'r');store8(s1+5,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 720); cmd_idx = cmd_idx + 1;
-        int s2 = kscratch_start + 720; store8(s2+0,'c');store8(s2+1,'h');store8(s2+2,'a');store8(s2+3,'r');store8(s2+4,'s');store8(s2+5,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 730); cmd_idx = cmd_idx + 1;
-        int s3 = kscratch_start + 730; store8(s3+0,'e');store8(s3+1,'c');store8(s3+2,'h');store8(s3+3,'o');store8(s3+4,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 740); cmd_idx = cmd_idx + 1;
-        int s4 = kscratch_start + 740; store8(s4+0,'l');store8(s4+1,'i');store8(s4+2,'s');store8(s4+3,'t');store8(s4+4,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 750); cmd_idx = cmd_idx + 1;
-        int s5 = kscratch_start + 750; store8(s5+0,'c');store8(s5+1,'h');store8(s5+2,'a');store8(s5+3,'n');store8(s5+4,'g');store8(s5+5,'e');store8(s5+6,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 760); cmd_idx = cmd_idx + 1;
-        int s6 = kscratch_start + 760; store8(s6+0,'m');store8(s6+1,'a');store8(s6+2,'k');store8(s6+3,'e');store8(s6+4,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 770); cmd_idx = cmd_idx + 1;
-        int s7 = kscratch_start + 770; store8(s7+0,'r');store8(s7+1,'e');store8(s7+2,'m');store8(s7+3,'o');store8(s7+4,'v');store8(s7+5,'e');store8(s7+6,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 780); cmd_idx = cmd_idx + 1;
-        int s8 = kscratch_start + 780; store8(s8+0,'w');store8(s8+1,'r');store8(s8+2,'i');store8(s8+3,'t');store8(s8+4,'e');store8(s8+5,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 790); cmd_idx = cmd_idx + 1;
-        int s9 = kscratch_start + 790; store8(s9+0,'w');store8(s9+1,'h');store8(s9+2,'e');store8(s9+3,'r');store8(s9+4,'e');store8(s9+5,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 800); cmd_idx = cmd_idx + 1;
-        int s10 = kscratch_start + 800; store8(s10+0,'s');store8(s10+1,'y');store8(s10+2,'n');store8(s10+3,'c');store8(s10+4,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 810); cmd_idx = cmd_idx + 1;
-        int s11 = kscratch_start + 810; store8(s11+0,'c');store8(s11+1,'o');store8(s11+2,'p');store8(s11+3,'y');store8(s11+4,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 820); cmd_idx = cmd_idx + 1;
-        int s12 = kscratch_start + 820; store8(s12+0,'r');store8(s12+1,'e');store8(s12+2,'n');store8(s12+3,'a');store8(s12+4,'m');store8(s12+5,'e');store8(s12+6,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 830); cmd_idx = cmd_idx + 1;
-        int s13 = kscratch_start + 830; store8(s13+0,'c');store8(s13+1,'o');store8(s13+2,'u');store8(s13+3,'n');store8(s13+4,'t');store8(s13+5,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 840); cmd_idx = cmd_idx + 1;
-        int s14 = kscratch_start + 840; store8(s14+0,'e');store8(s14+1,'v');store8(s14+2,'a');store8(s14+3,'l');store8(s14+4,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 850); cmd_idx = cmd_idx + 1;
-        int s15 = kscratch_start + 850; store8(s15+0,'e');store8(s15+1,'d');store8(s15+2,'i');store8(s15+3,'t');store8(s15+4,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 860); cmd_idx = cmd_idx + 1;
-        int s16 = kscratch_start + 860; store8(s16+0,'r');store8(s16+1,'u');store8(s16+2,'n');store8(s16+3,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 870); cmd_idx = cmd_idx + 1;
-        int s17 = kscratch_start + 870; store8(s17+0,'t');store8(s17+1,'a');store8(s17+2,'s');store8(s17+3,'k');store8(s17+4,'s');store8(s17+5,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 880); cmd_idx = cmd_idx + 1;
-        int s18 = kscratch_start + 880; store8(s18+0,'s');store8(s18+1,'p');store8(s18+2,'a');store8(s18+3,'w');store8(s18+4,'n');store8(s18+5,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 890); cmd_idx = cmd_idx + 1;
-        int s19 = kscratch_start + 890; store8(s19+0,'k');store8(s19+1,'i');store8(s19+2,'l');store8(s19+3,'l');store8(s19+4,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 900); cmd_idx = cmd_idx + 1;
-        int s20 = kscratch_start + 900; store8(s20+0,'s');store8(s20+1,'p');store8(s20+2,'l');store8(s20+3,'i');store8(s20+4,'t');store8(s20+5,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 910); cmd_idx = cmd_idx + 1;
-        int s21 = kscratch_start + 910; store8(s21+0,'c');store8(s21+1,'l');store8(s21+2,'o');store8(s21+3,'s');store8(s21+4,'e');store8(s21+5,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 920); cmd_idx = cmd_idx + 1;
-        int s22 = kscratch_start + 920; store8(s22+0,'r');store8(s22+1,'u');store8(s22+2,'n');store8(s22+3,'3');store8(s22+4,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 930); cmd_idx = cmd_idx + 1;
-        int s23 = kscratch_start + 930; store8(s23+0,'s');store8(s23+1,'p');store8(s23+2,'a');store8(s23+3,'w');store8(s23+4,'n');store8(s23+5,'3');store8(s23+6,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 940); cmd_idx = cmd_idx + 1;
-        int s24 = kscratch_start + 940; store8(s24+0,'m');store8(s24+1,'o');store8(s24+2,'d');store8(s24+3,'e');store8(s24+4,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 950); cmd_idx = cmd_idx + 1;
-        int s25 = kscratch_start + 950; store8(s25+0,'o');store8(s25+1,'w');store8(s25+2,'n');store8(s25+3,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 960); cmd_idx = cmd_idx + 1;
-        int s26 = kscratch_start + 960; store8(s26+0,'w');store8(s26+1,'h');store8(s26+2,'o');store8(s26+3,'a');store8(s26+4,'m');store8(s26+5,'i');store8(s26+6,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 970); cmd_idx = cmd_idx + 1;
-        int s27 = kscratch_start + 970; store8(s27+0,'l');store8(s27+1,'o');store8(s27+2,'g');store8(s27+3,'i');store8(s27+4,'n');store8(s27+5,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 980); cmd_idx = cmd_idx + 1;
-        int s28 = kscratch_start + 980; store8(s28+0,'a');store8(s28+1,'d');store8(s28+2,'d');store8(s28+3,'u');store8(s28+4,'s');store8(s28+5,'e');store8(s28+6,'r');store8(s28+7,0);
-        store64(cmd_ptrs + cmd_idx * 8, kscratch_start + 990); cmd_idx = cmd_idx + 1;
-        int s29 = kscratch_start + 990; store8(s29+0,'p');store8(s29+1,'a');store8(s29+2,'s');store8(s29+3,'s');store8(s29+4,'w');store8(s29+5,'d');store8(s29+6,0);
-        int total_cmds = 30;
+        store64(cmd_ptrs + cmd_idx * 8, "help");    cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "clear");   cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "chars");   cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "echo");    cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "list");    cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "change");  cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "make");    cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "remove");  cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "write");   cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "where");   cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "sync");    cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "copy");    cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "rename");  cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "count");   cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "eval");    cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "edit");    cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "draw");    cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "run");     cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "tasks");   cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "spawn");   cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "kill");    cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "split");   cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "close");   cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "run3");    cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "spawn3");  cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "mode");    cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "own");     cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "whoami");  cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "login");   cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "adduser"); cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "passwd");  cmd_idx = cmd_idx + 1;
+        store64(cmd_ptrs + cmd_idx * 8, "mouse");   cmd_idx = cmd_idx + 1;
+        int total_cmds = cmd_idx;
 
         // Match commands against the prefix.
         int mi = 0;
@@ -1697,6 +1907,17 @@ void shell_input(int f, int ascii) {
     if (cpos > len) { cpos = len; store64(shell_cpos_base + f * 8, cpos); }
     if (ascii == '\n') {
         store8(line + len, 0);
+        if (raket_authed(f) == 0) {
+            // Still at raket's login prompt -- a typed password has no
+            // business in shell history, and shell_run must never see this
+            // line at all. raket_login_line prints whatever prompt comes
+            // next itself (password:, a retry, or the shell's own prompt
+            // once authenticated), so there is no shell_prompt() call here.
+            store64(shell_len_base + f * 8, 0);
+            store64(shell_cpos_base + f * 8, 0);
+            raket_login_line(f, line);
+            return;
+        }
         if (len > 0 && sk_hist_buf != 0) {
             int slot = sk_hist_next * SHELL_LINE_MAX;
             int ci = 0;
@@ -1828,6 +2049,17 @@ int sk_user_check_pass(int uid, int pass) {
     int stored = load64(sk_pass_base + uid * 8);
     if (stored == 0) { return 0; }
     return sk_pass_cmp(stored, pass);
+}
+
+// Whether uid has ever had a password set via `passwd`. Used by raket's
+// login gate (raket.c0) to tell "no password configured" apart from "wrong
+// password" -- sk_user_check_pass alone cannot distinguish them, both return
+// 0, but raket needs to know which one it is looking at to decide whether an
+// EMPTY password line should be accepted.
+int sk_user_has_pass(int uid) {
+    if (sk_pass_base == 0) { return 0; }
+    if (load64(sk_pass_base + uid * 8) == 0) { return 0; }
+    return 1;
 }
 
 // Store (or replace) a password for user uid.

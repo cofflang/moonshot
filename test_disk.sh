@@ -14,7 +14,7 @@
 # shuts down. Phase 2 reboots against the SAME disk.img and verifies
 # the file is still there and its content survived.
 #
-# Two independent passes: if the first-boot sync didn't actually write
+# Two independent passes: if the first-boot sync did not actually write
 # anything, phase 2 has nothing to load and the test fails.
 set -u
 cd "$(dirname "$0")"
@@ -72,6 +72,15 @@ time.sleep(0.4)
 " 2>/dev/null
 }
 
+# Log in as root (raket's boot-time login gate) before any shell command
+# can reach shell_run -- root has no password set at boot, so an empty
+# password line logs in. See raket.c0.
+sendkey "root"
+sendkey "\n"
+sleep 1
+sendkey "\n"
+sleep 1
+
 # make test.txt
 sendkey "make test.txt"
 sendkey "\n"
@@ -117,6 +126,13 @@ qemu-system-x86_64 -cdrom moonshot.iso \
 
 QEMU_PID=$!
 sleep 2
+
+# Log in as root again (a fresh boot, raket's login gate is back too).
+sendkey "root"
+sendkey "\n"
+sleep 1
+sendkey "\n"
+sleep 1
 
 # Send: echo --file test.txt
 sendkey "echo --file test.txt"

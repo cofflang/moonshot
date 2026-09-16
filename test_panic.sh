@@ -42,7 +42,7 @@ trap restore EXIT
 # folding of 1/panic_z at compile time -- the idiv executes with a zero
 # divisor and raises #DE. The python script asserts its target marker is
 # actually found (not a silent no-op if the source ever moves again) --
-# `set -e` isn't used in this script, so an unhandled Python exception is
+# `set -e` is not used in this script, so an unhandled Python exception is
 # what actually stops the script here, same as any other command failure.
 python3 - <<'PY'
 p = 'knekt.c0'

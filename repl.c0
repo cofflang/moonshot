@@ -190,9 +190,16 @@ int repl_word_is(int start, int len, int kw) {
 // Sets `*count` to the number of tokens produced. Returns the token array
 // pointer (kmalloc'd). On any lex error, prints a message, sets *count to 0,
 // and returns 0.
+layout Token {
+    int kind;
+    int ival;
+    int name;
+    int len;
+}
+
 int repl_tokenize(int src, int count_ptr) {
     int max_tok = 64;
-    int toks = kmalloc(max_tok * 32);  // 32 bytes per token
+    int toks = kmalloc(max_tok * sizeof(Token));
     if (toks == 0) { store64(count_ptr, 0); return 0; }
     int n = 0;
     int p = 0;
@@ -201,7 +208,7 @@ int repl_tokenize(int src, int count_ptr) {
         // Skip whitespace.
         if (c == ' ' || c == '\t' || c == '\n' || c == 13) { p = p + 1; continue; }
         if (n >= max_tok) { break; }
-        int off = n * 32;
+        int off = n * sizeof(Token);
         // Digit: parse integer literal (decimal or hex).
         if (repl_is_digit(c) == 1) {
             int v = 0;
@@ -226,10 +233,10 @@ int repl_tokenize(int src, int count_ptr) {
                 }
                 p = p + 1;
             }
-            store64(toks + off, TK_NUM);
-            store64(toks + off + 8, v);
-            store64(toks + off + 16, 0);
-            store64(toks + off + 24, 0);
+            (toks + off).kind = TK_NUM;
+            (toks + off).ival = v;
+            (toks + off).name = 0;
+            (toks + off).len = 0;
             n = n + 1;
             continue;
         }
@@ -246,10 +253,10 @@ int repl_tokenize(int src, int count_ptr) {
             store8(src + p, 0);
             if (load8(src + p) == '"') { p = p + 1; }  // skip closing quote
             else { p = p + 0; }  // missing closing quote — use what we have
-            store64(toks + off, TK_STR);
-            store64(toks + off + 8, 0);
-            store64(toks + off + 16, str_start);
-            store64(toks + off + 24, str_len);
+            (toks + off).kind = TK_STR;
+            (toks + off).ival = 0;
+            (toks + off).name = str_start;
+            (toks + off).len = str_len;
             n = n + 1;
             continue;
         }
@@ -267,79 +274,79 @@ int repl_tokenize(int src, int count_ptr) {
             store8(kw, 'p'); store8(kw + 1, 'r'); store8(kw + 2, 'i');
             store8(kw + 3, 'n'); store8(kw + 4, 't'); store8(kw + 5, 0);
             if (repl_word_is(start, len, kw) == 1) {
-                store64(toks + off, TK_PRINT); is_kw = 1;
+                (toks + off).kind = TK_PRINT; is_kw = 1;
             }
             // if
             store8(kw, 'i'); store8(kw + 1, 'f'); store8(kw + 2, 0);
             if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
-                store64(toks + off, TK_IF); is_kw = 1;
+                (toks + off).kind = TK_IF; is_kw = 1;
             }
             // else
             store8(kw, 'e'); store8(kw + 1, 'l'); store8(kw + 2, 's');
             store8(kw + 3, 'e'); store8(kw + 4, 0);
             if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
-                store64(toks + off, TK_ELSE); is_kw = 1;
+                (toks + off).kind = TK_ELSE; is_kw = 1;
             }
             // while
             store8(kw, 'w'); store8(kw + 1, 'h'); store8(kw + 2, 'i');
             store8(kw + 3, 'l'); store8(kw + 4, 'e'); store8(kw + 5, 0);
             if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
-                store64(toks + off, TK_WHILE); is_kw = 1;
+                (toks + off).kind = TK_WHILE; is_kw = 1;
             }
             // for
             store8(kw, 'f'); store8(kw + 1, 'o'); store8(kw + 2, 'r');
             store8(kw + 3, 0);
             if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
-                store64(toks + off, TK_FOR); is_kw = 1;
+                (toks + off).kind = TK_FOR; is_kw = 1;
             }
             // break
             store8(kw, 'b'); store8(kw + 1, 'r'); store8(kw + 2, 'e');
             store8(kw + 3, 'a'); store8(kw + 4, 'k'); store8(kw + 5, 0);
             if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
-                store64(toks + off, TK_BREAK); is_kw = 1;
+                (toks + off).kind = TK_BREAK; is_kw = 1;
             }
             // continue
             store8(kw, 'c'); store8(kw + 1, 'o'); store8(kw + 2, 'n');
             store8(kw + 3, 't'); store8(kw + 4, 'i'); store8(kw + 5, 'n');
             store8(kw + 6, 'u'); store8(kw + 7, 'e'); store8(kw + 8, 0);
             if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
-                store64(toks + off, TK_CONTINUE); is_kw = 1;
+                (toks + off).kind = TK_CONTINUE; is_kw = 1;
             }
             if (is_kw == 0) {
-                store64(toks + off, TK_IDENT);
+                (toks + off).kind = TK_IDENT;
             }
-            store64(toks + off + 8, 0);
-            store64(toks + off + 16, start);  // name pointer into source
-            store64(toks + off + 24, len);
+            (toks + off).ival = 0;
+            (toks + off).name = start;  // name pointer into source
+            (toks + off).len = len;
             n = n + 1;
             continue;
         }
         // Single-character operators.
-        if (c == '+') { store64(toks + off, TK_PLUS); p = p + 1; n = n + 1; continue; }
-        if (c == '*') { store64(toks + off, TK_STAR); p = p + 1; n = n + 1; continue; }
-        if (c == '(') { store64(toks + off, TK_LPAREN); p = p + 1; n = n + 1; continue; }
-        if (c == ')') { store64(toks + off, TK_RPAREN); p = p + 1; n = n + 1; continue; }
-        if (c == '{') { store64(toks + off, TK_LBRACE); p = p + 1; n = n + 1; continue; }
-        if (c == '}') { store64(toks + off, TK_RBRACE); p = p + 1; n = n + 1; continue; }
-        if (c == ';') { store64(toks + off, TK_SEMI); p = p + 1; n = n + 1; continue; }
-        if (c == ',') { store64(toks + off, TK_COMMA); p = p + 1; n = n + 1; continue; }
+        if (c == '+') { (toks + off).kind = TK_PLUS; p = p + 1; n = n + 1; continue; }
+        if (c == '*') { (toks + off).kind = TK_STAR; p = p + 1; n = n + 1; continue; }
+        if (c == '(') { (toks + off).kind = TK_LPAREN; p = p + 1; n = n + 1; continue; }
+        if (c == ')') { (toks + off).kind = TK_RPAREN; p = p + 1; n = n + 1; continue; }
+        if (c == '{') { (toks + off).kind = TK_LBRACE; p = p + 1; n = n + 1; continue; }
+        if (c == '}') { (toks + off).kind = TK_RBRACE; p = p + 1; n = n + 1; continue; }
+        if (c == ';') { (toks + off).kind = TK_SEMI; p = p + 1; n = n + 1; continue; }
+        if (c == ',') { (toks + off).kind = TK_COMMA; p = p + 1; n = n + 1; continue; }
         // '-' : could be MINUS or part of a two-char token (no two-char '-' tokens exist).
-        if (c == '-') { store64(toks + off, TK_MINUS); p = p + 1; n = n + 1; continue; }
+        if (c == '-') { (toks + off).kind = TK_MINUS; p = p + 1; n = n + 1; continue; }
         // '/' : division only (no comments in eval mode — the line is the whole input).
-        if (c == '/') { store64(toks + off, TK_SLASH); p = p + 1; n = n + 1; continue; }
+        if (c == '/') { (toks + off).kind = TK_SLASH; p = p + 1; n = n + 1; continue; }
         // '=' : could be ASSIGN or EQ.
         if (c == '=') {
             if (load8(src + p + 1) == '=') {
-                store64(toks + off, TK_EQ); p = p + 2;
+                (toks + off).kind = TK_EQ; p = p + 2;
             } else {
-                store64(toks + off, TK_ASSIGN); p = p + 1;
+                (toks + off).kind = TK_ASSIGN; p = p + 1;
             }
             n = n + 1; continue;
         }
         // '!' : must be followed by '=' for NE.
         if (c == '!') {
             if (load8(src + p + 1) == '=') {
-                store64(toks + off, TK_NE); p = p + 2; n = n + 1; continue;
+                (toks + off).kind = TK_NE; p = p + 2; n = n + 1; continue;
             }
             // Invalid token — skip it (error recovery for REPL).
             p = p + 1; continue;
@@ -347,18 +354,18 @@ int repl_tokenize(int src, int count_ptr) {
         // '<' : LT or LE.
         if (c == '<') {
             if (load8(src + p + 1) == '=') {
-                store64(toks + off, TK_LE); p = p + 2;
+                (toks + off).kind = TK_LE; p = p + 2;
             } else {
-                store64(toks + off, TK_LT); p = p + 1;
+                (toks + off).kind = TK_LT; p = p + 1;
             }
             n = n + 1; continue;
         }
         // '>' : GT or GE.
         if (c == '>') {
             if (load8(src + p + 1) == '=') {
-                store64(toks + off, TK_GE); p = p + 2;
+                (toks + off).kind = TK_GE; p = p + 2;
             } else {
-                store64(toks + off, TK_GT); p = p + 1;
+                (toks + off).kind = TK_GT; p = p + 1;
             }
             n = n + 1; continue;
         }
@@ -367,11 +374,11 @@ int repl_tokenize(int src, int count_ptr) {
     }
     // Append EOF token.
     if (n < max_tok) {
-        int off = n * 32;
-        store64(toks + off, TK_EOF);
-        store64(toks + off + 8, 0);
-        store64(toks + off + 16, 0);
-        store64(toks + off + 24, 0);
+        int off = n * sizeof(Token);
+        (toks + off).kind = TK_EOF;
+        (toks + off).ival = 0;
+        (toks + off).name = 0;
+        (toks + off).len = 0;
         n = n + 1;
     }
     store64(count_ptr, n);
@@ -379,25 +386,37 @@ int repl_tokenize(int src, int count_ptr) {
 }
 
 // --- AST node helpers -------------------------------------------------------
+// child1/child2 are heavily overloaded per node kind (an immediate value
+// for ND_NUM, a name/string pointer for ND_STR/ND_VAR/ND_CALL/ND_ASSIGN, a
+// real AST child everywhere else) -- same generic-name-per-slot spirit as
+// c0-coff's own Node record, which has the identical "one flat shape for
+// every kind" reason to avoid a name that would only be accurate some of
+// the time. `next` chains statements in a block; unused by expression nodes.
+layout Node {
+    int kind;
+    int child1;
+    int child2;
+    int extra;
+    int next;
+}
+
 // Allocates a 40-byte AST node (5 × 8-byte slots) and sets its kind.
-// Slots: [0]=kind, [8]=left/ival, [16]=right, [24]=extra, [32]=next.
-// `next` chains statements in a block; unused by expression nodes.
 int repl_node(int kind) {
     int nd = kmalloc(40);
     if (nd == 0) { return 0; }
-    store64(nd, kind);
-    store64(nd + 8, 0);
-    store64(nd + 16, 0);
-    store64(nd + 24, 0);
-    store64(nd + 32, 0);
+    nd.kind = kind;
+    nd.child1 = 0;
+    nd.child2 = 0;
+    nd.extra = 0;
+    nd.next = 0;
     return nd;
 }
 
 // Read a token field from the token array at position `pos`.
-int repl_tok_kind(int toks, int pos) { return load64(toks + pos * 32); }
-int repl_tok_ival(int toks, int pos) { return load64(toks + pos * 32 + 8); }
-int repl_tok_name(int toks, int pos) { return load64(toks + pos * 32 + 16); }
-int repl_tok_len(int toks, int pos)  { return load64(toks + pos * 32 + 24); }
+int repl_tok_kind(int toks, int pos) { return (toks + pos * sizeof(Token)).kind; }
+int repl_tok_ival(int toks, int pos) { return (toks + pos * sizeof(Token)).ival; }
+int repl_tok_name(int toks, int pos) { return (toks + pos * sizeof(Token)).name; }
+int repl_tok_len(int toks, int pos)  { return (toks + pos * sizeof(Token)).len; }
 
 // --- parser ----------------------------------------------------------------
 // tpos is a global so every parsing function can advance it. The parser is
@@ -409,14 +428,14 @@ int repl_p_primary(int toks) {
     int k = repl_tok_kind(toks, repl_tpos);
     if (k == TK_NUM) {
         int nd = repl_node(ND_NUM);
-        store64(nd + 8, repl_tok_ival(toks, repl_tpos));
+        nd.child1 = repl_tok_ival(toks, repl_tpos);
         repl_tpos = repl_tpos + 1;
         return nd;
     }
     if (k == TK_STR) {
         int nd = repl_node(ND_STR);
-        store64(nd + 8, repl_tok_name(toks, repl_tpos));
-        store64(nd + 24, repl_tok_len(toks, repl_tpos));
+        nd.child1 = repl_tok_name(toks, repl_tpos);
+        nd.extra = repl_tok_len(toks, repl_tpos);
         repl_tpos = repl_tpos + 1;
         return nd;
     }
@@ -428,16 +447,16 @@ int repl_p_primary(int toks) {
         if (repl_tok_kind(toks, repl_tpos) == TK_LPAREN) {
             repl_tpos = repl_tpos + 1;  // skip '('
             int nd = repl_node(ND_CALL);
-            store64(nd + 8, name_ptr);
-            store64(nd + 24, name_len);
+            nd.child1 = name_ptr;
+            nd.extra = name_len;
             // Parse first argument.
-            store64(nd + 16, repl_p_expr(toks));
+            nd.child2 = repl_p_expr(toks);
             // Parse additional arguments (comma-separated), chained via sibling ptr.
-            int arg_tail = load64(nd + 16);
+            int arg_tail = nd.child2;
             while (repl_tok_kind(toks, repl_tpos) == TK_COMMA) {
                 repl_tpos = repl_tpos + 1;  // skip ','
                 int next_arg = repl_p_expr(toks);
-                store64(arg_tail + 32, next_arg);  // chain via sibling
+                arg_tail.next = next_arg;  // chain via sibling
                 arg_tail = next_arg;
             }
             if (repl_tok_kind(toks, repl_tpos) == TK_RPAREN) {
@@ -447,8 +466,8 @@ int repl_p_primary(int toks) {
         }
         // Plain variable reference.
         int nd = repl_node(ND_VAR);
-        store64(nd + 8, name_ptr);
-        store64(nd + 24, name_len);
+        nd.child1 = name_ptr;
+        nd.extra = name_len;
         return nd;
     }
     if (k == TK_PRINT) {
@@ -459,7 +478,7 @@ int repl_p_primary(int toks) {
         }
         repl_tpos = repl_tpos + 1;  // skip '('
         int nd = repl_node(ND_PRINT);
-        store64(nd + 8, repl_p_expr(toks));
+        nd.child1 = repl_p_expr(toks);
         if (repl_tok_kind(toks, repl_tpos) == TK_RPAREN) {
             repl_tpos = repl_tpos + 1;
         }
@@ -476,7 +495,7 @@ int repl_p_primary(int toks) {
     if (k == TK_MINUS) {
         repl_tpos = repl_tpos + 1;
         int nd = repl_node(ND_NEG);
-        store64(nd + 8, repl_p_primary(toks));
+        nd.child1 = repl_p_primary(toks);
         return nd;
     }
     // Unexpected token — return 0.
@@ -488,7 +507,7 @@ int repl_p_unary(int toks) {
     if (repl_tok_kind(toks, repl_tpos) == TK_MINUS) {
         repl_tpos = repl_tpos + 1;
         int nd = repl_node(ND_NEG);
-        store64(nd + 8, repl_p_unary(toks));
+        nd.child1 = repl_p_unary(toks);
         return nd;
     }
     return repl_p_primary(toks);
@@ -502,14 +521,14 @@ int repl_p_term(int toks) {
         if (k == TK_STAR) {
             repl_tpos = repl_tpos + 1;
             int nd = repl_node(ND_MUL);
-            store64(nd + 8, left);
-            store64(nd + 16, repl_p_unary(toks));
+            nd.child1 = left;
+            nd.child2 = repl_p_unary(toks);
             left = nd;
         } else if (k == TK_SLASH) {
             repl_tpos = repl_tpos + 1;
             int nd = repl_node(ND_DIV);
-            store64(nd + 8, left);
-            store64(nd + 16, repl_p_unary(toks));
+            nd.child1 = left;
+            nd.child2 = repl_p_unary(toks);
             left = nd;
         } else { break; }
     }
@@ -524,14 +543,14 @@ int repl_p_add(int toks) {
         if (k == TK_PLUS) {
             repl_tpos = repl_tpos + 1;
             int nd = repl_node(ND_ADD);
-            store64(nd + 8, left);
-            store64(nd + 16, repl_p_term(toks));
+            nd.child1 = left;
+            nd.child2 = repl_p_term(toks);
             left = nd;
         } else if (k == TK_MINUS) {
             repl_tpos = repl_tpos + 1;
             int nd = repl_node(ND_SUB);
-            store64(nd + 8, left);
-            store64(nd + 16, repl_p_term(toks));
+            nd.child1 = left;
+            nd.child2 = repl_p_term(toks);
             left = nd;
         } else { break; }
     }
@@ -551,8 +570,8 @@ int repl_p_compare(int toks) {
         else { break; }
         repl_tpos = repl_tpos + 1;
         int nd = repl_node(kind);
-        store64(nd + 8, left);
-        store64(nd + 16, repl_p_add(toks));
+        nd.child1 = left;
+        nd.child2 = repl_p_add(toks);
         left = nd;
     }
     return left;
@@ -569,8 +588,8 @@ int repl_p_eq(int toks) {
         else { break; }
         repl_tpos = repl_tpos + 1;
         int nd = repl_node(kind);
-        store64(nd + 8, left);
-        store64(nd + 16, repl_p_compare(toks));
+        nd.child1 = left;
+        nd.child2 = repl_p_compare(toks);
         left = nd;
     }
     return left;
@@ -582,15 +601,15 @@ int repl_p_assign(int toks) {
     if (repl_tok_kind(toks, repl_tpos) == TK_ASSIGN) {
         repl_tpos = repl_tpos + 1;
         // left must be a VAR node.
-        if (load64(left) != ND_VAR) {
+        if (left.kind != ND_VAR) {
             // Invalid assignment target — return the right side anyway.
             return repl_p_assign(toks);
         }
         int nd = repl_node(ND_ASSIGN);
-        store64(nd + 8, load64(left + 8));   // name ptr
-        store64(nd + 24, load64(left + 24)); // name len
+        nd.child1 = left.child1;   // name ptr
+        nd.extra = left.extra; // name len
         kfree(left);
-        store64(nd + 16, repl_p_assign(toks));  // rhs
+        nd.child2 = repl_p_assign(toks);  // rhs
         return nd;
     }
     return left;
@@ -632,19 +651,19 @@ int repl_p_stmt(int toks) {
         int nd = repl_node(ND_IF);
         if (repl_tok_kind(toks, repl_tpos) != TK_LPAREN) {
             // Expected '(' — try to recover.
-            store64(nd + 8, repl_node(ND_NUM));  // cond = 0
-            store64(nd + 16, repl_node(ND_NUM)); // then = 0
+            nd.child1 = repl_node(ND_NUM);  // cond = 0
+            nd.child2 = repl_node(ND_NUM); // then = 0
             return nd;
         }
         repl_tpos = repl_tpos + 1;  // skip '('
-        store64(nd + 8, repl_p_expr(toks));  // condition
+        nd.child1 = repl_p_expr(toks);  // condition
         if (repl_tok_kind(toks, repl_tpos) == TK_RPAREN) {
             repl_tpos = repl_tpos + 1;
         }
-        store64(nd + 16, repl_p_stmt(toks));  // then-branch
+        nd.child2 = repl_p_stmt(toks);  // then-branch
         if (repl_tok_kind(toks, repl_tpos) == TK_ELSE) {
             repl_tpos = repl_tpos + 1;
-            store64(nd + 24, repl_p_stmt(toks));  // else-branch
+            nd.extra = repl_p_stmt(toks);  // else-branch
         }
         return nd;
     }
@@ -653,16 +672,16 @@ int repl_p_stmt(int toks) {
         repl_tpos = repl_tpos + 1;
         int nd = repl_node(ND_WHILE);
         if (repl_tok_kind(toks, repl_tpos) != TK_LPAREN) {
-            store64(nd + 8, repl_node(ND_NUM));
-            store64(nd + 16, repl_node(ND_NUM));
+            nd.child1 = repl_node(ND_NUM);
+            nd.child2 = repl_node(ND_NUM);
             return nd;
         }
         repl_tpos = repl_tpos + 1;
-        store64(nd + 8, repl_p_expr(toks));  // condition
+        nd.child1 = repl_p_expr(toks);  // condition
         if (repl_tok_kind(toks, repl_tpos) == TK_RPAREN) {
             repl_tpos = repl_tpos + 1;
         }
-        store64(nd + 16, repl_p_stmt(toks));  // body
+        nd.child2 = repl_p_stmt(toks);  // body
         return nd;
     }
     if (k == TK_FOR) {
@@ -670,33 +689,33 @@ int repl_p_stmt(int toks) {
         repl_tpos = repl_tpos + 1;
         int nd = repl_node(ND_FOR);
         if (repl_tok_kind(toks, repl_tpos) != TK_LPAREN) {
-            store64(nd + 8, 0); store64(nd + 16, 0);
-            store64(nd + 24, 0); store64(nd + 32, repl_node(ND_NUM));
+            nd.child1 = 0; nd.child2 = 0;
+            nd.extra = 0; nd.next = repl_node(ND_NUM);
             return nd;
         }
         repl_tpos = repl_tpos + 1;  // skip '('
         // Init (optional — skip if the next token is already ;).
         if (repl_tok_kind(toks, repl_tpos) != TK_SEMI) {
-            store64(nd + 8, repl_p_expr(toks));
+            nd.child1 = repl_p_expr(toks);
         }
         if (repl_tok_kind(toks, repl_tpos) == TK_SEMI) {
             repl_tpos = repl_tpos + 1;
         }
         // Condition (optional — 0 means always true).
         if (repl_tok_kind(toks, repl_tpos) != TK_SEMI) {
-            store64(nd + 16, repl_p_expr(toks));
+            nd.child2 = repl_p_expr(toks);
         }
         if (repl_tok_kind(toks, repl_tpos) == TK_SEMI) {
             repl_tpos = repl_tpos + 1;
         }
         // Increment (optional).
         if (repl_tok_kind(toks, repl_tpos) != TK_RPAREN) {
-            store64(nd + 24, repl_p_expr(toks));
+            nd.extra = repl_p_expr(toks);
         }
         if (repl_tok_kind(toks, repl_tpos) == TK_RPAREN) {
             repl_tpos = repl_tpos + 1;
         }
-        store64(nd + 32, repl_p_stmt(toks));  // body
+        nd.next = repl_p_stmt(toks);  // body
         return nd;
     }
     if (k == TK_LBRACE) {
@@ -708,9 +727,9 @@ int repl_p_stmt(int toks) {
                && repl_tok_kind(toks, repl_tpos) != TK_EOF) {
             int stmt = repl_p_stmt(toks);
             if (tail == 0) {
-                store64(block + 8, stmt);  // first statement
+                block.child1 = stmt;  // first statement
             } else {
-                store64(tail + 32, stmt);  // chain via next
+                tail.next = stmt;  // chain via next
             }
             tail = stmt;
         }
@@ -725,7 +744,7 @@ int repl_p_stmt(int toks) {
         repl_tpos = repl_tpos + 1;
     }
     int nd = repl_node(ND_EXPR_STMT);
-    store64(nd + 8, expr);
+    nd.child1 = expr;
     return nd;
 }
 
@@ -737,9 +756,9 @@ int repl_p_stmts(int toks) {
         int stmt = repl_p_stmt(toks);
         if (stmt == 0) { break; }
         if (tail == 0) {
-            store64(block + 8, stmt);
+            block.child1 = stmt;
         } else {
-            store64(tail + 32, stmt);
+            tail.next = stmt;
         }
         tail = stmt;
     }
@@ -752,9 +771,9 @@ int repl_p_stmts(int toks) {
 // On undefined variable or division by zero, prints an error and returns 0.
 int repl_eval_node(int nd) {
     if (nd == 0) { return 0; }
-    int kind = load64(nd);
-    int left = load64(nd + 8);
-    int right = load64(nd + 16);
+    int kind = nd.kind;
+    int left = nd.child1;
+    int right = nd.child2;
 
     if (kind == ND_NUM) {
         return left;  // ival stored in left slot
@@ -764,7 +783,7 @@ int repl_eval_node(int nd) {
     }
     if (kind == ND_CALL) {
         int fname = left;     // function name pointer
-        int flen  = load64(nd + 24);
+        int flen  = nd.extra;
         int arg   = repl_eval_node(right);  // evaluate argument
         // Dispatch known builtins.
         // load8
@@ -777,7 +796,7 @@ int repl_eval_node(int nd) {
         store8(kw,'s');store8(kw+1,'t');store8(kw+2,'o');store8(kw+3,'r');store8(kw+4,'e');store8(kw+5,'8');store8(kw+6,0);
         if (repl_word_is(fname, flen, kw) == 1) {
             int addr_arg = arg;
-            int val_arg  = load64(addr_arg + 32);  // second arg via sibling
+            int val_arg  = addr_arg.next;  // second arg via sibling
             if (val_arg == 0) { serial_print("[repl] store8 needs two arguments\n"); return 0; }
             store8(repl_eval_node(addr_arg), repl_eval_node(val_arg));
             return 0;
@@ -791,7 +810,7 @@ int repl_eval_node(int nd) {
         store8(kw,'s');store8(kw+1,'t');store8(kw+2,'o');store8(kw+3,'r');store8(kw+4,'e');store8(kw+5,'6');store8(kw+6,'4');store8(kw+7,0);
         if (repl_word_is(fname, flen, kw) == 1) {
             int addr_arg = arg;
-            int val_arg  = load64(addr_arg + 32);
+            int val_arg  = addr_arg.next;
             if (val_arg == 0) { serial_print("[repl] store64 needs two arguments\n"); return 0; }
             store64(repl_eval_node(addr_arg), repl_eval_node(val_arg));
             return 0;
@@ -804,7 +823,7 @@ int repl_eval_node(int nd) {
     }
     if (kind == ND_VAR) {
         int name = left;
-        int len = load64(nd + 24);
+        int len = nd.extra;
         int idx = repl_lookup(name, len);
         if (idx < 0) {
             serial_print("[repl] unknown variable '");
@@ -818,7 +837,7 @@ int repl_eval_node(int nd) {
     }
     if (kind == ND_ASSIGN) {
         int val = repl_eval_node(right);
-        return repl_assign(left, load64(nd + 24), val);
+        return repl_assign(left, nd.extra, val);
     }
     if (kind == ND_ADD) {
         return repl_eval_node(left) + repl_eval_node(right);
@@ -865,9 +884,9 @@ int repl_eval_node(int nd) {
         return 0;
     }
     if (kind == ND_PRINT) {
-        if (left != 0 && load64(left) == ND_STR) {
+        if (left != 0 && left.kind == ND_STR) {
             // String argument — print it directly.
-            int str = load64(left + 8);
+            int str = left.child1;
             serial_print("[repl] ");
             serial_print(str);
             serial_print("\n");
@@ -891,7 +910,7 @@ int repl_eval_node(int nd) {
         if (cond != 0) {
             return repl_eval_node(right);  // then-branch
         }
-        int else_br = load64(nd + 24);
+        int else_br = nd.extra;
         if (else_br != 0) {
             return repl_eval_node(else_br);
         }
@@ -911,8 +930,8 @@ int repl_eval_node(int nd) {
     if (kind == ND_FOR) {
         int init = left;
         int cond = right;
-        int incr = load64(nd + 24);
-        int body = load64(nd + 32);
+        int incr = nd.extra;
+        int body = nd.next;
         int result = 0;
         repl_loop_depth = repl_loop_depth + 1;
         if (init != 0) { repl_eval_node(init); }
@@ -932,7 +951,7 @@ int repl_eval_node(int nd) {
         while (stmt != 0) {
             result = repl_eval_node(stmt);
             if (repl_break_flag == 1 || repl_continue_flag == 1) { break; }
-            stmt = load64(stmt + 32);  // chain via next slot
+            stmt = stmt.next;  // chain via next slot
         }
         return result;
     }
@@ -958,11 +977,11 @@ int repl_eval_node(int nd) {
 // Recursively free every node in the AST rooted at `nd`.
 void repl_free_tree(int nd) {
     if (nd == 0) { return; }
-    int kind = load64(nd);
-    int left  = load64(nd + 8);
-    int right = load64(nd + 16);
-    int extra = load64(nd + 24);
-    int next  = load64(nd + 32);
+    int kind = nd.kind;
+    int left  = nd.child1;
+    int right = nd.child2;
+    int extra = nd.extra;
+    int next  = nd.next;
     // Free children based on node kind.
     if (kind == ND_NUM) {
         // no children — ival stored in left slot
@@ -971,7 +990,7 @@ void repl_free_tree(int nd) {
     } else if (kind == ND_NEG || kind == ND_PRINT || kind == ND_EXPR_STMT) {
         repl_free_tree(left);
     } else if (kind == ND_CALL) {
-        // left = function name pointer (in source buffer, don't free)
+        // left = function name pointer (in source buffer, do not free)
         repl_free_tree(right);  // first argument + its sibling chain
     } else if (kind == ND_IF) {
         repl_free_tree(left);   // cond
@@ -989,7 +1008,7 @@ void repl_free_tree(int nd) {
         // Free each statement in the chain.
         int stmt = left;
         while (stmt != 0) {
-            int nxt = load64(stmt + 32);
+            int nxt = stmt.next;
             repl_free_tree(stmt);
             stmt = nxt;
         }
@@ -1037,25 +1056,25 @@ void repl_eval(int src) {
     // assignment. ND_BLOCK returns its last statement's result. We print
     // unless the effective last action was a print() call (already printed)
     // or an if/while (only useful for side effects; always return 0).
-    int top_kind = load64(ast);
+    int top_kind = ast.kind;
     if (top_kind == ND_BLOCK) {
         // Find the last statement in the block chain.
-        int stmt = load64(ast + 8);
+        int stmt = ast.child1;
         int last = stmt;
         while (stmt != 0) {
             last = stmt;
-            stmt = load64(stmt + 32);
+            stmt = stmt.next;
         }
         if (last != 0) {
-            top_kind = load64(last);
+            top_kind = last.kind;
             // Unwrap ND_EXPR_STMT to check the inner expression.
             if (top_kind == ND_EXPR_STMT) {
-                top_kind = load64(load64(last + 8));  // inner expr kind
+                top_kind = last.child1.kind;  // inner expr kind
             }
         }
     } else if (top_kind == ND_EXPR_STMT) {
         // Single expression statement at top level.
-        top_kind = load64(load64(ast + 8));
+        top_kind = ast.child1.kind;
     }
     if (top_kind != ND_PRINT && top_kind != ND_IF && top_kind != ND_WHILE && top_kind != ND_FOR
         && top_kind != ND_BREAK && top_kind != ND_CONTINUE) {

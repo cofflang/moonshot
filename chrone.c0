@@ -19,8 +19,52 @@
 // question.
 
 // How many timer ticks (~100Hz) a task runs before being forcibly switched
-// out -- purely a demo cadence choice, not derived from anything.
-int SCHED_SWITCH_PERIOD = 10;
+// out. One tick (~10ms) is the finest quantum this timer can express, and is
+// in the range real schedulers use.
+//
+// This was 10 (~0.1s) while nothing on screen moved, where it was invisible.
+// It stopped being invisible as soon as a ring-3 program tried to animate:
+// with four runnable tasks, a 10-tick quantum means each task runs for 100ms
+// and is then frozen for ~300ms. Measured from inside Gnista's demo, its
+// frames arrived in bursts of nine ~10ms apart followed by a ~310ms gap
+// (nothing in between), so the sprite swept forward and then stalled, over
+// and over. That reads as lag, and no amount of tuning inside the ring-3
+// program can fix it -- nothing can be drawn during the 300ms it is not
+// running.
+//
+// Note the frame RATE is unaffected by this value: a task gets one tick in
+// every N with N tasks either way, so ~25fps here regardless. What changes is
+// the distribution -- at one tick per quantum those frames are evenly spaced
+// ~40ms apart instead of arriving in a clump. Shortening it costs one extra
+// rsp swap and one sched_pick_next per tick, which at 100Hz is nothing; the
+// genuinely expensive per-period work was the status bar, and that now runs
+// on its own counter below.
+int SCHED_SWITCH_PERIOD = 1;
+
+// How many timer ticks between status-bar refreshes. Deliberately NOT tied to
+// the switch period any more: the bar is the most expensive thing drawn on a
+// tick (full-width fill + ~40 glyphs) and only needs to be current to about a
+// tenth of a second, whereas the scheduler now runs every tick.
+int STATS_REFRESH_PERIOD = 10;
+int stats_tick_count = 0;
+
+// Per-task stack size, in 4096-byte pages. Used to be a single page (4096
+// bytes) -- fine for a kernel-context task's own execution, but a real
+// bottleneck once the SAME stack also serves as the kernel stack for a
+// ring-3 task's syscall/interrupt handling (see enter_ring3/syscall_entry
+// in ring3_handlers.s): a syscall handler's own call depth, stacked under
+// an interrupt that lands mid-handler and does real work (int_dispatch ->
+// sched_tick -> sched_stats_update's string formatting and framebuffer
+// draws), overflowed a single page -- silently corrupting whatever
+// physical page happened to sit right below it (another freshly-allocated
+// frame, from jenna's bump allocator, easily one of THIS SAME task's own
+// private page-table frames) and producing a #GP on a LATER, seemingly
+// unrelated iretq once the corrupted mapping was read back. Caught by
+// actually letting a real timer interrupt land mid-syscall-handler, not by
+// inspection. 4 pages (16KB) is an ordinary real-kernel per-task stack
+// size, comfortable headroom over what was actually measured to overflow.
+int TASK_STACK_PAGES = 4;
+int TASK_STACK_SIZE = 16384;
 
 // Task-table sizing. MAX_TASKS is the fixed slot count of the parallel arrays
 // below; NUM_TASKS is how many the boot-time demo actually spawns. Task states
@@ -66,16 +110,77 @@ int sched_tick_count = 0;
 //                           (pmm_alloc_page in task_spawn), kept so the reaper
 //                           (sched_tick) can pmm_free_page it once the task has
 //                           EXITED. Set to 0 once reclaimed, both as the
-//                           "already reaped, don't double-free" marker and
+//                           "already reaped, do not double-free" marker and
 //                           because a task that never got a stack has none to
 //                           free.
+//   task_cr3_base[i]     -- task i's page-table root (physical PML4
+//                           address). Every task starts on the kernel's own
+//                           pml4_phys (task_spawn); a task that later enters
+//                           ring 3 (run_ring3_binary, syscall.c0) overwrites
+//                           its own slot with a fresh pt_create()'d private
+//                           table (jenna.c0). sched_tick copies the incoming
+//                           task's slot into SCHED_NEXT_CR3 alongside
+//                           SCHED_NEXT_RSP; isr_common reloads CR3 from
+//                           there right after swapping rsp, so a preempted
+//                           ring-3 task resumes on its own address space
+//                           instead of whichever one happened to be live.
+//   task_win_base[i]     -- task i's dedicated kakel window id, or -1 for
+//                           none. Every task starts with none (task_spawn
+//                           sets -1); a task that later enters ring 3 via a
+//                           windowed path (run_ring3_binary/run_elf_binary
+//                           with windowed=1, syscall.c0) overwrites its own
+//                           slot with the id from kakel_split(). sys_dispatch
+//                           routes SYS_DEBUG_PRINT output to this window
+//                           instead of kakel_focus, so a ring-3 process's
+//                           output stays in its own tile regardless of which
+//                           window the user is focused on. Kernel-context
+//                           tasks (thread_worker, shell_task) keep -1 forever.
+//   task_heap_next_base[i] -- task i's next-free address in its own private
+//                           ring-3 heap, or 0 if it has none (kernel-context
+//                           tasks, or a ring-3 task before its heap region
+//                           is mapped). SYS_ALLOC (syscall.c0) bump-allocates
+//                           from here; there is no free -- a ring-3 process's
+//                           heap lives and dies with the process itself, the
+//                           same "add real free/reuse only once something
+//                           needs it" restraint every other feature here
+//                           follows.
+//   task_heap_end_base[i] -- one past the last usable byte of task i's heap
+//                           region (0 alongside task_heap_next_base[i] == 0).
+//                           SYS_ALLOC's bounds check is next+n > end.
 int task_rsp_base = 0;
 int task_state_base = 0;
 int task_counter_base = 0;
 int task_runs_base = 0;
 int task_stack_base = 0;
+int task_cr3_base = 0;
+int task_win_base = 0;
+int task_heap_next_base = 0;
+int task_heap_end_base = 0;
+// First virtual address in the task's heap region that is NOT yet backed by
+// a physical page. The ring-3 heap is DEMAND-mapped: the region is reserved
+// at spawn but pages are attached only as SYS_ALLOC hands memory out.
+int task_heap_mapped_base = 0;
 
-// Calls boot.s's sched_launch(rsp) indirectly, exactly once. c0 can't call an
+// The window size, in pixels, that SYS_WIN_INFO last REPORTED to task i --
+// packed w * 65536 + h, or 0 if it has never asked. Not the same thing as the
+// window's current size, and that difference is the point.
+//
+// A graphical program asks once at startup and sizes its frame buffer from the
+// answer, out of a bump heap with no realloc. Its tile then changes size
+// underneath it on every reflow -- another spawn3, a split, a close -- and
+// SYS_PRESENT, which took its row stride from the window, started reading that
+// buffer at the wrong pitch: one `close` next to a running Infecteria widened
+// its tile from half the screen to all of it and the game's frame came out
+// duplicated side by side with the bottom third unpainted. Wider still, and it
+// read clean off the end of the mapped heap and page-faulted in ring 0.
+//
+// Recording what the program was TOLD lets SYS_PRESENT read the buffer at the
+// pitch the program actually wrote it at, and place that frame in the window
+// it has now. The frame is then the wrong SIZE for the tile, which is honest
+// and looks it, instead of being the wrong SHAPE, which looks like corruption.
+int task_win_reported_base = 0;
+
+// Calls boot.s's sched_launch(rsp) indirectly, exactly once. c0 cannot call an
 // externally-defined asm symbol by name (coff0's resolve() knows only
 // builtins, same-file functions, and indirect calls through a value), so
 // boot.s stashed sched_launch's address in the .sched slot and this reads it
@@ -107,14 +212,14 @@ void task_wake(int id) {
 // (0x200 = just the IF bit -- setting it here rather than via an explicit `sti`
 // is what lets the first task launch and every later resume share the exact
 // same code path, see isr_common), RSP (the task's real stack top,
-// `stack_base + 4096`), and SS (0). The RSP/SS fields exist because of a real
-// x86-64 wrinkle: `iretq` unconditionally pops RSP/SS too, even with no
-// privilege change -- see isr_common's own comment in boot.s for the full
+// `stack_base + TASK_STACK_SIZE`), and SS (0). The RSP/SS fields exist because
+// of a real x86-64 wrinkle: `iretq` unconditionally pops RSP/SS too, even with
+// no privilege change -- see isr_common's own comment in boot.s for the full
 // story (a fresh, zeroed page reading as RSP=0 there triple-faults, which is
 // exactly why these fields cannot be omitted). 176 bytes total, matching
 // isr_common's own frame-size accounting. Reused unchanged per spawned task.
 int sched_craft_stack(int stack_base, int entry) {
-    int sp = stack_base + 4096 - 176;
+    int sp = stack_base + TASK_STACK_SIZE - 176;
     store64(sp, 0);        // r15
     store64(sp + 8, 0);    // r14
     store64(sp + 16, 0);   // r13
@@ -132,29 +237,55 @@ int sched_craft_stack(int stack_base, int entry) {
     store64(sp + 112, 0);  // rax
     store64(sp + 120, 0);  // vector (unused on resume)
     store64(sp + 128, 0);  // error code (unused on resume)
-    store64(sp + 136, entry);            // RIP -> task entry point
-    store64(sp + 144, 0x08);              // CS = 0x08, gdt64's flat code selector
-    store64(sp + 152, 0x200);             // RFLAGS: IF (bit 9) set, else clear
-    store64(sp + 160, stack_base + 4096); // RSP: the task's real stack top
-    store64(sp + 168, 0);                 // SS
+    store64(sp + 136, entry);                  // RIP -> task entry point
+    store64(sp + 144, 0x08);                   // CS = 0x08, gdt64's flat code selector
+    store64(sp + 152, 0x200);                  // RFLAGS: IF (bit 9) set, else clear
+    store64(sp + 160, stack_base + TASK_STACK_SIZE); // RSP: the task's real stack top
+    store64(sp + 168, 0);                      // SS
     return sp;
 }
 
-// Allocates the next FREE task-table slot, gives it a fresh 4096-byte stack
-// from jenna, crafts that stack for `entry`, and marks it RUNNABLE. Returns the
-// new task id, or -1 if the table is full. This is the "spawn" half of the
-// process model: the whole table is set up by repeated task_spawn calls in
-// sched_start.
+// Allocates the next FREE task-table slot, gives it a fresh TASK_STACK_PAGES-
+// page stack from jenna, crafts that stack for `entry`, and marks it
+// RUNNABLE. Returns the new task id, or -1 if the table is full. This is the
+// "spawn" half of the process model: the whole table is set up by repeated
+// task_spawn calls in sched_start.
+//
+// The stack must be physically CONTIGUOUS (sched_craft_stack/isr_common treat
+// it as one flat range), so the pages are allocated in a loop the same way
+// heap_init does -- safe because pmm_alloc_page bumps a monotonic watermark
+// whenever the free-list is empty, giving contiguous physical pages back to
+// back. If the free-list is NOT empty (an earlier task's stack was already
+// reaped), a task's stack pages might legitimately be non-contiguous with
+// each other across DIFFERENT calls to this loop, but within one call the
+// pages returned are still handed out in address order relative to each
+// other as long as nothing else allocates in between -- true here, since
+// task_spawn does not call anything else between these pmm_alloc_page calls.
 int task_spawn(int entry) {
     int id = 0;
     while (id < MAX_TASKS) {
         if (load64(task_state_base + id * 8) == TASK_FREE) {
             int stack = pmm_alloc_page();
+            int p = 1;
+            while (p < TASK_STACK_PAGES) {
+                pmm_alloc_page();
+                p = p + 1;
+            }
             int sp = sched_craft_stack(stack, entry);
             store64(task_rsp_base + id * 8, sp);
             store64(task_stack_base + id * 8, stack);
             store64(task_counter_base + id * 8, 0);
             store64(task_runs_base + id * 8, 0);
+            // Every task starts on the kernel's own page tables; a task
+            // that later drops to ring 3 (run_ring3_binary) overwrites this
+            // slot with its own pt_create()'d private table.
+            store64(task_cr3_base + id * 8, pml4_phys);
+            store64(task_win_base + id * 8, 0 - 1);
+            store64(task_heap_next_base + id * 8, 0);
+            store64(task_heap_end_base + id * 8, 0);
+            store64(task_heap_mapped_base + id * 8, 0);
+            store64(task_win_reported_base + id * 8, 0);
+            key_task_reset(id);
             store64(task_state_base + id * 8, TASK_RUNNABLE);
             // Log the stack page too: paired with the reaper's "reaped ...
             // stack=" line, this is what lets test_shell.sh prove a reaped
@@ -198,7 +329,7 @@ int sched_pick_next(int cur) {
 // running on) that still owns its page. Safe precisely because such a task is
 // NOT executing -- it was switched away, so nothing is on its stack -- while
 // this code runs on `cur`'s stack, never a reaped one. That is also why exit/
-// kill can't free their own stack inline: a task can't free the stack it is
+// kill cannot free their own stack inline: a task cannot free the stack it is
 // standing on, so reclamation is deferred to here, a different task's context.
 // After reclaiming the stack page, the slot is fully reset to FREE so
 // task_spawn can reuse it -- zeroing all five table arrays eliminates any
@@ -212,7 +343,24 @@ void sched_reap(int cur) {
         if (r != cur && load64(task_state_base + r * 8) == TASK_EXITED) {
             int sb = load64(task_stack_base + r * 8);
             if (sb != 0) {
-                pmm_free_page(sb);
+                // Free all TASK_STACK_PAGES pages, HIGHEST address first.
+                // pmm's free-list is LIFO (see pmm_free_page/pmm_alloc_page,
+                // jenna.c0), so freeing high-to-low means the NEXT
+                // task_spawn's own allocation loop (which also runs
+                // low-to-high, taking whatever pmm hands back first as the
+                // stack's base) pops `sb` itself first, then sb+4096,
+                // sb+8192, ... in order -- reconstructing the exact same
+                // contiguous range, not a scrambled one. Freeing in the
+                // other order would still return a technically-contiguous
+                // range (pmm does not care), but a DIFFERENT base address
+                // than what was actually reaped, which would silently break
+                // test_shell.sh's proof that a reaped page is genuinely the
+                // one handed back out.
+                int fp = TASK_STACK_PAGES - 1;
+                while (fp >= 0) {
+                    pmm_free_page(sb + fp * 4096);
+                    fp = fp - 1;
+                }
                 store64(task_stack_base + r * 8, 0);
                 serial_print("[sched] reaped task ");
                 serial_print_int(r);
@@ -220,10 +368,31 @@ void sched_reap(int cur) {
                 serial_print_int(sb);
                 serial_print("\n");
                 // Reset the slot fully to FREE so task_spawn can reuse it.
+                // The process-private page-table frame a ring-3 task's
+                // task_cr3_base slot pointed at is intentionally NOT freed
+                // here -- reclaiming a whole PML4/PDPT/PD/PT tree is a later
+                // problem (see task_exit's own comment on the analogous
+                // stack-leak-for-now tradeoff); resetting the slot to
+                // pml4_phys just stops a future reuse of this id from
+                // inheriting a stale pointer before task_spawn overwrites it.
                 store64(task_state_base + r * 8, TASK_FREE);
                 store64(task_rsp_base + r * 8, 0);
                 store64(task_counter_base + r * 8, 0);
                 store64(task_runs_base + r * 8, 0);
+                store64(task_cr3_base + r * 8, pml4_phys);
+                // If this task owned a tavla, the window outlives it: the last
+                // frame a graphical program drew stays on screen (unlike a text
+                // window there is nothing to scroll back to, so closing it here
+                // would just make the result unviewable). Marking it ownerless
+                // is what stops it from swallowing keys for a program that no
+                // longer exists, and relabels its title strip as exited.
+                kakel_tavla_orphan(load64(task_win_base + r * 8));
+                store64(task_win_base + r * 8, 0 - 1);
+                store64(task_heap_next_base + r * 8, 0);
+                store64(task_heap_end_base + r * 8, 0);
+                store64(task_heap_mapped_base + r * 8, 0);
+                store64(task_win_reported_base + r * 8, 0);
+                key_task_reset(r);
             }
         }
         r = r + 1;
@@ -240,7 +409,7 @@ void sched_reap(int cur) {
 // Format: up Xh Xm Xs | tasks N/M | mem free/total
 // Cached status-bar values so we only redraw when something actually
 // changes. The bar is the most expensive thing on screen (full-width fill
-// + ~40 glyphs, every SCHED_SWITCH_PERIOD ticks), and most ticks nothing
+// + ~40 glyphs, every STATS_REFRESH_PERIOD ticks), and most ticks nothing
 // visible changes — uptime rolls over once per second, task count only on
 // spawn/kill/exit, free pages only on alloc/free.
 int stats_last_secs = -1;
@@ -248,7 +417,7 @@ int stats_last_tasks = -1;
 int stats_last_free = -1;
 
 void sched_stats_update() {
-    int secs = ticks / 100;
+    int secs = pit_ticks / 100;
     int n = 0;
     int i = 0;
     while (i < MAX_TASKS) {
@@ -297,8 +466,8 @@ void sched_stats_update() {
     return;
 }
 
-// Every SCHED_SWITCH_PERIOD timer ticks, refreshes the status bar, reaps any
-// dead tasks' stacks, then picks the next runnable task and, if it differs from
+// Every SCHED_SWITCH_PERIOD timer ticks (now every tick), reaps any dead
+// tasks' stacks, then picks the next runnable task and, if it differs from
 // the current one, forces a switch by writing isr_common's two swap inputs
 // (SCHED_SAVE_SLOT_ADDR = the outgoing task's rsp slot address, SCHED_NEXT_RSP
 // = the incoming task's saved rsp) and setting SCHED_SWITCH_PENDING -- isr_common
@@ -306,15 +475,20 @@ void sched_stats_update() {
 // timer_tick (interrupts.c0), so this only ever runs on the timer vector, never
 // keyboard.
 void sched_tick() {
+    // Status bar first, on its own counter -- it is far too expensive to
+    // redraw at the scheduler's (now every-tick) cadence, and ~0.1s is plenty
+    // fresh for uptime/task-count/free-memory.
+    stats_tick_count = stats_tick_count + 1;
+    if (stats_tick_count >= STATS_REFRESH_PERIOD) {
+        stats_tick_count = 0;
+        sched_stats_update();
+    }
+
     sched_tick_count = sched_tick_count + 1;
     if (sched_tick_count < SCHED_SWITCH_PERIOD) {
         return;
     }
     sched_tick_count = 0;
-
-    // Refresh the on-screen status bar before running the scheduler logic.
-    // Runs on every switch period (~0.1s) so it stays current.
-    sched_stats_update();
 
     int cur = sched_current;
     sched_reap(cur);
@@ -342,13 +516,15 @@ void sched_tick() {
     // at, and loads rsp from SCHED_NEXT_RSP -- see boot.s.
     store64(SCHED_SAVE_SLOT_ADDR, task_rsp_base + cur * 8);
     store64(SCHED_NEXT_RSP, load64(task_rsp_base + next * 8));
+    store64(SCHED_NEXT_CR3, load64(task_cr3_base + next * 8));
+    store64(SCHED_NEXT_RSP0, load64(task_stack_base + next * 8) + TASK_STACK_SIZE);
     sched_current = next;
     store64(SCHED_SWITCH_PENDING, 1);
     return;
 }
 
 // The "exit" half of the process model. Marks the current task EXITED so
-// sched_pick_next skips it forever, then parks: we can't context-switch
+// sched_pick_next skips it forever, then parks: we cannot context-switch
 // ourselves here (this runs in ordinary task context, not an ISR), so we idle
 // via hlt and wait for the very next timer tick, which will pick_next past this
 // now-exited task and never schedule it again. The task's stack page is
@@ -409,6 +585,12 @@ void sched_start() {
     task_counter_base = kmalloc(MAX_TASKS * 8);
     task_runs_base = kmalloc(MAX_TASKS * 8);
     task_stack_base = kmalloc(MAX_TASKS * 8);
+    task_cr3_base = kmalloc(MAX_TASKS * 8);
+    task_win_base = kmalloc(MAX_TASKS * 8);
+    task_heap_next_base = kmalloc(MAX_TASKS * 8);
+    task_heap_end_base = kmalloc(MAX_TASKS * 8);
+    task_heap_mapped_base = kmalloc(MAX_TASKS * 8);
+    task_win_reported_base = kmalloc(MAX_TASKS * 8);
 
     // kmalloc does not zero, so every slot starts explicitly FREE before any
     // spawn -- otherwise task_spawn/sched_pick_next would read stale heap bytes
@@ -420,6 +602,12 @@ void sched_start() {
         store64(task_counter_base + i * 8, 0);
         store64(task_runs_base + i * 8, 0);
         store64(task_stack_base + i * 8, 0);
+        store64(task_cr3_base + i * 8, pml4_phys);
+        store64(task_win_base + i * 8, 0 - 1);
+        store64(task_heap_next_base + i * 8, 0);
+        store64(task_heap_end_base + i * 8, 0);
+        store64(task_win_reported_base + i * 8, 0);
+        store64(task_heap_mapped_base + i * 8, 0);
         i = i + 1;
     }
 
@@ -440,7 +628,7 @@ void sched_start() {
     sched_current = 0;
     sched_tick_count = 0;
     store64(SCHED_SWITCH_PENDING, 0);
-    // Task 0's initial launch below is a scheduling too, but it doesn't go
+    // Task 0's initial launch below is a scheduling too, but it does not go
     // through sched_tick's bump, so count it here for consistency.
     store64(task_runs_base, 1);
 

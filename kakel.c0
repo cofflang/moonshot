@@ -8,9 +8,11 @@
 // WARRANTY; see the LICENSE file for the full text.
 // kakel.c0 -- the windowing layer, v1 (Swedish for "tile": a fixed set of
 // non-overlapping rectangular regions tiling the screen). This is NOT a
-// window manager yet -- no overlap, no z-order, no dragging/resizing, no
-// borders or title bars, and keyboard-only (no mouse driver exists at
-// all). What it genuinely adds over punkt's single full-screen terminal
+// window manager yet -- no overlap, no z-order, no dragging or resizing, no
+// borders (a tavla's title strip is the one piece of window decoration that
+// exists), and no clicking to focus: klick tracks a mouse pointer, but
+// nothing reacts to it yet. What it genuinely adds over punkt's single
+// full-screen terminal
 // are the two mechanics a real windowing layer is built from: CLIPPING
 // (each window's text wraps and scrolls inside its own rectangle, never
 // touching a neighbour's pixels) and MULTIPLE SIMULTANEOUS CURSOR STATES
@@ -41,6 +43,48 @@
 
 int KAKEL_MAX_WIN = 12;
 int KAKEL_MAX_RING = 8;
+
+// --- Window kinds ---
+// A window is either a shell session (the default: a text console skalman
+// owns and prompts into) or a TAVLA -- the window kind a graphical ring-3
+// program gets, created by run_ring3_binary/run_elf_binary.
+//
+// A tavla differs from a shell window in three ways, all of them here in
+// kakel rather than scattered across the callers:
+//   1. It has a kakel-owned title strip (KAKEL_TAVLA_TITLE_ROWS cells) that
+//      the owning program cannot draw over -- see kakel_resize, which insets
+//      the window's own rectangle below the strip, so cx/cy/cols/rows (and
+//      therefore every kakel_putc, SYS_FILL and SYS_BLIT) already mean the
+//      CLIENT area. Nothing outside kakel needs to know the strip exists.
+//   2. It shows focus. Focus used to be visible only as a bright vs dim text
+//      cursor, and a graphical program never draws a cursor -- so a tavla and
+//      the shell looked equally focused at the same time, with no way to tell
+//      which one keys were going to. The title strip renders bright when
+//      focused and dim otherwise.
+//   3. Keys go exclusively to its owner via the key ring buffer
+//      (SYS_KEY_POLL) -- but only while it HAS a live owner, see below.
+//
+// A tavla is still an ordinary tile in the ring: same geometry rules, same
+// Alt+Tab order, shown alongside skalman rather than taking over the screen.
+// That is deliberate -- a graphical program being able to talk to the shell
+// is wanted later, and a sealed-off fullscreen mode would foreclose it.
+int KAKEL_KIND_SHELL = 0;
+int KAKEL_KIND_TAVLA = 1;
+int KAKEL_TAVLA_TITLE_ROWS = 1;
+
+// Per-window kind (KAKEL_KIND_*), kmalloc'd in kakel_init.
+int kakel_kind_base = 0;
+
+// Per-window owning task id for tavlas, or -1 for "no live owner" -- both
+// for shell windows (which never have one) and for a tavla whose program has
+// exited. That second case is why this is an owner id and not a flag: a dead
+// tavla must STOP consuming keys. It used to keep swallowing every keystroke
+// forever, which is how closing skalman's own window while a graphical
+// program was open left the machine with no reachable shell at all.
+int kakel_owner_base = 0;
+
+// Per-window title string (kmalloc'd copy, 0 = none) shown in the strip.
+int kakel_title_base = 0;
 
 // Height of the status bar at the bottom of the screen, in character rows.
 // Changing this requires updating knekt.c0's readback check (which uses
@@ -130,7 +174,145 @@ void kakel_draw_cursor(int id, int row, int col, int color) {
 // without borders or any other decoration (v1 has none).
 int kakel_cursor_color(int id) {
     if (id == kakel_focus) { return FB_FG; }
-    return KAKEL_DIM;
+    // The window's own background, i.e. NO cursor at all rather than a dim
+    // one. Dim-vs-bright is too subtle to answer "which window am I typing
+    // into", and it kept reading as two windows being active at once --
+    // especially against a tavla running a game, which animates whether or
+    // not it has focus. Present-vs-absent is unambiguous.
+    return load64(kakel_bg_base + id * 8);
+}
+
+// --- tavla ---
+// Title-strip colors, built in kakel_init for the same reason FB_FG/FB_BG
+// and KAKEL_DIM are: fb_rgb needs the framebuffer's channel positions,
+// which are not known until punkt has read the multiboot tag.
+int KAKEL_TAVLA_BAR = 0;
+int KAKEL_TAVLA_BAR_DIM = 0;
+
+int kakel_is_tavla(int id) {
+    if (load64(kakel_kind_base + id * 8) == KAKEL_KIND_TAVLA) { return 1; }
+    return 0;
+}
+
+// 1 only for a tavla whose owning program is still running. Keys are routed
+// exclusively to a tavla's owner, so an orphaned one must answer 0 here or it
+// swallows every keystroke aimed at a program that no longer exists.
+int kakel_tavla_live(int id) {
+    if (kakel_is_tavla(id) == 0) { return 0; }
+    if (load64(kakel_owner_base + id * 8) < 0) { return 0; }
+    return 1;
+}
+
+// Draws a NUL-terminated string into the title strip starting at a
+// window-relative cell column, clipped to the window's width. Returns the
+// column just past the last character drawn.
+int kakel_title_draw_str(int cx, int trow, int col, int maxcol, int s, int fg, int bg) {
+    if (s == 0) { return col; }
+    int i = 0;
+    while (load8(s + i) != 0 && col < maxcol) {
+        fb_draw_char((cx + col) * FONT_W, trow * FONT_H, load8(s + i), fg, bg);
+        col = col + 1;
+        i = i + 1;
+    }
+    return col;
+}
+
+int kakel_str_cells(int s) {
+    if (s == 0) { return 0; }
+    int n = 0;
+    while (load8(s + n) != 0) { n = n + 1; }
+    return n;
+}
+
+// Repaints one tavla's title strip -- the row directly ABOVE the window's
+// stored rectangle, since kakel_resize already inset the client area below
+// it. Bright bar = focused, dim bar = not. Cheap enough to call on every
+// focus change and every reflow; never called per tick.
+void kakel_tavla_paint_title(int id) {
+    if (kakel_active != 1) { return; }
+    if (kakel_is_tavla(id) == 0) { return; }
+    int cx = load64(kakel_cx_base + id * 8);
+    int cy = load64(kakel_cy_base + id * 8);
+    int cols = load64(kakel_cols_base + id * 8);
+    int trow = cy - KAKEL_TAVLA_TITLE_ROWS;
+    if (trow < 0) { return; }
+    int bar = KAKEL_TAVLA_BAR_DIM;
+    int fg = KAKEL_DIM;
+    if (id == kakel_focus) {
+        bar = KAKEL_TAVLA_BAR;
+        fg = FB_FG;
+    }
+    fb_fill_rect(cx * FONT_W, trow * FONT_H,
+                 cols * FONT_W, KAKEL_TAVLA_TITLE_ROWS * FONT_H, bar);
+    int col = kakel_title_draw_str(cx, trow, 1, cols,
+                                   load64(kakel_title_base + id * 8), fg, bar);
+    if (load64(kakel_owner_base + id * 8) < 0) {
+        col = kakel_title_draw_str(cx, trow, col, cols, " [exited]", fg, bar);
+    }
+    // Right-aligned close hint, only on the focused tavla -- alt+w acts on
+    // the focused window, so showing it anywhere else would be a lie.
+    if (id == kakel_focus) {
+        int hint_len = kakel_str_cells("alt+w close");
+        int start = cols - hint_len - 1;
+        if (start > col + 1) {
+            kakel_title_draw_str(cx, trow, start, cols, "alt+w close", fg, bar);
+        }
+    }
+    return;
+}
+
+// Repaints every visible tavla's title strip. Called after any reflow (which
+// recomputes geometry and clears window interiors) and after a focus change.
+void kakel_paint_titles() {
+    if (kakel_active != 1) { return; }
+    int r = 0;
+    while (r < kakel_rows) {
+        int cnt = load64(kakel_ring_cnt + r * 8);
+        int vis = load64(kakel_ring_vis + r * 8);
+        int head = load64(kakel_ring_head + r * 8);
+        int i = 0;
+        while (i < vis) {
+            int wid = load64(kakel_ring_ids + (r * KAKEL_MAX_RING + kakel_wrap_inc(head + i, cnt)) * 8);
+            kakel_tavla_paint_title(wid);
+            i = i + 1;
+        }
+        r = r + 1;
+    }
+    return;
+}
+
+// Turns an already-created window into a tavla owned by task `owner`, titled
+// `name`. Reflows so the title strip's inset is applied to the geometry
+// (kakel_resize does that, and only runs from reflow) and repaints.
+//
+// `name` is stored by pointer and outlives this call, so it must be a string
+// literal or a caller-owned copy -- NOT a slice of the shell's line buffer,
+// which is overwritten by the time the spawned task gets here.
+//
+// Callers that own shell prompts must call shell_reprompt_others afterwards:
+// the reflow here clears every visible window, prompts included.
+void kakel_tavla_claim(int wid, int owner, int name) {
+    if (kakel_active != 1 || wid < 0) { return; }
+    store64(kakel_kind_base + wid * 8, KAKEL_KIND_TAVLA);
+    store64(kakel_owner_base + wid * 8, owner);
+    store64(kakel_title_base + wid * 8, name);
+    kakel_reflow();
+    kakel_paint_titles();
+    return;
+}
+
+// Marks a tavla's owner as gone, without closing the window: the last frame
+// the program drew stays on screen (there is nothing to scroll back to in a
+// graphical window, so closing it out from under the user would just make the
+// result unviewable), but it stops consuming keys and its title says so.
+// Called from sched_reap, i.e. from the timer ISR -- so it repaints one strip
+// and nothing else, the same budget the status bar already runs on.
+void kakel_tavla_orphan(int wid) {
+    if (kakel_active != 1 || wid < 0) { return; }
+    if (kakel_is_tavla(wid) == 0) { return; }
+    store64(kakel_owner_base + wid * 8, 0 - 1);
+    kakel_tavla_paint_title(wid);
+    return;
 }
 
 // Scrolls ONE window's contents up by one cell row and blanks its bottom
@@ -144,6 +326,8 @@ int kakel_cursor_color(int id) {
 // scroll a hundred times while window 0's pixels stay untouched (proven
 // by test_kakel_scroll.sh's readback, not just asserted here).
 void kakel_scroll(int id) {
+    // Lift klick's pointer: this moves whole rows of pixels underneath it.
+    klick_lift();
     int cx = load64(kakel_cx_base + id * 8);
     int cy = load64(kakel_cy_base + id * 8);
     int cols = load64(kakel_cols_base + id * 8);
@@ -163,6 +347,7 @@ void kakel_scroll(int id) {
         y = y + 1;
     }
     fb_fill_rect(cx * FONT_W, ybot - FONT_H, cols * FONT_W, FONT_H, bg);
+    klick_drop();
     return;
 }
 
@@ -174,6 +359,11 @@ void kakel_scroll(int id) {
 // only that window. The foreground color is the shared FB_FG; the
 // background is the window's own.
 void kakel_putc(int id, int ch) {
+    // A negative or out-of-range id indexes BEFORE the per-window arrays and
+    // corrupts whatever sits there. Callers should not pass one, but the cost
+    // of being sure is a compare, and the cost of being wrong is a crash from
+    // inside an interrupt handler.
+    if (id < 0 || id >= KAKEL_MAX_WIN) { return; }
     int bg = load64(kakel_bg_base + id * 8);
     int crow = load64(kakel_crow_base + id * 8);
     if (crow >= 0) {
@@ -212,6 +402,7 @@ void kakel_putc(int id, int ch) {
 // Like kakel_putc but with a caller-specified foreground colour. Used by
 // skalman's sk_putc to support coloured REPL output through kakel windows.
 void kakel_putc_fg(int id, int ch, int fg) {
+    if (id < 0 || id >= KAKEL_MAX_WIN) { return; }
     int bg = load64(kakel_bg_base + id * 8);
     int crow = load64(kakel_crow_base + id * 8);
     if (crow >= 0) {
@@ -331,6 +522,7 @@ void kakel_print_dim(int id, int s) {
 // glyph is left undrawn (crow -1), same as fb_clear; the next kakel_putc
 // draws it.
 void kakel_clear(int id) {
+    if (id < 0 || id >= KAKEL_MAX_WIN) { return; }
     fb_fill_rect(load64(kakel_cx_base + id * 8) * FONT_W,
                  load64(kakel_cy_base + id * 8) * FONT_H,
                  load64(kakel_cols_base + id * 8) * FONT_W,
@@ -419,6 +611,29 @@ void kakel_focus_next() {
     }
 
     int nf = load64(kakel_ring_ids + (next_row * KAKEL_MAX_RING + next_pos) * 8);
+
+    // Skip a tavla whose program has exited. It still shows its last frame,
+    // which is the point of leaving it open, but it consumes every keystroke
+    // sent to it and has no shell behind it to answer -- so landing on one
+    // makes the whole keyboard look dead. Only alt+w and another Alt+Tab work
+    // there, which is not discoverable.
+    //
+    // Bounded by the window count rather than looping until something live is
+    // found: if EVERY window is a dead tavla there is nothing better to land
+    // on, and spinning forever inside the keyboard interrupt would be worse
+    // than focusing a dead one.
+    int guard = 0;
+    while (kakel_is_tavla(nf) == 1 && load64(kakel_owner_base + nf * 8) < 0
+           && guard < KAKEL_MAX_WIN) {
+        next_pos = next_pos + 1;
+        if (next_pos >= load64(kakel_ring_cnt + next_row * 8)) {
+            next_row = next_row + 1;
+            if (next_row >= kakel_rows) { next_row = 0; }
+            next_pos = 0;
+        }
+        nf = load64(kakel_ring_ids + (next_row * KAKEL_MAX_RING + next_pos) * 8);
+        guard = guard + 1;
+    }
     kakel_focus = nf;
 
     // Retint cursors
@@ -430,6 +645,11 @@ void kakel_focus_next() {
     if (crow >= 0) {
         kakel_draw_cursor(nf, crow, load64(kakel_ccol_base + nf * 8), FB_FG);
     }
+    // Retint title strips. A tavla draws no text cursor, so without this a
+    // graphical window gives no sign at all of whether it holds focus -- and
+    // the window that just lost focus would keep looking active.
+    kakel_tavla_paint_title(old);
+    kakel_tavla_paint_title(nf);
     return;
 }
 
@@ -453,6 +673,15 @@ int kakel_win_new(int cx, int cy, int cols, int rows, int bg) {
     store64(kakel_crow_base + id * 8, 0 - 1);
     store64(kakel_ccol_base + id * 8, 0 - 1);
     store64(kakel_bg_base + id * 8, bg);
+    store64(kakel_kind_base + id * 8, KAKEL_KIND_SHELL);
+    store64(kakel_owner_base + id * 8, 0 - 1);
+    store64(kakel_title_base + id * 8, 0);
+    // A window id is reused after its slot is freed, and every per-session
+    // array (raket's login state, skalman's uid/cwd) is indexed by that id --
+    // so a fresh window must not inherit the closed session's. `split` sets
+    // its new window's session state explicitly right after this returns,
+    // which is what makes inheriting-on-purpose still work there.
+    raket_reset_session(id);
     return id;
 }
 
@@ -466,12 +695,27 @@ void kakel_win_free(int id) {
     store64(kakel_row_base + id * 8, 0);
     store64(kakel_crow_base + id * 8, 0 - 1);
     store64(kakel_ccol_base + id * 8, 0 - 1);
+    store64(kakel_kind_base + id * 8, KAKEL_KIND_SHELL);
+    store64(kakel_owner_base + id * 8, 0 - 1);
+    store64(kakel_title_base + id * 8, 0);
     return;
 }
 
 // Updates a window's cell geometry and clamps its cursor if it now falls
 // outside the new bounds.
+//
+// The layout (kakel_reflow) hands every window its OUTER rectangle. For a
+// tavla the stored rectangle is inset below the title strip, and this is the
+// single place that inset happens -- which is why nothing else in the kernel
+// knows the strip exists. cx/cy/cols/rows mean the client area from here on,
+// so kakel_putc, kakel_scroll, kakel_clear and all three ring-3 graphics
+// syscalls stay correct with no change and no way for a program to paint over
+// its own title.
 void kakel_resize(int id, int cx, int cy, int cols, int rows) {
+    if (kakel_is_tavla(id) == 1 && rows > KAKEL_TAVLA_TITLE_ROWS) {
+        cy = cy + KAKEL_TAVLA_TITLE_ROWS;
+        rows = rows - KAKEL_TAVLA_TITLE_ROWS;
+    }
     store64(kakel_cx_base + id * 8, cx);
     store64(kakel_cy_base + id * 8, cy);
     store64(kakel_cols_base + id * 8, cols);
@@ -562,9 +806,35 @@ void kakel_reflow() {
         while (i < vis) {
             int wid = load64(kakel_ring_ids + (r * KAKEL_MAX_RING + kakel_wrap_inc(head + i, cnt)) * 8);
             kakel_clear(wid);
+            kakel_tavla_paint_title(wid);
             i = i + 1;
         }
         r = r + 1;
+    }
+    // Whoever owns a window's content has to put it back after the clear
+    // above, and skalman is not the only one: pensel and skrift own a window
+    // just as completely as a shell session does. Neither was ever told, so a
+    // reflow -- a `split` typed in ANOTHER window, a spawn3, a close -- wiped
+    // the editor's screen and skalman then printed a shell prompt into it. The
+    // window then looked like an idle shell while every keystroke still went
+    // to an invisible editor: typing `q` quit it, `c` cleared the drawing.
+    //
+    // pensel_render also recomputes pensel_ox/pensel_oy, which is not optional
+    // -- it paints its canvas in ABSOLUTE screen pixels, so a stale origin
+    // means the next mouse stroke lands in a neighbouring window.
+    kakel_reflow_repaint_editors();
+    return;
+}
+
+// Repaints whichever in-kernel editor is live, if its window is still one of
+// the visible ones. Split out of kakel_reflow only so kakel does not have to
+// name pensel's and skrift's internals inline; both are no-ops when inactive.
+void kakel_reflow_repaint_editors() {
+    if (pensel_active == 1 && load64(kakel_rows_base + pensel_win * 8) > 0) {
+        pensel_render();
+    }
+    if (skrift_active == 1 && load64(kakel_rows_base + skrift_win * 8) > 0) {
+        skrift_render();
     }
     return;
 }
@@ -625,9 +895,17 @@ void kakel_ring_remove(int row, int wid) {
 // visible and only 1 row, splits into 2 rows (creating a new row with 2
 // windows — taking total visible from 2 to 4). Otherwise adds a hidden
 // window to the focused row's ring.
-void kakel_split() {
+//
+// Returns the new window's id, or -1 if the layout is already full (all 4
+// slots visible) or window creation otherwise failed. Used both by the
+// shell's own `split` command (which ignores the return value -- it only
+// cares that a window appeared somewhere the user can Alt+Tab to) and by
+// spawn3/spawnelf (syscall.c0), which need the id itself to give a
+// ring-3 process its own dedicated output window (see run_ring3_binary's
+// windowed variant).
+int kakel_split() {
     int row = kakel_find_row(kakel_focus);
-    if (row < 0) { return; }
+    if (row < 0) { return 0 - 1; }
     int vis = load64(kakel_ring_vis + row * 8);
     int cnt = load64(kakel_ring_cnt + row * 8);
     int head = load64(kakel_ring_head + row * 8);
@@ -637,10 +915,11 @@ void kakel_split() {
         // Split 1 column → 2 columns in the same row.
         int nid = kakel_win_new(0, 0, 1, 1,
             load64(kakel_bg_palette + ((kakel_shell_wins - (kakel_shell_wins / 6) * 6) * 8)));
-        if (nid < 0) { return; }
+        if (nid < 0) { return 0 - 1; }
         kakel_ring_add(row, nid, head);
         store64(kakel_ring_vis + row * 8, 2);
         kakel_reflow();
+        return nid;
     } else if (vis == 2 && kakel_rows == 1) {
         // Split 1 row → 2 rows. Create a new row 1 with one new window.
         store64(kakel_ring_cnt + 8, 0);
@@ -651,6 +930,7 @@ void kakel_split() {
         if (nid >= 0) { kakel_ring_add(1, nid, -1); }
         kakel_rows = 2;
         kakel_reflow();
+        return nid;
     } else if (vis == 2 && kakel_rows == 2) {
         // Focused row is full. If the other row has room, split that one.
         int other = 1 - row;
@@ -663,39 +943,88 @@ void kakel_split() {
                 kakel_ring_add(other, nid, ohead);
                 store64(kakel_ring_vis + other * 8, 2);
                 kakel_reflow();
+                return nid;
             }
+            return 0 - 1;
         } else {
             sk_print("split: all 4 slots are full\n");
+            return 0 - 1;
         }
     } else {
+        // Refused, and nothing was allocated -- important, because a spawn
+        // that silently consumed a window slot it could not display would
+        // exhaust the KAKEL_MAX_WIN table long before the four visible tiles
+        // suggest, and the failure surfaces far away as kakel_win_new
+        // returning -1 during an unrelated close.
         sk_print("split: all 4 slots are full\n");
+        return 0 - 1;
     }
+}
+
+// Kills a tavla's owning program, if it still has one. Setting TASK_EXITED is
+// exactly what SYS_EXIT does; the scheduler skips the task from the next tick
+// and sched_reap frees its stack. task_win_base is cleared here too so the
+// dying task cannot write into a window id that is about to be reused.
+void kakel_tavla_kill(int wid) {
+    if (kakel_tavla_live(wid) == 0) { return; }
+    int owner = load64(kakel_owner_base + wid * 8);
+    store64(task_state_base + owner * 8, TASK_EXITED);
+    store64(task_win_base + owner * 8, 0 - 1);
+    store64(kakel_owner_base + wid * 8, 0 - 1);
+    serial_print("[tavla] closed win=");
+    serial_print_int(wid);
+    serial_print(" killed task=");
+    serial_print_int(owner);
+    serial_print("\n");
     return;
 }
 
-// Removes the focused window. If its row had 2 visible, drops to 1 (full
-// width). If it had 1 visible, the entire row is removed and the other row
-// expands to fill the space. The window's shell session is abandoned (its
-// line buffer stays allocated — leak is bounded by KAKEL_MAX_WIN).
-// If this is the last window (1 row, 1 visible), it is closed and a single
-// fresh window replaces it so the screen is never windowless.
-void kakel_close() {
-    int wid = kakel_focus;
+// Removes the FOCUSED window -- the shell's `close` command, and alt+w.
+int kakel_close() {
+    return kakel_close_id(kakel_focus);
+}
+
+// Removes a window by id. If its row had 2 visible, drops to 1 (full width).
+// If it had 1 visible, the entire row is removed and the other row expands to
+// fill the space. The window's shell session is abandoned (its line buffer
+// stays allocated — leak is bounded by KAKEL_MAX_WIN). If this is the last
+// window (1 row, 1 visible), it is closed and a single fresh window replaces
+// it so the screen is never windowless.
+//
+// Focus only moves if the window being closed is the one that had it.
+//
+// Returns 1 if the layout actually changed (and therefore kakel_reflow ran,
+// clearing every visible window), 0 if nothing happened. Callers that repaint
+// per-window content afterwards -- skalman's prompts -- MUST check this:
+// repainting when no reflow occurred stacks a second copy on top of the first.
+int kakel_close_id(int wid) {
     int row = kakel_find_row(wid);
-    if (row < 0) { return; }
+    if (row < 0) { return 0; }
     int vis = load64(kakel_ring_vis + row * 8);
+    int was_focused = 0;
+    if (wid == kakel_focus) { was_focused = 1; }
+    // Closing a tavla is how a graphical program is meant to be shut down, so
+    // the window and the program go together -- otherwise the program would
+    // keep running with nowhere to draw.
+    kakel_tavla_kill(wid);
+    // The two in-kernel editors are the same argument for a shell window: both
+    // hold `their` window id in a global and keep acting on it, so neither may
+    // outlive the window. Both save first; closing a window is not discarding
+    // an edit. Each is a no-op unless it is that editor's own window.
+    pensel_window_closed(wid);
+    skrift_window_closed(wid);
 
     if (vis == 2) {
         // Drop to 1 visible in this row.
         kakel_ring_remove(row, wid);
         kakel_win_free(wid);
         store64(kakel_ring_vis + row * 8, 1);
-        if (load64(kakel_ring_cnt + row * 8) > 0) {
+        if (was_focused == 1 && load64(kakel_ring_cnt + row * 8) > 0) {
             int head = load64(kakel_ring_head + row * 8);
             kakel_focus = load64(kakel_ring_ids + (row * KAKEL_MAX_RING + head) * 8);
         }
         kakel_reflow();
-        return;
+        return 1;
     }
     if (vis == 1 && kakel_rows == 2) {
         // Remove this entire row. The other row expands to fill the screen.
@@ -721,7 +1050,7 @@ void kakel_close() {
             kakel_focus = load64(kakel_ring_ids + (0 * KAKEL_MAX_RING + 0) * 8);
         }
         kakel_reflow();
-        return;
+        return 1;
     }
     // Last window (1 row, 1 visible). Replace it with a fresh window so the
     // screen is never windowless — the old session is abandoned.
@@ -742,10 +1071,17 @@ void kakel_close() {
             kakel_focus = load64(kakel_ring_ids + (0 * KAKEL_MAX_RING + 0) * 8);
         }
         kakel_reflow();
-        kakel_print(nid, "\ntype 'help' for commands.\n");
-        return;
+        // Guarded, unlike before. This sat OUTSIDE the `nid >= 0` check above,
+        // so a failed kakel_win_new printed into window -1 -- indexing
+        // kakel_bg_base minus 8 and handing fb_fill_rect garbage geometry, an
+        // out-of-bounds write from inside the keyboard interrupt. Reported as
+        // "closed the last window and everything crashed".
+        if (nid >= 0) {
+            kakel_print(nid, "\ntype 'help' for commands.\n");
+        }
+        return 1;
     }
-    return;
+    return 0;
 }
 
 // --- Status bar helpers (kakel_stats_win) ---
@@ -773,6 +1109,26 @@ void kakel_stats_clear() {
 
 // Writes an unsigned integer into the stats bar, one character at a time,
 // using the same digit-extraction shape as serial_print_int.
+// Prints an unsigned integer into an arbitrary window. Same shape as
+// kakel_stats_int below, which is the same routine pinned to the status bar;
+// this one takes the window, for callers like pensel that want a number in
+// their own tile.
+void kakel_print_int(int id, int v) {
+    int tmp = kscratch_start;
+    int i = 31;
+    if (v == 0) { kakel_putc(id, '0'); return; }
+    while (v > 0) {
+        i = i - 1;
+        store8(tmp + i, '0' + (v - (v / 10) * 10));
+        v = v / 10;
+    }
+    while (i < 31) {
+        kakel_putc(id, load8(tmp + i));
+        i = i + 1;
+    }
+    return;
+}
+
 void kakel_stats_int(int v) {
     if (kakel_stats_win < 0) { return; }
     int tmp = kscratch_start;
@@ -808,7 +1164,12 @@ void kakel_init() {
     kakel_ccol_base = kmalloc(KAKEL_MAX_WIN * 8);
     kakel_bg_base = kmalloc(KAKEL_MAX_WIN * 8);
     kakel_prompt_col_base = kmalloc(KAKEL_MAX_WIN * 8);
+    kakel_kind_base = kmalloc(KAKEL_MAX_WIN * 8);
+    kakel_owner_base = kmalloc(KAKEL_MAX_WIN * 8);
+    kakel_title_base = kmalloc(KAKEL_MAX_WIN * 8);
     KAKEL_DIM = fb_rgb(100, 100, 100);
+    KAKEL_TAVLA_BAR = fb_rgb(48, 48, 128);
+    KAKEL_TAVLA_BAR_DIM = fb_rgb(24, 24, 40);
 
     // Ring state: two rows, each with KAKEL_MAX_RING slots
     kakel_ring_ids = kmalloc(2 * KAKEL_MAX_RING * 8);

@@ -7,10 +7,10 @@
 // License version 3 or (at your option) any later version, WITHOUT ANY
 // WARRANTY; see the LICENSE file for the full text.
 // punkt.c0 -- the pixel-framebuffer subsystem: detecting and mapping the
-// real VBE linear framebuffer GRUB grants (or doesn't), and a custom 8x8
+// real VBE linear framebuffer GRUB grants (or does not), and a custom 8x8
 // bitmap font renderer drawn directly onto it. This is Moonshot's real
 // step toward a graphical interface, not just serial logs -- text mode
-// (vga.c0) is now the fallback for when this isn't available, not the
+// (vga.c0) is now the fallback for when this is not available, not the
 // primary path.
 
 // Multiboot framebuffer info -- populated by fb_probe() (called from
@@ -44,7 +44,7 @@ int FONT_H = 8;
 int fb_cursor_row = -1;
 int fb_cursor_col = -1;
 // Colors, built once in knekt.c0's main() via fb_rgb() once the real
-// channel positions are known -- can't be compile-time constants like
+// channel positions are known -- cannot be compile-time constants like
 // VGA_DEFAULT_ATTR was, since they depend on what GRUB actually granted.
 int FB_FG = 0;
 int FB_BG = 0;
@@ -59,7 +59,7 @@ int FB_BG = 0;
 // type 1 (direct RGB color) at 32bpp -- the one combination fb_rgb/
 // fb_put_pixel below actually handle; anything else (indexed/palette
 // color, a different bpp) leaves pixel graphics off and VGA text mode
-// untouched, a graceful "didn't get what we wanted" fallback rather than
+// untouched, a graceful "did not get what we wanted" fallback rather than
 // writing pixels with wrong assumptions. Field offsets (88 addr/96 pitch/
 // 100 width/104 height/108 bpp/109 type/110-115 the RGB field positions)
 // per the Multiboot1 info struct layout -- cross-checked against jenna.c0's
@@ -153,14 +153,14 @@ int fb_rgb(int r, int g, int b) {
 // paging_init identity-maps by default (real VBE framebuffers sit at a
 // high physical address; QEMU granted ~4GB here), so without this every
 // pixel write would fault. Rounds the range to whole 4KB pages (fb_addr
-// itself is page-aligned in practice, but this doesn't assume that).
+// itself is page-aligned in practice, but this does not assume that).
 // Reuses map_page() exactly as paging_init's own identity-map loop does --
 // an identity map (virt == phys) is the simplest correct choice for MMIO
 // that nothing else needs a different virtual address for. Deliberately
 // NOT marked cache-disabled (a real driver would want that for MMIO, to
 // avoid the CPU caching stale framebuffer reads/delaying writes) -- c0 has
 // no bitwise ops to build a richer entry flag cheaply, and QEMU's
-// emulation doesn't make caching visibly wrong here; a documented
+// emulation does not make caching visibly wrong here; a documented
 // simplification, not an oversight, revisit if it ever causes real tearing.
 void fb_map() {
     int start = (fb_addr / 4096) * 4096;
@@ -183,14 +183,30 @@ void fb_put_pixel(int x, int y, int color) {
     return;
 }
 
+// Reads one pixel back. The framebuffer is readable memory, so this is just
+// the mirror of fb_put_pixel -- built for klick, which has to save whatever
+// is under the mouse pointer so it can put it back when the pointer moves.
+// Same no-bounds-check contract as fb_put_pixel: klick clamps first.
+int fb_get_pixel(int x, int y) {
+    return load8(fb_addr + y * fb_pitch + x * 4)
+        + load8(fb_addr + y * fb_pitch + x * 4 + 1) * 256
+        + load8(fb_addr + y * fb_pitch + x * 4 + 2) * 65536
+        + load8(fb_addr + y * fb_pitch + x * 4 + 3) * 16777216;
+}
+
 // Fills the axis-aligned rectangle [x, x+w) x [y, y+h) with `color`. Unlike
 // fb_put_pixel this CLAMPS to the framebuffer bounds, so a caller can pass a
 // rect that runs off any edge (or covers the whole screen) without faulting
 // -- the point of having a real primitive rather than open-coding pixel
 // loops per feature. Row-by-row via fb_put_pixel; no load64/store64 block
-// write like fb_scroll's, since the panic/UI paths that use this aren't
+// write like fb_scroll's, since the panic/UI paths that use this are not
 // megabyte-scale and clarity wins here.
 void fb_fill_rect(int x, int y, int w, int h, int color) {
+    // Lift klick's pointer out of the way first: it caches the pixels it
+    // covers, and painting over them without lifting either erases the
+    // pointer or leaves it restoring stale pixels later. No-op until klick
+    // is up, and re-entrant (see klick_lift's depth counter).
+    klick_lift();
     int x0 = x;
     int y0 = y;
     int x1 = x + w;
@@ -208,6 +224,7 @@ void fb_fill_rect(int x, int y, int w, int h, int color) {
         }
         yy = yy + 1;
     }
+    klick_drop();
     return;
 }
 
@@ -265,7 +282,7 @@ void fb_draw_rect(int x, int y, int w, int h, int color) {
 // Lowercase glyphs sit on the same row-6 baseline as uppercase, with a
 // ~5px x-height (rows 2-6), ascenders reaching row 0 (b/d/f/h/i/j/k/l/t)
 // and descenders reaching row 7 (g/j/p/q/y). Extend when something real
-// needs wider coverage, same "don't pre-build" discipline as everywhere
+// needs wider coverage, same "do not pre-build" discipline as everywhere
 // else in this codebase. Unmapped characters (including
 // space) return 0, an all-blank glyph -- correct for space, a reasonable
 // fallback for anything else.
@@ -484,6 +501,9 @@ int font_lo(int ch) {
 // overwrites whatever was there before -- needed for both scrolling and
 // simply typing over old content.
 void fb_draw_char(int x, int y, int ch, int fg, int bg) {
+    // Same reason as fb_fill_rect: lift klick's pointer before painting a
+    // glyph over the region it is caching.
+    klick_lift();
     int hi = font_hi(ch);
     int v = font_lo(ch);
     int row = 7;
@@ -503,6 +523,7 @@ void fb_draw_char(int x, int y, int ch, int fg, int bg) {
         }
         row = row - 1;
     }
+    klick_drop();
     return;
 }
 
@@ -531,7 +552,7 @@ void fb_clear(int bg) {
 // underline at the bottom of one character cell -- the pixel-graphics
 // cursor glyph. An underline rather than a solid block: matches VGA text
 // mode's own default hardware cursor shape (a few scanlines at the bottom
-// of the cell, see vga_move_cursor), and doesn't visually clash with the
+// of the cell, see vga_move_cursor), and does not visually clash with the
 // character about to be drawn into that cell next.
 void fb_draw_cursor(int row, int col, int color) {
     int x = col * FONT_W;
@@ -612,7 +633,7 @@ void fb_putc(int ch, int fg, int bg) {
 }
 
 // Erases the previous character -- same deliberate simplification as
-// vga_backspace (only within the current row, doesn't unwind a previous
+// vga_backspace (only within the current row, does not unwind a previous
 // newline/wrap). Moves the cursor glyph back along with it.
 void fb_backspace(int fg, int bg) {
     if (fb_col > 0) {

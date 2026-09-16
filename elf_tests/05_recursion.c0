@@ -1,0 +1,16 @@
+// expect: 41
+// Recursion: a real test of prologue/epilogue and stack-local handling,
+// since every frame has to keep its own copy of n across the nested call.
+int fib(int n) {
+    if (n < 2) { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+int fact(int n) {
+    if (n <= 1) { return 1; }
+    return n * fact(n - 1);
+}
+int main() {
+    if (fib(10) != 55) { return 201; }
+    if (fact(5) != 120) { return 202; }
+    return 41;
+}

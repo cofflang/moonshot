@@ -1,0 +1,491 @@
+// klick.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// klick -- the PS/2 mouse driver: the pointer, its position and buttons.
+//
+// The mouse hangs off the same 8042 controller as the keyboard, on the
+// auxiliary port. That shared controller is the whole reason this file is
+// fiddlier than its size suggests: every byte sent to the mouse goes out
+// through the KEYBOARD's data port (0x60), prefixed by a command telling the
+// controller "the next byte is for the aux device" (0xD4), and every byte
+// read back arrives on that same 0x60 -- so keyboard and mouse bytes are told
+// apart only by a bit in the status register, and only at the moment the
+// interrupt fires.
+//
+// Data arrives as 3-byte packets on IRQ12 (vector 44), which is on the SLAVE
+// PIC. Two consequences that are easy to get wrong and silent when you do:
+// the slave's cascade line (IRQ2 on the master) has to be unmasked as well as
+// IRQ12 itself, or no interrupt is ever delivered; and the handler owes an
+// EOI to BOTH PICs, or exactly one packet arrives and the mouse then goes
+// quiet forever.
+//
+// Packet layout (the standard 3-byte PS/2 stream, no scroll wheel):
+//   byte 0: flags -- bit 0 left button, bit 1 right, bit 2 middle,
+//           bit 3 always 1, bit 4 X sign, bit 5 Y sign,
+//           bits 6/7 X and Y overflow
+//   byte 1: X movement, a signed 9-bit value whose sign bit lives in byte 0
+//   byte 2: Y movement, same, and positive means UP -- the opposite of the
+//           framebuffer's y axis, so it is subtracted rather than added.
+//
+// The pointer is drawn by klick itself rather than by punkt or kakel, and it
+// saves the pixels underneath before drawing so it can put them back when it
+// moves. That keeps it independent of what it happens to be floating over: a
+// window's text, a tavla's graphics, or the status bar. It also means the
+// pointer must be lifted before anything else redraws that region -- see
+// klick_hide/klick_show.
+
+// Set to 1 once klick_init has completed successfully. Everything below is a
+// no-op until then, the same way kakel_active gates the windowing layer.
+int klick_active = 0;
+
+// Pointer position, in pixels, clamped to the framebuffer.
+int klick_x = 0;
+int klick_y = 0;
+
+// Button state, one flag each, from the most recent packet's flag byte.
+int klick_left = 0;
+int klick_right = 0;
+int klick_middle = 0;
+
+// Packet assembly state: which byte of the 3-byte packet comes next, and the
+// two bytes already collected.
+int klick_phase = 0;
+int klick_b0 = 0;
+int klick_b1 = 0;
+
+// Total packets decoded -- a liveness counter, printed by the `mouse` shell
+// command and checked by verify_klick.sh. Proves the IRQ is really arriving
+// rather than the pointer having been moved by something else.
+int klick_packets = 0;
+
+// The pointer is a KLICK_SIZE x KLICK_SIZE block. Small enough that saving
+// what is underneath costs a handful of bytes and redrawing is cheap enough
+// to do inside an interrupt handler.
+int KLICK_SIZE = 6;
+
+// Saved pixels under the pointer (KLICK_SIZE*KLICK_SIZE ints, kmalloc'd), and
+// where they were saved from. klick_saved_at is -1 when nothing is currently
+// saved, i.e. the pointer is not on screen.
+int klick_save_buf = 0;
+int klick_saved_x = 0;
+int klick_saved_y = 0;
+int klick_saved_at = -1;
+
+int KLICK_COLOR = 0;
+int KLICK_EDGE = 0;
+
+// --- 8042 controller plumbing ---------------------------------------------
+
+// Waits until the controller is ready to be WRITTEN to (status bit 1, the
+// input-buffer-full flag, clear). Bounded rather than a bare `while`: a
+// controller that never clears the flag -- no PS/2 hardware at all, which is
+// possible on real machines even though QEMU always has one -- would
+// otherwise hang the boot forever.
+int klick_wait_write() {
+    int spin = 0;
+    while (spin < 100000) {
+        if ((inb(0x64) / 2) - ((inb(0x64) / 2) / 2) * 2 == 0) { return 1; }
+        spin = spin + 1;
+    }
+    return 0;
+}
+
+// Waits until there is a byte to READ (status bit 0, output-buffer-full, set).
+// Same bounded-spin reasoning.
+int klick_wait_read() {
+    int spin = 0;
+    while (spin < 100000) {
+        if (inb(0x64) - (inb(0x64) / 2) * 2 == 1) { return 1; }
+        spin = spin + 1;
+    }
+    return 0;
+}
+
+// Sends one byte to the MOUSE (not the keyboard): 0xD4 tells the controller
+// to forward the next data byte to the aux port. Returns the mouse's
+// acknowledgement byte (0xFA on success), or -1 if the controller never
+// became ready.
+int klick_write(int b) {
+    if (klick_wait_write() == 0) { return 0 - 1; }
+    outb(0x64, 0xD4);
+    if (klick_wait_write() == 0) { return 0 - 1; }
+    outb(0x60, b);
+    if (klick_wait_read() == 0) { return 0 - 1; }
+    return inb(0x60);
+}
+
+// --- pointer rendering ----------------------------------------------------
+
+// Puts back whatever was under the pointer. Safe to call when nothing is
+// saved. Every path that erases the pointer goes through here rather than
+// painting background over it, so the pointer never leaves a hole in the
+// window it was floating above.
+void klick_hide() {
+    if (klick_active != 1 || klick_saved_at < 0) { return; }
+    int row = 0;
+    while (row < KLICK_SIZE) {
+        int col = 0;
+        while (col < KLICK_SIZE) {
+            int x = klick_saved_x + col;
+            int y = klick_saved_y + row;
+            if (x < fb_width && y < fb_height) {
+                fb_put_pixel(x, y, load64(klick_save_buf + (row * KLICK_SIZE + col) * 8));
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    klick_saved_at = 0 - 1;
+    return;
+}
+
+// Saves the pixels at the current position and draws the pointer over them.
+// The pointer is a solid block with a darker edge on its right and bottom, so
+// it stays visible against both a light and a dark background without needing
+// to sample what is underneath.
+void klick_show() {
+    if (klick_active != 1) { return; }
+    if (klick_saved_at >= 0) { return; }
+    klick_saved_x = klick_x;
+    klick_saved_y = klick_y;
+    int row = 0;
+    while (row < KLICK_SIZE) {
+        int col = 0;
+        while (col < KLICK_SIZE) {
+            int x = klick_saved_x + col;
+            int y = klick_saved_y + row;
+            if (x < fb_width && y < fb_height) {
+                store64(klick_save_buf + (row * KLICK_SIZE + col) * 8,
+                        fb_get_pixel(x, y));
+                int c = KLICK_COLOR;
+                if (col == KLICK_SIZE - 1 || row == KLICK_SIZE - 1) { c = KLICK_EDGE; }
+                fb_put_pixel(x, y, c);
+            }
+            col = col + 1;
+        }
+        row = row + 1;
+    }
+    klick_saved_at = 1;
+    return;
+}
+
+// --- lifting the pointer for other drawing --------------------------------
+//
+// The pointer floats above everything, and it keeps a copy of the pixels it
+// covers so it can put them back. That copy goes stale the instant anything
+// else paints that region: the pointer is either painted over and gone, or
+// -- worse -- it later restores pixels that no longer belong there.
+//
+// So every drawing primitive that paints an area lifts the pointer first and
+// drops it again afterwards. Doing it at the rectangle/glyph level rather
+// than per pixel keeps the cost proportional to the operation: a 36-pixel
+// save/restore around a glyph or a filled rect, not around every pixel of a
+// blit.
+//
+// The depth counter makes nesting safe. klick_hide/klick_show are each
+// individually idempotent, so a nested pair would otherwise redraw the
+// pointer in the middle of the outer operation -- visible as the pointer
+// being painted over anyway. Only the outermost lift/drop does the work.
+int klick_lift_depth = 0;
+
+void klick_lift() {
+    if (klick_active != 1) { return; }
+    if (klick_lift_depth == 0) { klick_hide(); }
+    klick_lift_depth = klick_lift_depth + 1;
+    return;
+}
+
+void klick_drop() {
+    if (klick_active != 1) { return; }
+    klick_lift_depth = klick_lift_depth - 1;
+    if (klick_lift_depth <= 0) {
+        klick_lift_depth = 0;
+        klick_show();
+    }
+    return;
+}
+
+// Moves the pointer to (x, y), clamped to the screen: lift, move, redraw.
+void klick_move_to(int x, int y) {
+    if (klick_active != 1) { return; }
+    if (x < 0) { x = 0; }
+    if (y < 0) { y = 0; }
+    if (x > fb_width - KLICK_SIZE) { x = fb_width - KLICK_SIZE; }
+    if (y > fb_height - KLICK_SIZE) { y = fb_height - KLICK_SIZE; }
+    if (x == klick_x && y == klick_y && klick_saved_at >= 0) { return; }
+    klick_hide();
+    klick_x = x;
+    klick_y = y;
+    klick_show();
+    return;
+}
+
+// --- the event ring -------------------------------------------------------
+//
+// Mouse events are queued here and drained OUTSIDE the mouse interrupt, the
+// same way keyboard.c0's key ring decouples the keyboard ISR from whoever
+// consumes keystrokes.
+//
+// This is not tidiness. pensel used to be called straight from klick_handler
+// and painted a cell -- several filled rects, each lifting and restoring the
+// pointer's backing store -- while still inside the interrupt. The 8042 kept
+// delivering bytes throughout, and the result was a pointer whose drawn
+// position desynced from its logical one and clicks that landed on the wrong
+// thing. Found by locating the pointer in a screendump: it was still at its
+// boot position while klick's own coordinates had moved on.
+//
+// The handler now only decodes and enqueues. Draining happens on the timer
+// tick, in kernel context, where taking a while is harmless.
+//
+// Each event packs position and buttons into one int: the framebuffer is
+// 1024x768, so x and y fit in ten bits each with the three button bits below
+// them. Packed with multiplication rather than shifts, as everywhere else in
+// this codebase.
+int KLICK_EV_CAP = 64;
+int klick_ev_buf = 0;
+int klick_ev_head = 0;
+int klick_ev_tail = 0;
+int klick_ev_count = 0;
+
+void klick_ev_push(int x, int y, int buttons) {
+    if (klick_ev_buf == 0) { return; }
+    // Dropping the OLDEST event when full is wrong for a mouse: the newest
+    // position is the one that matters, and a full ring means the consumer is
+    // behind. Drop the new one instead -- a stroke loses a sample, which is
+    // invisible, rather than jumping.
+    if (klick_ev_count >= KLICK_EV_CAP) { return; }
+    store64(klick_ev_buf + klick_ev_tail * 8, (x * 1024 + y) * 8 + buttons);
+    klick_ev_tail = klick_ev_tail + 1;
+    if (klick_ev_tail >= KLICK_EV_CAP) { klick_ev_tail = 0; }
+    klick_ev_count = klick_ev_count + 1;
+    return;
+}
+
+// Returns a packed event, or -1 when empty.
+int klick_ev_poll() {
+    if (klick_ev_count <= 0) { return 0 - 1; }
+    int ev = load64(klick_ev_buf + klick_ev_head * 8);
+    klick_ev_head = klick_ev_head + 1;
+    if (klick_ev_head >= KLICK_EV_CAP) { klick_ev_head = 0; }
+    klick_ev_count = klick_ev_count - 1;
+    return ev;
+}
+
+// --- interrupt handling ---------------------------------------------------
+
+// Dispatched via int_dispatch(44) on every byte the mouse sends. One byte per
+// interrupt, so a packet takes three.
+//
+// The EOI at the end goes to BOTH PICs: IRQ12 is on the slave, and the slave
+// only regains the ability to deliver interrupts once IT is acknowledged,
+// while the master needs its own acknowledgement for the cascade line. Send
+// only the master's and exactly one packet arrives, then silence.
+void klick_handler() {
+    int status = inb(0x64);
+    // Bit 5 of the status register distinguishes an aux-device byte from a
+    // keyboard byte -- both arrive on port 0x60, and consuming a keyboard
+    // byte here would silently eat keystrokes.
+    int from_aux = (status / 32) - ((status / 32) / 2) * 2;
+    if (from_aux != 1) {
+        outb(0xA0, 0x20);
+        outb(0x20, 0x20);
+        return;
+    }
+    int b = inb(0x60);
+
+    if (klick_phase == 0) {
+        // Bit 3 of the first byte is always 1. If it is not, the stream is
+        // out of sync (a dropped byte, or a byte that arrived before the
+        // enable completed) -- drop it and wait for a byte that looks like a
+        // real packet start rather than decoding garbage into pointer jumps.
+        int always = (b / 8) - ((b / 8) / 2) * 2;
+        if (always != 1) {
+            outb(0xA0, 0x20);
+            outb(0x20, 0x20);
+            return;
+        }
+        klick_b0 = b;
+        klick_phase = 1;
+    } else if (klick_phase == 1) {
+        klick_b1 = b;
+        klick_phase = 2;
+    } else {
+        int flags = klick_b0;
+        int dx = klick_b1;
+        int dy = b;
+        klick_phase = 0;
+        klick_packets = klick_packets + 1;
+
+        int was_l = klick_left;
+        int was_m = klick_middle;
+        int was_r = klick_right;
+        klick_left = flags - (flags / 2) * 2;
+        klick_right = (flags / 2) - ((flags / 2) / 2) * 2;
+        klick_middle = (flags / 4) - ((flags / 4) / 2) * 2;
+        // Only on a CHANGE: buttons are re-reported in every packet, so
+        // logging unconditionally would put a line on serial for every
+        // pixel of movement. On change it stays bounded, and it is the
+        // only way to see button state from outside the running system --
+        // the `mouse` command prints into a window, not to serial.
+        if (klick_left != was_l || klick_middle != was_m || klick_right != was_r) {
+            serial_print("[klick] buttons L");
+            serial_print_int(klick_left);
+            serial_print(" M");
+            serial_print_int(klick_middle);
+            serial_print(" R");
+            serial_print_int(klick_right);
+            serial_print("\n");
+        }
+
+        // Sign-extend: the movement bytes are the low 8 bits of a signed
+        // 9-bit value whose sign bit sits in the flag byte.
+        int xsign = (flags / 16) - ((flags / 16) / 2) * 2;
+        int ysign = (flags / 32) - ((flags / 32) / 2) * 2;
+        if (xsign == 1) { dx = dx - 256; }
+        if (ysign == 1) { dy = dy - 256; }
+
+        // Overflow bits mean the counters saturated and the deltas are
+        // meaningless; treat the packet as no movement rather than lurching.
+        //
+        // Clamping to a large step in the sign's direction was tried instead,
+        // on the theory that a fast flick should still travel. It was REVERTED
+        // after the mouse regressed on real hardware -- this discard is the
+        // behaviour that works. Revisit only with a real mouse to test
+        // against, not from reasoning about the spec.
+        int xover = (flags / 64) - ((flags / 64) / 2) * 2;
+        int yover = (flags / 128) - ((flags / 128) / 2) * 2;
+        if (xover == 1 || yover == 1) {
+            dx = 0;
+            dy = 0;
+        }
+
+        // The mouse's y axis points up, the framebuffer's points down.
+        klick_move_to(klick_x + dx, klick_y - dy);
+
+        // Queue the event rather than acting on it here. Everything a
+        // consumer might do -- pensel paints a cell and redraws swatches --
+        // is far too much work for an interrupt handler that has more PS/2
+        // bytes arriving behind it. Drained by klick_drain on the timer tick.
+        if (klick_left == 1 || klick_right == 1) {
+            klick_ev_push(klick_x, klick_y, klick_left + klick_right * 2);
+        }
+    }
+
+    outb(0xA0, 0x20);
+    outb(0x20, 0x20);
+    return;
+}
+
+// --- init -----------------------------------------------------------------
+
+// Brings the aux port up and starts the packet stream. Called from
+// kernel_post_init AFTER the framebuffer is up, since the pointer is drawn
+// the moment the first packet arrives.
+//
+// Returns 1 on success, 0 if the controller never answered -- in which case
+// klick_active stays 0 and every entry point above is inert, exactly like a
+// boot with no usable framebuffer leaves kakel_active at 0.
+int klick_init() {
+    if (fb_available != 1) {
+        serial_print("[klick] no framebuffer, mouse disabled\n");
+        return 0;
+    }
+
+    // Enable the auxiliary device.
+    if (klick_wait_write() == 0) {
+        serial_print("[klick] controller not ready, mouse disabled\n");
+        return 0;
+    }
+    outb(0x64, 0xA8);
+
+    // Read the controller configuration byte, set bit 1 (aux interrupt
+    // enable) and clear bit 5 (aux clock disable), then write it back.
+    // Without the interrupt-enable bit the mouse happily produces packets
+    // that nothing is ever told about.
+    if (klick_wait_write() == 0) { return 0; }
+    outb(0x64, 0x20);
+    if (klick_wait_read() == 0) { return 0; }
+    int cfg = inb(0x60);
+    int bit1 = (cfg / 2) - ((cfg / 2) / 2) * 2;
+    if (bit1 == 0) { cfg = cfg + 2; }
+    int bit5 = (cfg / 32) - ((cfg / 32) / 2) * 2;
+    if (bit5 == 1) { cfg = cfg - 32; }
+    if (klick_wait_write() == 0) { return 0; }
+    outb(0x64, 0x60);
+    if (klick_wait_write() == 0) { return 0; }
+    outb(0x60, cfg);
+
+    // Set defaults, then enable data reporting. Both should answer 0xFA.
+    int ack1 = klick_write(0xF6);
+    int ack2 = klick_write(0xF4);
+    serial_print("[klick] setdefaults ack=");
+    serial_print_int(ack1);
+    serial_print(" enable ack=");
+    serial_print_int(ack2);
+    serial_print("\n");
+    if (ack2 != 0xFA) {
+        serial_print("[klick] mouse did not acknowledge, disabled\n");
+        return 0;
+    }
+
+    klick_ev_buf = kmalloc(KLICK_EV_CAP * 8);
+    klick_ev_head = 0;
+    klick_ev_tail = 0;
+    klick_ev_count = 0;
+    klick_save_buf = kmalloc(KLICK_SIZE * KLICK_SIZE * 8);
+    if (klick_save_buf == 0) {
+        serial_print("[klick] no memory for pointer backing store\n");
+        return 0;
+    }
+    KLICK_COLOR = fb_rgb(255, 255, 255);
+    KLICK_EDGE = fb_rgb(40, 40, 40);
+
+    // Start in the middle of the screen.
+    klick_x = fb_width / 2;
+    klick_y = fb_height / 2;
+
+    // Unmask IRQ12 (slave bit 4) and IRQ2 (master bit 2, the cascade the
+    // slave is wired through). pic_remap left everything but IRQ0/IRQ1
+    // masked; forgetting the cascade here is the classic way to get a mouse
+    // that is fully configured and never interrupts.
+    outb(0x21, 0xF8);  // master: IRQ0, IRQ1, IRQ2 unmasked
+    outb(0xA1, 0xEF);  // slave: IRQ12 unmasked
+
+    klick_active = 1;
+    klick_show();
+    serial_print("[klick] mouse ready at ");
+    serial_print_int(klick_x);
+    serial_print(",");
+    serial_print_int(klick_y);
+    serial_print("\n");
+    return 1;
+}
+
+// Drains queued mouse events and hands them to whoever is listening. Called
+// from timer_tick, i.e. still an interrupt but a DIFFERENT one: the timer has
+// no byte stream behind it that goes wrong when a handler runs long, which is
+// the whole reason this is not done in klick_handler.
+//
+// pensel is the only consumer so far, and it ignores anything outside its own
+// canvas, so this stays a single call rather than a dispatch table.
+void klick_drain() {
+    if (klick_active != 1) { return; }
+    int ev = klick_ev_poll();
+    while (ev >= 0) {
+        int buttons = ev - (ev / 8) * 8;
+        int rest = ev / 8;
+        int y = rest - (rest / 1024) * 1024;
+        int x = rest / 1024;
+        int left = buttons - (buttons / 2) * 2;
+        int right = (buttons / 2) - ((buttons / 2) / 2) * 2;
+        pensel_mouse(x, y, left, right);
+        ev = klick_ev_poll();
+    }
+    return;
+}

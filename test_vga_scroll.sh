@@ -20,7 +20,7 @@
 # puts the hardware in that mode regardless of what fb_available says
 # afterward at the c0 level. 0xB8000 only holds real VGA text-mode content
 # when the hardware is actually IN text mode -- forcing the c0-side
-# variable doesn't undo GRUB's own mode-setting. Confirmed by temporarily
+# variable does not undo GRUB's own mode-setting. Confirmed by temporarily
 # zeroing MB_FLAGS (no video mode requested at all): GRUB then reports a
 # type=2 (EGA text) "framebuffer", fb_probe correctly rejects it as
 # unsupported and falls back to VGA on its own, and the readback came back

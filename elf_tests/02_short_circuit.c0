@@ -1,0 +1,37 @@
+// expect: 31
+// && and || in every position they can appear, including cases where the
+// short circuit itself has to hold. && / || were miscompiled in --elf mode,
+// and since every ring-3 binary Moonshot runs is built through that path, the
+// demo that found it simply rendered nothing.
+//
+// The short-circuit half is checked with a counter in allocated memory rather
+// than something like 1/0: a divide-by-zero in ring 3 raises #DE, which
+// reaches the panic handler and takes the whole machine down -- so a
+// regression would abort every remaining test in the boot instead of
+// reporting a wrong exit code for this one.
+int bump(int p) {
+    store64(p, load64(p) + 1);
+    return 1;
+}
+int main() {
+    int c = alloc(8);
+    if (c == 0) { return 210; }
+    store64(c, 0);
+
+    int t = 0;
+    if (1 == 1 && 2 == 2) { t = t + 1; }
+    if (1 == 1 && 2 == 3) { t = t + 100; }
+    if (1 == 2 || 3 == 3) { t = t + 2; }
+    if (1 == 2 || 3 == 4) { t = t + 100; }
+    if (bump(c) == 1 && bump(c) == 1) { t = t + 4; }
+    if (load64(c) != 2) { return 211; }
+
+    // false && X must not evaluate X; true || X must not evaluate X.
+    store64(c, 0);
+    if (0 == 1 && bump(c) == 1) { t = t + 100; }
+    if (1 == 1 || bump(c) == 1) { t = t + 8; }
+    if (load64(c) != 0) { return 212; }
+
+    if ((1 == 1 && 2 == 2) || (3 == 4 && 5 == 5)) { t = t + 16; }
+    return t;
+}

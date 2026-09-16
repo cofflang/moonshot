@@ -7,7 +7,7 @@
 // License version 3 or (at your option) any later version, WITHOUT ANY
 // WARRANTY; see the LICENSE file for the full text.
 // skrift.c0 — text editor for Moonshot, running in a kakel window.
-// Named "skrift" (Swedish for "writing/script"), chosen by the user.
+// Named "skrift" (Swedish for "writing/script").
 // Architecture: runs directly in the keyboard IRQ handler (like skalman v1),
 // not as a separate scheduled task. Buffer ops are fast; file I/O only at
 // launch (shell task context) and quit (IRQ context — jakel_write for a small
@@ -215,7 +215,7 @@ int skrift_prev_word_start(int cursor) {
            && load8(skrift_buf + p) != '\n') {
         p = p - 1;
     }
-    // If we're at a space or newline (from the outer loop), step forward.
+    // If we are at a space or newline (from the outer loop), step forward.
     // Also handle p=0 which might be a word char.
     if (load8(skrift_buf + p) == ' ' || load8(skrift_buf + p) == '\n') {
         p = p + 1;
@@ -1747,7 +1747,7 @@ void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int 
                     skrift_insert(load8(skrift_yank_buf + yi));
                     yi = yi + 1;
                 }
-                // If yanked text doesn't end with newline, add one.
+                // If yanked text does not end with newline, add one.
                 if (skrift_yank_len > 0
                     && load8(skrift_yank_buf + skrift_yank_len - 1) != '\n') {
                     skrift_insert('\n');
@@ -1953,6 +1953,32 @@ void skrift_start(int win, int filename_str) {
 
 // Quit the editor: write the buffer back to jakel, free memory, restore the
 // shell prompt. Called from skrift_handle_key (keyboard IRQ context).
+// Same as pensel_window_closed, one editor over: kakel_close_id calls this
+// before freeing a window so skrift does not keep editing an id that is about
+// to belong to somebody else. The file is saved, since the user closing a
+// window is not the user discarding their edits.
+void skrift_window_closed(int win) {
+    if (skrift_active != 1 || skrift_win != win) { return; }
+    if (skrift_filename != 0 && skrift_modified == 1) {
+        int cwd = 0;
+        if (kakel_active == 1) { cwd = load64(sk_cwd_base + skrift_win * 8); }
+        int fid = jakel_lookup(cwd, skrift_filename);
+        if (fid < 0) { fid = jakel_make_file(cwd, skrift_filename); }
+        if (fid >= 0) {
+            jakel_write(fid, 0, skrift_buf, skrift_size);
+            store64(jakel_size_base + fid * 8, skrift_size);
+        }
+    }
+    if (skrift_buf != 0) { kfree(skrift_buf); skrift_buf = 0; }
+    if (skrift_filename != 0) { kfree(skrift_filename); skrift_filename = 0; }
+    skrift_active = 0;
+    skrift_modified = 0;
+    skrift_size = 0;
+    skrift_cursor = 0;
+    serial_print("[skrift] window closed, editor torn down\n");
+    return;
+}
+
 void skrift_quit() {
     // Write the buffer to jakel.
     if (skrift_filename != 0 && skrift_modified == 1) {

@@ -326,7 +326,6 @@ void jakel_list(int id) {
                 sk_print_int(frac);
                 sk_print(" MB)");
             }
-            sk_print(")");
         }
         sk_print("  #");
         sk_print_int(load64(jakel_created_base + cid * 8));
@@ -369,6 +368,32 @@ void jakel_where(int id) {
         }
     }
     return;
+}
+
+// On-disk superblock (sector 0, 48 bytes). `magic` is 8 raw bytes ("JAKELBK\0"),
+// checked/written byte-by-byte (jakel_verify_magic, jakel_sync) rather than as
+// a single int field, so it is still just store8/load8 below despite being
+// named here for the record's overall shape.
+layout Superblock {
+    int magic;
+    int version;
+    int node_count;
+    int name_max;
+    int first_data_sector;
+    int total_data_sectors;
+}
+
+// On-disk node-table entry (32 bytes named + a variable-length inline name
+// buffer immediately after, up to JAKEL_NAME_LEN bytes -- the 64-byte
+// per-entry stride accounts for that trailing name space, so it stays a
+// literal rather than sizeof(NodeEntry) (which would only cover the 4 named
+// fields, 32 bytes). `fsize`, not `size` -- HeapBlock already claims `size`
+// for something else entirely (payload byte count, not a file's byte count).
+layout NodeEntry {
+    int type;
+    int parent;
+    int fsize;
+    int name_len;
 }
 
 // Verify the 8-byte magic at `buf` matches "JAKELBK\0".
@@ -426,12 +451,12 @@ void jakel_load() {
     int i = 0;
     while (i < JAKEL_MAX_NODES) {
         int off = i * 64;
-        int type = load64(nt + off);
+        int type = (nt + off).type;
         i = i + 1;
         if (type == JAKEL_TYPE_FREE) { continue; }
-        int parent = load64(nt + off + 8);
-        int sz     = load64(nt + off + 16);
-        int nl     = load64(nt + off + 24);  // name_len
+        int parent = (nt + off).parent;
+        int sz     = (nt + off).fsize;
+        int nl     = (nt + off).name_len;
         // Copy the inline name into a heap buffer.
         int name_buf = kmalloc(JAKEL_NAME_LEN);
         int j = 0;
@@ -516,10 +541,10 @@ void jakel_sync() {
     store8(sb + 0, 0x4A); store8(sb + 1, 0x41); store8(sb + 2, 0x4B);
     store8(sb + 3, 0x45); store8(sb + 4, 0x4C); store8(sb + 5, 0x42);
     store8(sb + 6, 0x4B); store8(sb + 7, 0x00);
-    store64(sb + 8,  1);                // version
-    store64(sb + 16, JAKEL_MAX_NODES);  // node_count
-    store64(sb + 24, JAKEL_NAME_LEN);   // name_max
-    store64(sb + 32, 5);                // first_data_sector
+    sb.version = 1;
+    sb.node_count = JAKEL_MAX_NODES;
+    sb.name_max = JAKEL_NAME_LEN;
+    sb.first_data_sector = 5;
     // total_data_sectors filled below
     // --- Build node table (sectors 1-4, 2048 bytes) ---
     int nt = kmalloc(2048);
@@ -531,9 +556,9 @@ void jakel_sync() {
     while (i < JAKEL_MAX_NODES) {
         int type = load64(jakel_type_base + i * 8);
         int off = i * 64;
-        store64(nt + off,      type);
-        store64(nt + off + 8,  load64(jakel_parent_base + i * 8));
-        store64(nt + off + 16, load64(jakel_size_base   + i * 8));
+        (nt + off).type = type;
+        (nt + off).parent = load64(jakel_parent_base + i * 8);
+        (nt + off).fsize = load64(jakel_size_base + i * 8);
         int name = load64(jakel_name_base + i * 8);
         if (name != 0) {
             int nl = 0;
@@ -541,7 +566,7 @@ void jakel_sync() {
                 store8(nt + off + 32 + nl, load8(name + nl));
                 nl = nl + 1;
             }
-            store64(nt + off + 24, nl);  // name_len
+            (nt + off).name_len = nl;
         }
         if (type == JAKEL_TYPE_FILE) {
             int sz = load64(jakel_size_base + i * 8);
@@ -550,7 +575,7 @@ void jakel_sync() {
         node_count = node_count + 1;
         i = i + 1;
     }
-    store64(sb + 40, data_secs);  // total_data_sectors
+    sb.total_data_sectors = data_secs;
     // Write superblock
     ata_write(0, sb);
     kfree(sb);
@@ -658,7 +683,7 @@ void jakel_init() {
         if (demo >= 0) {
             int b = kscratch_start;
             int p = 0;
-            // Use distinctive values (777, 888, 999) that won't match earlier
+            // Use distinctive values (777, 888, 999) that will not match earlier
             // test assertions — avoids false positives in the test script.
             store8(b+p, 'p'); p=p+1; store8(b+p, 'r'); p=p+1;
             store8(b+p, 'i'); p=p+1; store8(b+p, 'n'); p=p+1;
@@ -682,6 +707,189 @@ void jakel_init() {
             jakel_write(demo, 0, b, p);
             store64(jakel_size_base + demo * 8, p);
         }
+    }
+
+    // --- test fixtures -----------------------------------------------------
+    //
+    // Everything below is seeded on EVERY boot, not just the first one, and
+    // that placement is the whole point.
+    //
+    // All of this used to sit inside the "no filesystem found on disk" branch
+    // that just closed above. Each fixture carefully removes any stale copy
+    // before writing itself -- logic added precisely because disk.img
+    // survives reboots and a rebuilt ELF was being silently ignored. But
+    // inside that branch it could never fire: if the branch runs there is no
+    // filesystem, so there is nothing stale; and if a filesystem loaded, the
+    // branch is skipped entirely and nothing is re-seeded at all. So a test
+    // that reused disk.img ran the PREVIOUS build's ring-3 binaries, and
+    // passing proved nothing about the code just compiled. Confirmed by
+    // booting on a persisted disk: "[jakel] loaded 14 nodes from disk" and
+    // not one "filesystem ready" line.
+    //
+    // Out here the remove-then-write is idempotent and actually does its job,
+    // so every boot gets the binaries this kernel was built with.
+    //
+    // demo.c0 deliberately stays behind, seeded once: it is a file the user
+    // can edit from the REPL, and re-seeding would silently discard that.
+    // These are fixtures nobody edits.
+    //
+    // They live in /test rather than the root directory. Thirteen files were
+    // being seeded into root, ten of them scaffolding, so `list` showed
+    // mostly noise. Root now holds what is actually worth running.
+    int tdir = jakel_lookup(0, "test");
+    if (tdir < 0) { tdir = jakel_mkdir(0, "test"); }
+    if (tdir >= 0) {
+
+        // A real ELF64 executable for the ELF loader (elf_load, syscall.c0)
+        // to prove itself against -- the same "demo file for testing" role
+        // demo.c0 plays for the REPL, but for run3/spawn3's file-loading
+        // path. elf_test_code() hand-builds the bytes (ELF header + one
+        // PT_LOAD program header + a tiny sys_debug_print/sys_exit body)
+        // directly into kscratch, mirroring ring3_test_code's flat-binary
+        // equivalent (syscall.c0).
+        int stale_hello = jakel_lookup(tdir, "hello.elf");
+        if (stale_hello >= 0) { jakel_remove(stale_hello); }
+        int hello_elf = jakel_make_file(tdir, "hello.elf");
+        if (hello_elf >= 0) {
+            int eb = elf_test_code();
+            jakel_write(hello_elf, 0, eb, ELF_TEST_LEN);
+            store64(jakel_size_base + hello_elf * 8, ELF_TEST_LEN);
+        }
+
+        // Seed a coff-compiled ELF executable — the first real program
+        // compiled by coff's new --elf mode (Moonshot syscall ABI) rather
+        // than the hand-built hello.elf above.  Same "proof the loader
+        // works" role, but this closes the full toolchain loop:
+        //   write c0 → coff --elf → spawn3 in a kakel window.
+        // The bytes below were generated by:
+        //   coff --elf hello_elf.c0 hello_elf.bin
+        // where hello_elf.c0 is:
+        //   int main() { print("hello from coff elf\n"); return 7; }
+        int stale_coff_hello = jakel_lookup(tdir, "coff_hello.elf");
+        if (stale_coff_hello >= 0) { jakel_remove(stale_coff_hello); }
+        int coff_hello = jakel_make_file(tdir, "coff_hello.elf");
+        if (coff_hello >= 0) {
+            int eb = kscratch_start;
+            int eb_p = 0;
+            store64(eb + eb_p, 0x00010102464c457f); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x0000000000000000); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x00000001003e0002); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x0000000080000078); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x0000000000000040); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x0000000000000000); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x0038004000000000); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x0000000000000001); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x0000000500000001); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x0000000000000000); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x0000000080000000); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x0000000080000000); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x00000000000000e1); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x00000000000000e1); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x0000000000001000); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0xb8c78900000009e8); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x4855050f00000000); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x6c6c656815ebe589); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x63206d6f7266206f); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x0a666c652066666f); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0xffffffe4058d4800); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x3c80c93148c38948); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x00000008840f000b); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0xffffffeee9c1ff48); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x01b8ce8948df8948); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x07b848050f000000); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0xe900000000000000); eb_p = eb_p + 8;
+            store64(eb + eb_p, 0x5dec894800000000); eb_p = eb_p + 8;
+            store8(eb + eb_p, 195); eb_p = eb_p + 1;
+            jakel_write(coff_hello, 0, eb, eb_p);
+            store64(jakel_size_base + coff_hello * 8, eb_p);
+        }
+
+        // A persisted heart_demo.elf from before that demo was removed would
+        // otherwise survive here forever -- disk.img outlives rebuilds, and
+        // nothing else deletes a file the kernel no longer seeds.
+        int stale_heart = jakel_lookup(tdir, "heart_demo.elf");
+        if (stale_heart >= 0) { jakel_remove(stale_heart); }
+
+        // Seed a coff-compiled test verifying layout + sizeof + alloc()
+        // (SYS_ALLOC) end to end in a real ring-3 --elf program -- see
+        // alloc_test_data.c0's own header comment.
+        int existing_alloc = jakel_lookup(tdir, "alloctest.elf");
+        if (existing_alloc >= 0) { jakel_remove(existing_alloc); }
+        int alloc_test = jakel_make_file(tdir, "alloctest.elf");
+        if (alloc_test >= 0) {
+            int asz = seed_alloc_test_size();
+            int aeb = kmalloc(asz);
+            if (aeb != 0) {
+                seed_alloc_test(aeb);
+                jakel_write(alloc_test, 0, aeb, asz);
+                kfree(aeb);
+            }
+        }
+
+        // Seed a coff-compiled test verifying ticks() (SYS_TICKS) end to
+        // end in a real ring-3 --elf program -- see ticks_test_data.c0's
+        // own header comment.
+        int existing_ticks = jakel_lookup(tdir, "tickstest.elf");
+        if (existing_ticks >= 0) { jakel_remove(existing_ticks); }
+        int ticks_test = jakel_make_file(tdir, "tickstest.elf");
+        if (ticks_test >= 0) {
+            int tsz = seed_ticks_test_size();
+            int teb = kmalloc(tsz);
+            if (teb != 0) {
+                seed_ticks_test(teb);
+                jakel_write(ticks_test, 0, teb, tsz);
+                kfree(teb);
+            }
+        }
+
+        // Seed Gnista's own first demo -- see gnista_demo_data.c0's header
+        // comment and code/gnista/gnista.c0.
+        int existing_gnista = jakel_lookup(0, "gnista.elf");
+        if (existing_gnista >= 0) { jakel_remove(existing_gnista); }
+        int gnista_demo = jakel_make_file(0, "gnista.elf");
+        if (gnista_demo >= 0) {
+            int gsz = seed_gnista_demo_size();
+            int geb = kmalloc(gsz);
+            if (geb != 0) {
+                seed_gnista_demo(geb);
+                jakel_write(gnista_demo, 0, geb, gsz);
+                kfree(geb);
+            }
+        }
+
+        // Infecteria, the game. In the root directory, not /test -- it is
+        // something to play, not scaffolding.
+        int stale_inf = jakel_lookup(0, "infecteria.elf");
+        if (stale_inf >= 0) { jakel_remove(stale_inf); }
+        int inf_f = jakel_make_file(0, "infecteria.elf");
+        if (inf_f >= 0) {
+            int isz = seed_infecteria_size();
+            int ibuf = kmalloc(isz);
+            if (ibuf != 0) {
+                seed_infecteria(ibuf);
+                jakel_write(inf_f, 0, ibuf, isz);
+                kfree(ibuf);
+            }
+        }
+
+        // The full-frame rendering probe -- see fps_probe_data.c0.
+        int stale_fps = jakel_lookup(tdir, "fps.elf");
+        if (stale_fps >= 0) { jakel_remove(stale_fps); }
+        int fps_f = jakel_make_file(tdir, "fps.elf");
+        if (fps_f >= 0) {
+            int fsz2 = seed_fps_probe_size();
+            int fbuf = kmalloc(fsz2);
+            if (fbuf != 0) {
+                seed_fps_probe(fbuf);
+                jakel_write(fps_f, 0, fbuf, fsz2);
+                kfree(fbuf);
+            }
+        }
+
+        // Seed the coff --elf backend test programs (etNN.elf). Generated by
+        // gen_elf_tests.py from elf_tests/*.c0; one call so this stays put
+        // when a test is added or removed. Run by verify_elf_backend.sh.
+        seed_elf_tests_install(tdir);
     }
     // Persist the initial filesystem so the next boot finds it.
     jakel_sync();
