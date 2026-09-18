@@ -1,10 +1,17 @@
-# build artifacts -- everything in the repo is source; the pre-built
-# moonshot.iso is tracked for now since the released coff does not have
-# the extern keyword yet, so building from source is not possible until
-# coff's next release (see README)
+# build artifacts -- everything in the repo is source and the kernel, the
+# ISO and every seed are rebuilt from it
 kmain.s
 *.o
 moonshot.elf
-isoroot/
+*.iso
+isoroot*/
 *.log
+*.sock
+*.ppm
+*.bak
+*.panicbak
+*.dfbak
 disk.img
+# written by build.sh after a passing bootstrap audit; describes a binary on
+# this machine, not source (see README, Trust)
+coff1.sha256
