@@ -122,7 +122,7 @@ fi
 python3 - <<'PY'
 import sys
 
-# Sprite frame colours from gen_sprite.py, as RGB: frame 0 orange, frame 1
+# Sprite frame colours from gen_sprite.c0, as RGB: frame 0 orange, frame 1
 # yellow. Static blocks are 0x606060.
 SPRITE = ((255, 140, 0), (255, 220, 0))
 BLOCK = (96, 96, 96)

@@ -325,7 +325,37 @@ void heap_coalesce() {
 // free(NULL) in C.
 void kfree(int ptr) {
     if (ptr == 0) { return; }
-    (ptr - sizeof(HeapBlock)).free = 1;
+    // Two guards, both of which exist because of one bug and the day it cost.
+    //
+    // The write below stores the number 1 eight bytes before `ptr`. If `ptr`
+    // is not a pointer this allocator handed out, that store lands wherever
+    // the bad value happens to point, and the symptom is a wrong value in
+    // something entirely unrelated, later. The REPL freed a for loop's body
+    // twice (see repl.c0's `layout Node`), and the second free read its
+    // fields out of a header that coalescing had already overwritten -- so
+    // the "pointers" it then freed were whatever those bytes now held. A
+    // wild store of the number 1 is a very good way to turn -(5 + 3) into
+    // -(5 + 1), which is -6, which is what the REPL once answered.
+    //
+    // Neither guard makes a double free correct. They make it LOUD: an
+    // allocator that refuses a pointer it never handed out turns a silent
+    // corruption at a distance into a line in the serial log naming the
+    // caller's bad value, which is the difference between an afternoon and
+    // a month.
+    if (ptr < heap_start + sizeof(HeapBlock) || ptr >= heap_end) {
+        serial_print("[jenna] kfree: pointer outside the heap, refusing: ");
+        serial_print_int(ptr);
+        serial_print("\n");
+        return;
+    }
+    int b = ptr - sizeof(HeapBlock);
+    if (b.free == 1) {
+        serial_print("[jenna] kfree: double free at ");
+        serial_print_int(ptr);
+        serial_print("\n");
+        return;
+    }
+    b.free = 1;
     heap_coalesce();
     return;
 }

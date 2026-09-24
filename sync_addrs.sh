@@ -25,7 +25,7 @@
 set -eu
 cd "$(dirname "$0")"
 
-read_sym_addr()  { nm moonshot.elf | awk -v s="$1" '$3==s{print $1; exit}'; }
+read_sym_addr()  { awk -v s="$1" '$2==s{print $1; exit}' moonshot.map; }
 
 patch_literal() { # name  decimal-value
   sed -i "s/^int $1 *= .*/int $1 = $2;/" kmain.c0

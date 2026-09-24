@@ -170,7 +170,16 @@ while read -r task counter; do
   if [ "$task" = "$prev_task" ]; then
     sched_ok=0
   fi
-  if [ -n "${last_counter[$task]:-}" ] && [ "$counter" -le "${last_counter[$task]}" ]; then
+  # Strictly increasing from the second appearance on. A task's FIRST
+  # quantum can legitimately be empty: the launch happens wherever main()
+  # happens to be in the 10ms tick period, so the first tick after it can
+  # arrive before the task has executed a single increment, and it shows up
+  # again still at 0. That is a fact about when the timer fires, not about
+  # preserved state, and it started tripping this check (3 runs in 7) once
+  # the kernel's boot timing shifted slightly. A zero counter
+  # is therefore allowed to repeat once; any later stall still fails.
+  if [ -n "${last_counter[$task]:-}" ] && [ "${last_counter[$task]}" -ne 0 ] \
+     && [ "$counter" -le "${last_counter[$task]}" ]; then
     sched_ok=0
   fi
   last_counter[$task]=$counter

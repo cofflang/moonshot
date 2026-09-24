@@ -221,6 +221,13 @@ void pensel_render() {
 void pensel_mouse(int sx, int sy, int left, int right) {
     if (pensel_active != 1) { return; }
     if (left == 0 && right == 0) { return; }
+    // Same rule ring-3 programs get from SYS_MOUSE_POLL: a button acts only
+    // in the focused window, and the press that performed a focus change is
+    // spent. Before this, clicking an unfocused pensel focused it AND laid
+    // down a pixel wherever the pointer happened to be, which is a stray
+    // edit in a file the user was only trying to look at.
+    if (kakel_active == 1 && pensel_win != kakel_focus) { return; }
+    if (klick_focus_click == 1) { return; }
 
     // Palette first: it sits to the right of the canvas.
     int palx = pensel_ox + pensel_dim * pensel_zoom + PENSEL_MARGIN;

@@ -155,9 +155,9 @@ extern int _kernel_end;
 // names would collide with extern declarations in the same translation
 // unit. The values are the runtime addresses of jit_print_helper /
 // jit_print_str_helper / jit_assign_helper, patched after the ELF is linked.
-int JIT_PRINT_ADDR = 1571456;
-int JIT_PRINT_STR_ADDR = 1571505;
-int JIT_ASSIGN_ADDR = 1571580;
+int JIT_PRINT_ADDR = 2430285;
+int JIT_PRINT_STR_ADDR = 2430348;
+int JIT_ASSIGN_ADDR = 2430439;
 
 include "serial.c0";
 include "interrupts.c0";
@@ -178,6 +178,8 @@ include "gnista_demo_data.c0";
 include "elf_tests_data.c0";
 include "fps_probe_data.c0";
 include "infecteria_data.c0";
+include "utsikt_data.c0";
+include "index_html.c0";
 include "jit.c0";
 include "repl.c0";
 include "skrift.c0";

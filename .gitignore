@@ -12,6 +12,7 @@ isoroot*/
 *.panicbak
 *.dfbak
 disk.img
-# written by build.sh after a passing bootstrap audit; describes a binary on
+moonshot.map
+# written by build.sh after a passing bootstrap audit; describes binaries on
 # this machine, not source (see README, Trust)
-coff1.sha256
+toolchain.sha256

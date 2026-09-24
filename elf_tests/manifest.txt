@@ -7,3 +7,5 @@ et06 06_layout_alloc.c0 90
 et07 07_loops_nested.c0 51
 et08 08_readfile.c0 111
 et09 09_nested_exit.c0 42
+et10 10_glyph.c0 26
+et11 11_globals.c0 137

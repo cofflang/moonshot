@@ -354,10 +354,17 @@ void klick_handler() {
         // meaningless; treat the packet as no movement rather than lurching.
         //
         // Clamping to a large step in the sign's direction was tried instead,
-        // on the theory that a fast flick should still travel. It was REVERTED
-        // after the mouse regressed on real hardware -- this discard is the
-        // behaviour that works. Revisit only with a real mouse to test
-        // against, not from reasoning about the spec.
+        // on the theory that a fast flick should still travel. It was reverted
+        // as part of a batch of changes that regressed the mouse.
+        //
+        // This branch is unreachable under QEMU, though, so that revert
+        // convicted it on proximity to the other changes in the batch rather
+        // than on evidence. QEMU's ps2_mouse_send_packet() clamps deltas to
+        // +/-127 and never sets bits 6/7 at all; a session of deliberate fast
+        // flicking logged 4396 packets and 0 overflows. Only real hardware
+        // can exercise this code. The clamp is very likely correct (it is
+        // what QEMU itself does), but it stays out until there is hardware
+        // that can tell the difference.
         int xover = (flags / 64) - ((flags / 64) / 2) * 2;
         int yover = (flags / 128) - ((flags / 128) / 2) * 2;
         if (xover == 1 || yover == 1) {
@@ -372,7 +379,15 @@ void klick_handler() {
         // consumer might do -- pensel paints a cell and redraws swatches --
         // is far too much work for an interrupt handler that has more PS/2
         // bytes arriving behind it. Drained by klick_drain on the timer tick.
-        if (klick_left == 1 || klick_right == 1) {
+        //
+        // Queued while a button is held, and once more on the packet that
+        // releases it: kakel's click-to-focus fires on the press edge and
+        // needs to see the release, or the second click of a session would
+        // never look like a new press. Before that release event existed,
+        // exactly that happened -- the first click focused, every later one
+        // was silently a continuation of it.
+        if (klick_left == 1 || klick_right == 1
+            || klick_left != was_l || klick_right != was_r) {
             klick_ev_push(klick_x, klick_y, klick_left + klick_right * 2);
         }
     }
@@ -472,8 +487,30 @@ int klick_init() {
 // no byte stream behind it that goes wrong when a handler runs long, which is
 // the whole reason this is not done in klick_handler.
 //
-// pensel is the only consumer so far, and it ignores anything outside its own
-// canvas, so this stays a single call rather than a dispatch table.
+// Two consumers: kakel, which focuses the window under the pointer on a
+// left press (the edge, not the held state, so a drag does not keep
+// re-focusing), and pensel, which ignores anything outside its own canvas.
+// Ring-3 programs are not consumers here: they poll the current state
+// through SYS_MOUSE_POLL (syscall.c0) whenever they like, the way they poll
+// keys, so nothing has to be queued per task for them.
+int klick_drain_left = 0;
+
+// Set when a left press changed the focus, cleared when that press is
+// released. While it is 1 the press is SPENT: it did its job by focusing a
+// window and must not also reach whatever is inside that window.
+//
+// Without this, the first click on an unfocused window did two things at
+// once -- one click on an unfocused browser both focused it and followed
+// whatever link happened to be under the pointer, and the same click on
+// pensel focused it and painted a pixel. Focusing is a windowing action
+// and belongs to kakel; what a program does with a click belongs to the
+// program; a single press should not be both.
+//
+// It is a flag rather than a count because only one press can be in flight:
+// the focus change fires on the press edge, and there is exactly one edge
+// per press.
+int klick_focus_click = 0;
+
 void klick_drain() {
     if (klick_active != 1) { return; }
     int ev = klick_ev_poll();
@@ -484,6 +521,14 @@ void klick_drain() {
         int x = rest / 1024;
         int left = buttons - (buttons / 2) * 2;
         int right = (buttons / 2) - ((buttons / 2) / 2) * 2;
+        if (left == 1 && klick_drain_left == 0) {
+            // kakel_click returns the window it focused, or -1 when the
+            // click changed nothing (already focused, or no window there).
+            // Only a real focus change spends the press.
+            if (kakel_click(x, y) >= 0) { klick_focus_click = 1; }
+        }
+        if (left == 0) { klick_focus_click = 0; }
+        klick_drain_left = left;
         pensel_mouse(x, y, left, right);
         ev = klick_ev_poll();
     }

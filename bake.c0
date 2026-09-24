@@ -1,0 +1,370 @@
+// bake.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// Turns compiled programs into the *_data.c0 byte arrays the kernel ships.
+// Moonshot has no way to receive a file from the host, so every ring-3
+// program that has to exist as a file is baked into the kernel as a c0
+// function that writes its bytes into a buffer, and jakel_init writes it
+// onto the filesystem at boot. Two modes:
+//
+//     bake seed <binary> <name> <output.c0> [description...]
+//
+// emits one program as seed_<name>_size() and seed_<name>(buf), with the
+// description (any number of arguments, joined by spaces, newlines kept)
+// as a comment in the header. gen_programs.sh calls this once per program.
+//
+//     bake tests <output.c0> <manifest> [<name> <source> <expect> <elf>]...
+//
+// emits the whole elf_tests suite into one file, one seed function per
+// program plus seed_elf_tests_install(dir), and writes the manifest the
+// runner reads (name, source, expected exit code per line).
+// gen_elf_tests.sh compiles the programs and calls this once.
+//
+// This replaced gen_seed.py and gen_elf_tests.py. They were
+// the last programs between the sources and moonshot.elf not written in
+// c0: hashed in the bootstrap manifest, but never checked against anything,
+// and standing exactly where the xz-utils backdoor stood, on the path that
+// carries compiler output into the shipped image. This file is compiled by
+// coff1 and assembled by smed like everything else, and it sits in the
+// diverse double-compiling corpus with the kernel. Its output is
+// byte-identical to the scripts it replaced, which is how the change was
+// checked: every committed *_data.c0 regenerates unchanged.
+//
+// The generated shape, store64 eight bytes at a time and store8 for the
+// tail, is what the earliest hand-generated seed files used, and jakel.c0
+// depends only on the two function names, so it is kept as it is.
+
+int out = 0;       // the output file, accumulated then written once
+int outpos = 0;
+int OUTCAP = 8388608;
+
+void die(int msg) {
+    print("bake: ");
+    print(msg);
+    print("\n");
+    exit(1);
+    return;
+}
+
+void emit_ch(int c) {
+    if (outpos >= OUTCAP) { die("output larger than the buffer"); }
+    store8(out + outpos, c);
+    outpos = outpos + 1;
+    return;
+}
+
+void emit(int s) {
+    int i = 0;
+    while (s[i] != 0) { emit_ch(s[i]); i = i + 1; }
+    return;
+}
+
+void emit_int(int v) {
+    int buf = alloc(24);
+    int i = 23;
+    int n = v;
+    if (n == 0) { emit("0"); return; }
+    if (n < 0) { emit("-"); n = 0 - n; }
+    buf[i] = 0;
+    while (n > 0) {
+        i = i - 1;
+        buf[i] = 48 + (n - (n / 10) * 10);
+        n = n / 10;
+    }
+    emit(buf + i);
+    return;
+}
+
+// Two decimal digits, zero-padded: the etNN test names.
+void emit_int2(int v) {
+    if (v < 10) { emit("0"); }
+    emit_int(v);
+    return;
+}
+
+// Sixteen lowercase hex digits.  The value is a whole little-endian 8-byte
+// word and can be negative as a c0 int, so digits come from the remainder
+// with the sign fixed up, not from the sign-blind division alone.
+void emit_hex16(int v) {
+    int buf = alloc(20);
+    int i = 16;
+    int u = v;
+    int q = 0;
+    int d = 0;
+    buf[16] = 0;
+    while (i > 0) {
+        i = i - 1;
+        q = u / 16;
+        d = u - q * 16;
+        if (d < 0) { d = d + 16; q = q - 1; }
+        if (d < 10) { buf[i] = 48 + d; } else { buf[i] = 87 + d; }
+        u = q;
+    }
+    emit(buf);
+    return;
+}
+
+int file_len = 0;
+
+int read_file(int name) {
+    int fd = open_read(name);
+    int cap = 4194304;
+    int buf = 0;
+    int len = 0;
+    int got = 0;
+    if (fd < 0) { print("bake: cannot open "); print(name); print("\n"); exit(1); }
+    buf = alloc(cap);
+    got = read(fd, buf, cap);
+    while (got > 0) {
+        len = len + got;
+        got = read(fd, buf + len, cap - len);
+    }
+    close(fd);
+    if (len >= cap) { die("input larger than the read buffer"); }
+    file_len = len;
+    return buf;
+}
+
+// The last path component, for the "GENERATED from" line.
+int basename(int path) {
+    int i = 0;
+    int last = 0;
+    while (path[i] != 0) {
+        if (path[i] == 47) { last = i + 1; }
+        i = i + 1;
+    }
+    return path + last;
+}
+
+// The byte array itself: the two functions jakel.c0 calls.
+void emit_seed(int name, int data, int n) {
+    int i = 0;
+    int w = 0;
+    int k = 0;
+    emit("int seed_"); emit(name); emit("_size() { return "); emit_int(n); emit("; }\n");
+    emit("void seed_"); emit(name); emit("(int buf) {\n");
+    emit("    int p = 0;\n");
+    while (i + 8 <= n) {
+        w = 0;
+        k = 8;
+        while (k > 0) {
+            k = k - 1;
+            w = w * 256 + data[i + k];
+        }
+        emit("    store64(buf + p, 0x"); emit_hex16(w); emit("); p = p + 8;\n");
+        i = i + 8;
+    }
+    while (i < n) {
+        emit("    store8(buf + p, "); emit_int(data[i]); emit("); p = p + 1;\n");
+        i = i + 1;
+    }
+    emit("    return;\n");
+    emit("}\n");
+    return;
+}
+
+void emit_license(int filename) {
+    emit("// "); emit(filename); emit(" — part of the moonshot operating system.\n");
+    emit("//\n");
+    emit("// Copyright (C) 2026 tavro\n");
+    emit("//\n");
+    emit("// This file is part of moonshot, an operating system built from scratch.\n");
+    emit("// moonshot is free software, distributed under the GNU General Public\n");
+    emit("// License version 3 or (at your option) any later version, WITHOUT ANY\n");
+    emit("// WARRANTY; see the LICENSE file for the full text.\n");
+    emit("//\n");
+    return;
+}
+
+void write_out(int name) {
+    int fd = open_write(name);
+    if (fd < 0) { print("bake: cannot write "); print(name); print("\n"); exit(1); }
+    write(fd, out, outpos);
+    close(fd);
+    return;
+}
+
+// bake seed <binary> <name> <output.c0> [description...]
+int do_seed() {
+    int src = 0;
+    int name = 0;
+    int dst = 0;
+    int data = 0;
+    int n = 0;
+    int i = 0;
+    int j = 0;
+    int a = 0;
+    int any = 0;
+    if (argc() < 5) { die("usage: bake seed <binary> <name> <output.c0> [description...]"); }
+    src = argv(2);
+    name = argv(3);
+    dst = argv(4);
+    data = read_file(src);
+    n = file_len;
+
+    emit_license(basename(dst));
+    emit("// GENERATED by bake from "); emit(basename(src));
+    emit(" ("); emit_int(n); emit(" bytes) -- do not edit by hand.\n");
+
+    // The description: the remaining arguments joined by single spaces,
+    // then broken at newlines into comment lines.  Empty description, no
+    // comment block at all.
+    i = 5;
+    while (i < argc()) {
+        a = argv(i);
+        if (a[0] != 0) { any = 1; }
+        i = i + 1;
+    }
+    if (any == 1) {
+        emit("//\n// ");
+        i = 5;
+        while (i < argc()) {
+            a = argv(i);
+            if (i > 5) { emit_ch(32); }
+            j = 0;
+            while (a[j] != 0) {
+                if (a[j] == 10) { emit("\n// "); } else { emit_ch(a[j]); }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        emit("\n");
+    }
+    emit("\n");
+    emit_seed(name, data, n);
+    write_out(dst);
+    print("wrote "); print(dst); print(" ("); print_int(n); print(" bytes of ");
+    print(basename(src)); print(")\n");
+    return 0;
+}
+
+void print_int(int v) {
+    int buf = alloc(24);
+    int i = 23;
+    int n = v;
+    if (n == 0) { print("0"); return; }
+    if (n < 0) { print("-"); n = 0 - n; }
+    buf[i] = 0;
+    while (n > 0) {
+        i = i - 1;
+        buf[i] = 48 + (n - (n / 10) * 10);
+        n = n / 10;
+    }
+    print(buf + i);
+    return;
+}
+
+// bake tests <output.c0> <manifest> [<name> <source> <expect> <elf>]...
+int do_tests() {
+    int dst = 0;
+    int mname = 0;
+    int count = 0;
+    int i = 0;
+    int name = 0;
+    int src = 0;
+    int expect = 0;
+    int data = 0;
+    int n = 0;
+    int sizes = 0;
+    int fd = 0;
+    if (argc() < 4 || (argc() - 4) - ((argc() - 4) / 4) * 4 != 0) {
+        die("usage: bake tests <output.c0> <manifest> [<name> <source> <expect> <elf>]...");
+    }
+    dst = argv(2);
+    mname = argv(3);
+    count = (argc() - 4) / 4;
+    if (count == 0) { die("no test programs given"); }
+    sizes = alloc(count * 8);
+
+    emit_license("elf_tests_data.c0");
+    emit("// GENERATED by gen_elf_tests.sh and bake from elf_tests/*.c0 -- do not edit by hand.\n");
+    emit("//\n");
+    emit("// Each program below was compiled with `coff --elf` and is seeded onto jakel\n");
+    emit("// as etNN.elf. Each returns a value that is only correct if codegen, the\n");
+    emit("// target's syscall sequences, smed's image and the kernel's loader all\n");
+    emit("// agree; verify_elf_backend.sh spawns them and checks the exit codes the\n");
+    emit("// kernel prints to serial.\n");
+    emit("\n");
+
+    i = 0;
+    while (i < count) {
+        name = argv(4 + i * 4);
+        src = argv(5 + i * 4);
+        expect = argv(6 + i * 4);
+        data = read_file(argv(7 + i * 4));
+        n = file_len;
+        store64(sizes + i * 8, n);
+        emit("\n// "); emit(name); emit(" -- "); emit(src);
+        emit(", expects exit code "); emit(expect); emit("\n");
+        emit_seed(name, data, n);
+        i = i + 1;
+    }
+
+    // One install function so jakel.c0 needs a single call and never changes
+    // when a test is added or removed.
+    emit("\n");
+    emit("// Seeds every test ELF into directory `dir`. Any stale copy is removed\n");
+    emit("// first: disk.img survives reboots, so a rebuilt test would otherwise\n");
+    emit("// be silently ignored in favour of the previous run's bytes. Called on\n");
+    emit("// EVERY boot from jakel_init, not just the first -- see the fixture\n");
+    emit("// section there for why that placement is load-bearing.\n");
+    emit("void seed_elf_tests_install(int dir) {\n");
+    i = 0;
+    while (i < count) {
+        name = argv(4 + i * 4);
+        n = load64(sizes + i * 8);
+        emit("    int stale_"); emit(name); emit(" = jakel_lookup(dir, \""); emit(name); emit(".elf\");\n");
+        emit("    if (stale_"); emit(name); emit(" >= 0) { jakel_remove(stale_"); emit(name); emit("); }\n");
+        emit("    int f_"); emit(name); emit(" = jakel_make_file(dir, \""); emit(name); emit(".elf\");\n");
+        emit("    if (f_"); emit(name); emit(" >= 0) {\n");
+        emit("        int b_"); emit(name); emit(" = kmalloc("); emit_int(n); emit(");\n");
+        emit("        if (b_"); emit(name); emit(" != 0) {\n");
+        emit("            seed_"); emit(name); emit("(b_"); emit(name); emit(");\n");
+        emit("            jakel_write(f_"); emit(name); emit(", 0, b_"); emit(name); emit(", "); emit_int(n); emit(");\n");
+        emit("            kfree(b_"); emit(name); emit(");\n");
+        emit("        }\n");
+        emit("    }\n");
+        i = i + 1;
+    }
+    emit("    return;\n");
+    emit("}\n");
+    write_out(dst);
+
+    // The runner reads this to know what to spawn and what to expect.
+    outpos = 0;
+    i = 0;
+    while (i < count) {
+        emit(argv(4 + i * 4)); emit(" "); emit(argv(5 + i * 4)); emit(" ");
+        emit(argv(6 + i * 4)); emit("\n");
+        i = i + 1;
+    }
+    write_out(mname);
+
+    print("generated "); print(basename(dst)); print(" from "); print_int(count); print(" programs\n");
+    return 0;
+}
+
+int streq(int a, int b) {
+    int i = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] != b[i]) { return 0; }
+    return 1;
+}
+
+int main() {
+    out = alloc(OUTCAP);
+    if (argc() < 2) { die("usage: bake seed ... | bake tests ...  (see the header of bake.c0)"); }
+    if (streq(argv(1), "seed") == 1) { return do_seed(); }
+    if (streq(argv(1), "tests") == 1) { return do_tests(); }
+    die("unknown mode, expected seed or tests");
+    return 1;
+}
