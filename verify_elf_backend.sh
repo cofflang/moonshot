@@ -9,20 +9,23 @@
 # License version 3 or (at your option) any later version, WITHOUT ANY
 # WARRANTY; see the LICENSE file for the full text.
 #
-# Gives coff's machine-code backend a verification story of its own.
+# Runs coff's ring-3 output on the real kernel and checks the answers.
 #
-# c0-coff's 267-test suite is differential: it compares coff against coff0.c.
-# But coff0.c implements ONLY the text backend, so none of those tests say
-# anything about the `--raw`/`--elf` machine-code backend -- which is the path
-# every ring-3 binary Moonshot runs is built through. Three separate
-# silent-wrong-code bugs have been found in it (a label collision that sent
-# false branches into function epilogues, arg4 passed in rcx instead of r10,
-# and miscompiled && / ||), each one spotted by eye after something on screen
-# looked wrong. Nothing was checking.
+# This began as the only verification the `--elf` machine-code backend had:
+# c0-coff's differential suite compares coff against coff0.c, and coff0.c had
+# only the text backend, so nothing checked the path every ring-3 binary was
+# built through, and three silent-wrong-code bugs were found in it by eye (a
+# label collision that sent false branches into function epilogues, arg4
+# passed in rcx instead of r10, miscompiled && / ||). That backend is now
+# gone: --elf is the text backend with Moonshot's syscall numbers,
+# coff0.c has the same target, and run_tests.sh diffs the two over every
+# ring-3 program. What this script still proves is the part no diff can: that
+# the target's syscall sequences, smed's image and the kernel's loader agree,
+# end to end, with real exit codes.
 #
 # Each program in elf_tests/ computes a value that only comes out right if
 # codegen is correct and returns it, with the expected value written next to
-# it as `// expect: N`. gen_elf_tests.py compiles them all with `coff --elf`
+# it as `// expect: N`. gen_elf_tests.sh compiles them all with `coff --elf`
 # and bakes them into the kernel as etNN.elf; this script boots once, spawns
 # each in turn, and checks the exit code the kernel prints to serial.
 #
@@ -34,13 +37,13 @@ cd "$(dirname "$0")"
 
 # Regenerate first: the checked-in elf_tests_data.c0 is only as fresh as the
 # last run, and a stale one would test the previous compiler's output.
-python3 gen_elf_tests.py || exit 1
+./gen_elf_tests.sh || exit 1
 
 ./build.sh || exit 1
 
 manifest=elf_tests/manifest.txt
 if [ ! -f "$manifest" ]; then
-  echo "FAIL: gen_elf_tests.py produced no manifest"
+  echo "FAIL: gen_elf_tests.sh produced no manifest"
   exit 1
 fi
 
@@ -169,8 +172,8 @@ fi
 
 echo
 if [ "$ok" -eq 1 ]; then
-  echo "PASS: coff --elf backend verified — $total programs compiled through the"
-  echo "  machine-code backend, run in ring 3, every exit code correct"
+  echo "PASS: coff --elf target verified — $total programs compiled for ring 3,"
+  echo "  assembled by smed, run on the kernel, every exit code correct"
   exit 0
 fi
 echo "FAIL: coff --elf backend produced wrong code"

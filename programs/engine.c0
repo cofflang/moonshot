@@ -333,6 +333,191 @@ void view_circle_blend(int v, int wx, int wy, int d, int color) {
     return;
 }
 
+// --- loading a sprite -----------------------------------------------------
+//
+// A sprite file is three 64-bit numbers -- width, height, frame count -- and
+// then the pixels, which is deliberately the shape this layout already has.
+// Loading is three reads and a pointer into the buffer rather than a parse,
+// and it is the format pensel writes, so a sprite drawn on the machine itself
+// loads with no conversion step anywhere.
+layout Sprite {
+    int sp_w;
+    int sp_h;
+    int sp_frames;
+    int sp_pixels;
+}
+
+// Returns 0 when the file is missing or malformed, which every caller treats
+// as "use the baked-in default" rather than as an error. A game that refuses
+// to start because nobody has drawn anything is a worse game.
+int sprite_from_file(int name) {
+    int size = readfile(name, 0, 0);
+    // The header plus at least one pixel.
+    if (size < 28) { return 0; }
+    int buf = alloc(size);
+    if (buf == 0) { return 0; }
+    if (readfile(name, buf, size) != size) { return 0; }
+    int s = alloc(sizeof(Sprite));
+    if (s == 0) { return 0; }
+    s.sp_w = load64(buf);
+    s.sp_h = load64(buf + 8);
+    s.sp_frames = load64(buf + 16);
+    s.sp_pixels = buf + 24;
+    if (s.sp_w <= 0 || s.sp_h <= 0 || s.sp_frames <= 0) { return 0; }
+    // A header claiming more pixels than the file holds would have the
+    // renderer read past the allocation, so it is refused here rather than
+    // clipped later.
+    if (24 + s.sp_w * s.sp_h * s.sp_frames * 4 > size) { return 0; }
+    return s;
+}
+
+// The frame to show for a two-frame sprite at animation phase `phase`, and
+// frame 0 for anything with only one. Every animated thing in a game this
+// size can share one clock, so the phase is computed once per frame from the
+// tick counter rather than tracked per entity.
+int sprite_frame(int s, int phase) {
+    if (s.sp_frames <= 1) { return 0; }
+    return phase - (phase / s.sp_frames) * s.sp_frames;
+}
+
+// --- sprites --------------------------------------------------------------
+//
+// A sprite here is just w*h*4 bytes of BGR0, the same shape SYS_BLIT and
+// pensel already use, with colour 0 meaning transparent. Frames sit one
+// after another in the same allocation, so frame f starts at f * w * h * 4.
+//
+// These two draw into the game's own frame buffer rather than calling
+// SYS_BLIT, for the reason the whole View exists: a scrolling game composites
+// one frame and presents it with a single syscall, and a blit straight to the
+// framebuffer would both tear and ignore the camera.
+
+// One frame of a sprite, in WORLD coordinates, clipped to the view. Colour 0
+// is a hole, which is what lets a round organism sit on a background without
+// a square of dead pixels around it.
+void view_sprite(int v, int wx, int wy, int w, int h, int pixels, int frame) {
+    int sx = wx - v.cam_x;
+    int sy = wy - v.cam_y;
+    // Whole-sprite rejection before the per-pixel loops. Without it a world
+    // full of cells costs w*h loop iterations each even when every one of
+    // them is off screen, which is most of them in a world several times the
+    // size of the view.
+    if (sx >= v.vw || sy >= v.vh || sx + w <= 0 || sy + h <= 0) { return; }
+    int src = pixels + frame * w * h * 4;
+    int row = 0;
+    while (row < h) {
+        int y = sy + row;
+        if (y >= 0 && y < v.vh) {
+            int col = 0;
+            while (col < w) {
+                int x = sx + col;
+                if (x >= 0 && x < v.vw) {
+                    int s = src + (row * w + col) * 4;
+                    int c = load_px(s);
+                    if (c != 0) {
+                        store32_le_px(v.buf + (y * v.vw + x) * 4, c);
+                    }
+                }
+                col = col + 1;
+            }
+        }
+        row = row + 1;
+    }
+    return;
+}
+
+// The same, half-transparent: every covered pixel becomes the average of what
+// is already there and the sprite's own colour. This is the sprite equivalent
+// of view_circle_blend, and it is what lets Infecteria's cells show the
+// player underneath them once a cell is a drawn membrane rather than a disc.
+void view_sprite_blend(int v, int wx, int wy, int w, int h, int pixels, int frame) {
+    int sx = wx - v.cam_x;
+    int sy = wy - v.cam_y;
+    // Whole-sprite rejection before the per-pixel loops. Without it a world
+    // full of cells costs w*h loop iterations each even when every one of
+    // them is off screen, which is most of them in a world several times the
+    // size of the view.
+    if (sx >= v.vw || sy >= v.vh || sx + w <= 0 || sy + h <= 0) { return; }
+    int src = pixels + frame * w * h * 4;
+    int row = 0;
+    while (row < h) {
+        int y = sy + row;
+        if (y >= 0 && y < v.vh) {
+            int col = 0;
+            while (col < w) {
+                int x = sx + col;
+                if (x >= 0 && x < v.vw) {
+                    int s = src + (row * w + col) * 4;
+                    int c = load_px(s);
+                    if (c != 0) {
+                        int addr = v.buf + (y * v.vw + x) * 4;
+                        store8(addr, (load8(addr) + load8(s)) / 2);
+                        store8(addr + 1, (load8(addr + 1) + load8(s + 1)) / 2);
+                        store8(addr + 2, (load8(addr + 2) + load8(s + 2)) / 2);
+                    }
+                }
+                col = col + 1;
+            }
+        }
+        row = row + 1;
+    }
+    return;
+}
+
+// Tints a sprite as it draws: every non-transparent pixel keeps its own
+// brightness but takes the given hue, by scaling each channel of `color` by
+// the sprite pixel's green channel. Infecteria uses it so one drawn cell
+// serves as the clean cell, the infected cell and the factory, instead of
+// three near-identical sprites that would all have to be redrawn together.
+void view_sprite_tint(int v, int wx, int wy, int w, int h, int pixels,
+                      int frame, int color, int blend) {
+    int sx = wx - v.cam_x;
+    int sy = wy - v.cam_y;
+    // Whole-sprite rejection before the per-pixel loops. Without it a world
+    // full of cells costs w*h loop iterations each even when every one of
+    // them is off screen, which is most of them in a world several times the
+    // size of the view.
+    if (sx >= v.vw || sy >= v.vh || sx + w <= 0 || sy + h <= 0) { return; }
+    int src = pixels + frame * w * h * 4;
+    int tb = color - (color / 256) * 256;
+    int tg = (color / 256) - (color / 65536) * 256;
+    int tr = (color / 65536) - (color / 16777216) * 256;
+    int row = 0;
+    while (row < h) {
+        int y = sy + row;
+        if (y >= 0 && y < v.vh) {
+            int col = 0;
+            while (col < w) {
+                int x = sx + col;
+                if (x >= 0 && x < v.vw) {
+                    int s = src + (row * w + col) * 4;
+                    if (load_px(s) != 0) {
+                        // The green channel is the sprite's shading: the art
+                        // is drawn in greys where it is meant to be tinted,
+                        // so this reads as "how lit is this pixel".
+                        int lum = load8(s + 1);
+                        int nb = tb * lum / 255;
+                        int ng = tg * lum / 255;
+                        int nr = tr * lum / 255;
+                        int addr = v.buf + (y * v.vw + x) * 4;
+                        if (blend == 1) {
+                            store8(addr, (load8(addr) + nb) / 2);
+                            store8(addr + 1, (load8(addr + 1) + ng) / 2);
+                            store8(addr + 2, (load8(addr + 2) + nr) / 2);
+                        } else {
+                            store8(addr, nb);
+                            store8(addr + 1, ng);
+                            store8(addr + 2, nr);
+                        }
+                    }
+                }
+                col = col + 1;
+            }
+        }
+        row = row + 1;
+    }
+    return;
+}
+
 // A progress bar above a world rectangle: dark trough, bright fill, 0..100.
 void view_bar(int v, int wx, int wy, int w, int pct, int color) {
     int h = 4;

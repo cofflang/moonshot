@@ -718,7 +718,7 @@ int jit_compile_node(int nd, int pos) {
         int init = nd.child1;
         int cond = nd.child2;
         int incr = nd.extra;
-        int body = nd.next;
+        int body = nd.nd_body;
         // Compile init (result ignored).
         if (init != 0) {
             pos = jit_compile_node(init, pos);

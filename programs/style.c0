@@ -1,0 +1,572 @@
+// style.c0 — part of utsikt, a browser engine for the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of utsikt, a browser engine written in c0 for moonshot.
+// utsikt is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// style.c0 -- a stylesheet parser and the cascade.
+//
+// The subset is chosen by what changes what a page LOOKS like at this stage,
+// not by what is easy: colours, backgrounds, text size and weight,
+// alignment, the block/inline distinction, and the two boxes-model numbers
+// (margin and padding) that make a document stop looking like one long
+// paragraph. Everything else in CSS either refines those or needs a layout
+// engine that does more than block and inline flow, and would be a property
+// that parses and then does nothing.
+//
+// Selectors are type (`p`), class (`.lead`) and the two together
+// (`p.lead`), in comma-separated lists, plus a descendant selector of two
+// such compounds (`.note code`). A longer chain (`div p span`) is not here:
+// it needs a list of ancestors rather than one, which is a different shape
+// of code, not a longer version of this one.
+//
+// The default stylesheet at the bottom is written in the same CSS this
+// parser reads, rather than as c0 setting fields. That is a test as much as
+// a convenience: every page rendered exercises the parser against a
+// stylesheet that uses every property it supports.
+
+int DISPLAY_INLINE = 0;
+int DISPLAY_BLOCK  = 1;
+int DISPLAY_NONE   = 2;
+
+int ALIGN_LEFT   = 0;
+int ALIGN_CENTER = 1;
+int ALIGN_RIGHT  = 2;
+
+// Computed values for one element. -1 everywhere means "not set here", which
+// is how the cascade tells a declaration that was written from one that was
+// merely inherited or defaulted.
+layout Props {
+    int p_color;
+    int p_bg;
+    int p_scale;    // integer multiple of the font's cell size
+    int p_bold;
+    int p_display;
+    int p_margin;
+    int p_pad;
+    int p_align;
+}
+
+layout Rule {
+    int r_tag;      // tag name string, or 0 for "any element"
+    int r_class;    // class string, or 0 for "any class"
+    // The ancestor half of a descendant selector (`div p` stores `p` in
+    // r_tag and `div` in r_atag). Both 0 when the selector has no ancestor
+    // part, which is the common case.
+    int r_atag;
+    int r_aclass;
+    // CSS specificity, as classes * 16 + types. Only four values occur with
+    // the selector shapes here, but storing the number rather than a rank
+    // means adding a shape later does not mean rewriting the cascade.
+    int r_spec;
+    int r_props;
+    int r_next;
+}
+
+int rules;
+int rules_tail;
+
+// The largest r_spec any selector shape here can produce, which is two
+// classes and two types (`.a.b .c.d`). The cascade counts up to it.
+int SPEC_MAX = 34;
+
+// The stylesheet cursor. A second set of globals rather than reusing dom.c0's
+// `src`/`pos`: the HTML parser is still holding those when the <style> blocks
+// it collected get parsed.
+int css_src;
+int css_len;
+int css_pos;
+
+int props_new() {
+    int p = alloc(sizeof(Props));
+    if (p == 0) { return 0; }
+    p.p_color = -1;
+    p.p_bg = -1;
+    p.p_scale = -1;
+    p.p_bold = -1;
+    p.p_display = -1;
+    p.p_margin = -1;
+    p.p_pad = -1;
+    p.p_align = -1;
+    return p;
+}
+
+// Copies every value that was actually set in `from` over `into`. This is
+// the whole of the cascade's override step: a later rule wins on the
+// properties it mentions and leaves the rest alone.
+void props_merge(int into, int from) {
+    if (from.p_color >= 0)   { into.p_color = from.p_color; }
+    if (from.p_bg >= 0)      { into.p_bg = from.p_bg; }
+    if (from.p_scale >= 0)   { into.p_scale = from.p_scale; }
+    if (from.p_bold >= 0)    { into.p_bold = from.p_bold; }
+    if (from.p_display >= 0) { into.p_display = from.p_display; }
+    if (from.p_margin >= 0)  { into.p_margin = from.p_margin; }
+    if (from.p_pad >= 0)     { into.p_pad = from.p_pad; }
+    if (from.p_align >= 0)   { into.p_align = from.p_align; }
+    return;
+}
+
+// --- colours ---------------------------------------------------------------
+
+int hex_digit(int c) {
+    if (is_digit(c) == 1) { return c - '0'; }
+    c = to_lower(c);
+    if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+    return -1;
+}
+
+// #rgb, #rrggbb, or one of the names below. Returns -1 for anything else,
+// which the caller treats as "this declaration said nothing" rather than as
+// an error -- an unknown colour leaving the inherited one in place is what a
+// browser does and is far less alarming than a page going black.
+int parse_color(int s) {
+    if (s == 0) { return -1; }
+    if (s[0] == '#') {
+        int n = str_len(s) - 1;
+        int v = 0;
+        int i = 0;
+        while (i < n) {
+            int d = hex_digit(s[1 + i]);
+            if (d < 0) { return -1; }
+            v = v * 16 + d;
+            i = i + 1;
+        }
+        if (n == 6) { return v; }
+        if (n == 3) {
+            // #abc means #aabbcc: each digit doubled.
+            int r = v / 256;
+            int g = (v / 16) - r * 16;
+            int b = v - (v / 16) * 16;
+            return (r * 17) * 65536 + (g * 17) * 256 + b * 17;
+        }
+        return -1;
+    }
+    if (str_eq(s, "black") == 1)   { return 0x000000; }
+    if (str_eq(s, "white") == 1)   { return 0xFFFFFF; }
+    if (str_eq(s, "red") == 1)     { return 0xCC0000; }
+    if (str_eq(s, "green") == 1)   { return 0x008000; }
+    if (str_eq(s, "blue") == 1)    { return 0x0000CC; }
+    if (str_eq(s, "yellow") == 1)  { return 0xE0C000; }
+    if (str_eq(s, "orange") == 1)  { return 0xE08000; }
+    if (str_eq(s, "purple") == 1)  { return 0x800080; }
+    if (str_eq(s, "gray") == 1)    { return 0x808080; }
+    if (str_eq(s, "grey") == 1)    { return 0x808080; }
+    if (str_eq(s, "silver") == 1)  { return 0xC0C0C0; }
+    if (str_eq(s, "navy") == 1)    { return 0x000060; }
+    if (str_eq(s, "teal") == 1)    { return 0x008080; }
+    if (str_eq(s, "olive") == 1)   { return 0x808000; }
+    if (str_eq(s, "maroon") == 1)  { return 0x800000; }
+    return -1;
+}
+
+// A leading integer, ignoring whatever unit follows. px is the only unit
+// that means anything on a framebuffer with no notion of physical size, and
+// treating "16px" and "16" alike costs one comparison that is never made.
+int parse_px(int s) {
+    if (s == 0) { return -1; }
+    int i = 0;
+    int v = 0;
+    int any = 0;
+    while (is_digit(s[i]) == 1) {
+        v = v * 10 + (s[i] - '0');
+        any = 1;
+        i = i + 1;
+    }
+    if (any == 0) { return -1; }
+    return v;
+}
+
+// --- the stylesheet cursor -------------------------------------------------
+
+void css_skip_space() {
+    while (css_pos < css_len) {
+        int c = css_src[css_pos];
+        if (is_space(c) == 1) { css_pos = css_pos + 1; }
+        else if (c == '/' && css_pos + 1 < css_len && css_src[css_pos + 1] == '*') {
+            css_pos = css_pos + 2;
+            while (css_pos + 1 < css_len) {
+                if (css_src[css_pos] == '*' && css_src[css_pos + 1] == '/') {
+                    css_pos = css_pos + 2;
+                    break;
+                }
+                css_pos = css_pos + 1;
+            }
+        } else { return; }
+    }
+    return;
+}
+
+// --- declarations ----------------------------------------------------------
+
+// Applies one `name: value` pair to a Props. Unknown properties and
+// unparseable values are dropped silently, which is what CSS requires of a
+// browser that meets something from a later version of the language than it
+// implements -- and is the behaviour that lets a stylesheet be written for a
+// real browser and still mean something here.
+void apply_decl(int props, int name, int value) {
+    if (str_eq(name, "color") == 1) {
+        int c = parse_color(value);
+        if (c >= 0) { props.p_color = c; }
+    } else if (str_eq(name, "background") == 1
+               || str_eq(name, "background-color") == 1) {
+        int c = parse_color(value);
+        if (c >= 0) { props.p_bg = c; }
+    } else if (str_eq(name, "font-size") == 1) {
+        int px = parse_px(value);
+        if (px > 0) {
+            // The font has one size and scales by whole pixels, so a size is
+            // rounded down to a multiple of the cell and never below 1x.
+            // Anything else would mean a resampled bitmap, which at this size
+            // is unreadable.
+            int s = px / cell_h;
+            if (s < 1) { s = 1; }
+            if (s > 8) { s = 8; }
+            props.p_scale = s;
+        }
+    } else if (str_eq(name, "font-weight") == 1) {
+        if (str_eq(value, "bold") == 1) { props.p_bold = 1; }
+        else if (str_eq(value, "normal") == 1) { props.p_bold = 0; }
+    } else if (str_eq(name, "display") == 1) {
+        if (str_eq(value, "block") == 1) { props.p_display = DISPLAY_BLOCK; }
+        else if (str_eq(value, "inline") == 1) { props.p_display = DISPLAY_INLINE; }
+        else if (str_eq(value, "none") == 1) { props.p_display = DISPLAY_NONE; }
+    } else if (str_eq(name, "margin") == 1) {
+        int v = parse_px(value);
+        if (v >= 0) { props.p_margin = v; }
+    } else if (str_eq(name, "padding") == 1) {
+        int v = parse_px(value);
+        if (v >= 0) { props.p_pad = v; }
+    } else if (str_eq(name, "text-align") == 1) {
+        if (str_eq(value, "left") == 1) { props.p_align = ALIGN_LEFT; }
+        else if (str_eq(value, "center") == 1) { props.p_align = ALIGN_CENTER; }
+        else if (str_eq(value, "right") == 1) { props.p_align = ALIGN_RIGHT; }
+    }
+    return;
+}
+
+// Reads `{ name: value; ... }`, the cursor sitting on the brace.
+int read_block() {
+    int props = props_new();
+    if (props == 0) { return 0; }
+    if (css_pos < css_len && css_src[css_pos] == '{') { css_pos = css_pos + 1; }
+    while (css_pos < css_len) {
+        css_skip_space();
+        if (css_pos >= css_len) { break; }
+        if (css_src[css_pos] == '}') { css_pos = css_pos + 1; break; }
+        int nstart = css_pos;
+        while (css_pos < css_len && is_name_char(css_src[css_pos]) == 1) {
+            css_pos = css_pos + 1;
+        }
+        if (css_pos == nstart) { css_pos = css_pos + 1; } else {
+            int name = str_dup_lower(css_src, nstart, css_pos - nstart);
+            css_skip_space();
+            if (css_pos < css_len && css_src[css_pos] == ':') {
+                css_pos = css_pos + 1;
+                css_skip_space();
+                int vstart = css_pos;
+                while (css_pos < css_len && css_src[css_pos] != ';'
+                       && css_src[css_pos] != '}') {
+                    css_pos = css_pos + 1;
+                }
+                int vend = css_pos;
+                // Trailing whitespace before the semicolon is not part of
+                // the value; "red ;" and "red;" are the same declaration.
+                while (vend > vstart && is_space(css_src[vend - 1]) == 1) {
+                    vend = vend - 1;
+                }
+                int value = str_dup_lower(css_src, vstart, vend - vstart);
+                apply_decl(props, name, value);
+                if (css_pos < css_len && css_src[css_pos] == ';') {
+                    css_pos = css_pos + 1;
+                }
+            }
+        }
+    }
+    return props;
+}
+
+// Scratch for parse_compound. A compound selector yields three things -- a
+// tag, a class and where it ended -- and a c0 function returns one int, so
+// the first two come back in globals.
+int sel_tag;
+int sel_class;
+
+// Reads one compound selector (`div`, `.note`, `div.note`, `*`) from `i`,
+// stopping at `stop`. Returns the position just past it with sel_tag and
+// sel_class set, or `i` unchanged when there was nothing there.
+int parse_compound(int i, int stop) {
+    sel_tag = 0;
+    sel_class = 0;
+    int tstart = i;
+    while (i < stop && is_name_char(css_src[i]) == 1) { i = i + 1; }
+    if (i > tstart) { sel_tag = str_dup_lower(css_src, tstart, i - tstart); }
+    if (i < stop && css_src[i] == '.') {
+        i = i + 1;
+        int cstart = i;
+        while (i < stop && is_name_char(css_src[i]) == 1) { i = i + 1; }
+        sel_class = str_dup_lower(css_src, cstart, i - cstart);
+    }
+    if (i < stop && css_src[i] == '*') { i = i + 1; }
+    return i;
+}
+
+void rule_add(int tag, int class_name, int atag, int aclass, int props) {
+    int r = alloc(sizeof(Rule));
+    if (r == 0) { return; }
+    r.r_tag = tag;
+    r.r_class = class_name;
+    r.r_atag = atag;
+    r.r_aclass = aclass;
+    int types = 0;
+    int classes = 0;
+    if (tag != 0) { types = types + 1; }
+    if (atag != 0) { types = types + 1; }
+    if (class_name != 0) { classes = classes + 1; }
+    if (aclass != 0) { classes = classes + 1; }
+    r.r_spec = classes * 16 + types;
+    r.r_props = props;
+    r.r_next = 0;
+    if (rules == 0) { rules = r; } else {
+        int t = rules_tail;
+        t.r_next = r;
+    }
+    rules_tail = r;
+    return;
+}
+
+// Parses a whole stylesheet and appends its rules to the list. Called once
+// for the default sheet and once per <style> block, in that order, so
+// document order across the whole list is also cascade order.
+void css_parse(int text) {
+    css_src = text;
+    css_len = str_len(text);
+    css_pos = 0;
+    while (css_pos < css_len) {
+        css_skip_space();
+        if (css_pos >= css_len) { break; }
+        // An at-rule (@media, @import) is skipped whole, including a block
+        // if it has one. Rendering its contents unconditionally would be
+        // worse than ignoring it: @media print exists to NOT apply here.
+        if (css_src[css_pos] == '@') {
+            while (css_pos < css_len && css_src[css_pos] != '{'
+                   && css_src[css_pos] != ';') { css_pos = css_pos + 1; }
+            if (css_pos < css_len && css_src[css_pos] == ';') {
+                css_pos = css_pos + 1;
+            } else {
+                int depth = 0;
+                while (css_pos < css_len) {
+                    if (css_src[css_pos] == '{') { depth = depth + 1; }
+                    if (css_src[css_pos] == '}') {
+                        depth = depth - 1;
+                        if (depth == 0) { css_pos = css_pos + 1; break; }
+                    }
+                    css_pos = css_pos + 1;
+                }
+            }
+        } else {
+            // Collect the selector list first, then parse ONE block and give
+            // every selector in the list its own rule pointing at the same
+            // Props. Sharing rather than copying is not a saving here, it is
+            // the definition: `h1, h2 { color: red }` is one declaration.
+            int sel_start = css_pos;
+            while (css_pos < css_len && css_src[css_pos] != '{') {
+                css_pos = css_pos + 1;
+            }
+            int sel_end = css_pos;
+            if (css_pos >= css_len) { break; }
+            int props = read_block();
+            if (props == 0) { return; }
+            int i = sel_start;
+            while (i < sel_end) {
+                while (i < sel_end && (is_space(css_src[i]) == 1
+                                       || css_src[i] == ',')) { i = i + 1; }
+                if (i >= sel_end) { break; }
+                int tstart = i;
+                i = parse_compound(i, sel_end);
+                int tag = sel_tag;
+                int class_name = sel_class;
+                int got_one = 0;
+                if (i > tstart) { got_one = 1; }
+                // A second compound after whitespace makes this a descendant
+                // selector, and the part read FIRST is the ancestor: in
+                // `div p` the subject is `p`, which is what the rule has to
+                // match against, while `div` is only a condition on where it
+                // sits.
+                int atag = 0;
+                int aclass = 0;
+                int j = i;
+                while (j < sel_end && is_space(css_src[j]) == 1) { j = j + 1; }
+                if (got_one == 1 && j < sel_end && css_src[j] != ',') {
+                    int k = parse_compound(j, sel_end);
+                    if (k > j) {
+                        atag = tag;
+                        aclass = class_name;
+                        tag = sel_tag;
+                        class_name = sel_class;
+                        i = k;
+                    }
+                }
+                // Whatever is left before the comma is a selector shape this
+                // engine cannot represent -- a combinator, an id, an
+                // attribute, or a third compound like `div p span`, which
+                // needs a list of ancestors rather than one.
+                //
+                // The rule is DROPPED in that case, not added. It used to be
+                // added with whatever it had managed to parse, which is
+                // worse than useless: `div > p { color: red }` parsed as
+                // `div`, so a selector meant for some paragraphs coloured
+                // every div instead. Refusing it means an unsupported
+                // selector does nothing, which is wrong in the direction a
+                // reader can see and reason about.
+                int rest = i;
+                while (rest < sel_end && is_space(css_src[rest]) == 1) {
+                    rest = rest + 1;
+                }
+                int usable = 1;
+                if (rest < sel_end && css_src[rest] != ',') { usable = 0; }
+                if (usable == 1 && got_one == 1) {
+                    rule_add(tag, class_name, atag, aclass, props);
+                }
+                while (i < sel_end && css_src[i] != ',') { i = i + 1; }
+            }
+        }
+    }
+    return;
+}
+
+// --- the cascade -----------------------------------------------------------
+
+// Does an element carry this class? The attribute is a space-separated list,
+// so a substring test would match `.nav` against class="navbar".
+int has_class(int node, int want) {
+    int cls = node.n_class;
+    if (cls == 0 || want == 0) { return 0; }
+    int i = 0;
+    while (cls[i] != 0) {
+        while (cls[i] != 0 && is_space(cls[i]) == 1) { i = i + 1; }
+        int start = i;
+        while (cls[i] != 0 && is_space(cls[i]) == 0) { i = i + 1; }
+        int n = i - start;
+        if (n == str_len(want)) {
+            int k = 0;
+            int same = 1;
+            while (k < n) {
+                if (cls[start + k] != want[k]) { same = 0; break; }
+                k = k + 1;
+            }
+            if (same == 1) { return 1; }
+        }
+    }
+    return 0;
+}
+
+// Does this compound (a tag, a class, either may be 0 for "any") describe
+// this element?
+int compound_matches(int node, int tag, int class_name) {
+    if (tag != 0 && str_eq(tag, node.n_name) == 0) { return 0; }
+    if (class_name != 0 && has_class(node, class_name) == 0) { return 0; }
+    return 1;
+}
+
+int rule_matches(int node, int rule) {
+    if (compound_matches(node, rule.r_tag, rule.r_class) == 0) { return 0; }
+    if (rule.r_atag == 0 && rule.r_aclass == 0) { return 1; }
+    // A descendant selector is the only thing here that looks outside the
+    // element being styled. Any ancestor will do, at any depth, which is
+    // what the space combinator means -- `div p` matches a p inside a div
+    // inside a blockquote.
+    int up = node.n_parent;
+    while (up != 0) {
+        if (up.n_kind == KIND_ELEM) {
+            if (compound_matches(up, rule.r_atag, rule.r_aclass) == 1) {
+                return 1;
+            }
+        }
+        up = up.n_parent;
+    }
+    return 0;
+}
+
+// Computes one element's style: what it inherits, then every matching rule,
+// least specific first and in document order within each level.
+//
+// One walk of the rule list per specificity level rather than a sorted list.
+// The list is short (a default sheet plus whatever the page carries), the
+// levels are few, and the alternative is a sort with a comparison function
+// and a stability requirement, which is more to get wrong than a loop. It
+// was two hardcoded passes, type selectors then class selectors, until
+// descendant selectors arrived and made four levels out of two.
+int style_compute(int node, int parent_props) {
+    int p = props_new();
+    if (p == 0) { return 0; }
+    // Inherited: what the text looks like. NOT inherited: the box. A child
+    // of a box with a background does not get its own copy of it, and this
+    // is the line that says so.
+    if (parent_props != 0) {
+        p.p_color = parent_props.p_color;
+        p.p_scale = parent_props.p_scale;
+        p.p_bold = parent_props.p_bold;
+        p.p_align = parent_props.p_align;
+    }
+    p.p_display = DISPLAY_INLINE;
+    p.p_bg = -1;
+    p.p_margin = 0;
+    p.p_pad = 0;
+    int level = 0;
+    while (level <= SPEC_MAX) {
+        int r = rules;
+        while (r != 0) {
+            if (r.r_spec == level && rule_matches(node, r) == 1) {
+                props_merge(p, r.r_props);
+            }
+            r = r.r_next;
+        }
+        level = level + 1;
+    }
+    return p;
+}
+
+// Walks the tree assigning a computed style to every element. Text nodes
+// share their parent's, which is what "inline text has no style of its own"
+// means in practice and saves a Props per word of the document.
+void style_tree(int node, int parent_props) {
+    int p = parent_props;
+    if (node.n_kind == KIND_ELEM) {
+        p = style_compute(node, parent_props);
+        node.n_style = p;
+    } else {
+        node.n_style = parent_props;
+    }
+    int c = node.n_first;
+    while (c != 0) {
+        style_tree(c, p);
+        c = c.n_next;
+    }
+    return;
+}
+
+// The default stylesheet -- what a document looks like before its author
+// says anything. Every browser has one of these, and most of what people
+// think of as "how HTML looks" lives in it rather than in the language.
+int default_css() {
+    return "html,body{display:block;color:#181818;background:#f6f5f0;}
+body{padding:8px;font-size:8px;text-align:left;font-weight:normal;}
+head,title,style,script{display:none;}
+div,p,ul,li,hr,h1,h2,h3,table{display:block;}
+table{margin:6px;}
+th{font-weight:bold;text-align:center;}
+h1{font-size:24px;font-weight:bold;margin:10px;color:#101010;}
+h2{font-size:16px;font-weight:bold;margin:8px;color:#101010;}
+h3{font-size:8px;font-weight:bold;margin:6px;}
+p{margin:5px;}
+ul{margin:6px;padding:16px;}
+li{margin:2px;}
+b,strong{font-weight:bold;}
+i,em{color:#404040;}
+code{color:#006060;background:#e8e8e0;}
+a{color:#0040c0;}
+hr{margin:6px;background:#b0b0a8;}";
+}

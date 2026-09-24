@@ -398,17 +398,32 @@ layout Node {
     int child2;
     int extra;
     int next;
+    // The body of a for loop, and nothing else. It has a slot of its own
+    // because `next` could not be shared: `next` is what chains one statement
+    // to the following one inside a block, and a for loop is a statement. A
+    // loop that was not the last statement therefore had its body
+    // OVERWRITTEN by whatever came after it, ran that statement once per
+    // iteration instead of its own body, and then had it freed twice -- once
+    // as the loop's body and once as the next link in the chain. Every for
+    // test in test_repl.sh had the loop last, which is the single
+    // arrangement in which none of that can happen.
+    //
+    // while and if were never affected: their bodies live in child2 and
+    // child2/extra. for is the only node that needed a fifth child, and
+    // taking `next` for it was the mistake.
+    int nd_body;
 }
 
-// Allocates a 40-byte AST node (5 × 8-byte slots) and sets its kind.
+// Allocates a 48-byte AST node (6 × 8-byte slots) and sets its kind.
 int repl_node(int kind) {
-    int nd = kmalloc(40);
+    int nd = kmalloc(48);
     if (nd == 0) { return 0; }
     nd.kind = kind;
     nd.child1 = 0;
     nd.child2 = 0;
     nd.extra = 0;
     nd.next = 0;
+    nd.nd_body = 0;
     return nd;
 }
 
@@ -690,7 +705,7 @@ int repl_p_stmt(int toks) {
         int nd = repl_node(ND_FOR);
         if (repl_tok_kind(toks, repl_tpos) != TK_LPAREN) {
             nd.child1 = 0; nd.child2 = 0;
-            nd.extra = 0; nd.next = repl_node(ND_NUM);
+            nd.extra = 0; nd.nd_body = repl_node(ND_NUM);
             return nd;
         }
         repl_tpos = repl_tpos + 1;  // skip '('
@@ -715,7 +730,7 @@ int repl_p_stmt(int toks) {
         if (repl_tok_kind(toks, repl_tpos) == TK_RPAREN) {
             repl_tpos = repl_tpos + 1;
         }
-        nd.next = repl_p_stmt(toks);  // body
+        nd.nd_body = repl_p_stmt(toks);  // body -- NOT next, see layout Node
         return nd;
     }
     if (k == TK_LBRACE) {
@@ -931,7 +946,7 @@ int repl_eval_node(int nd) {
         int init = left;
         int cond = right;
         int incr = nd.extra;
-        int body = nd.next;
+        int body = nd.nd_body;
         int result = 0;
         repl_loop_depth = repl_loop_depth + 1;
         if (init != 0) { repl_eval_node(init); }
@@ -991,7 +1006,16 @@ void repl_free_tree(int nd) {
         repl_free_tree(left);
     } else if (kind == ND_CALL) {
         // left = function name pointer (in source buffer, do not free)
-        repl_free_tree(right);  // first argument + its sibling chain
+        // The arguments are a chain through `next`, the same shape a block's
+        // statements have, so they need the same walk. This used to free
+        // `right` alone, with a comment claiming it covered the sibling
+        // chain, and every argument after the first leaked.
+        int arg = right;
+        while (arg != 0) {
+            int nxt_arg = arg.next;
+            repl_free_tree(arg);
+            arg = nxt_arg;
+        }
     } else if (kind == ND_IF) {
         repl_free_tree(left);   // cond
         repl_free_tree(right);  // then
@@ -1000,10 +1024,11 @@ void repl_free_tree(int nd) {
         repl_free_tree(left);
         repl_free_tree(right);
     } else if (kind == ND_FOR) {
-        repl_free_tree(left);   // init (may be 0)
-        repl_free_tree(right);  // cond (may be 0)
-        repl_free_tree(extra);  // incr (may be 0)
-        repl_free_tree(next);   // body
+        repl_free_tree(left);      // init (may be 0)
+        repl_free_tree(right);     // cond (may be 0)
+        repl_free_tree(extra);     // incr (may be 0)
+        repl_free_tree(nd.nd_body); // body -- `next` belongs to the caller's
+                                   // statement chain and is freed by it
     } else if (kind == ND_BLOCK) {
         // Free each statement in the chain.
         int stmt = left;

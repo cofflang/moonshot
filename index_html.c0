@@ -1,0 +1,174 @@
+// index_html.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// The pages jakel seeds -- /index.html, the document utsikt opens, and
+// /about.html, the one it links to.
+//
+// It lives in the kernel because Moonshot has no way to receive a file from
+// the host: everything that has to exist as a file on jakel is seeded by the
+// kernel itself, the same way the ring-3 binaries are. It is a string rather
+// than a baked byte array because it is text, and a byte array nobody can
+// read in a diff would be a worse version of the same thing.
+//
+// The content is chosen to exercise the engine, not to say something: every
+// property utsikt's CSS subset supports appears here, the colours are
+// distinct enough for verify_utsikt.sh to find by pixel, and it is long
+// enough that a window has to scroll to reach the end.
+//
+// There are two pages rather than one because a link needs somewhere to go,
+// and a link to the page you are already on proves nothing about following
+// it. The second page uses a background no other page uses, so a test can
+// tell which of the two is on screen by counting pixels of one colour.
+int utsikt_index_html() {
+    return "<!DOCTYPE html>
+<html>
+<head>
+<title>Moonshot</title>
+<style>
+body { background: #f0efe8; color: #202020; padding: 10px; }
+h1 { color: #202060; font-size: 24px; text-align: center; margin: 12px; }
+h2 { color: #204020; font-size: 16px; margin: 10px; }
+p { margin: 6px; }
+.note { background: #c8e0c8; padding: 8px; margin: 8px; }
+.quiet { color: #707070; }
+code { background: #e0e0d0; color: #006060; }
+.note code { color: #a03000; }
+</style>
+</head>
+<body>
+
+<h1>Moonshot</h1>
+
+<p class=\"quiet\">An operating system written from scratch, in a language
+written from scratch, compiled by a compiler written in that language and
+assembled by an assembler written in it too.</p>
+
+<p>There is <a href=\"about.html\">a second page</a> to follow from here.
+Click it. Backspace comes back.</p>
+
+<div class=\"note\">This page is a file on the filesystem. The browser
+reading it is a ring-3 program that asked the kernel for the bytes with
+<code>readfile</code> and for the font with <code>glyph</code>, and drew
+every pixel you are looking at itself.</div>
+
+<h2>What is here</h2>
+
+<p>The kernel is <b>knekt</b>. Memory is <b>jenna</b>, the scheduler is
+<b>chrone</b>, the filesystem is <b>jakel</b> and the init system is
+<b>raket</b>. Pixels and the font are <b>punkt</b>; the windowing layer is
+<b>kakel</b>, and a window holding a graphical program is a <b>tavla</b>.
+The shell is <b>skalman</b> and the mouse driver is <b>klick</b>.</p>
+
+<p>Nothing here came from a library. There is no libc, no runtime and no
+allocator worth the name: memory is handed out and never given back, which
+is a real limit rather than an oversight, and it is written down as one.</p>
+
+<h2>The toolchain</h2>
+
+<p>The language is <b>c0</b>. It has one type, the 64-bit integer, and
+everything -- numbers, addresses, strings, function references -- is a value
+of that type. The compiler is <b>coff</b>, written in c0, compiling itself.
+The assembler and linker are <b>smed</b>, also written in c0, also assembling
+themselves.</p>
+
+<p>Neither GNU <code>as</code> nor GNU <code>ld</code> is on the path from
+this source to this kernel any more. A C compiler is needed once, to get the
+first coff, in the same way a first assembler always has to come from
+somewhere.</p>
+
+<hr>
+
+<h2>Why the bootstrap is checked</h2>
+
+<p>A compiler is a binary, and a binary is exactly where Ken Thompson's 1984
+attack lives: a compiler that recognises its own source and puts a backdoor
+into every compiler it builds, leaving no trace in any source file. A green
+test suite is not evidence against it, because the bootstrap fixpoint is the
+property such an attack is built to preserve.</p>
+
+<p>So the build gate is a hash, checked on every build, and the audit is
+diverse double-compiling: the bootstrap compiler built by two unrelated C
+compilers has to agree byte for byte on every source in the corpus. That
+stage caught a simulated attack that every other check passed.</p>
+
+<h2>What this browser does</h2>
+
+<ul>
+<li>Parses HTML into a tree, tolerating what real documents actually
+contain: unclosed paragraphs, stray end tags, unknown elements.</li>
+<li>Reads a subset of CSS -- colours, backgrounds, text size and weight,
+alignment, display, margin and padding -- with type and class selectors.</li>
+<li>Lays the tree out as block and inline boxes, breaking lines at the
+window edge and re-wrapping when the window is resized.</li>
+<li>Paints into one buffer and hands it to the kernel in a single call, so
+the scheduler cannot tear a frame in half.</li>
+</ul>
+
+<h2>What it does not do</h2>
+
+<p>There is no networking, and that is a decision rather than a gap:
+<b>verk</b>, the network stack, is the last subsystem this system will get.
+Until then a page is a file, and this is one.</p>
+
+<p class=\"quiet\">Arrow keys and PageUp/PageDown scroll. Home and End jump.
+Click a link to follow it and Backspace to come back. r re-reads the page.
+Esc quits, and alt+w closes the window.</p>
+
+</body>
+</html>";
+}
+
+// The page /index.html links to. Short on purpose: its job is to be
+// unmistakably NOT the first page, from one screendump, without scrolling.
+// The background is the only place #e8e0f4 appears anywhere in the system,
+// which is what lets verify_utsikt_links.sh say which page is on screen by
+// counting pixels rather than by reading text.
+int utsikt_about_html() {
+    return "<!DOCTYPE html>
+<html>
+<head>
+<title>About</title>
+<style>
+body { background: #e8e0f4; color: #202020; padding: 10px; }
+h1 { color: #402060; font-size: 24px; text-align: center; margin: 12px; }
+p { margin: 6px; }
+</style>
+</head>
+<body>
+
+<h1>The second page</h1>
+
+<p>You got here by clicking a link. The engine kept an <code>href</code>
+through parsing, knew where it painted the words that carried it, matched a
+click against that rectangle and read a different file off the filesystem.
+Backspace goes back to where you came from.</p>
+
+<p>A link target is a name on the filesystem, resolved from the root. There
+is no network, so a target naming a host is not followed at all. The page
+you are reading stays where it is.</p>
+
+<h2>What the engine can lay out</h2>
+
+<table>
+<tr><th>Box</th><th>State</th></tr>
+<tr><td>Blocks and inline text</td><td>yes</td></tr>
+<tr><td>Margins, collapsed</td><td>yes</td></tr>
+<tr><td>Tables</td><td>this one</td></tr>
+<tr><td>Images</td><td>not yet</td></tr>
+</table>
+
+<p>The table above is laid out by the same engine as everything else. Its
+columns are equal width rather than sized to their contents, which is a
+simplification written down in the source rather than an accident.</p>
+
+<p><a href=\"index.html\">Back to the first page</a>, the long way.</p>
+
+</body>
+</html>";
+}

@@ -1,0 +1,60 @@
+// expect: 137
+// Globals in ring 3. These only became possible when the separate --elf
+// machine-code backend was deleted and `coff --elf` became the ordinary
+// text backend aimed at Moonshot: the old backend refused a global
+// outright, so every ring-3 program written before then is all-locals,
+// and none of them was changed afterwards. That left the feature compiled
+// but never once executed under the kernel's loader -- which is the part
+// that is not obviously fine. A global with an
+// initialiser lives in .data, and .data is memory the ELF loader has to
+// map, copy and leave writable. This test is here because nothing else
+// would notice if it did not.
+//
+// So: read an initialised global, write one, read it back through a
+// function that never saw it as an argument, and take the address of a
+// zero-initialised one (.bss, a different section with a file size of zero
+// and a memory size that is not).
+int counter = 40;
+int scratch = 0;
+int table;
+
+int bump(int by) {
+    counter = counter + by;
+    return counter;
+}
+
+int seen() {
+    return counter;
+}
+
+int main() {
+    // Initialised .data arrived intact.
+    if (counter != 40) { return 101; }
+
+    // A write from one function is visible in another -- one object, not a
+    // per-function copy.
+    if (bump(2) != 42) { return 102; }
+    if (seen() != 42) { return 103; }
+
+    // An uninitialised global is zero, and stays a real writable location.
+    if (scratch != 0) { return 104; }
+    scratch = 7;
+    if (scratch != 7) { return 105; }
+
+    // A global holding a heap pointer, written and read across calls, with
+    // the memory behind it actually used. alloc() is the only ring-3 source
+    // of memory, so this is the shape every real program needs.
+    table = alloc(32);
+    if (table == 0) { return 106; }
+    store64(table, 88);
+    store64(table + 8, 0 - 1);
+    if (load64(table) != 88) { return 107; }
+    if (load64(table + 8) != 0 - 1) { return 108; }
+
+    // A global holding a function reference, called indirectly.
+    int f = bump;
+    counter = 100;
+    if (f(30) != 130) { return 109; }
+
+    return counter + scratch;
+}

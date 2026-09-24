@@ -1,0 +1,353 @@
+// utsikt.c0 — part of utsikt, a browser engine for the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of utsikt, a browser engine written in c0 for moonshot.
+// utsikt is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// utsikt -- a browser engine for Moonshot, written in c0.
+//
+// What it does: read an HTML file off the filesystem, build a DOM, apply a
+// subset of CSS, lay the result out as block and inline boxes, and paint it
+// into a window. Links are followed with the mouse, and Backspace goes back.
+// No networking -- that is deliberate and long-term, not a gap waiting to be
+// filled: verk is the LAST subsystem Moonshot gets, so utsikt reads files for
+// a long while yet. Everything that fetches bytes goes through
+// load_document() below and nothing else does, so the day there is a network
+// stack, one function changes. A link target is therefore a name on jakel,
+// resolved from the root, and a href naming a host is left alone rather than
+// failing.
+//
+// It runs as a tavla: an ordinary ring-3 program in a kakel window, spawned
+// with `spawn3 utsikt.elf`, composited into its own buffer and
+// presented in one syscall. The pieces:
+//
+//   paint.c0   pixels, the font, and the string helpers
+//   dom.c0     HTML -> a tree
+//   style.c0   CSS -> rules, and the cascade that computes a style per node
+//   flow.c0    the tree -> boxes and lines, measured then painted
+//
+// The order of these includes is the dependency order, and c0 `include` is
+// textual substitution, so it is also the order the compiler sees. flow.c0
+// uses the constants style.c0 defines; style.c0 uses paint.c0's cell size.
+
+include "paint.c0";
+include "dom.c0";
+include "style.c0";
+include "flow.c0";
+
+// The document utsikt opens first. A function rather than a global because
+// a global initialiser is a constant, and a string literal is an address the
+// linker fills in.
+int page_file() { return "index.html"; }
+
+// The document on screen now. Following a link moves this; the reload key
+// re-reads THIS rather than the start page, or reloading would quietly be a
+// second home key.
+int current_page;
+
+// Where following a link came from. A plain stack of names, not of parsed
+// documents: re-reading and re-parsing a page costs a fraction of what
+// keeping every document ever visited would, and alloc() has no free, so
+// holding on to them is the expensive option rather than the cheap one.
+//
+// Going back therefore loses the scroll position, which is a real cost and
+// the honest one to pay here.
+int HIST_MAX = 32;
+int history;
+int history_n;
+
+void history_push(int name) {
+    if (history_n >= HIST_MAX) {
+        // Drop the oldest rather than refuse to navigate. A browser that
+        // stops following links after enough of them is worse than one whose
+        // memory of the way back is finite.
+        int k = 1;
+        while (k < HIST_MAX) {
+            store64(history + (k - 1) * 8, load64(history + k * 8));
+            k = k + 1;
+        }
+        history_n = HIST_MAX - 1;
+    }
+    store64(history + history_n * 8, name);
+    history_n = history_n + 1;
+    return;
+}
+
+int history_pop() {
+    if (history_n <= 0) { return 0; }
+    history_n = history_n - 1;
+    return load64(history + history_n * 8);
+}
+
+// Whether a link target is something this engine can open at all. There is
+// no network and there are no fragments, so a href naming either is not a
+// broken link, it is a link to somewhere that does not exist here yet.
+// Refusing it leaves the current page alone, which is the one behaviour that
+// cannot lose what the reader was looking at.
+int followable(int href) {
+    if (href == 0) { return 0; }
+    if (href[0] == 0) { return 0; }
+    if (href[0] == '#') { return 0; }
+    int i = 0;
+    while (href[i] != 0) {
+        if (href[i] == ':') { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// The page shown when there is no index.html on the filesystem. Same role as
+// Gnista's baked-in sprite: the program has to do something visible on a
+// machine where nobody has put a file there yet, and a blank window is
+// indistinguishable from a program that crashed.
+//
+// It also doubles as the one page that is always available to test against,
+// which is why it uses every feature the engine has rather than saying
+// something short and friendly.
+int builtin_page() {
+    return "<!DOCTYPE html>
+<html><head><title>utsikt</title>
+<style>
+body { background: #f0efe8; color: #202020; padding: 10px; }
+h1 { color: #202060; text-align: center; }
+.note { background: #e0e8e0; padding: 6px; margin: 6px; }
+.quiet { color: #707070; }
+</style></head>
+<body>
+<h1>utsikt</h1>
+<p>No <code>index.html</code> was found, so this is the page built into the
+engine. It is here so that an empty filesystem looks different from a
+crash.</p>
+<h2>What renders</h2>
+<ul>
+<li>Block and inline boxes, with margins and padding.</li>
+<li>Text that <b>wraps</b> at the window edge and re-wraps when the window
+is resized.</li>
+<li>Colours, backgrounds, three text sizes and alignment.</li>
+<li>Links, clicked with the mouse. There is no page here to go to, since
+this is the page that exists when the filesystem has none.</li>
+</ul>
+<div class=\"note\">A div with a class, a background and its own padding.</div>
+<hr>
+<p class=\"quiet\">Arrow keys and PageUp/PageDown scroll. Click a link to
+follow it and Backspace to come back. r re-reads the page. Esc quits.
+alt+w closes the window.</p>
+</body></html>";
+}
+
+// The only place bytes enter the engine. It reads a file today; it is the
+// function verk would change and the reason nothing else calls readfile().
+//
+// Returns 0 when there is no such file, which the caller turns into the
+// built-in page rather than into an error: a browser with nothing to show is
+// still a browser.
+int load_document(int name) {
+    int size = readfile(name, 0, 0);
+    if (size <= 0) { return 0; }
+    int buf = alloc(size + 1);
+    if (buf == 0) { return 0; }
+    int n = readfile(name, buf, size);
+    if (n <= 0) { return 0; }
+    buf[n] = 0;
+    return buf;
+}
+
+// Parses a document and computes every node's style. Separate from main so
+// that reloading is the same code path as loading, which is the only way a
+// reload key can be trusted to show what a fresh start would have shown.
+int build_page(int html) {
+    rules = 0;
+    rules_tail = 0;
+    css_parse(default_css());
+    int root = html_parse(html);
+    if (root == 0) { return 0; }
+    int b = style_blocks;
+    while (b != 0) {
+        css_parse(b.sb_text);
+        b = b.sb_next;
+    }
+    style_tree(root, 0);
+    int bg = find_page_bg(root);
+    if (bg < 0) { bg = 0xFFFFFF; }
+    page_bg = bg;
+    return root;
+}
+
+// Loads a document by name, parses it, and makes it the page on screen.
+// Returns the new root, or 0 if the name does not resolve to a file -- in
+// which case the caller keeps whatever was already there.
+int goto_page(int name) {
+    int html = load_document(name);
+    if (html == 0) { return 0; }
+    int r = build_page(html);
+    if (r == 0) { return 0; }
+    current_page = name;
+    scroll_y = 0;
+    return r;
+}
+
+int main() {
+    int winfo = win_info();
+    if (winfo <= 0) {
+        print("utsikt: no window -- spawn me with spawn3, not run3\n");
+        return 2;
+    }
+    int winmax = win_max();
+    if (winmax <= 0) {
+        print("utsikt: win_max unavailable\n");
+        return 3;
+    }
+    fb_max_w = winmax / 65536;
+    fb_max_h = winmax - fb_max_w * 65536;
+    // Sized for the largest window this machine can hand out, once. alloc()
+    // is bump-only, so a buffer cut to today's window could never grow with
+    // it, and present() copies what the window measures NOW.
+    fb = alloc(fb_max_w * fb_max_h * 4);
+    if (fb == 0) {
+        print("utsikt: cannot allocate a frame buffer\n");
+        return 4;
+    }
+    if (font_init() == 0) {
+        print("utsikt: the kernel would not hand over its font\n");
+        return 5;
+    }
+    if (flow_init() == 0) {
+        print("utsikt: cannot allocate a line buffer\n");
+        return 6;
+    }
+    history = alloc(HIST_MAX * 8);
+    if (history == 0) {
+        print("utsikt: cannot allocate the history stack\n");
+        return 8;
+    }
+    history_n = 0;
+
+    current_page = page_file();
+    int html = load_document(page_file());
+    if (html == 0) {
+        print("utsikt: no index.html -- showing the built-in page\n");
+        html = builtin_page();
+    }
+    int root = build_page(html);
+    if (root == 0) {
+        print("utsikt: out of memory parsing the document\n");
+        return 7;
+    }
+
+    // Nothing may be printed past this point. print() is SYS_DEBUG_PRINT,
+    // and for a task that owns a window the kernel routes it INTO that
+    // window as text -- which would draw over the page. Diagnostics belong
+    // before the first frame or nowhere.
+
+    scroll_y = 0;
+    int dirty = 1;
+    int last_w = 0;
+    int last_h = 0;
+    int last_left = 0;
+    while (1) {
+        int wi = win_info();
+        int ww = wi / 65536;
+        int wh = wi - ww * 65536;
+        if (ww > fb_max_w) { ww = fb_max_w; }
+        if (wh > fb_max_h) { wh = fb_max_h; }
+        if (ww != last_w || wh != last_h) {
+            // The window changed under us. Re-laying out rather than scaling
+            // is the whole point of having a layout engine: text re-wraps to
+            // the new width instead of being squeezed.
+            last_w = ww;
+            last_h = wh;
+            dirty = 1;
+        }
+        view_w = ww;
+        // The address line's height comes off the document's, here and not
+        // at paint time, so that every height-dependent thing downstream
+        // agrees: PageDown pages by what is actually visible, End stops
+        // where the last line really is, and the layout clips to the same
+        // rectangle it was measured against.
+        view_h = wh - bar_height();
+        if (view_h < 0) { view_h = 0; }
+
+        // Links. mouse_poll() is state rather than events, so following one
+        // means finding the PRESS EDGE here: the frame where a button is
+        // down and was not down before. Acting on the state itself would
+        // follow the same link on every frame the button stayed held, which
+        // at this frame rate is a page load per few milliseconds.
+        int mp = mouse_poll();
+        int buttons = 0;
+        if (mp >= 0) {
+            int packed = mp / 8;
+            buttons = mp - packed * 8;
+            int mx = packed / 1024;
+            int my = packed - mx * 1024;
+            int left = buttons - (buttons / 2) * 2;
+            if (left == 1 && last_left == 0) {
+                int href = link_hit(mx, my);
+                if (followable(href) == 1) {
+                    int prev = current_page;
+                    int r3 = goto_page(href);
+                    if (r3 != 0) {
+                        history_push(prev);
+                        root = r3;
+                        dirty = 1;
+                    }
+                }
+            }
+        }
+        // A pointer that has left the window reports -1, which is not the
+        // same as a button being released. Treating it as released is right
+        // anyway: a press that happened somewhere else is not this window's
+        // press, and the next one inside the window has to read as new.
+        last_left = buttons - (buttons / 2) * 2;
+
+        int key = key_poll();
+        while (key >= 0) {
+            int make = key / 2;
+            int is_break = key - make * 2;
+            if (is_break == 0) {
+                if (make == 1) { return 0; }                      // Esc
+                if (make == 72) { scroll_y = scroll_y - cell_h * 3; dirty = 1; }
+                if (make == 80) { scroll_y = scroll_y + cell_h * 3; dirty = 1; }
+                if (make == 73) { scroll_y = scroll_y - view_h + cell_h * 2; dirty = 1; }
+                if (make == 81) { scroll_y = scroll_y + view_h - cell_h * 2; dirty = 1; }
+                if (make == 71) { scroll_y = 0; dirty = 1; }      // Home
+                if (make == 79) { scroll_y = doc_h; dirty = 1; }  // End
+                if (make == 14) {
+                    // Backspace -- back. Without it a link is a one-way
+                    // door, since the reload key now re-reads the page that
+                    // was followed to rather than the one it started on.
+                    int back = history_pop();
+                    if (back != 0) {
+                        int r4 = goto_page(back);
+                        if (r4 != 0) { root = r4; dirty = 1; }
+                    }
+                }
+                if (make == 19) {
+                    // r -- re-read the file and rebuild. Every allocation
+                    // this makes is permanent: alloc() is bump-only with no
+                    // free, so each reload costs another document's worth of
+                    // the 8MB heap. That is a real limit, not a rounding
+                    // error, and it is the honest cost of having no
+                    // allocator rather than something to hide.
+                    int fresh = load_document(current_page);
+                    if (fresh == 0) { fresh = builtin_page(); }
+                    int r2 = build_page(fresh);
+                    if (r2 != 0) { root = r2; scroll_y = 0; }
+                    dirty = 1;
+                }
+            }
+            key = key_poll();
+        }
+
+        if (scroll_y < 0) { scroll_y = 0; }
+        if (dirty == 1 && view_w > 0 && view_h > 0) {
+            render_page(root);
+            draw_address_bar(wh, current_page);
+            present(fb);
+            dirty = 0;
+        }
+    }
+    return 0;
+}

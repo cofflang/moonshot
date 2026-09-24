@@ -1,0 +1,761 @@
+// flow.c0 — part of utsikt, a browser engine for the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of utsikt, a browser engine written in c0 for moonshot.
+// utsikt is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// flow.c0 -- normal flow: blocks stack down the page, inline content fills
+// lines across it, and lines break when they run out of room.
+//
+// The engine runs the SAME traversal twice, with one global telling it
+// whether to draw. The measure pass records where every block box landed and
+// how tall it turned out; the paint pass repeats the traversal and draws.
+// The reason is the background: a block's background covers the box, and the
+// box's height is not known until its children have been laid out, so a
+// single pass would have to paint the background after the text it sits
+// behind. Two passes over a tree that is already in memory costs almost
+// nothing and keeps the painting order right -- box, then contents.
+//
+// Because both passes run the identical code, any disagreement between them
+// would be a bug in this file rather than a difference in inputs. That is
+// worth more than the saved traversal.
+//
+// Coordinates are DOCUMENT coordinates: y grows down the whole page, not
+// down the window. The scroll offset is subtracted at the single point where
+// something is actually drawn, and nowhere else, so scrolling cannot change
+// layout -- which is the property that makes it safe to scroll without
+// re-measuring.
+
+layout Item {
+    int i_text;    // first byte of the run, pointing into the text node
+    int i_len;
+    int i_x;       // x within the content box, before alignment
+    int i_w;
+    int i_h;
+    int i_scale;
+    int i_color;
+    int i_bold;
+    int i_bg;      // inline background, or -1
+    int i_href;    // the link this run belongs to, or 0
+}
+
+// Where a link ended up on screen. Filled in by the paint pass, in WINDOW
+// coordinates rather than document ones, because that is what a click
+// arrives in and converting once here is cheaper than converting on every
+// click. Rebuilt from scratch every frame, so it cannot go stale against a
+// scroll or a re-wrap: there is one frame and one table, and they are always
+// the same frame.
+layout LinkBox {
+    int lb_x;
+    int lb_y;
+    int lb_w;
+    int lb_h;
+    int lb_href;
+}
+
+int LINK_MAX = 256;
+int link_boxes;
+int link_count;
+
+int LINE_MAX = 512;
+
+int flow_paint;    // 0 = measure, 1 = draw
+int flow_left;     // content box edges, in document coordinates
+int flow_right;
+int flow_align;
+int flow_y;        // the pen: the top of whatever comes next
+
+int line_items;
+int word_scratch;  // where a word that has to move to the next line is held
+int line_count;
+// The item index where the current WORD began. A word is not the same thing
+// as an item: "<b>knekt</b>." is two runs with no space between them, and a
+// line may only break where a space was. Without this the wrap landed
+// between the bold word and the full stop, and a line started with ".".
+int word_start;
+int line_x;        // width of the content placed on this line so far
+int line_top;      // document y of the current line box
+int line_h;        // tallest thing on the line so far
+
+int scroll_y;
+int doc_h;
+int page_bg;
+
+
+// The height a line box occupies, from the height of the tallest glyph on
+// it. The extra is leading -- the space between one line's descenders and
+// the next line's ascenders -- and without it lines touch: this font fills
+// its whole 8-pixel cell, so consecutive lines rendered at exactly the
+// glyph height come out as a solid block of text with no gaps. Roughly a
+// third of the size, which is what the ratio behind every readable body
+// text has always been, and it scales with the text rather than being a
+// fixed number of pixels that a heading would swallow.
+//
+// The space goes BELOW the glyphs, not around them: descenders already
+// reach the bottom row of the cell, so the gap that matters is the one
+// before the next line starts.
+int line_advance(int h) {
+    if (h <= 0) { return 0; }
+    return h + (h + 2) / 3;
+}
+
+// The link the inline content being flowed belongs to, or 0. A global for
+// the same reason flow_paint and flow_align are: it is context that every
+// run inherits from where it sits in the tree, not an argument each caller
+// would have to thread through.
+int flow_href;
+
+// The bottom margin of the block that just finished, still collapsible.
+//
+// CSS says two vertical margins that meet collapse to the larger of the
+// two rather than adding. Without this, an h2 with an 8px margin followed
+// by a p with a 6px one left a 14px gap where every other browser leaves 8,
+// and the page read as though it had been double-spaced by accident.
+//
+// The mechanism is a carry rather than a lookahead. A block's bottom margin
+// is added to flow_y as it always was, and remembered here; the next block
+// to start then adds only the DIFFERENCE, if its own top margin is larger.
+// So the gap ends up as the larger of the two and neither block has to know
+// anything about its sibling.
+//
+// It is cleared the moment anything real is laid down, in flush_line below,
+// because a margin only collapses against another margin. Two paragraphs
+// with a line of loose text between them are not adjacent.
+//
+// NOT collapsed: a parent's margin with its first or last child's, which is
+// the other half of the CSS rule. That one needs a block to know whether
+// its own box has a border, padding or content above the child, and it
+// changes where the parent's background starts rather than just the gap
+// between siblings. Written down as missing rather than left to be found.
+int flow_carry;
+
+int flow_init() {
+    line_items = alloc(LINE_MAX * sizeof(Item));
+    if (line_items == 0) { return 0; }
+    word_scratch = alloc(LINE_MAX * sizeof(Item));
+    if (word_scratch == 0) { return 0; }
+    link_boxes = alloc(LINK_MAX * sizeof(LinkBox));
+    if (link_boxes == 0) { return 0; }
+    link_count = 0;
+    return 1;
+}
+
+// Records one painted run of a link. Silently stops at LINK_MAX rather than
+// growing: alloc() has no free, so a table that grew per frame would leak a
+// page of heap every repaint. A document with more links than this loses the
+// ones past the limit, which is a visible and bounded failure rather than a
+// slow one.
+void link_box_add(int x, int y, int w, int h, int href) {
+    if (link_count >= LINK_MAX) { return; }
+    int lb = link_boxes + link_count * sizeof(LinkBox);
+    lb.lb_x = x;
+    lb.lb_y = y;
+    lb.lb_w = w;
+    lb.lb_h = h;
+    lb.lb_href = href;
+    link_count = link_count + 1;
+    return;
+}
+
+// The link under a window pixel, or 0. Walks backwards so that the last run
+// painted at a point wins, which is the same rule the pixels themselves
+// follow.
+int link_hit(int mx, int my) {
+    int k = link_count - 1;
+    while (k >= 0) {
+        int lb = link_boxes + k * sizeof(LinkBox);
+        if (mx >= lb.lb_x && mx < lb.lb_x + lb.lb_w
+            && my >= lb.lb_y && my < lb.lb_y + lb.lb_h) {
+            return lb.lb_href;
+        }
+        k = k - 1;
+    }
+    return 0;
+}
+
+// Ends the current line: draws what is on it, if this is the paint pass,
+// and moves the pen below it.
+//
+// Alignment happens here and only here, because it is the one thing about a
+// line that cannot be decided until the line is complete. That is also why
+// the items are buffered rather than drawn as they are placed: a centred
+// line's first word depends on where its last word ended.
+void flush_line() {
+    if (line_count == 0) {
+        if (line_h > 0) {
+            flow_y = line_top + line_advance(line_h);
+            flow_carry = 0;
+        }
+        line_top = flow_y;
+        line_x = 0;
+        line_h = 0;
+        word_start = 0;
+        return;
+    }
+    // A line with content on it separates whatever margin came before from
+    // whatever comes after, so nothing may collapse across it.
+    flow_carry = 0;
+    if (flow_paint == 1) {
+        int dx = 0;
+        if (flow_align == ALIGN_CENTER) { dx = (flow_right - flow_left - line_x) / 2; }
+        if (flow_align == ALIGN_RIGHT) { dx = flow_right - flow_left - line_x; }
+        if (dx < 0) { dx = 0; }
+        int k = 0;
+        while (k < line_count) {
+            int it = line_items + k * sizeof(Item);
+            // Bottom-aligned, not top-aligned: a line mixing a heading-sized
+            // word with body text should sit them on one baseline, and with
+            // a single-size font every glyph's baseline is its own bottom.
+            int x = flow_left + it.i_x + dx;
+            int y = line_top + line_h - it.i_h - scroll_y;
+            if (it.i_bg >= 0) { fill_rect(x, y, it.i_w, it.i_h, it.i_bg); }
+            draw_text(x, y, it.i_text, it.i_len, it.i_color, it.i_scale, it.i_bold);
+            if (it.i_href != 0) {
+                // The underline is drawn from the run being part of a link,
+                // not from a CSS property: text-decoration is not in the
+                // subset, and a link that is only a different colour is a
+                // link nobody can find. Colour alone also fails the one
+                // reader who cannot tell these two blues apart.
+                //
+                // It runs to the START of the next run when that run belongs
+                // to the same link, which covers the spaces between the
+                // words. A space is not an item, it only advances the pen, so
+                // underlining item by item draws a dashed line under a phrase
+                // and makes one link look like several.
+                int uw = it.i_w;
+                if (k + 1 < line_count) {
+                    int nxt = line_items + (k + 1) * sizeof(Item);
+                    if (nxt.i_href == it.i_href) { uw = nxt.i_x - it.i_x; }
+                }
+                fill_rect(x, y + it.i_h - 1, uw, 1, it.i_color);
+                link_box_add(x, y, it.i_w, it.i_h, it.i_href);
+            }
+            k = k + 1;
+        }
+    }
+    flow_y = line_top + line_advance(line_h);
+    line_top = flow_y;
+    line_x = 0;
+    line_h = 0;
+    line_count = 0;
+    word_start = 0;
+    return;
+}
+
+void push_item(int s, int n, int w, int scale, int color, int bold, int bg) {
+    if (line_count >= LINE_MAX) { flush_line(); }
+    if (line_count == 0) { line_top = flow_y; }
+    int it = line_items + line_count * sizeof(Item);
+    it.i_text = s;
+    it.i_len = n;
+    it.i_x = line_x;
+    it.i_w = w;
+    it.i_h = cell_h * scale;
+    it.i_scale = scale;
+    it.i_color = color;
+    it.i_bold = bold;
+    it.i_bg = bg;
+    it.i_href = flow_href;
+    line_x = line_x + w;
+    if (it.i_h > line_h) { line_h = it.i_h; }
+    line_count = line_count + 1;
+    return;
+}
+
+void item_copy(int dst, int src) {
+    dst.i_text = src.i_text;
+    dst.i_len = src.i_len;
+    dst.i_x = src.i_x;
+    dst.i_w = src.i_w;
+    dst.i_h = src.i_h;
+    dst.i_scale = src.i_scale;
+    dst.i_color = src.i_color;
+    dst.i_bold = src.i_bold;
+    dst.i_bg = src.i_bg;
+    dst.i_href = src.i_href;
+    return;
+}
+
+// Takes the items belonging to the word in progress off this line, ends the
+// line without them, and puts them back at the start of the next one.
+//
+// This is what makes a word that several elements contributed to behave like
+// one word. The alternative -- breaking between the runs -- is not a
+// cosmetic difference: a line that begins with "." or with a closing bracket
+// reads as a rendering fault, and it is the most common thing bold and code
+// spans in real prose produce.
+void move_word_down() {
+    int n = line_count - word_start;
+    int k = 0;
+    while (k < n) {
+        item_copy(word_scratch + k * sizeof(Item),
+                  line_items + (word_start + k) * sizeof(Item));
+        k = k + 1;
+    }
+    // The line's remaining width ends where its last kept item ends, NOT
+    // where the moved word began: the difference is the space between them,
+    // and counting it would offset every centred or right-aligned line by a
+    // character.
+    int last = line_items + (word_start - 1) * sizeof(Item);
+    line_x = last.i_x + last.i_w;
+    line_count = word_start;
+    // The line's height was the tallest thing on it INCLUDING what is
+    // leaving, so it has to be recomputed before the line is flushed --
+    // otherwise a line losing its only large word keeps its height.
+    line_h = 0;
+    k = 0;
+    while (k < line_count) {
+        int it = line_items + k * sizeof(Item);
+        if (it.i_h > line_h) { line_h = it.i_h; }
+        k = k + 1;
+    }
+    flush_line();
+    k = 0;
+    while (k < n) {
+        int it2 = word_scratch + k * sizeof(Item);
+        push_item(it2.i_text, it2.i_len, it2.i_w, it2.i_scale,
+                  it2.i_color, it2.i_bold, it2.i_bg);
+        // push_item stamps the CURRENT flow_href, and a word can straddle a
+        // link boundary -- "<a>read</a>me" is two runs and one word. The
+        // moved copy carries the href each run actually had.
+        int moved = line_items + (line_count - 1) * sizeof(Item);
+        moved.i_href = it2.i_href;
+        k = k + 1;
+    }
+    return;
+}
+
+// Places one unbreakable run of text, breaking the line before it when it
+// does not fit.
+//
+// The second case is the one worth stating: a single run wider than the
+// whole content box. Leaving it to overflow looks like a rendering bug and
+// hides text off the right edge, so it is broken mid-run instead. That is
+// wrong for prose and right for a long URL or an unspaced string, which is
+// the only way a run gets that long in the first place.
+void add_run(int s, int n, int scale, int color, int bold, int bg) {
+    int cw = cell_w * scale;
+    if (cw <= 0) { return; }
+    while (n > 0) {
+        if (line_count == 0) { line_top = flow_y; line_x = 0; word_start = 0; }
+        if (flow_left + line_x + n * cw <= flow_right) {
+            push_item(s, n, n * cw, scale, color, bold, bg);
+            return;
+        }
+        if (line_count > word_start && word_start > 0) {
+            // Part of this same word is already on the line. The whole word
+            // moves down together, or the break lands inside it.
+            move_word_down();
+        } else if (line_count > 0) {
+            flush_line();
+        } else {
+            int fit = (flow_right - flow_left) / cw;
+            if (fit < 1) { fit = 1; }
+            if (fit >= n) {
+                // The content box is wide enough after all -- only possible
+                // when the pen was not at the left edge, which the branch
+                // above has already handled. Placing it ends the run.
+                push_item(s, n, n * cw, scale, color, bold, bg);
+                return;
+            }
+            push_item(s, fit, fit * cw, scale, color, bold, bg);
+            flush_line();
+            s = s + fit;
+            n = n - fit;
+        }
+    }
+    return;
+}
+
+// A <br>, or the end of a block whose last line is empty: the line still
+// occupies a line's height.
+void break_line(int scale) {
+    if (line_count == 0 && line_h == 0) {
+        line_top = flow_y;
+        line_h = cell_h * scale;
+    }
+    flush_line();
+    return;
+}
+
+int style_scale(int p) {
+    if (p == 0) { return 1; }
+    if (p.p_scale >= 1) { return p.p_scale; }
+    return 1;
+}
+
+// The nearest ancestor link's target, or 0. Walked per text node rather
+// than carried down the traversal because the traversal is a plain recursive
+// descent with no state object, and a document is small enough that a walk
+// to the root costs nothing next to laying the text out.
+int enclosing_href(int node) {
+    int n = node;
+    while (n != 0) {
+        if (n.n_kind == KIND_ELEM && n.n_href != 0) { return n.n_href; }
+        n = n.n_parent;
+    }
+    return 0;
+}
+
+void flow_text(int node) {
+    int p = node.n_style;
+    int color = 0x000000;
+    int scale = 1;
+    int bold = 0;
+    int bg = -1;
+    if (p != 0) {
+        if (p.p_color >= 0) { color = p.p_color; }
+        if (p.p_scale >= 1) { scale = p.p_scale; }
+        if (p.p_bold == 1) { bold = 1; }
+    }
+    // A background belongs to a box. For a block that box is painted whole,
+    // by flow_block, and painting it again behind every word would be work
+    // for no pixels. For an INLINE element there is no box until the words
+    // are placed, so the background has to travel with them -- which is what
+    // makes <code> look like code.
+    int parent = node.n_parent;
+    if (parent != 0 && parent.n_style != 0) {
+        int pp = parent.n_style;
+        if (pp.p_display == DISPLAY_INLINE && pp.p_bg >= 0) { bg = pp.p_bg; }
+    }
+    flow_href = enclosing_href(node);
+    int s = node.n_text;
+    int i = 0;
+    while (s[i] != 0) {
+        if (s[i] == ' ') {
+            // A space at the start of a line is dropped, which is what makes
+            // a wrapped paragraph line up on the left edge.
+            if (line_count > 0) { line_x = line_x + cell_w * scale; }
+            // A space is the only place a line may break, so it is also
+            // where the next word starts.
+            word_start = line_count;
+            i = i + 1;
+        } else {
+            int start = i;
+            while (s[i] != 0 && s[i] != ' ') { i = i + 1; }
+            add_run(s + start, i - start, scale, color, bold, bg);
+        }
+    }
+    // flow_href means something only while a text node is being flowed.
+    // Nothing else pushes items today, and leaving a stale target in a
+    // global is how that stops being true quietly.
+    flow_href = 0;
+    return;
+}
+
+
+// --- tables ---------------------------------------------------------------
+
+// Cell padding and the colour of the grid. `border` and `border-collapse`
+// are not in the CSS subset, so this is the table's look rather than a
+// default a stylesheet could replace -- the same call <li>'s bullet makes.
+// A table drawn without any grid at all reads as ragged columns of text,
+// which is worse than a plain paragraph.
+int CELL_PAD = 3;
+int GRID_RGB = 0x9098a0;
+
+// Rows are searched for among a table's DESCENDANTS, not its children, so a
+// page that wraps them in <tbody> (or <thead>, or nothing at all) lays out
+// the same. That is also why those three have no tag id.
+int table_rows(int node, int out, int n, int max) {
+    int c = node.n_first;
+    while (c != 0) {
+        if (c.n_kind == KIND_ELEM) {
+            if (c.n_tag == TAG_TR) {
+                if (n < max) { store64(out + n * 8, c); n = n + 1; }
+            } else if (c.n_tag != TAG_TABLE) {
+                // Not into a nested table: its rows are its own.
+                n = table_rows(c, out, n, max);
+            }
+        }
+        c = c.n_next;
+    }
+    return n;
+}
+
+int row_cells(int row) {
+    int n = 0;
+    int c = row.n_first;
+    while (c != 0) {
+        if (c.n_kind == KIND_ELEM && (c.n_tag == TAG_TD || c.n_tag == TAG_TH)) {
+            n = n + 1;
+        }
+        c = c.n_next;
+    }
+    return n;
+}
+
+int TABLE_MAX_ROWS = 256;
+
+// Lays out a table between flow_left and flow_right, starting at flow_y,
+// and leaves flow_y under it.
+//
+// Columns are equal width. Real browsers size them to their contents, which
+// takes a measuring pass per cell before any of them can be placed and a
+// rule for what to do when the sum does not fit. Equal columns need neither
+// and are right often enough to be useful; the cost is a narrow column of
+// numbers next to a wide column of prose getting the same width, which is
+// visible but not wrong. Written down here rather than discovered later.
+//
+// Every cell in a row starts at the same y and the row is as tall as the
+// tallest of them, which is the one part of this that a single linear pen
+// cannot express -- so the pen is rewound to the row's top before each
+// cell and set past the tallest afterwards.
+void flow_table(int node) {
+    int rows = alloc(TABLE_MAX_ROWS * 8);
+    if (rows == 0) { return; }
+    int nrows = table_rows(node, rows, 0, TABLE_MAX_ROWS);
+    if (nrows == 0) { return; }
+
+    int ncols = 0;
+    int i = 0;
+    while (i < nrows) {
+        int rc = row_cells(load64(rows + i * 8));
+        if (rc > ncols) { ncols = rc; }
+        i = i + 1;
+    }
+    if (ncols == 0) { return; }
+
+    int saved_left = flow_left;
+    int saved_right = flow_right;
+    int saved_align = flow_align;
+    int base = flow_left;
+    int total = saved_right - saved_left;
+    int colw = total / ncols;
+    if (colw < cell_w * 2) { colw = cell_w * 2; }
+
+    i = 0;
+    while (i < nrows) {
+        int row = load64(rows + i * 8);
+        int row_top = flow_y;
+        int maxh = 0;
+        int ci = 0;
+        int c = row.n_first;
+        while (c != 0) {
+            if (c.n_kind == KIND_ELEM && (c.n_tag == TAG_TD || c.n_tag == TAG_TH)) {
+                flow_left = base + ci * colw + CELL_PAD;
+                flow_right = base + (ci + 1) * colw - CELL_PAD;
+                if (flow_right <= flow_left) { flow_right = flow_left + cell_w; }
+                flow_align = saved_align;
+                int cp = c.n_style;
+                if (cp != 0 && cp.p_align >= 0) { flow_align = cp.p_align; }
+                // A fresh pen for every cell, rewound to the row's top.
+                flow_y = row_top + CELL_PAD;
+                line_top = flow_y;
+                line_x = 0;
+                line_h = 0;
+                line_count = 0;
+                flow_carry = 0;
+                int k = c.n_first;
+                while (k != 0) {
+                    flow_node(k);
+                    k = k.n_next;
+                }
+                flush_line();
+                int h = flow_y + CELL_PAD - row_top;
+                if (h > maxh) { maxh = h; }
+                ci = ci + 1;
+            }
+            c = c.n_next;
+        }
+        if (maxh < cell_h + CELL_PAD * 2) { maxh = cell_h + CELL_PAD * 2; }
+        if (flow_paint == 1) {
+            // The grid, drawn once the row's height is known. Lines, not
+            // boxes: this row's top rule and the ncols+1 verticals beside
+            // it. Drawing all four edges of every cell instead puts a row's
+            // bottom rule and the next row's top rule on ADJACENT pixels,
+            // which comes out as a two-pixel line between rows and a
+            // one-pixel line around the outside. The bottom of the table is
+            // one rule drawn after the last row.
+            fill_rect(base, row_top - scroll_y, ncols * colw, 1, GRID_RGB);
+            int g = 0;
+            while (g <= ncols) {
+                fill_rect(base + g * colw, row_top - scroll_y, 1, maxh, GRID_RGB);
+                g = g + 1;
+            }
+        }
+        flow_y = row_top + maxh;
+        i = i + 1;
+    }
+    if (flow_paint == 1) {
+        fill_rect(base, flow_y - scroll_y, ncols * colw + 1, 1, GRID_RGB);
+    }
+
+    flow_left = saved_left;
+    flow_right = saved_right;
+    flow_align = saved_align;
+    line_top = flow_y;
+    line_x = 0;
+    line_h = 0;
+    line_count = 0;
+    flow_carry = 0;
+    return;
+}
+
+void flow_block(int node, int p) {
+    flush_line();
+    // Collapse this block's top margin with the previous block's bottom.
+    // flow_y already moved by flow_carry when that block finished, so only
+    // the excess is added here -- and nothing at all when the earlier
+    // margin was the larger of the two.
+    int top_m = p.p_margin;
+    if (flow_carry > top_m) { top_m = flow_carry; }
+    flow_y = flow_y + top_m - flow_carry;
+    flow_carry = 0;
+    int saved_left = flow_left;
+    int saved_right = flow_right;
+    int saved_align = flow_align;
+    int top = flow_y;
+
+    node.n_x = saved_left;
+    node.n_y = top;
+    node.n_w = saved_right - saved_left;
+    // The height comes from the measure pass; on the paint pass it is
+    // already there, which is the entire reason there are two passes.
+    if (flow_paint == 1 && p.p_bg >= 0) {
+        fill_rect(node.n_x, node.n_y - scroll_y, node.n_w, node.n_h, p.p_bg);
+    }
+
+    flow_left = saved_left + p.p_pad;
+    flow_right = saved_right - p.p_pad;
+    if (flow_right <= flow_left) { flow_right = flow_left + cell_w; }
+    if (p.p_align >= 0) { flow_align = p.p_align; }
+    flow_y = flow_y + p.p_pad;
+    line_top = flow_y;
+
+    // A list item's marker, drawn into the padding its own <ul> reserved on
+    // the left. `list-style` is not in the CSS subset, so this is the marker
+    // rather than a default a stylesheet could replace -- and it is drawn
+    // here, inside the box, because a marker sitting outside the content box
+    // is what makes a list look like a list rather than like indented text.
+    if (node.n_tag == TAG_LI && flow_paint == 1) {
+        int mcolor = 0x000000;
+        if (p.p_color >= 0) { mcolor = p.p_color; }
+        int mscale = style_scale(p);
+        int msize = cell_h * mscale / 3;
+        if (msize < 2) { msize = 2; }
+        fill_rect(flow_left - cell_w * mscale,
+                  flow_y + (cell_h * mscale - msize) / 2 - scroll_y,
+                  msize, msize, mcolor);
+    }
+
+    if (node.n_tag == TAG_HR) {
+        // A horizontal rule has no contents; it IS its box. Two pixels so it
+        // reads as a line rather than as a hairline that a scaled display
+        // could lose.
+        if (flow_paint == 1) {
+            int c = 0x808080;
+            if (p.p_color >= 0) { c = p.p_color; }
+            fill_rect(flow_left, flow_y - scroll_y, flow_right - flow_left, 2, c);
+        }
+        flow_y = flow_y + 2;
+    } else if (node.n_tag == TAG_TABLE) {
+        flow_table(node);
+    } else {
+        int c = node.n_first;
+        while (c != 0) {
+            flow_node(c);
+            c = c.n_next;
+        }
+    }
+
+    flush_line();
+    flow_y = flow_y + p.p_pad;
+    node.n_h = flow_y - top;
+    flow_y = flow_y + p.p_margin;
+    // Remembered, not consumed: the next block collapses against it. Its
+    // padding, if it has any, has already separated this margin from the
+    // content, which is why the carry is set here and not before the pad.
+    flow_carry = p.p_margin;
+    flow_left = saved_left;
+    flow_right = saved_right;
+    flow_align = saved_align;
+    line_top = flow_y;
+    return;
+}
+
+void flow_node(int node) {
+    if (node.n_kind == KIND_TEXT) {
+        flow_text(node);
+        return;
+    }
+    int p = node.n_style;
+    if (p != 0 && p.p_display == DISPLAY_NONE) { return; }
+    if (node.n_tag == TAG_BR) {
+        break_line(style_scale(p));
+        return;
+    }
+    if (p != 0 && p.p_display == DISPLAY_BLOCK) {
+        flow_block(node, p);
+        return;
+    }
+    int c = node.n_first;
+    while (c != 0) {
+        flow_node(c);
+        c = c.n_next;
+    }
+    return;
+}
+
+// Lays the whole document out into a content box `width` pixels wide,
+// returning its total height. Called once to measure and once to paint.
+int layout_document(int root, int width) {
+    flow_left = 0;
+    flow_right = width;
+    flow_align = ALIGN_LEFT;
+    flow_y = 0;
+    line_x = 0;
+    line_top = 0;
+    line_h = 0;
+    line_count = 0;
+    // Reset with the rest of the pen state. This runs twice per frame, to
+    // measure and then to paint, and a carry left over from the measure
+    // pass would make the paint pass lay the page out differently from the
+    // heights it was measured against.
+    flow_carry = 0;
+    flow_node(root);
+    flush_line();
+    return flow_y;
+}
+
+// The colour behind everything, including the part of the window the
+// document does not reach. Taken from <body>, then <html>, because that is
+// where an author puts it and because a page shorter than the window looks
+// broken if the remainder stays whatever was there before.
+int find_page_bg(int node) {
+    if (node.n_kind == KIND_ELEM && node.n_style != 0) {
+        if (node.n_tag == TAG_BODY) {
+            int p = node.n_style;
+            if (p.p_bg >= 0) { return p.p_bg; }
+        }
+    }
+    int c = node.n_first;
+    while (c != 0) {
+        int v = find_page_bg(c);
+        if (v >= 0) { return v; }
+        c = c.n_next;
+    }
+    if (node.n_kind == KIND_ELEM && node.n_tag == TAG_HTML && node.n_style != 0) {
+        int p = node.n_style;
+        if (p.p_bg >= 0) { return p.p_bg; }
+    }
+    return -1;
+}
+
+// One frame: measure, clear, paint.
+void render_page(int root) {
+    flow_paint = 0;
+    doc_h = layout_document(root, view_w);
+    if (scroll_y > doc_h - view_h) { scroll_y = doc_h - view_h; }
+    if (scroll_y < 0) { scroll_y = 0; }
+    fill_rect(0, 0, view_w, view_h, page_bg);
+    flow_paint = 1;
+    // Emptied here rather than in layout_document, so the measure pass
+    // cannot contribute to it and the table is exactly what one paint drew.
+    link_count = 0;
+    layout_document(root, view_w);
+    return;
+}

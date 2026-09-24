@@ -1,0 +1,89 @@
+// expect: 26
+// glyph(ch, buf) -- SYS_GLYPH, the kernel handing its own font over to ring
+// 3 so a program can composite text into its own frame instead of asking the
+// kernel to draw it. Three things have to hold, and each one is a different
+// way the syscall can be wrong.
+//
+// 1. The size query. glyph(ch, 0) copies nothing and returns the cell size
+//    packed width * 65536 + height, the same shape win_info() uses. A program
+//    is supposed to learn 8x8 from here rather than hardcode it, so if this
+//    returned a plain 8, or the two halves swapped, every text position in
+//    every program built on it would be wrong.
+// 2. The bitmap itself. 'M' has exactly 18 lit pixels in punkt's font -- the
+//    same count kernel_post_init checks on the kernel side, and the number
+//    that came back as 63 when the naive single-64-bit packing made the glyph
+//    value negative. Counting bits proves the bytes arrived; the next check
+//    proves they arrived in the right order.
+// 3. Row order and bit order. Row 0 is the first byte and bit 7 of a byte is
+//    the LEFTMOST pixel. '/' is the one glyph in the font that is different
+//    along both axes at once: 0x01020408 over rows 0..3, so its top row is
+//    the rightmost column and each row below moves one column left. Reading
+//    the rows backwards, or the bits mirrored, changes this sum.
+//
+// The total is 18 + 8 = 26. Any single failure returns its own code instead,
+// so a failure says which of the three broke.
+int main() {
+    int buf = alloc(64);
+    if (buf == 0) { return 101; }
+
+    int d = glyph('M', 0);
+    if (d != 8 * 65536 + 8) { return 102; }
+    int cols = d / 65536;
+    int rows = d - cols * 65536;
+
+    // Nothing may be written through a null buffer: if the size query also
+    // copied, this byte would have changed.
+    store8(buf, 0xAB);
+    d = glyph('M', 0);
+    if (load8(buf) != 0xAB) { return 103; }
+
+    if (glyph('M', buf) != d) { return 104; }
+    int lit = 0;
+    int i = 0;
+    while (i < rows) {
+        int b = load8(buf + i);
+        while (b > 0) {
+            lit = lit + b - (b / 2) * 2;
+            b = b / 2;
+        }
+        i = i + 1;
+    }
+    if (lit != 18) { return 200 + lit; }
+
+    // A space is blank in this font, and so is anything unmapped -- font_hi
+    // and font_lo return 0 for both. A glyph() that ignored its character
+    // argument and always returned the same bitmap would pass check 2 and
+    // fail here.
+    if (glyph(' ', buf) != d) { return 105; }
+    i = 0;
+    while (i < rows) {
+        if (load8(buf + i) != 0) { return 106; }
+        i = i + 1;
+    }
+
+    // '/' rises to the right: row r has exactly one pixel, at column
+    // cols - 1 - r for the top four rows. Summing the column index of the
+    // single lit pixel in rows 0..3 gives 7 + 6 + 5 + 4 = 22 if the order is
+    // right, and 4 + 5 + 6 + 7 read backwards is the same -- so the rows are
+    // walked with their index, which mirroring does change.
+    if (glyph('/', buf) != d) { return 107; }
+    int sum = 0;
+    i = 0;
+    while (i < 4) {
+        int b = load8(buf + i);
+        int col = 0;
+        while (col < cols) {
+            // bit 7 is the leftmost pixel, so column `col` is bit 7 - col.
+            int shifted = b;
+            int k = 0;
+            while (k < 7 - col) { shifted = shifted / 2; k = k + 1; }
+            if (shifted - (shifted / 2) * 2 == 1) { sum = sum + col * (i + 1); }
+            col = col + 1;
+        }
+        i = i + 1;
+    }
+    // rows 0..3 lit at columns 7,6,5,4 weighted by row+1: 7 + 12 + 15 + 16.
+    if (sum != 50) { return 300 + sum; }
+
+    return lit + cols;
+}

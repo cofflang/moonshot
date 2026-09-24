@@ -28,17 +28,28 @@
 // outrun them, but touching one kills you. You cannot fight back directly;
 // the only counterplay is to build factories and let the mini-bacteria do it.
 //
-// Shapes are circles for now. Everything is drawn from the entity's own
-// colour and size, so swapping in sprites drawn in pensel later is a change
-// to the draw call, not to the game.
+// Everything is drawn from sprites. Five of them ship compiled into this
+// binary, drawn by gen_art.c0, and every one can be replaced by drawing over
+// it in pensel and saving as player.spr, cell.spr, factory.spr, anti.spr or
+// mini.spr -- the game looks for those on the filesystem at startup and uses
+// what it finds. Draw them at the sizes the game uses (16x16 for the player,
+// 32x32 for a cell or factory, 18x18 for an antibacterium, 8x8 for a
+// mini-bacterium). A sprite of the wrong size is ignored rather than
+// stretched or allowed to change what collides with what, because how big a
+// thing is is a rule of the game and not a property of its picture.
+//
+// The cell and the factory are drawn in GREY and tinted as they are drawn.
+// That is what lets one drawn cell be the clean cell, the infected cell and
+// the factory, instead of three sprites that have to be redrawn together.
 
 include "engine.c0";
+include "infecteria_art.c0";
 
-// NOTHING here is a global. --elf mode has no support for global-variable
-// reads (coff.c0's gen_expr rejects them when raw_mode is set), so every
-// constant lives as a local in main and is passed down. Trying it the other
-// way produces a bare CODEGENERROR with no indication that globals are the
-// cause, which is worth knowing before hunting a layout conflict.
+// NOTHING here is a global, for a reason that no longer holds: --elf was
+// once a separate machine-code backend with no support for
+// global-variable reads, so every constant lives as a local in main and is
+// passed down. --elf is the ordinary assembly backend now and globals work
+// in ring 3; this layout stays because it is not wrong, only historical.
 //
 // Entity kinds, as used below: 1 player, 2 cell, 3 factory, 4 mini, 5 anti.
 //
@@ -103,6 +114,23 @@ void clamp_world(int e, int world_w, int world_h) {
     return;
 }
 
+// A drawn sprite when one is there and it is the size the game uses, and the
+// default drawn by infecteria_art.c0 otherwise. The size check is the reason
+// this exists rather than a bare sprite_from_file: an entity's dimensions
+// decide what it collides with, so a 40x40 player drawn in pensel must not
+// silently become a 40x40 hitbox, and stretching the picture to fit would be
+// worse than ignoring it.
+//
+// `draw_fn` is a function reference. A bare function name in c0 is its
+// address, so the default is passed in rather than chosen here by name, and
+// the two halves of "where does this sprite come from" stay in one place per
+// sprite at the call site.
+int art_load(int name, int w, int h, int draw_fn) {
+    int s = sprite_from_file(name);
+    if (s != 0 && s.sp_w == w && s.sp_h == h) { return s; }
+    return draw_fn();
+}
+
 int main() {
     int v;
     int pool;
@@ -128,7 +156,7 @@ int main() {
     int POOL_CAP; int NUM_CELLS; int NUM_ANTI;
     int SPD_PLAYER; int SPD_PLAYER_SLOW; int SPD_MINI; int SPD_ANTI;
     int INFECT_PER_TICK; int INFECT_PER_MINI; int MINI_LIFETIME;
-    int FACTORY_PERIOD; int ANTI_HEALTH;
+    int FACTORY_PERIOD; int ANTI_HEALTH; int ANTI_MIN_SPAWN;
     int PLAYER_MAX_HP; int ANTI_DPS; int ABSORB_HEAL; int MINI_DAMAGE;
     int COL_HP;
     int COL_BG; int COL_PLAYER; int COL_CELL; int COL_INFECT;
@@ -136,6 +164,8 @@ int main() {
     int col;
     int bc;
     int COL_READY;
+    int sp_player; int sp_cell; int sp_factory; int sp_anti; int sp_mini;
+    int phase;
 
     K_PLAYER = 1; K_CELL = 2; K_FACTORY = 3; K_MINI = 4; K_ANTI = 5;
     WORLD_W = 2400; WORLD_H = 1800;
@@ -145,8 +175,19 @@ int main() {
     // outrun them -- that is the whole counterplay, since you cannot fight.
     SPD_PLAYER = 3; SPD_PLAYER_SLOW = 2; SPD_MINI = 2; SPD_ANTI = 2;
     INFECT_PER_TICK = 1; INFECT_PER_MINI = 12; MINI_LIFETIME = 900;
-    FACTORY_PERIOD = 120; ANTI_HEALTH = 100;
-    PLAYER_MAX_HP = 100; ANTI_DPS = 1; ABSORB_HEAL = 25; MINI_DAMAGE = 20;
+    // A screen is about 1000 px wide, so an antibacterium that starts closer
+    // than this is one you can see hunting you before you have moved.
+    FACTORY_PERIOD = 120; ANTI_HEALTH = 100; ANTI_MIN_SPAWN = 1100;
+    // Health is counted in 400ths rather than 100ths, and that is the whole
+    // of the damage change. Contact drains ANTI_DPS per tick and a tick is a
+    // hundredth of a second, so a hundred-point player died one second after
+    // being touched -- long enough to notice and far too short to do anything
+    // about, with an antibacterium that follows you forever and a world where
+    // running into a second one while fleeing the first is ordinary. c0 has
+    // no fractions, so the way to make a hit cost less is to make the pool
+    // deeper. Four hundred is four seconds of being held, which is time to
+    // turn and outrun it, and the bar still reads 0 to 100.
+    PLAYER_MAX_HP = 400; ANTI_DPS = 1; ABSORB_HEAL = 100; MINI_DAMAGE = 20;
     COL_BG = 0x101820; COL_PLAYER = 0x40FF80; COL_CELL = 0x6080C0;
     COL_INFECT = 0xC06040; COL_FACTORY = 0xE0A030; COL_MINI = 0x80FFC0;
     COL_ANTI = 0xE04040; COL_BAR = 0x40E060; COL_READY = 0xFFFFA0;
@@ -167,6 +208,21 @@ int main() {
     // is one that was always big enough.
     v.buf = view_alloc_max(v);
     if (v.buf == 0) { return 201; }
+
+    // The art. Each one is the drawn file when there is a usable one on the
+    // filesystem and the baked-in default otherwise, so the game runs on a
+    // machine where nobody has opened pensel and improves on one where
+    // somebody has.
+    sp_player = art_load("player.spr", PLAYER_D, PLAYER_D, draw_player);
+    sp_cell = art_load("cell.spr", CELL_D, CELL_D, draw_cell);
+    sp_factory = art_load("factory.spr", CELL_D, CELL_D, draw_factory);
+    sp_anti = art_load("anti.spr", ANTI_D, ANTI_D, draw_anti);
+    sp_mini = art_load("mini.spr", MINI_D, MINI_D, draw_mini);
+    if (sp_player == 0 || sp_cell == 0 || sp_factory == 0
+        || sp_anti == 0 || sp_mini == 0) {
+        print("infecteria: out of memory loading art\n");
+        return 203;
+    }
 
     seed = alloc(8);
     store64(seed, ticks() + 12345);
@@ -229,13 +285,29 @@ int main() {
             e.y = rng_range(seed, 0, WORLD_H - ANTI_D);
             e.color = COL_ANTI;
             e.a1 = ANTI_HEALTH;
-            // Push it a half-world away if it landed near the player, and
-            // wrap. NOT a mirror about the world centre, which was the first
-            // attempt and does nothing at all here: the player starts AT the
-            // centre, so reflecting a nearby point across it leaves the
-            // distance identical. It looked like a guard and was a no-op, and
-            // the player was being killed within seconds of starting.
-            if (dist2(e, player) < 900 * 900) {
+            // Keep it at least a full screen away from where the player
+            // starts. A bounded re-roll rather than one corrective push: the
+            // push moved a half-world and wrapped, which lands inside the
+            // exclusion zone again whenever the first roll was roughly a
+            // half-world away to begin with, and the only thing stopping that
+            // from being common was luck. Sixteen tries is not a loop that
+            // can hang, and the push is kept as the last resort so the
+            // outcome is bounded even in the case where every try was bad.
+            //
+            // The earlier version of this guard mirrored the point about the
+            // world centre, which does nothing at all here, because the
+            // player starts AT the centre and reflecting a nearby point
+            // across it leaves the distance identical. It looked like a guard
+            // and was a no-op, and the player was being killed within seconds
+            // of starting.
+            int tries = 0;
+            while (dist2(e, player) < ANTI_MIN_SPAWN * ANTI_MIN_SPAWN
+                   && tries < 16) {
+                e.x = rng_range(seed, 0, WORLD_W - ANTI_D);
+                e.y = rng_range(seed, 0, WORLD_H - ANTI_D);
+                tries = tries + 1;
+            }
+            if (dist2(e, player) < ANTI_MIN_SPAWN * ANTI_MIN_SPAWN) {
                 e.x = e.x + WORLD_W / 2;
                 if (e.x > WORLD_W - ANTI_D) { e.x = e.x - (WORLD_W - ANTI_D); }
                 e.y = e.y + WORLD_H / 2;
@@ -402,9 +474,16 @@ int main() {
             view_follow(v, player, WORLD_W, WORLD_H);
             view_clear(v, COL_BG);
 
+            // One animation clock for the whole world rather than a phase per
+            // entity. Everything that animates here is a flagellum or a set
+            // of spikes, and having them all whip together at five beats a
+            // second looks like life rather than like a mistake.
+            phase = (t / 20) - ((t / 20) / 2) * 2;
+
             // Opaque things first, so the half-transparent cells blend over
             // them and you can see yourself underneath.
-            view_circle(v, player.x, player.y, PLAYER_D, COL_PLAYER);
+            view_sprite(v, player.x, player.y, PLAYER_D, PLAYER_D,
+                        sp_player.sp_pixels, sprite_frame(sp_player, phase));
             view_bar(v, player.x, player.y, PLAYER_D,
                      player.a1 * 100 / PLAYER_MAX_HP, COL_HP);
             i = 0;
@@ -412,17 +491,24 @@ int main() {
                 e = pool_at(pool, i);
                 if (e.alive == 1) {
                     if (e.kind == K_MINI) {
-                        view_circle(v, e.x, e.y, MINI_D, COL_MINI);
+                        view_sprite(v, e.x, e.y, MINI_D, MINI_D,
+                                    sp_mini.sp_pixels, sprite_frame(sp_mini, phase));
                     }
                     if (e.kind == K_ANTI) {
-                        view_circle(v, e.x, e.y, ANTI_D, COL_ANTI);
+                        view_sprite(v, e.x, e.y, ANTI_D, ANTI_D,
+                                    sp_anti.sp_pixels, sprite_frame(sp_anti, phase));
                         view_bar(v, e.x, e.y, ANTI_D, e.a1 * 100 / ANTI_HEALTH, COL_ANTI);
                     }
                 }
                 i = i + 1;
             }
 
-            // Then the cells, blended, with their infection bars on top.
+            // Then the cells and factories, with their infection bars on top.
+            // A cell is blended so you can see yourself inside one, which is
+            // the feedback that tells you the infection is running. A factory
+            // is not: it has stopped being something you can be inside and
+            // become a thing that stands there, and looking solid is how it
+            // says so without a label.
             i = 0;
             while (i < POOL_CAP) {
                 e = pool_at(pool, i);
@@ -430,7 +516,13 @@ int main() {
                     col = COL_CELL;
                     if (e.kind == K_FACTORY) { col = COL_FACTORY; }
                     else if (e.a1 > 0) { col = COL_INFECT; }
-                    view_circle_blend(v, e.x, e.y, CELL_D, col);
+                    if (e.kind == K_FACTORY) {
+                        view_sprite_tint(v, e.x, e.y, CELL_D, CELL_D,
+                                         sp_factory.sp_pixels, 0, col, 0);
+                    } else {
+                        view_sprite_tint(v, e.x, e.y, CELL_D, CELL_D,
+                                         sp_cell.sp_pixels, 0, col, 1);
+                    }
                     if (e.kind == K_CELL && e.a1 > 0) {
                         // A full bar gets its own colour: without it there is
                         // no way to tell that e/q have become available, and

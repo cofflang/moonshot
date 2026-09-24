@@ -18,6 +18,8 @@ int SYS_TICKS       = 7;
 int SYS_READFILE    = 8;
 int SYS_PRESENT     = 9;
 int SYS_WIN_MAX     = 10;
+int SYS_MOUSE_POLL  = 11;
+int SYS_GLYPH       = 12;
 
 int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
     if (num == 0) {
@@ -359,6 +361,58 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         klick_drop();
         return 0;
     }
+    if (num == 11) {
+        // SYS_MOUSE_POLL -- the pointer as seen from THIS TASK'S window:
+        // (x * 1024 + y) * 8 + buttons, with x and y relative to the window's
+        // client area and buttons packed left=1, right=2, middle=4 (the same
+        // packing klick's own event ring uses). Returns -1 when the task has
+        // no window, when there is no mouse, or when the pointer is outside
+        // the window -- a program never sees coordinates that are not its
+        // own, and does not have to know where its window sits on screen.
+        //
+        // State, not events: a game asks once per frame, like win_info(),
+        // and a press it did not catch was too short to matter. Nothing is
+        // queued per task, unlike keys, where a missed keystroke is a lost
+        // character. The press edge kakel needs for click-to-focus is
+        // detected in klick_drain, not here.
+        //
+        // BUTTONS ARE REPORTED ONLY TO THE FOCUSED WINDOW. The position is
+        // reported to any window the pointer is over, because hover is
+        // harmless and a program that highlights what is under the cursor
+        // should keep doing so while it waits its turn. A press is not
+        // harmless, and a click that focuses a window must not also act
+        // inside it -- see klick_focus_click in klick.c0 for why.
+        //
+        // Two gates rather than one, and they cover different things.
+        //
+        // The spent flag is what stops a held left press. Measured, by
+        // disabling each gate in turn and re-running verify_mouse.sh with
+        // the focusing press held for four seconds: with the spent flag off
+        // and this focus test on, a sprite reached the pointer (1 px) and
+        // the test failed; with the focus test off and the spent flag on,
+        // nothing came near it (119 px) and the test passed.
+        //
+        // So the focus test is NOT what that check measures. It is here for
+        // the two cases the spent flag cannot see. One is the right button,
+        // which never focuses anything, so no press of it is ever spent and
+        // without this line it would reach an unfocused window. The other is
+        // a race, since klick_left is set by the mouse interrupt at once
+        // while the flag is set by klick_drain on the timer tick, so a
+        // program polling in between would see a press that has not focused
+        // anything yet. That race is a few milliseconds wide and the suite
+        // cannot catch it; this line is reasoning, not a measurement.
+        int wid11 = load64(task_win_base + sched_current * 8);
+        if (wid11 < 0 || kakel_active == 0 || klick_active != 1) { return -1; }
+        int mx = klick_x - load64(kakel_cx_base + wid11 * 8) * FONT_W;
+        int my = klick_y - load64(kakel_cy_base + wid11 * 8) * FONT_H;
+        if (mx < 0 || my < 0) { return -1; }
+        if (mx >= load64(kakel_cols_base + wid11 * 8) * FONT_W) { return -1; }
+        if (my >= load64(kakel_rows_base + wid11 * 8) * FONT_H) { return -1; }
+        int btn11 = klick_left + klick_right * 2 + klick_middle * 4;
+        if (wid11 != kakel_focus) { btn11 = 0; }
+        if (klick_focus_click == 1) { btn11 = 0; }
+        return (mx * 1024 + my) * 8 + btn11;
+    }
     if (num == 10) {
         // SYS_WIN_MAX — the largest window this machine can ever hand out,
         // packed width * 65536 + height, the same shape SYS_WIN_INFO uses.
@@ -378,6 +432,54 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         int mw = (fb_width / FONT_W) * FONT_W;
         int mh = (fb_height / FONT_H - KAKEL_LOG_ROWS) * FONT_H;
         return mw * 65536 + mh;
+    }
+    if (num == 12) {
+        // SYS_GLYPH(ch, buf) -- copies one character's font bitmap into the
+        // caller's memory: FONT_H bytes, row 0 first, each byte's bit 7 the
+        // LEFTMOST pixel. Returns the cell size packed FONT_W * 65536 +
+        // FONT_H, the same shape SYS_WIN_INFO and SYS_WIN_MAX use.
+        //
+        // With buf == 0 it returns the cell size and copies nothing, the way
+        // SYS_READFILE's buf == 0 returns a size -- so a program asks once
+        // what a character cell measures and never hardcodes 8x8. The three
+        // graphics syscalls hardcoded FONT_H once and the doubled value was
+        // a real visible bug; there is no reason to hand ring 3 the same
+        // trap.
+        //
+        // Why a bitmap and not a draw call: ring-3 programs composite whole
+        // frames into their own buffer and present them with ONE syscall,
+        // because a multi-call draw sequence gets torn by the scheduler (see
+        // SYS_PRESENT and gnista.c0's header). A kernel-side draw_text would
+        // write straight to the framebuffer and put text back outside that
+        // discipline. Handing over the bitmap keeps every pixel a program
+        // shows under its own compositing, and costs one syscall per glyph
+        // ONCE -- a program builds its table at startup and never calls this
+        // again.
+        //
+        // The font is punkt's, the same one kakel draws with, so a program's
+        // text and the shell's look like one system. Unmapped characters
+        // (including space) come back all-zero, which is what font_hi/font_lo
+        // already return for them.
+        if (a2 == 0) { return FONT_W * 65536 + FONT_H; }
+        // Written through, like SYS_READFILE's buffer and unlike the pointers
+        // the kernel only reads -- so it gets the same refusal.
+        if (a2 < USER_VIRT_BASE) {
+            serial_print("[syscall] glyph: refusing non-user buffer\n");
+            return -1;
+        }
+        int ghi12 = font_hi(a1);
+        int gv12 = font_lo(a1);
+        // Same peel-from-the-low-end sweep as fb_draw_char: font_lo's lowest
+        // byte is row 7, so four peels visit 7,6,5,4, and switching to the
+        // untouched font_hi continues the identical pattern for 3,2,1,0.
+        int gr12 = 7;
+        while (gr12 >= 0) {
+            if (gr12 == 3) { gv12 = ghi12; }
+            store8(a2 + gr12, gv12 - (gv12 / 256) * 256);
+            gv12 = gv12 / 256;
+            gr12 = gr12 - 1;
+        }
+        return FONT_W * 65536 + FONT_H;
     }
     serial_print("[syscall] unknown syscall ");
     serial_print_int(num);

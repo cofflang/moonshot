@@ -238,6 +238,19 @@ type_cmd "eval b=2;for(;b>0;b=b-1){print(b);}"
 check "for condition-only" '\[repl] 2'
 check "for condition-only" '\[repl] 1'
 
+# A for loop that is NOT the last statement. Every for test above has the
+# loop last, which is the one arrangement that cannot show this: ND_FOR kept
+# its body in the `next` slot, and `next` is also the slot the statement
+# chain uses, so the parser overwrote the loop's body with whatever came
+# after it. The loop then ran the following statement once per iteration and
+# the real body never ran at all -- and freeing the tree afterwards freed
+# that statement twice, once as the loop's body and once as the next link in
+# the chain, which is a double free into the kernel heap.
+type_cmd "eval for(d=0;d<2;d=d+1){print(d);}print(7)"
+check "for then stmt: body ran (0)" '\[repl] 0'
+check "for then stmt: body ran (1)" '\[repl] 1'
+check "for then stmt: the statement after ran" '\[repl] 7'
+
 # --- REPL v4: break / continue ---
 
 # break in while

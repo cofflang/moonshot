@@ -1,0 +1,279 @@
+// infecteria_art.c0 — part of gnista, a game engine for the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of gnista, a game engine written in c0 for moonshot.
+// gnista is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// Infecteria's default sprites, DRAWN AT STARTUP rather than baked in as
+// pixel data.
+//
+// The first version of this was a generator that wrote the pixels out as a
+// c0 byte array, the way bake writes an ELF and gen_sprite.c0 writes Gnista's
+// demo sprite. Thirteen kilobytes of pixels became a hundred and twenty-two
+// kilobytes of program, because c0 has no optimizer and every eight bytes of
+// data compiled to a whole store64 sequence -- and the resulting kernel was
+// large enough that smed refused it outright. Drawing the same sprites from
+// the code that describes them costs about two kilobytes instead, and the
+// code is a better record of the art than the pixels are anyway. This is a
+// picture of five organisms, not a table of numbers that happens to be one.
+//
+// None of these is the only possibility. infecteria loads player.spr,
+// cell.spr, factory.spr, anti.spr and mini.spr from the filesystem when they
+// are there, so anything drawn in pensel replaces one of them with no rebuild
+// anywhere. These are what it falls back to.
+//
+// Everything works in DOUBLED coordinates: a 16-pixel sprite's centre falls
+// between pixel 7 and pixel 8, and doubling makes that centre the whole
+// number 15 rather than a half. Radii are doubled too, so a radius written as
+// 11 is five and a half pixels.
+//
+// The cell and the factory are drawn in GREY on purpose. infecteria tints
+// them as it draws (view_sprite_tint), so one drawn cell serves as the clean
+// cell, the infected cell and the factory rather than three near-identical
+// sprites that would all have to be redrawn together.
+
+// The sprite being drawn: its dimensions, frame count and pixel buffer.
+int SW = 0;
+int SH = 0;
+int SF = 0;
+int data = 0;
+
+void sprite_begin(int w, int h, int frames) {
+    SW = w;
+    SH = h;
+    SF = frames;
+    data = alloc(w * h * 4 * frames);
+    int i = 0;
+    while (i < w * h * 4 * frames) { store8(data + i, 0); i = i + 1; }
+    return;
+}
+
+// One pixel, clipped. Colour is given as 0xRRGGBB, the way the game writes
+// its colours, and stored blue first, the way the framebuffer wants them.
+void put(int f, int x, int y, int color) {
+    if (x < 0 || y < 0 || x >= SW || y >= SH) { return; }
+    int p = data + (f * SW * SH + y * SW + x) * 4;
+    store8(p, color - (color / 256) * 256);
+    store8(p + 1, (color / 256) - (color / 65536) * 256);
+    store8(p + 2, (color / 65536) - (color / 16777216) * 256);
+    store8(p + 3, 0);
+    return;
+}
+
+// A shade of grey as a colour. These run high on purpose: view_sprite_tint
+// scales the tint by the sprite pixel's own brightness, and a cell is then
+// blended half and half with the background, so a membrane drawn at 235
+// arrives on a dark screen at barely a third of its colour. 255 means "this
+// pixel is the tint colour", not "this pixel is white".
+int grey(int v) { return v * 65536 + v * 256 + v; }
+
+// Is (x, y) inside the ellipse centred at the doubled point (cx, cy) with
+// doubled semi-axes rx and ry? The usual (dx/rx)^2 + (dy/ry)^2 <= 1, with
+// both sides multiplied by rx^2 * ry^2 so nothing has to be a fraction.
+int in_ellipse(int x, int y, int cx, int cy, int rx, int ry) {
+    int dx = 2 * x - cx;
+    int dy = 2 * y - cy;
+    if (dx * dx * ry * ry + dy * dy * rx * rx <= rx * rx * ry * ry) { return 1; }
+    return 0;
+}
+
+void fill_ellipse(int f, int cx, int cy, int rx, int ry, int color) {
+    int y = 0;
+    while (y < SH) {
+        int x = 0;
+        while (x < SW) {
+            if (in_ellipse(x, y, cx, cy, rx, ry) == 1) { put(f, x, y, color); }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return;
+}
+
+// The band between two ellipses -- a membrane, a rim, an outline.
+void ring_ellipse(int f, int cx, int cy, int rx, int ry, int thick, int color) {
+    int y = 0;
+    while (y < SH) {
+        int x = 0;
+        while (x < SW) {
+            if (in_ellipse(x, y, cx, cy, rx, ry) == 1
+                && in_ellipse(x, y, cx, cy, rx - thick, ry - thick) == 0) {
+                put(f, x, y, color);
+            }
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return;
+}
+
+// A straight run of pixels from one whole-pixel point to another, stepping on
+// whichever axis is longer. Not an anti-aliased line: at these sizes every
+// pixel is a deliberate decision and a smoothed edge would just look muddy.
+void line(int f, int x0, int y0, int x1, int y1, int color) {
+    int dx = x1 - x0;
+    int dy = y1 - y0;
+    int adx = dx;
+    int ady = dy;
+    if (adx < 0) { adx = 0 - adx; }
+    if (ady < 0) { ady = 0 - ady; }
+    int steps = adx;
+    if (ady > steps) { steps = ady; }
+    if (steps == 0) { put(f, x0, y0, color); return; }
+    int i = 0;
+    while (i <= steps) {
+        put(f, x0 + dx * i / steps, y0 + dy * i / steps, color);
+        i = i + 1;
+    }
+    return;
+}
+
+// Wraps whatever was just drawn as a Sprite for the renderer. Each draw_*
+// function below ends with this, so a caller gets one value back and never
+// sees SW/SH/SF at all.
+int art_sprite() {
+    int s = alloc(sizeof(Sprite));
+    if (s == 0) { return 0; }
+    s.sp_w = SW;
+    s.sp_h = SH;
+    s.sp_frames = SF;
+    s.sp_pixels = data;
+    return s;
+}
+
+// --- the sprites ----------------------------------------------------------
+
+// The player: a bacterium. An oval body with a darker membrane and a lit
+// upper left, and a flagellum that whips to the other side between the two
+// frames, which is the whole of the animation and reads as swimming.
+int draw_player() {
+    sprite_begin(16, 16, 2);
+    int body = 0x40FF80;
+    int rim = 0x1E8C4A;
+    int lit = 0xC8FFDC;
+    int tail = 0x2FBE68;
+    int f = 0;
+    while (f < 2) {
+        // Centre x 7.5, centre y 6.0, so the bottom four rows are free for
+        // the flagellum.
+        fill_ellipse(f, 15, 12, 11, 12, rim);
+        fill_ellipse(f, 15, 12, 8, 9, body);
+        fill_ellipse(f, 11, 9, 3, 3, lit);
+        f = f + 1;
+    }
+    // The flagellum, swept one way in frame 0 and the other in frame 1.
+    // Two pixels wide and three across, because the first version was a
+    // single-pixel line that moved two pixels between frames and the
+    // animation was invisible at this size.
+    flagellum(0, 1, tail);
+    flagellum(1, 0 - 1, tail);
+    return art_sprite();
+}
+
+void flagellum(int f, int dir, int color) {
+    int x = 8;
+    while (x <= 9) {
+        line(f, x, 11, x + dir * 3, 13, color);
+        line(f, x + dir * 3, 13, x, 15, color);
+        x = x + 1;
+    }
+    return;
+}
+
+// An antibacterium: a red core with eight spikes that lengthen and shorten
+// between the frames. Spikes rather than a smooth disc because it is the one
+// thing in the world that can hurt you, and it should not look like food.
+int draw_anti() {
+    sprite_begin(18, 18, 2);
+    int core = 0xE04040;
+    int rim = 0x7A1E1E;
+    int spike = 0xFF8080;
+    int eye = 0xFFD8D8;
+    int f = 0;
+    while (f < 2) {
+        // Spikes first, so the core is drawn over their inner ends.
+        int reach = 8;
+        if (f == 1) { reach = 6; }
+        int k = 0;
+        while (k < 8) {
+            int dx = 0;
+            int dy = 0;
+            if (k == 0) { dx = 1; dy = 0; }
+            if (k == 1) { dx = -1; dy = 0; }
+            if (k == 2) { dx = 0; dy = 1; }
+            if (k == 3) { dx = 0; dy = -1; }
+            if (k == 4) { dx = 1; dy = 1; }
+            if (k == 5) { dx = 1; dy = -1; }
+            if (k == 6) { dx = -1; dy = 1; }
+            if (k == 7) { dx = -1; dy = -1; }
+            line(f, 8 + dx * 3, 8 + dy * 3,
+                    8 + dx * reach, 8 + dy * reach, spike);
+            k = k + 1;
+        }
+        fill_ellipse(f, 17, 17, 12, 12, rim);
+        fill_ellipse(f, 17, 17, 9, 9, core);
+        fill_ellipse(f, 15, 15, 3, 3, eye);
+        f = f + 1;
+    }
+    return art_sprite();
+}
+
+// A mini-bacterium: the player in miniature, small enough that a body and a
+// two-pixel tail is all there is room for.
+int draw_mini() {
+    sprite_begin(8, 8, 1);
+    fill_ellipse(0, 7, 6, 6, 7, 0x2FBE68);
+    fill_ellipse(0, 7, 6, 4, 5, 0x80FFC0);
+    line(0, 4, 6, 3, 7, 0x2FBE68);
+    return art_sprite();
+}
+
+// A cell, in grey so that infecteria can tint it: a bright membrane, a dimmer
+// cytoplasm, a nucleus a little off centre and four organelles. Off centre
+// because a nucleus dead in the middle reads as a target reticle rather than
+// as something alive.
+int draw_cell() {
+    sprite_begin(32, 32, 1);
+    ring_ellipse(0, 31, 31, 31, 31, 5, grey(255));
+    fill_ellipse(0, 31, 31, 26, 26, grey(150));
+    fill_ellipse(0, 27, 27, 10, 10, grey(225));
+    ring_ellipse(0, 27, 27, 10, 10, 3, grey(255));
+    // Organelles, placed by hand rather than by a loop: four positions that
+    // look scattered are not four positions a formula produces.
+    fill_ellipse(0, 44, 22, 5, 5, grey(200));
+    fill_ellipse(0, 40, 46, 4, 4, grey(195));
+    fill_ellipse(0, 20, 48, 5, 4, grey(205));
+    fill_ellipse(0, 18, 18, 3, 3, grey(190));
+    return art_sprite();
+}
+
+// A factory: the same membrane, with the inside replaced by machinery. Four
+// buds around the rim are where mini-bacteria come out, so the sprite says
+// what the building does without a label.
+int draw_factory() {
+    sprite_begin(32, 32, 1);
+    ring_ellipse(0, 31, 31, 31, 31, 5, grey(255));
+    fill_ellipse(0, 31, 31, 26, 26, grey(140));
+    // A cross of two thick bars, which at this size reads as structure where
+    // a finer pattern would read as noise.
+    int y = 13;
+    while (y < 19) {
+        line(0, 8, y, 23, y, grey(235));
+        y = y + 1;
+    }
+    int x = 13;
+    while (x < 19) {
+        line(0, x, 8, x, 23, grey(235));
+        x = x + 1;
+    }
+    fill_ellipse(0, 31, 31, 9, 9, grey(255));
+    // The buds.
+    fill_ellipse(0, 15, 15, 6, 6, grey(250));
+    fill_ellipse(0, 47, 15, 6, 6, grey(250));
+    fill_ellipse(0, 15, 47, 6, 6, grey(250));
+    fill_ellipse(0, 47, 47, 6, 6, grey(250));
+    return art_sprite();
+}
