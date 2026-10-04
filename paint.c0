@@ -1,0 +1,301 @@
+// paint.c0 — part of utsikt, a browser engine for the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of utsikt, a browser engine written in c0 for moonshot.
+// utsikt is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// paint.c0 -- pixels, glyphs and the string helpers everything else needs.
+//
+// Everything utsikt draws goes into ONE buffer it owns and hands to the
+// kernel with a single present(). That is not a preference: fill() and
+// blit() write straight to the live framebuffer, and the scheduler can
+// preempt a task between any two syscalls, so a page painted with a
+// thousand separate draw calls would be visibly torn by whatever else is
+// running. One buffer, one present, one atomic update.
+//
+// The buffer is sized from win_max(), not win_info(). alloc() is bump-only
+// with no free, so a buffer cut to the window's size at startup is a buffer
+// that cannot grow when the window does -- and present() copies whatever
+// the window measures NOW, so it would be read past. The maximum is the
+// only safe size; the layout still only draws into the current window.
+
+// The framebuffer utsikt composites into, and the geometry it was SIZED for.
+// Sized, not laid out: the allocation is big enough for the largest window
+// this machine can hand out, but the pixels inside it are packed at the
+// CURRENT window's width, because that is the stride present() reads with.
+// Those are two different numbers and using the wrong one is invisible in
+// the code and unmistakable on screen -- with the buffer strided at the
+// maximum width and the window half of it, present() showed every other
+// row of the page and the untouched right half of the buffer in between.
+int fb;
+int fb_max_w;
+int fb_max_h;
+
+// The window as of this frame -- what present() will copy, and what layout
+// treats as the viewport. Re-read every frame: a tile can be resized under
+// a running program by anything that reflows kakel's layout.
+int view_w;
+int view_h;
+
+// One character cell, learned from the kernel rather than assumed. The
+// three ring-3 graphics syscalls hardcoded this number once and the wrong
+// value was a real visible bug; glyph() hands it over precisely so that no
+// program has to guess again.
+int cell_w;
+int cell_h;
+
+// Every glyph the font has, cached at startup: 128 characters of cell_h
+// bytes each. glyph() is a syscall, and a page is thousands of characters
+// redrawn on every scroll, so asking the kernel per character per frame
+// would put a syscall in the innermost loop of the renderer. Asking 128
+// times at startup and never again puts it nowhere.
+int font_cache;
+
+int str_len(int s) {
+    int n = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+int str_eq(int a, int b) {
+    int i = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    if (a[i] == b[i]) { return 1; }
+    return 0;
+}
+
+int to_lower(int c) {
+    if (c >= 'A' && c <= 'Z') { return c + 32; }
+    return c;
+}
+
+// HTML calls space, tab, newline and carriage return all whitespace, and
+// collapses runs of them into one space. Form feed is in the spec's set too
+// and costs nothing to include.
+int is_space(int c) {
+    if (c == ' ' || c == 9 || c == 10 || c == 13 || c == 12) { return 1; }
+    return 0;
+}
+
+int is_digit(int c) {
+    if (c >= '0' && c <= '9') { return 1; }
+    return 0;
+}
+
+// A tag or property name character: letters, digits and the hyphen that
+// CSS property names are full of (font-size, text-align, background-color).
+int is_name_char(int c) {
+    if (c >= 'a' && c <= 'z') { return 1; }
+    if (c >= 'A' && c <= 'Z') { return 1; }
+    if (is_digit(c) == 1) { return 1; }
+    if (c == '-' || c == '_') { return 1; }
+    return 0;
+}
+
+// Copies `n` bytes out of a buffer into a fresh NUL-terminated string,
+// lowercased. Tag and property names are matched case-insensitively, and
+// lowercasing once at parse time means nothing downstream has to remember
+// that <BODY> and <body> are the same element.
+int str_dup_lower(int buf, int start, int n) {
+    int s = alloc(n + 1);
+    if (s == 0) { return 0; }
+    int i = 0;
+    while (i < n) {
+        s[i] = to_lower(buf[start + i]);
+        i = i + 1;
+    }
+    s[n] = 0;
+    return s;
+}
+
+int str_dup(int buf, int start, int n) {
+    int s = alloc(n + 1);
+    if (s == 0) { return 0; }
+    int i = 0;
+    while (i < n) {
+        s[i] = buf[start + i];
+        i = i + 1;
+    }
+    s[n] = 0;
+    return s;
+}
+
+// --- pixels ----------------------------------------------------------------
+
+// The framebuffer is 4 bytes per pixel, blue first, then green, then red,
+// then a byte the hardware ignores. Colours are carried around as 0xRRGGBB
+// because that is how they are written in a stylesheet, so the store order
+// below is the conversion.
+void put_px(int addr, int color) {
+    store8(addr, color - (color / 256) * 256);
+    store8(addr + 1, (color / 256) - (color / 65536) * 256);
+    store8(addr + 2, (color / 65536) - (color / 16777216) * 256);
+    store8(addr + 3, 0);
+}
+
+// Fills a rectangle of the composite buffer, clipped to the window. Two
+// pixels per store64 where the row allows it: c0 has no optimizer, so the
+// per-pixel version costs four stores plus three divisions per pixel, and a
+// page background is the largest single thing utsikt paints. The pair trick
+// needs an 8-byte aligned start, which is every second pixel, so a row
+// beginning on an odd pixel writes one on its own first.
+void fill_rect(int x, int y, int w, int h, int color) {
+    int x0 = x;
+    int y0 = y;
+    int x1 = x + w;
+    int y1 = y + h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > view_w) { x1 = view_w; }
+    if (y1 > view_h) { y1 = view_h; }
+    if (x1 <= x0 || y1 <= y0) { return; }
+    int pair = color * 4294967296 + color;
+    int row = y0;
+    while (row < y1) {
+        int col = x0;
+        int base = fb + (row * view_w + col) * 4;
+        // An odd pixel index means the byte offset is 4 modulo 8, so the
+        // paired store would be unaligned. One single pixel fixes that.
+        if ((row * view_w + col) - ((row * view_w + col) / 2) * 2 == 1) {
+            put_px(base, color);
+            col = col + 1;
+            base = base + 4;
+        }
+        while (col + 1 < x1) {
+            store64(base, pair);
+            col = col + 2;
+            base = base + 8;
+        }
+        while (col < x1) {
+            put_px(base, color);
+            col = col + 1;
+            base = base + 4;
+        }
+        row = row + 1;
+    }
+    return;
+}
+
+// Asks the kernel for the whole font once. Characters the font does not
+// have come back all-zero, which is exactly what a blank cell is, so there
+// is nothing to special-case for them here or anywhere downstream.
+int font_init() {
+    int d = glyph('M', 0);
+    if (d <= 0) { return 0; }
+    cell_w = d / 65536;
+    cell_h = d - cell_w * 65536;
+    if (cell_w <= 0 || cell_h <= 0 || cell_h > 32) { return 0; }
+    font_cache = alloc(128 * cell_h);
+    if (font_cache == 0) { return 0; }
+    int c = 0;
+    while (c < 128) {
+        if (glyph(c, font_cache + c * cell_h) != d) { return 0; }
+        c = c + 1;
+    }
+    return 1;
+}
+
+// Draws one character with its top-left at (x, y), scaled by an integer
+// factor, painting ONLY its lit pixels -- the glyph is transparent, unlike
+// the kernel's own fb_draw_char, which paints a background too. A browser
+// draws text over backgrounds that were laid down by other boxes, so an
+// opaque cell would punch a hole through them.
+//
+// Bold is a second pass one pixel to the right. That is the whole of it:
+// the font has one weight, and smearing horizontally is what a bitmap font
+// has always done for bold.
+void draw_char(int x, int y, int ch, int color, int scale, int bold) {
+    if (ch < 0 || ch > 127) { return; }
+    if (x >= view_w || y >= view_h) { return; }
+    if (x + cell_w * scale <= 0 || y + cell_h * scale <= 0) { return; }
+    int row = 0;
+    while (row < cell_h) {
+        int b = load8(font_cache + ch * cell_h + row);
+        if (b != 0) {
+            int col = 0;
+            while (col < cell_w) {
+                // Bit 7 of the byte is the LEFTMOST pixel, so the column
+                // being tested is peeled off the top end.
+                int shifted = b;
+                int k = 0;
+                while (k < cell_w - 1 - col) { shifted = shifted / 2; k = k + 1; }
+                if (shifted - (shifted / 2) * 2 == 1) {
+                    fill_rect(x + col * scale, y + row * scale, scale, scale, color);
+                    if (bold == 1) {
+                        fill_rect(x + col * scale + 1, y + row * scale, scale, scale, color);
+                    }
+                }
+                col = col + 1;
+            }
+        }
+        row = row + 1;
+    }
+    return;
+}
+
+// Draws `n` bytes of text starting at `s`. Returns nothing: the caller
+// already knows the width, because it had to measure it to decide where the
+// line broke.
+void draw_text(int x, int y, int s, int n, int color, int scale, int bold) {
+    int i = 0;
+    int px = x;
+    while (i < n) {
+        draw_char(px, y, s[i], color, scale, bold);
+        px = px + cell_w * scale;
+        i = i + 1;
+    }
+    return;
+}
+
+// --- the address line -----------------------------------------------------
+
+// A strip along the bottom of the window saying which file is on screen.
+// Bottom rather than top because the document is laid out from y = 0 with
+// scroll_y subtracted, so a top strip would mean an offset threaded through
+// every paint call, while a bottom one is simply height the document is
+// never given.
+int BAR_PAD = 2;
+int BAR_BG = 0x282828;
+int BAR_FG = 0xd0d0c8;
+int BAR_RULE = 0x505048;
+
+// How tall the strip is: one line of text, padded above and below, plus the
+// hairline that separates it from the page.
+int bar_height() {
+    return cell_h + BAR_PAD * 2 + 1;
+}
+
+// Draws the strip. `full_h` is the whole window height; view_h at this point
+// is the document's share of it, which is where the strip starts.
+//
+// fill_rect and draw_char both clip to view_h, and that is exactly right for
+// the document and exactly wrong here, since this is the one thing that
+// draws outside it. So view_h is raised to the full window for the three
+// calls and put back afterwards. The row stride is view_w, which does not
+// change, so nothing else has to know.
+void draw_address_bar(int full_h, int name) {
+    int doc_bottom = view_h;
+    view_h = full_h;
+    fill_rect(0, doc_bottom, view_w, full_h - doc_bottom, BAR_BG);
+    fill_rect(0, doc_bottom, view_w, 1, BAR_RULE);
+    int ty = doc_bottom + 1 + BAR_PAD;
+    draw_text(BAR_PAD, ty, "/", 1, BAR_FG, 1, 0);
+    draw_text(BAR_PAD + cell_w, ty, name, str_len(name), BAR_FG, 1, 0);
+    view_h = doc_bottom;
+    return;
+}
+
+// Every glyph in this font is one cell wide, so text width is a
+// multiplication rather than a sum over the string. That is a property of
+// the font, not of the engine: the day punkt grows a proportional face,
+// this is the one function that has to start adding per-character advances,
+// and it is called from everywhere precisely so that it can.
+int text_width(int n, int scale) {
+    return n * cell_w * scale;
+}
