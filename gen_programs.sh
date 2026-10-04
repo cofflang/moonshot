@@ -84,11 +84,12 @@ ticks as the exit code (~100Hz, so ms/frame = code * 10 / 30). Measured
 244. Sizes its buffer from win_max(), not win_info(), so a window resized
 mid-run cannot make present() read past it. Source: fps_probe.c0."
 
-# utsikt is its own project too, next door in my tree at ../utsikt, and its
-# sources ship in programs/ in a release, exactly like Gnista's. Its four
-# files `include` each other by plain name, so it compiles from its own
-# directory for the same reason gnista.c0 does.
-UTSIKT_DIR=${UTSIKT_DIR:-programs}
+# utsikt is its own repository (cofflang/utsikt), and a release carries it
+# in programs/utsikt/ as a git subtree; sync_utsikt.sh pulls a newer one in.
+# Its four files `include` each other by plain name, so it compiles from its
+# own directory for the same reason gnista.c0 does. Working on utsikt itself,
+# its dev.sh runs this script with UTSIKT_DIR pointing at its own checkout.
+UTSIKT_DIR=${UTSIKT_DIR:-programs/utsikt}
 (cd "$UTSIKT_DIR" && "$OLDPWD/$COFF1" --elf utsikt.c0 "$tmp/utsikt.s")
 "$SMED" --base 0x80000000 "$tmp/utsikt.s" "$tmp/utsikt.elf"
 
@@ -99,4 +100,5 @@ DOM, applies a subset of CSS, lays the tree out as block and inline boxes
 and paints the result into its own buffer, one SYS_PRESENT per frame. Gets
 the font from the kernel with SYS_GLYPH rather than carrying one, so its
 text and the shell's are the same face. No networking: verk is the last
-subsystem Moonshot will get, so a page is a file. Source: programs/utsikt.c0."
+subsystem Moonshot will get, so a page is a file. Source:
+programs/utsikt/utsikt.c0."

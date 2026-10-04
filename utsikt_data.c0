@@ -15,7 +15,8 @@
 // and paints the result into its own buffer, one SYS_PRESENT per frame. Gets
 // the font from the kernel with SYS_GLYPH rather than carrying one, so its
 // text and the shell's are the same face. No networking: verk is the last
-// subsystem Moonshot will get, so a page is a file. Source: programs/utsikt.c0.
+// subsystem Moonshot will get, so a page is a file. Source:
+// programs/utsikt/utsikt.c0.
 
 int seed_utsikt_size() { return 62464; }
 void seed_utsikt(int buf) {

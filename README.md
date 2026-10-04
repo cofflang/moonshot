@@ -23,7 +23,7 @@ in front of.
 | `kmain.c0` | The kernel entry point. It `include`s every other `.c0` subsystem file, so coff compiles one flat translation unit. |
 | `*.c0` | The kernel subsystems: knekt (core), jenna (memory/paging), chrone (scheduler), jakel (filesystem), kakel (windowing), punkt (framebuffer + font), raket (init and login), skalman (shell), skrift (editor), pensel (pixel-art editor), klick (mouse), jit (JIT compiler), repl (REPL), syscall (ring-3 syscalls and the ELF loader), serial, interrupts, keyboard, vga (text-mode fallback), ata (disk). |
 | `*_data.c0` | Generated. The ring-3 programs the kernel seeds onto the filesystem at first boot, as byte arrays. Every one is rebuilt from source by `gen_programs.sh`; see [Baked-in programs](#baked-in-programs). |
-| `programs/` | The sources of those programs: two syscall probes, Gnista's engine demo, the Infecteria game, a frame-rate probe and utsikt, the browser engine. Also `gen_sprite.c0`, which writes the demo's sprite. |
+| `programs/` | The sources of those programs: two syscall probes, Gnista's engine demo, the Infecteria game, a frame-rate probe, and in `programs/utsikt/` the browser engine. Also `gen_sprite.c0`, which writes the demo's sprite. |
 | `index_html.c0` | The two pages utsikt opens, seeded onto the filesystem at boot like the programs are. |
 | `elf_tests/` | Eleven small c0 programs compiled with `coff --elf` and run inside the OS by `verify_elf_backend.sh`, so ring-3 code is checked end to end. `gen_elf_tests.sh` bakes them into `elf_tests_data.c0`. |
 | `boot.s` | The hand-written Multiboot entry stub that gets the CPU into 64-bit long mode before calling into c0-compiled code. |
@@ -31,6 +31,7 @@ in front of.
 | `linker.ld` | The linker script that places the kernel at 1 MiB. |
 | `build.sh` | Verifies the compiler and the assembler, then builds `moonshot.elf`. |
 | `sync_addrs.sh` | Patches the JIT helper function addresses into `kmain.c0` after linking, reading them from `moonshot.map`. Needed when any code changes size. |
+| `sync_utsikt.sh` | Pulls a newer utsikt into `programs/utsikt/` from its own repository, or checks that the copy here matches it. See [Baked-in programs](#baked-in-programs). |
 | `bake.c0`, `gen_programs.sh`, `gen_elf_tests.sh` | Turn compiled programs into the `*_data.c0` byte arrays. `bake` is a c0 program, built by the same `coff1` and `smed` as the kernel. |
 | `run_qemu.sh` | The main regression gate. Builds, boots headlessly, and asserts invariants on the serial log. |
 | `test_*.sh`, `verify_*.sh` | Twenty-seven more test scripts; see [Testing](#testing). |
@@ -151,9 +152,19 @@ know. `gen_elf_tests.sh` does the same for `elf_tests/`. The byte arrays
 themselves are written by `bake`, which is compiled from `bake.c0` on the
 spot, so nothing between the sources and the kernel image is python.
 
-Gnista, the game engine the demo and Infecteria are built on, and utsikt, the
-browser engine, are their own projects; the copies in `programs/` are what
-these seeds were built from.
+Gnista, the game engine the demo and Infecteria are built on, is its own
+project; the copies in `programs/` are what these seeds were built from.
+
+utsikt, the browser engine, has its own repository,
+[cofflang/utsikt](https://github.com/cofflang/utsikt), and is carried here in
+`programs/utsikt/` as a squashed git subtree, so every update records the
+utsikt commit it came from.
+
+```sh
+./sync_utsikt.sh --check   # does programs/utsikt/ match utsikt's main?
+./sync_utsikt.sh           # pull utsikt's main in, rebuild the seed and kernel
+./sync_utsikt.sh <ref>     # the same, for any other branch or tag
+```
 
 ## Trust
 
@@ -181,6 +192,11 @@ request:
   addresses.
 - After changing anything in `programs/` or `elf_tests/`, regenerate the
   seeds and commit the result.
+- Changes to the browser go to [cofflang/utsikt](https://github.com/cofflang/utsikt)
+  rather than to `programs/utsikt/` here; its CONTRIBUTING.md says how to
+  build and test it against a moonshot checkout. If you did change it here,
+  `./sync_utsikt.sh --send <branch>` pushes those commits to a branch of
+  utsikt to open a pull request from.
 - Keep it minimal. No new dependencies, no third-party code.
 
 ## License
