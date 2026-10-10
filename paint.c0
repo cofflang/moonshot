@@ -10,44 +10,43 @@
 // paint.c0 -- pixels, glyphs and the string helpers everything else needs.
 //
 // Everything utsikt draws goes into ONE buffer it owns and hands to the
-// kernel with a single present(). That is not a preference: fill() and
+// kernel with a single present(). That is not a preference. fill() and
 // blit() write straight to the live framebuffer, and the scheduler can
 // preempt a task between any two syscalls, so a page painted with a
 // thousand separate draw calls would be visibly torn by whatever else is
 // running. One buffer, one present, one atomic update.
 //
-// The buffer is sized from win_max(), not win_info(). alloc() is bump-only
-// with no free, so a buffer cut to the window's size at startup is a buffer
-// that cannot grow when the window does -- and present() copies whatever
+// The buffer is sized from win_max(), not win_info(). There is no realloc, so
+// a buffer cut to the window's size at startup is a buffer that cannot grow
+// when the window does -- and present() copies whatever
 // the window measures NOW, so it would be read past. The maximum is the
 // only safe size; the layout still only draws into the current window.
 
 // The framebuffer utsikt composites into, and the geometry it was SIZED for.
-// Sized, not laid out: the allocation is big enough for the largest window
+// Sized, not laid out. The allocation is big enough for the largest window
 // this machine can hand out, but the pixels inside it are packed at the
 // CURRENT window's width, because that is the stride present() reads with.
 // Those are two different numbers and using the wrong one is invisible in
 // the code and unmistakable on screen -- with the buffer strided at the
-// maximum width and the window half of it, present() showed every other
+// maximum width and the window half of it, present() would show every other
 // row of the page and the untouched right half of the buffer in between.
 int fb;
 int fb_max_w;
 int fb_max_h;
 
 // The window as of this frame -- what present() will copy, and what layout
-// treats as the viewport. Re-read every frame: a tile can be resized under
+// treats as the viewport. Re-read every frame, since a tile can be resized under
 // a running program by anything that reflows kakel's layout.
 int view_w;
 int view_h;
 
-// One character cell, learned from the kernel rather than assumed. The
-// three ring-3 graphics syscalls hardcoded this number once and the wrong
-// value was a real visible bug; glyph() hands it over precisely so that no
-// program has to guess again.
+// One character cell, learned from the kernel rather than assumed. glyph()
+// hands it over precisely so that no program has to hardcode it and get it
+// wrong when the font changes.
 int cell_w;
 int cell_h;
 
-// Every glyph the font has, cached at startup: 128 characters of cell_h
+// Every glyph the font has, cached at startup, 128 characters of cell_h
 // bytes each. glyph() is a syscall, and a page is thousands of characters
 // redrawn on every scroll, so asking the kernel per character per frame
 // would put a syscall in the innermost loop of the renderer. Asking 128
@@ -88,7 +87,7 @@ int is_digit(int c) {
     return 0;
 }
 
-// A tag or property name character: letters, digits and the hyphen that
+// A tag or property name character, meaning letters, digits and the hyphen that
 // CSS property names are full of (font-size, text-align, background-color).
 int is_name_char(int c) {
     if (c >= 'a' && c <= 'z') { return 1; }
@@ -103,7 +102,7 @@ int is_name_char(int c) {
 // lowercasing once at parse time means nothing downstream has to remember
 // that <BODY> and <body> are the same element.
 int str_dup_lower(int buf, int start, int n) {
-    int s = alloc(n + 1);
+    int s = doc_alloc(n + 1);
     if (s == 0) { return 0; }
     int i = 0;
     while (i < n) {
@@ -115,7 +114,7 @@ int str_dup_lower(int buf, int start, int n) {
 }
 
 int str_dup(int buf, int start, int n) {
-    int s = alloc(n + 1);
+    int s = doc_alloc(n + 1);
     if (s == 0) { return 0; }
     int i = 0;
     while (i < n) {
@@ -133,14 +132,83 @@ int str_dup(int buf, int start, int n) {
 // because that is how they are written in a stylesheet, so the store order
 // below is the conversion.
 void put_px(int addr, int color) {
-    store8(addr, color - (color / 256) * 256);
+    store8(addr, color % 256);
     store8(addr + 1, (color / 256) - (color / 65536) * 256);
     store8(addr + 2, (color / 65536) - (color / 16777216) * 256);
     store8(addr + 3, 0);
 }
 
+// --- images ------------------------------------------------------------------
+//
+// <img> reads pensel's .spr format, the one sprite format on moonshot. It is
+// three 8-byte words (width, height, frame count) and then width * height
+// pixels per frame, 4 bytes each in the framebuffer's own order (blue,
+// green, red, unused). A pixel that is all zero is transparent. Only the
+// first frame is shown.
+//
+// Parsed here in ring 3, not by the kernel. There is nothing to decode, the
+// pixels are already in the order the framebuffer wants, and a parser of
+// files anyone can write is better kept out of the kernel.
+
+// 2MB is a 724x724 image. Past that a page could take most of the 8MB heap
+// with one picture, and two documents exist at once while one replaces the
+// other.
+int IMG_MAX_BYTES = 2097152;
+
+// The .spr named `name`, read into memory the current document owns, or 0
+// when there is no such file or it is not a sprite. A header claiming more
+// pixels than the file holds is refused here, since draw_image would
+// otherwise read past the end of the buffer.
+int img_load(int name) {
+    int size = readfile(name, 0, 0);
+    if (size < 28 || size > IMG_MAX_BYTES) { return 0; }
+    // 8 spare bytes, since draw_image reads each pixel with an 8-byte load.
+    int buf = doc_alloc(size + 8);
+    if (buf == 0) { return 0; }
+    if (readfile(name, buf, size) != size) { return 0; }
+    int w = load64(buf);
+    int h = load64(buf + 8);
+    int frames = load64(buf + 16);
+    if (w <= 0 || h <= 0 || frames <= 0 || w > 4096 || h > 4096) { return 0; }
+    if (24 + w * h * frames * 4 > size) { return 0; }
+    return buf;
+}
+
+int img_w(int img) { return load64(img); }
+int img_h(int img) { return load64(img + 8); }
+
+// Draws frame 0 of a loaded image with its top-left corner at (x, y) in the
+// window, clipped, skipping transparent pixels. Each pixel is copied byte for
+// byte, since the file and the framebuffer agree on the order.
+void draw_image(int x, int y, int img) {
+    int w = img_w(img);
+    int h = img_h(img);
+    int px = img + 24;
+    int row = 0;
+    while (row < h) {
+        int yy = y + row;
+        if (yy >= 0 && yy < view_h) {
+            int col = 0;
+            while (col < w) {
+                int xx = x + col;
+                int s = px + (row * w + col) * 4;
+                if (xx >= 0 && xx < view_w && (load64(s) & 0xFFFFFFFF) != 0) {
+                    int d = fb + (yy * view_w + xx) * 4;
+                    store8(d, load8(s));
+                    store8(d + 1, load8(s + 1));
+                    store8(d + 2, load8(s + 2));
+                    store8(d + 3, 0);
+                }
+                col = col + 1;
+            }
+        }
+        row = row + 1;
+    }
+    return;
+}
+
 // Fills a rectangle of the composite buffer, clipped to the window. Two
-// pixels per store64 where the row allows it: c0 has no optimizer, so the
+// pixels per store64 where the row allows it. c0 has no optimizer, so the
 // per-pixel version costs four stores plus three divisions per pixel, and a
 // page background is the largest single thing utsikt paints. The pair trick
 // needs an 8-byte aligned start, which is every second pixel, so a row
@@ -207,8 +275,8 @@ int font_init() {
 // draws text over backgrounds that were laid down by other boxes, so an
 // opaque cell would punch a hole through them.
 //
-// Bold is a second pass one pixel to the right. That is the whole of it:
-// the font has one weight, and smearing horizontally is what a bitmap font
+// Bold is a second pass one pixel to the right. That is the whole of it,
+// since the font has one weight, and smearing horizontally is what a bitmap font
 // has always done for bold.
 void draw_char(int x, int y, int ch, int color, int scale, int bold) {
     if (ch < 0 || ch > 127) { return; }
@@ -225,7 +293,7 @@ void draw_char(int x, int y, int ch, int color, int scale, int bold) {
                 int shifted = b;
                 int k = 0;
                 while (k < cell_w - 1 - col) { shifted = shifted / 2; k = k + 1; }
-                if (shifted - (shifted / 2) * 2 == 1) {
+                if (shifted % 2 == 1) {
                     fill_rect(x + col * scale, y + row * scale, scale, scale, color);
                     if (bold == 1) {
                         fill_rect(x + col * scale + 1, y + row * scale, scale, scale, color);
@@ -239,7 +307,7 @@ void draw_char(int x, int y, int ch, int color, int scale, int bold) {
     return;
 }
 
-// Draws `n` bytes of text starting at `s`. Returns nothing: the caller
+// Draws `n` bytes of text starting at `s`. Returns nothing, since the caller
 // already knows the width, because it had to measure it to decide where the
 // line broke.
 void draw_text(int x, int y, int s, int n, int color, int scale, int bold) {
@@ -265,7 +333,7 @@ int BAR_BG = 0x282828;
 int BAR_FG = 0xd0d0c8;
 int BAR_RULE = 0x505048;
 
-// How tall the strip is: one line of text, padded above and below, plus the
+// How tall the strip is, which is one line of text, padded above and below, plus the
 // hairline that separates it from the page.
 int bar_height() {
     return cell_h + BAR_PAD * 2 + 1;
@@ -293,7 +361,7 @@ void draw_address_bar(int full_h, int name) {
 
 // Every glyph in this font is one cell wide, so text width is a
 // multiplication rather than a sum over the string. That is a property of
-// the font, not of the engine: the day punkt grows a proportional face,
+// the font, not of the engine. The day punkt grows a proportional face,
 // this is the one function that has to start adding per-character advances,
 // and it is called from everywhere precisely so that it can.
 int text_width(int n, int scale) {

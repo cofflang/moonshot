@@ -7,13 +7,13 @@
 // License version 3 or (at your option) any later version, WITHOUT ANY
 // WARRANTY; see the LICENSE file for the full text.
 //
-// flow.c0 -- normal flow: blocks stack down the page, inline content fills
+// flow.c0 -- normal flow, where blocks stack down the page, inline content fills
 // lines across it, and lines break when they run out of room.
 //
 // The engine runs the SAME traversal twice, with one global telling it
 // whether to draw. The measure pass records where every block box landed and
 // how tall it turned out; the paint pass repeats the traversal and draws.
-// The reason is the background: a block's background covers the box, and the
+// The reason is the background. A block's background covers the box, and the
 // box's height is not known until its children have been laid out, so a
 // single pass would have to paint the background after the text it sits
 // behind. Two passes over a tree that is already in memory costs almost
@@ -23,7 +23,7 @@
 // would be a bug in this file rather than a difference in inputs. That is
 // worth more than the saved traversal.
 //
-// Coordinates are DOCUMENT coordinates: y grows down the whole page, not
+// Coordinates are DOCUMENT coordinates, so y grows down the whole page, not
 // down the window. The scroll offset is subtracted at the single point where
 // something is actually drawn, and nowhere else, so scrolling cannot change
 // layout -- which is the property that makes it safe to scroll without
@@ -40,13 +40,14 @@ layout Item {
     int i_bold;
     int i_bg;      // inline background, or -1
     int i_href;    // the link this run belongs to, or 0
+    int i_img;     // an <img> placed as one item, or 0 for a run of text
 }
 
 // Where a link ended up on screen. Filled in by the paint pass, in WINDOW
 // coordinates rather than document ones, because that is what a click
 // arrives in and converting once here is cheaper than converting on every
 // click. Rebuilt from scratch every frame, so it cannot go stale against a
-// scroll or a re-wrap: there is one frame and one table, and they are always
+// scroll or a re-wrap. There is one frame and one table, and they are always
 // the same frame.
 layout LinkBox {
     int lb_x;
@@ -66,15 +67,15 @@ int flow_paint;    // 0 = measure, 1 = draw
 int flow_left;     // content box edges, in document coordinates
 int flow_right;
 int flow_align;
-int flow_y;        // the pen: the top of whatever comes next
+int flow_y;        // the pen, the top of whatever comes next
 
 int line_items;
 int word_scratch;  // where a word that has to move to the next line is held
 int line_count;
 // The item index where the current WORD began. A word is not the same thing
-// as an item: "<b>knekt</b>." is two runs with no space between them, and a
-// line may only break where a space was. Without this the wrap landed
-// between the bold word and the full stop, and a line started with ".".
+// as an item. "<b>knekt</b>." is two runs with no space between them, and a
+// line may only break where a space was. Without this the wrap would land
+// between the bold word and the full stop, and a line would start with ".".
 int word_start;
 int line_x;        // width of the content placed on this line so far
 int line_top;      // document y of the current line box
@@ -87,14 +88,14 @@ int page_bg;
 
 // The height a line box occupies, from the height of the tallest glyph on
 // it. The extra is leading -- the space between one line's descenders and
-// the next line's ascenders -- and without it lines touch: this font fills
+// the next line's ascenders -- and without it lines touch, since this font fills
 // its whole 8-pixel cell, so consecutive lines rendered at exactly the
 // glyph height come out as a solid block of text with no gaps. Roughly a
 // third of the size, which is what the ratio behind every readable body
 // text has always been, and it scales with the text rather than being a
 // fixed number of pixels that a heading would swallow.
 //
-// The space goes BELOW the glyphs, not around them: descenders already
+// The space goes BELOW the glyphs, not around them, because descenders already
 // reach the bottom row of the cell, so the gap that matters is the one
 // before the next line starts.
 int line_advance(int h) {
@@ -103,7 +104,7 @@ int line_advance(int h) {
 }
 
 // The link the inline content being flowed belongs to, or 0. A global for
-// the same reason flow_paint and flow_align are: it is context that every
+// the same reason flow_paint and flow_align are. It is context that every
 // run inherits from where it sits in the tree, not an argument each caller
 // would have to thread through.
 int flow_href;
@@ -112,11 +113,12 @@ int flow_href;
 //
 // CSS says two vertical margins that meet collapse to the larger of the
 // two rather than adding. Without this, an h2 with an 8px margin followed
-// by a p with a 6px one left a 14px gap where every other browser leaves 8,
-// and the page read as though it had been double-spaced by accident.
+// by a p with a 6px one would leave a 14px gap where every other browser
+// leaves 8, and the page would read as though it had been double-spaced by
+// accident.
 //
 // The mechanism is a carry rather than a lookahead. A block's bottom margin
-// is added to flow_y as it always was, and remembered here; the next block
+// is added to flow_y as usual, and remembered here; the next block
 // to start then adds only the DIFFERENCE, if its own top margin is larger.
 // So the gap ends up as the larger of the two and neither block has to know
 // anything about its sibling.
@@ -125,7 +127,7 @@ int flow_href;
 // because a margin only collapses against another margin. Two paragraphs
 // with a line of loose text between them are not adjacent.
 //
-// NOT collapsed: a parent's margin with its first or last child's, which is
+// NOT collapsed is a parent's margin with its first or last child's, which is
 // the other half of the CSS rule. That one needs a block to know whether
 // its own box has a border, padding or content above the child, and it
 // changes where the parent's background starts rather than just the gap
@@ -144,10 +146,9 @@ int flow_init() {
 }
 
 // Records one painted run of a link. Silently stops at LINK_MAX rather than
-// growing: alloc() has no free, so a table that grew per frame would leak a
-// page of heap every repaint. A document with more links than this loses the
-// ones past the limit, which is a visible and bounded failure rather than a
-// slow one.
+// growing. A fixed table costs nothing per repaint, where a growing one would
+// be an alloc and a dealloc every frame. A document with more links than this
+// loses the ones past the limit, which is a visible and bounded failure.
 void link_box_add(int x, int y, int w, int h, int href) {
     if (link_count >= LINK_MAX) { return; }
     int lb = link_boxes + link_count * sizeof(LinkBox);
@@ -176,12 +177,12 @@ int link_hit(int mx, int my) {
     return 0;
 }
 
-// Ends the current line: draws what is on it, if this is the paint pass,
+// Ends the current line. It draws what is on it, if this is the paint pass,
 // and moves the pen below it.
 //
 // Alignment happens here and only here, because it is the one thing about a
 // line that cannot be decided until the line is complete. That is also why
-// the items are buffered rather than drawn as they are placed: a centred
+// the items are buffered rather than drawn as they are placed. A centred
 // line's first word depends on where its last word ended.
 void flush_line() {
     if (line_count == 0) {
@@ -206,16 +207,24 @@ void flush_line() {
         int k = 0;
         while (k < line_count) {
             int it = line_items + k * sizeof(Item);
-            // Bottom-aligned, not top-aligned: a line mixing a heading-sized
+            // Bottom-aligned, not top-aligned, because a line mixing a heading-sized
             // word with body text should sit them on one baseline, and with
             // a single-size font every glyph's baseline is its own bottom.
             int x = flow_left + it.i_x + dx;
             int y = line_top + line_h - it.i_h - scroll_y;
+            if (it.i_img != 0) {
+                // A linked image is clickable like its text would be, but
+                // not underlined, since a line under a picture reads as part of it.
+                draw_image(x, y, it.i_img);
+                if (it.i_href != 0) { link_box_add(x, y, it.i_w, it.i_h, it.i_href); }
+                k = k + 1;
+                continue;
+            }
             if (it.i_bg >= 0) { fill_rect(x, y, it.i_w, it.i_h, it.i_bg); }
             draw_text(x, y, it.i_text, it.i_len, it.i_color, it.i_scale, it.i_bold);
             if (it.i_href != 0) {
                 // The underline is drawn from the run being part of a link,
-                // not from a CSS property: text-decoration is not in the
+                // not from a CSS property, since text-decoration is not in the
                 // subset, and a link that is only a different colour is a
                 // link nobody can find. Colour alone also fails the one
                 // reader who cannot tell these two blues apart.
@@ -259,6 +268,7 @@ void push_item(int s, int n, int w, int scale, int color, int bold, int bg) {
     it.i_bold = bold;
     it.i_bg = bg;
     it.i_href = flow_href;
+    it.i_img = 0;
     line_x = line_x + w;
     if (it.i_h > line_h) { line_h = it.i_h; }
     line_count = line_count + 1;
@@ -276,6 +286,7 @@ void item_copy(int dst, int src) {
     dst.i_bold = src.i_bold;
     dst.i_bg = src.i_bg;
     dst.i_href = src.i_href;
+    dst.i_img = src.i_img;
     return;
 }
 
@@ -284,7 +295,7 @@ void item_copy(int dst, int src) {
 //
 // This is what makes a word that several elements contributed to behave like
 // one word. The alternative -- breaking between the runs -- is not a
-// cosmetic difference: a line that begins with "." or with a closing bracket
+// cosmetic difference. A line that begins with "." or with a closing bracket
 // reads as a rendering fault, and it is the most common thing bold and code
 // spans in real prose produce.
 void move_word_down() {
@@ -296,7 +307,7 @@ void move_word_down() {
         k = k + 1;
     }
     // The line's remaining width ends where its last kept item ends, NOT
-    // where the moved word began: the difference is the space between them,
+    // where the moved word began. The difference is the space between them,
     // and counting it would offset every centred or right-aligned line by a
     // character.
     int last = line_items + (word_start - 1) * sizeof(Item);
@@ -323,6 +334,12 @@ void move_word_down() {
         // moved copy carries the href each run actually had.
         int moved = line_items + (line_count - 1) * sizeof(Item);
         moved.i_href = it2.i_href;
+        // An image keeps its own size, not a text cell's.
+        moved.i_img = it2.i_img;
+        if (it2.i_img != 0) {
+            moved.i_h = it2.i_h;
+            if (moved.i_h > line_h) { line_h = moved.i_h; }
+        }
         k = k + 1;
     }
     return;
@@ -331,7 +348,7 @@ void move_word_down() {
 // Places one unbreakable run of text, breaking the line before it when it
 // does not fit.
 //
-// The second case is the one worth stating: a single run wider than the
+// The second case is the one worth stating, a single run wider than the
 // whole content box. Leaving it to overflow looks like a rendering bug and
 // hides text off the right edge, so it is broken mid-run instead. That is
 // wrong for prose and right for a long URL or an unspaced string, which is
@@ -370,7 +387,33 @@ void add_run(int s, int n, int scale, int color, int bold, int bg) {
     return;
 }
 
-// A <br>, or the end of a block whose last line is empty: the line still
+// An <img> is one item as wide and tall as the picture, placed the way a word
+// is. It moves to the next line when it does not fit on this one, and the
+// line grows to its height, with the image sitting on the same bottom edge as
+// the text beside it. A picture wider than the whole content box is placed
+// anyway and clipped, not scaled, as there is no scaling yet. A missing or
+// unreadable image takes up no room at all.
+void flow_img(int node) {
+    int img = node.n_img;
+    if (img == 0) { return; }
+    int w = img_w(img);
+    int h = img_h(img);
+    if (line_count > 0 && flow_left + line_x + w > flow_right) { flush_line(); }
+    // An image is a word of its own. Text touching it does not move down
+    // with it, and it does not move down with the text.
+    word_start = line_count;
+    flow_href = enclosing_href(node);
+    push_item(0, 0, w, 1, 0, 0, 0 - 1);
+    int it = line_items + (line_count - 1) * sizeof(Item);
+    it.i_h = h;
+    it.i_img = img;
+    if (h > line_h) { line_h = h; }
+    flow_href = 0;
+    word_start = line_count;
+    return;
+}
+
+// A <br>, or the end of a block whose last line is empty. The line still
 // occupies a line's height.
 void break_line(int scale) {
     if (line_count == 0 && line_h == 0) {
@@ -440,7 +483,7 @@ void flow_text(int node) {
         }
     }
     // flow_href means something only while a text node is being flowed.
-    // Nothing else pushes items today, and leaving a stale target in a
+    // Nothing else pushes items, and leaving a stale target in a
     // global is how that stops being true quietly.
     flow_href = 0;
     return;
@@ -467,7 +510,7 @@ int table_rows(int node, int out, int n, int max) {
             if (c.n_tag == TAG_TR) {
                 if (n < max) { store64(out + n * 8, c); n = n + 1; }
             } else if (c.n_tag != TAG_TABLE) {
-                // Not into a nested table: its rows are its own.
+                // Not into a nested table, whose rows are its own.
                 n = table_rows(c, out, n, max);
             }
         }
@@ -505,10 +548,13 @@ int TABLE_MAX_ROWS = 256;
 // cannot express -- so the pen is rewound to the row's top before each
 // cell and set past the tallest afterwards.
 void flow_table(int node) {
+    // Scratch for this one call, given back on every way out. Tables are
+    // laid out again on every reflow, so a rows array that stayed would leak
+    // once per frame that has a table in it.
     int rows = alloc(TABLE_MAX_ROWS * 8);
     if (rows == 0) { return; }
     int nrows = table_rows(node, rows, 0, TABLE_MAX_ROWS);
-    if (nrows == 0) { return; }
+    if (nrows == 0) { dealloc(rows); return; }
 
     int ncols = 0;
     int i = 0;
@@ -517,7 +563,7 @@ void flow_table(int node) {
         if (rc > ncols) { ncols = rc; }
         i = i + 1;
     }
-    if (ncols == 0) { return; }
+    if (ncols == 0) { dealloc(rows); return; }
 
     int saved_left = flow_left;
     int saved_right = flow_right;
@@ -564,7 +610,7 @@ void flow_table(int node) {
         if (maxh < cell_h + CELL_PAD * 2) { maxh = cell_h + CELL_PAD * 2; }
         if (flow_paint == 1) {
             // The grid, drawn once the row's height is known. Lines, not
-            // boxes: this row's top rule and the ncols+1 verticals beside
+            // boxes, meaning this row's top rule and the ncols+1 verticals beside
             // it. Drawing all four edges of every cell instead puts a row's
             // bottom rule and the next row's top rule on ADJACENT pixels,
             // which comes out as a two-pixel line between rows and a
@@ -592,6 +638,7 @@ void flow_table(int node) {
     line_h = 0;
     line_count = 0;
     flow_carry = 0;
+    dealloc(rows);
     return;
 }
 
@@ -666,7 +713,7 @@ void flow_block(int node, int p) {
     flow_y = flow_y + p.p_pad;
     node.n_h = flow_y - top;
     flow_y = flow_y + p.p_margin;
-    // Remembered, not consumed: the next block collapses against it. Its
+    // Remembered, not consumed, since the next block collapses against it. Its
     // padding, if it has any, has already separated this margin from the
     // content, which is why the carry is set here and not before the pad.
     flow_carry = p.p_margin;
@@ -686,6 +733,10 @@ void flow_node(int node) {
     if (p != 0 && p.p_display == DISPLAY_NONE) { return; }
     if (node.n_tag == TAG_BR) {
         break_line(style_scale(p));
+        return;
+    }
+    if (node.n_tag == TAG_IMG) {
+        flow_img(node);
         return;
     }
     if (p != 0 && p.p_display == DISPLAY_BLOCK) {
@@ -745,7 +796,7 @@ int find_page_bg(int node) {
     return -1;
 }
 
-// One frame: measure, clear, paint.
+// One frame, which is measure, clear, paint.
 void render_page(int root) {
     flow_paint = 0;
     doc_h = layout_document(root, view_w);

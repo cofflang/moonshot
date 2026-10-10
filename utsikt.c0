@@ -9,20 +9,19 @@
 //
 // utsikt -- a browser engine for Moonshot, written in c0.
 //
-// What it does: read an HTML file off the filesystem, build a DOM, apply a
-// subset of CSS, lay the result out as block and inline boxes, and paint it
+// It reads an HTML file off the filesystem, builds a DOM, applies a
+// subset of CSS, lays the result out as block and inline boxes, and paints it
 // into a window. Links are followed with the mouse, and Backspace goes back.
-// No networking -- that is deliberate and long-term, not a gap waiting to be
-// filled: verk is the LAST subsystem Moonshot gets, so utsikt reads files for
-// a long while yet. Everything that fetches bytes goes through
+// There is no networking, and that is deliberate. Everything that fetches
+// bytes goes through
 // load_document() below and nothing else does, so the day there is a network
 // stack, one function changes. A link target is therefore a name on jakel,
 // resolved from the root, and a href naming a host is left alone rather than
 // failing.
 //
-// It runs as a tavla: an ordinary ring-3 program in a kakel window, spawned
+// It runs as a tavla, an ordinary ring-3 program in a kakel window, spawned
 // with `spawn3 utsikt.elf`, composited into its own buffer and
-// presented in one syscall. The pieces:
+// presented in one syscall. The pieces are
 //
 //   paint.c0   pixels, the font, and the string helpers
 //   dom.c0     HTML -> a tree
@@ -34,6 +33,7 @@
 // uses the constants style.c0 defines; style.c0 uses paint.c0's cell size.
 
 include "paint.c0";
+include "moon.c0";
 include "dom.c0";
 include "style.c0";
 include "flow.c0";
@@ -49,9 +49,13 @@ int page_file() { return "index.html"; }
 int current_page;
 
 // Where following a link came from. A plain stack of names, not of parsed
-// documents: re-reading and re-parsing a page costs a fraction of what
-// keeping every document ever visited would, and alloc() has no free, so
-// holding on to them is the expensive option rather than the cheap one.
+// documents, since re-reading and re-parsing a page costs a fraction of what
+// keeping every document ever visited would.
+//
+// Every name here, and current_page, is utsikt's own copy (name_keep). A
+// link's href lives inside the document it was clicked in, and that document
+// is given back once the next one is built, so a name that pointed into it
+// would point at nothing.
 //
 // Going back therefore loses the scroll position, which is a real cost and
 // the honest one to pay here.
@@ -64,6 +68,7 @@ void history_push(int name) {
         // Drop the oldest rather than refuse to navigate. A browser that
         // stops following links after enough of them is worse than one whose
         // memory of the way back is finite.
+        dealloc(load64(history));
         int k = 1;
         while (k < HIST_MAX) {
             store64(history + (k - 1) * 8, load64(history + k * 8));
@@ -100,7 +105,7 @@ int followable(int href) {
 }
 
 // The page shown when there is no index.html on the filesystem. Same role as
-// Gnista's baked-in sprite: the program has to do something visible on a
+// Gnista's baked-in sprite. The program has to do something visible on a
 // machine where nobody has put a file there yet, and a blank window is
 // indistinguishable from a program that crashed.
 //
@@ -138,16 +143,17 @@ alt+w closes the window.</p>
 </body></html>";
 }
 
-// The only place bytes enter the engine. It reads a file today; it is the
-// function verk would change and the reason nothing else calls readfile().
+// The only place bytes enter the engine. It reads a file, and it is the one
+// function a network stack would change and the reason nothing else calls
+// readfile().
 //
 // Returns 0 when there is no such file, which the caller turns into the
-// built-in page rather than into an error: a browser with nothing to show is
+// built-in page rather than into an error, since a browser with nothing to show is
 // still a browser.
 int load_document(int name) {
     int size = readfile(name, 0, 0);
     if (size <= 0) { return 0; }
-    int buf = alloc(size + 1);
+    int buf = doc_alloc(size + 1);
     if (buf == 0) { return 0; }
     int n = readfile(name, buf, size);
     if (n <= 0) { return 0; }
@@ -176,15 +182,104 @@ int build_page(int html) {
     return root;
 }
 
+// --- what a document owns -------------------------------------------------
+//
+// Everything allocated while a document is read and parsed -- its source
+// text, every node, every string, every style record, every CSS rule -- goes
+// through doc_alloc and is written down in a record. Building the next
+// document starts a new record (doc_begin). Once that build has worked,
+// doc_commit gives back everything the previous document owned in one sweep.
+// If it failed, doc_abort gives back the half-built one and the page on
+// screen stays as it was. Recording each allocation is simpler and much
+// harder to get wrong than teaching the DOM to free itself node by node,
+// with strings shared between nodes and rules.
+int doc_cur = 0;      // record of the document on screen, an array of pointers
+int doc_cur_n = 0;
+int doc_new = 0;      // record of the document being built
+int doc_new_n = 0;
+int doc_new_cap = 0;
+
+int doc_alloc(int n) {
+    int p = alloc(n);
+    if (p == 0) { return 0; }
+    if (doc_new_n == doc_new_cap) {
+        int cap = 256;
+        if (doc_new_cap > 0) { cap = doc_new_cap * 2; }
+        int grown = alloc(cap * 8);
+        if (grown == 0) { dealloc(p); return 0; }
+        int i = 0;
+        while (i < doc_new_n) {
+            store64(grown + i * 8, load64(doc_new + i * 8));
+            i = i + 1;
+        }
+        if (doc_new != 0) { dealloc(doc_new); }
+        doc_new = grown;
+        doc_new_cap = cap;
+    }
+    store64(doc_new + doc_new_n * 8, p);
+    doc_new_n = doc_new_n + 1;
+    return p;
+}
+
+void doc_release(int record, int n) {
+    int i = 0;
+    while (i < n) {
+        dealloc(load64(record + i * 8));
+        i = i + 1;
+    }
+    if (record != 0) { dealloc(record); }
+    return;
+}
+
+void doc_begin() {
+    doc_new = 0;
+    doc_new_n = 0;
+    doc_new_cap = 0;
+    return;
+}
+
+void doc_commit() {
+    doc_release(doc_cur, doc_cur_n);
+    doc_cur = doc_new;
+    doc_cur_n = doc_new_n;
+    doc_begin();
+    return;
+}
+
+void doc_abort() {
+    doc_release(doc_new, doc_new_n);
+    doc_begin();
+    return;
+}
+
+// A page name of utsikt's own, independent of any document. See history.
+int name_keep(int name) {
+    int n = 0;
+    while (name[n] != 0) { n = n + 1; }
+    int s = alloc(n + 1);
+    if (s == 0) { return 0; }
+    int i = 0;
+    while (i <= n) {
+        s[i] = name[i];
+        i = i + 1;
+    }
+    return s;
+}
+
 // Loads a document by name, parses it, and makes it the page on screen.
 // Returns the new root, or 0 if the name does not resolve to a file -- in
 // which case the caller keeps whatever was already there.
 int goto_page(int name) {
+    doc_begin();
     int html = load_document(name);
-    if (html == 0) { return 0; }
+    if (html == 0) { doc_abort(); return 0; }
     int r = build_page(html);
-    if (r == 0) { return 0; }
-    current_page = name;
+    if (r == 0) { doc_abort(); return 0; }
+    // Copied before doc_commit, which gives back the page the link was in.
+    int keep = name_keep(name);
+    if (keep == 0) { doc_abort(); return 0; }
+    doc_commit();
+    current_page = keep;
     scroll_y = 0;
     return r;
 }
@@ -202,8 +297,8 @@ int main() {
     }
     fb_max_w = winmax / 65536;
     fb_max_h = winmax - fb_max_w * 65536;
-    // Sized for the largest window this machine can hand out, once. alloc()
-    // is bump-only, so a buffer cut to today's window could never grow with
+    // Sized for the largest window this machine can hand out, once. There
+    // is no realloc, so a buffer cut to today's window could not grow with
     // it, and present() copies what the window measures NOW.
     fb = alloc(fb_max_w * fb_max_h * 4);
     if (fb == 0) {
@@ -225,17 +320,19 @@ int main() {
     }
     history_n = 0;
 
-    current_page = page_file();
+    current_page = name_keep(page_file());
+    doc_begin();
     int html = load_document(page_file());
     if (html == 0) {
         print("utsikt: no index.html -- showing the built-in page\n");
         html = builtin_page();
     }
     int root = build_page(html);
-    if (root == 0) {
+    if (root == 0 || current_page == 0) {
         print("utsikt: out of memory parsing the document\n");
         return 7;
     }
+    doc_commit();
 
     // Nothing may be printed past this point. print() is SYS_DEBUG_PRINT,
     // and for a task that owns a window the kernel routes it INTO that
@@ -255,7 +352,7 @@ int main() {
         if (wh > fb_max_h) { wh = fb_max_h; }
         if (ww != last_w || wh != last_h) {
             // The window changed under us. Re-laying out rather than scaling
-            // is the whole point of having a layout engine: text re-wraps to
+            // is the whole point of having a layout engine. Text re-wraps to
             // the new width instead of being squeezed.
             last_w = ww;
             last_h = wh;
@@ -264,14 +361,14 @@ int main() {
         view_w = ww;
         // The address line's height comes off the document's, here and not
         // at paint time, so that every height-dependent thing downstream
-        // agrees: PageDown pages by what is actually visible, End stops
+        // agrees. PageDown pages by what is actually visible, End stops
         // where the last line really is, and the layout clips to the same
         // rectangle it was measured against.
         view_h = wh - bar_height();
         if (view_h < 0) { view_h = 0; }
 
         // Links. mouse_poll() is state rather than events, so following one
-        // means finding the PRESS EDGE here: the frame where a button is
+        // means finding the PRESS EDGE here, the frame where a button is
         // down and was not down before. Acting on the state itself would
         // follow the same link on every frame the button stayed held, which
         // at this frame rate is a page load per few milliseconds.
@@ -282,7 +379,7 @@ int main() {
             buttons = mp - packed * 8;
             int mx = packed / 1024;
             int my = packed - mx * 1024;
-            int left = buttons - (buttons / 2) * 2;
+            int left = buttons % 2;
             if (left == 1 && last_left == 0) {
                 int href = link_hit(mx, my);
                 if (followable(href) == 1) {
@@ -298,9 +395,9 @@ int main() {
         }
         // A pointer that has left the window reports -1, which is not the
         // same as a button being released. Treating it as released is right
-        // anyway: a press that happened somewhere else is not this window's
+        // anyway, because a press that happened somewhere else is not this window's
         // press, and the next one inside the window has to read as new.
-        last_left = buttons - (buttons / 2) * 2;
+        last_left = buttons % 2;
 
         int key = key_poll();
         while (key >= 0) {
@@ -316,25 +413,33 @@ int main() {
                 if (make == 79) { scroll_y = doc_h; dirty = 1; }  // End
                 if (make == 14) {
                     // Backspace -- back. Without it a link is a one-way
-                    // door, since the reload key now re-reads the page that
+                    // door, since the reload key re-reads the page that
                     // was followed to rather than the one it started on.
                     int back = history_pop();
                     if (back != 0) {
+                        int was = current_page;
                         int r4 = goto_page(back);
-                        if (r4 != 0) { root = r4; dirty = 1; }
+                        if (r4 != 0) { root = r4; dirty = 1; dealloc(was); }
+                        // goto_page kept its own copy, so the popped name
+                        // goes either way.
+                        dealloc(back);
                     }
                 }
                 if (make == 19) {
-                    // r -- re-read the file and rebuild. Every allocation
-                    // this makes is permanent: alloc() is bump-only with no
-                    // free, so each reload costs another document's worth of
-                    // the 8MB heap. That is a real limit, not a rounding
-                    // error, and it is the honest cost of having no
-                    // allocator rather than something to hide.
+                    // r -- re-read the file and rebuild. The old document is
+                    // given back once the new one is built, so a reload
+                    // costs nothing that stays.
+                    doc_begin();
                     int fresh = load_document(current_page);
                     if (fresh == 0) { fresh = builtin_page(); }
                     int r2 = build_page(fresh);
-                    if (r2 != 0) { root = r2; scroll_y = 0; }
+                    if (r2 != 0) {
+                        doc_commit();
+                        root = r2;
+                        scroll_y = 0;
+                    } else {
+                        doc_abort();
+                    }
                     dirty = 1;
                 }
             }
@@ -347,6 +452,10 @@ int main() {
             draw_address_bar(wh, current_page);
             present(fb);
             dirty = 0;
+        } else {
+            // Nothing to redraw, so give the CPU away for a tick (10ms) instead
+            // of polling the mouse and keyboard again at once.
+            sleep(1);
         }
     }
     return 0;

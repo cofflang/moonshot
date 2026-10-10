@@ -14,13 +14,11 @@ Set up the three repositories side by side as the README shows, then:
 ./dev.sh test table   # only verify_utsikt_table.sh
 ```
 
-Every build bakes the sources in this checkout into moonshot's
-`utsikt_data.c0`, so the moonshot checkout will show a diff afterwards. That
-is expected, and nothing in it belongs in your pull request here.
+Every build compiles the sources in this checkout into moonshot's `build/`
+directory, which git ignores, so the moonshot checkout stays clean.
 
-If the first build stops with a bare `CODEGENERROR`, that is coff1 refusing
-something without saying what. Compiling the same file with `coff0` (in
-`c0-coff/`) prints the real message.
+If the build stops on a mistake in your code, coff1 says what and where, as
+in `coff1: flow.c0:812: expected ';'`. This needs coff v0.5.0 or later.
 
 ## Where the tests are
 
@@ -51,8 +49,12 @@ with. I will merge them together.
 - **Drop what is not supported rather than guess.** An unsupported selector
   is skipped whole, never applied as the part of it that parsed. A wrong
   rendering is worse than a missing one.
-- **Every allocation counts.** `alloc()` has no free. Anything that grows per
-  frame leaks the heap, so per-frame tables are fixed size and rebuilt.
+- **Know who owns an allocation.** Anything that belongs to a document goes
+  through `doc_alloc`, so the whole document can be given back when the next
+  one replaces it. Scratch memory for one call is `dealloc`ed before that call
+  returns, on every path out. Per-frame tables are fixed size and rebuilt.
+  `verify_utsikt_reload.sh` in moonshot fails on a leak, and on any `dealloc`
+  the kernel refuses.
 - **No new dependencies.** utsikt talks to the kernel through syscalls and
   nothing else, and it carries no third-party code.
 
@@ -84,13 +86,11 @@ These are known gaps, smallest first:
 - **Content-sized table columns.** Columns are equal width now. Sizing them
   by content needs a measuring pass per cell before any cell is placed.
 
-Two bigger ones need a decision from me before code, so please open an
-issue to talk them through first:
-
-- **Images.** These need an image format on moonshot's filesystem, and
-  whether decoding lives in the kernel or in utsikt.
-- **A real allocator.** Every page load and every reload costs a fresh
-  document's worth of heap that is never returned.
+Anything bigger than these, a new element with layout of its own or a new
+file format, needs a decision from me before code, so please open an issue
+to talk it through first. Images (`<img>` reading moonshot's `.spr` sprites)
+and giving a document's memory back on reload were the last two of those,
+and both are done.
 
 ## License
 
