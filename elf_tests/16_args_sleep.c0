@@ -1,0 +1,49 @@
+// expect: 8
+// argc()/argv() (SYS_ARGC 17, SYS_ARGV 18) and sleep() from the ring-3
+// library (programs/lib/moon.c0, SYS_SLEEP 16) on real moonshot. Each check
+// that holds adds one.
+//
+// verify_elf_backend.sh starts every test as `spawn3 test/etNN.elf one two`,
+// so this program sees three arguments, its own path first, as on Linux.
+include "moon.c0";
+
+int same(int a, int b) {
+    int i = 0;
+    while (load8(a + i) != 0 || load8(b + i) != 0) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+int main() {
+    int ok = 0;
+
+    // 1-3. The arguments, the program's own path first.
+    if (argc() == 3) { ok = ok + 1; }
+    if (same(argv(0), "test/et16.elf") == 1) { ok = ok + 1; }
+    if (same(argv(1), "one") == 1 && same(argv(2), "two") == 1) { ok = ok + 1; }
+
+    // 4. Out of range is 0, both ways.
+    if (argv(3) == 0 && argv(0 - 1) == 0) { ok = ok + 1; }
+
+    // 5. The strings are in the program's own memory, copied once, so asking
+    // twice gives the same pointer, and writing to it is allowed.
+    int a1 = argv(1);
+    if (argv(1) == a1) { ok = ok + 1; }
+    store8(a1, 'O');
+    if (load8(argv(1)) == 'O') { ok = ok + 1; }
+
+    // 6. sleep(50) lasts half a second, at least 50 ticks, and not much more.
+    int t0 = ticks();
+    sleep(50);
+    int took = ticks() - t0;
+    if (took >= 50 && took <= 70) { ok = ok + 1; }
+
+    // 7. sleep(0) does not wait.
+    t0 = ticks();
+    sleep(0);
+    if (ticks() - t0 <= 1) { ok = ok + 1; }
+
+    return ok;
+}

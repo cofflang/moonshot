@@ -12,7 +12,7 @@
 # the monitor's `sendkey` command, and verifies keyboard_handler's output
 # actually appears in the serial log.
 #
-# Why this exists separately from run_qemu.sh: the timer interrupt alone
+# Why this exists separately from run_qemu.sh. The timer interrupt alone
 # already proves the IDT/PIC/isr_common/dispatch-table machinery works end
 # to end (run_qemu.sh's tick count check). What it *cannot* prove is that
 # IRQ1 specifically reaches keyboard_handler, since nothing external ever
@@ -91,15 +91,15 @@ EOF
 sleep 0.5
 
 # This checks the keyboard->screen echo by RELATIONSHIPS, not fixed
-# coordinates, so it no longer breaks every time the boot banner or the
-# skalman shell's greeting/prompt changes where the cursor sits (that
-# absolute-position coupling bit this test twice). Echo now goes through
+# coordinates, so it does not break every time the boot banner or the
+# skalman shell's greeting/prompt changes where the cursor sits. Echo
+# goes through
 # kakel (the windowing layer), so every line also names the window it landed
-# in, and row/col are WINDOW-relative. The things proven:
+# in, and row/col are WINDOW-relative. The things proven
 #
 #   "kakel typed: win=0 char=97 row=R col=C1"  -- scancode 30 decoded to 'a'
 #       (97) via scancode_init's table and DREW into window 0 (the boot-time
-#       focus). This is the real point: a keypress visibly changes the
+#       focus). This is the real point, a keypress visibly changes the
 #       screen, not just that IRQ1 fired (the "key scancode" lines already
 #       prove delivery).
 #   "kakel typed: win=0 char=65 row=R col=C2"  -- the SECOND 'a', typed with
@@ -107,7 +107,7 @@ sleep 0.5
 #       inverts a letter's case on its own. Must be the SAME row R and
 #       C2 == C1 + 1 (drawn in the very next cell).
 #   "kakel tab: win=0 row=R col=CT"            -- Tab from just after 'A'
-#       advances to a TAB_WIDTH (8) column boundary: same row R, CT a
+#       advances to a TAB_WIDTH (8) column boundary, same row R, CT a
 #       positive multiple of 8, and CT > C2 (it jumped forward to a stop, not
 #       by one cell -- that would have printed "kakel typed", not "kakel tab").
 #   "kakel focus: win=1"                       -- Alt+Tab cycled focus to

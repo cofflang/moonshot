@@ -1,0 +1,67 @@
+// expect: 11
+// synth -- lira's noter-to-sound renderer (programs/lira/synth.c0) on real
+// moonshot. Each check that holds adds one, so the exit code counts them.
+//
+// It plays one second of A4 (440 Hz) and E5 (659.26 Hz) together through
+// oljud. verify_lira_synth.sh records the card and checks both pitches are
+// there; this program checks the arithmetic behind them. The expected phase
+// steps were worked out outside c0. 440 Hz is 440000 mHz * 2^32 / 22050000.
+include "../programs/lira/noter.c0";
+include "../programs/lira/synth.c0";
+
+int main() {
+    int ok = 0;
+
+    // 1. Pitch to phase step, A4 straight from the table, E5 an octave up
+    // from E4's entry, A3 exactly half of A4.
+    if (synth_step(69) == 85704562) { ok = ok + 1; }
+    if (synth_step(76) == 128411924) { ok = ok + 1; }
+    if (synth_step(57) == 42852281) { ok = ok + 1; }
+
+    // 2. Steps to samples. At 60 beats per minute and four steps a beat, a
+    // beat is exactly one second. At 120 a sixteenth is 2756.25 samples, so
+    // step 1 rounds down and step 4 lands exactly on 11025, with no drift.
+    int s = noter_new(8, 4, 60);
+    noter_add(s, 8, 69, 0, 4, 127);
+    noter_add(s, 8, 76, 0, 4, 127);
+    int fast = noter_new(8, 4, 120);
+    if (synth_at(s, 4) == 22050 && synth_at(fast, 1) == 2756
+        && synth_at(fast, 4) == 11025) { ok = ok + 1; }
+    if (synth_length(s) == 22050) { ok = ok + 1; }
+
+    // 3. After the song there is silence.
+    int out = alloc(1000);
+    int out2 = alloc(1000);
+    int mix = alloc(8000);
+    synth_render(s, 30000, 100, out, mix);
+    int quiet = 1;
+    int i = 0;
+    while (i < 100) { if (load8(out + i) != 128) { quiet = 0; } i = i + 1; }
+    if (quiet == 1) { ok = ok + 1; }
+
+    // 4. Rendering in pieces gives the same bytes as rendering at once,
+    // which is what lets a player stream a song block by block.
+    synth_render(s, 0, 1000, out, mix);
+    synth_render(s, 0, 400, out2, mix);
+    synth_render(s, 400, 600, out2 + 400, mix);
+    int same = 1;
+    i = 0;
+    while (i < 1000) { if (load8(out + i) != load8(out2 + i)) { same = 0; } i = i + 1; }
+    if (same == 1) { ok = ok + 1; }
+
+    // 5. Each note starts at zero and ramps in, so the first sample is
+    // silence; past the ramp, two full-velocity voices of +-16 each give
+    // 96, 128 or 160 and nothing else.
+    if (load8(out) == 128) { ok = ok + 1; }
+    int v = load8(out + 900);
+    if (v == 96 || v == 128 || v == 160) { ok = ok + 1; }
+
+    // 6. Played through oljud, and drained at the card's pace (one second).
+    if (synth_play(s, 4096) == 1) { ok = ok + 1; }
+    int t0 = ticks();
+    while (sound(0, 0) > 0 && ticks() - t0 < 400) { }
+    int took = ticks() - t0;
+    if (took >= 60 && took <= 200) { ok = ok + 1; }
+
+    return ok;
+}

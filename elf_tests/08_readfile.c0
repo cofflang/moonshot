@@ -1,5 +1,5 @@
 // expect: 111
-// SYS_READFILE end to end: the syscall that lets a ring-3 program read a
+// SYS_READFILE end to end, the syscall that lets a ring-3 program read a
 // file at all. Reads demo.c0, which jakel seeds into the root directory on a
 // fresh filesystem and whose first bytes are known ("print(777);...").
 //

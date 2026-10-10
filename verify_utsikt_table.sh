@@ -14,7 +14,7 @@
 #
 # /about.html carries a five-row, two-column table (a header row and four
 # data rows). The engine draws the grid in a colour used nowhere else, so
-# the structure can be read straight off the screen:
+# the structure can be read straight off the screen.
 #
 #   1. Six horizontal rules. Five rows have five tops and one bottom. Four
 #      would mean a row was lost, seven would mean one was invented.
@@ -143,8 +143,8 @@ sleep 1
 python3 - <<'PY'
 import sys
 GRID = (0x90, 0x98, 0xa0)
-WANT_RULES = 6      # five rows: five tops and one bottom
-WANT_COLS  = 3      # two columns: three verticals
+WANT_RULES = 6      # five rows, five tops and one bottom
+WANT_COLS  = 3      # two columns, three verticals
 
 def read_ppm(path):
     with open(path, "rb") as f:

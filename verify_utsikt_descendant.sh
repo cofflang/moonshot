@@ -13,7 +13,7 @@
 # first selector shape it has that looks anywhere except at the element
 # being styled.
 #
-# /index.html carries both of these:
+# /index.html carries both of these.
 #
 #     code      { color: #006060; }
 #     .note code { color: #a03000; }
@@ -21,7 +21,7 @@
 # and it has <code> elements in both positions -- two inside the
 # <div class="note">, and more further down the page outside it. So one
 # rendered page answers both halves of the question at once, and neither
-# half alone would be convincing:
+# half alone would be convincing.
 #
 #   1. The rust colour must appear. If the ancestor test never matched, or
 #      the rule were dropped as an unsupported selector, every <code> would
@@ -117,7 +117,7 @@ def read_ppm(path):
     w, h, _ = fields
     return w, h, data[pos:]
 
-# Count inside the tavla only: it is the right half of the screen, and the
+# Count inside the tavla only, since it is the right half of the screen, and the
 # shell beside it is not part of this question.
 def counts(path):
     w, h, buf = read_ppm(path)

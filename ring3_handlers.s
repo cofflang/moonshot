@@ -24,21 +24,18 @@ syscall_entry:
     # enter_ring3 sets, and isr_common's scheduler-switch path now keeps
     # correct for whichever task is current, see boot.s/chrone.c0) BEFORE
     # touching anything else. SYSCALL, unlike an interrupt gate, does NOT
-    # switch stacks automatically -- this handler used to run entirely on
-    # the calling process's own user stack (a single 4096-byte page). That
-    # was never actually exercised end-to-end until a real interrupt could
-    # land mid-handler (see enable_interrupts/syscall.c0's SYS_EXIT fix,
-    # which fixed a DIFFERENT bug that had been masking this one): the
-    # first timer interrupt to land while still on that tiny user stack
-    # produced a #GP on its own IRETQ, from a corrupted interrupt frame.
+    # switch stacks automatically. Running this handler on the calling
+    # process's own user stack (a single 4096-byte page) would let the first
+    # timer interrupt to land mid-handler #GP on its own IRETQ, from a
+    # corrupted interrupt frame.
     #
     # No register is free to hold the old (user) rsp across this switch --
     # every GPR either carries live SYSCALL-ABI data (rax/rdi/rsi/rdx/r10/
     # r8/r9/rcx/r11) or is one of the callee-saved registers this trampoline
     # already promises to preserve for the user program (rbx/rbp/r12-r15) --
     # so the swap goes through a scratch memory slot instead of a register.
-    # Safe as a single shared slot even with multiple ring-3 processes:
-    # the value is copied onto the NEW (per-task, exclusively-owned) kernel
+    # Safe as a single shared slot even with multiple ring-3 processes,
+    # since the value is copied onto the NEW (per-task, exclusively-owned) kernel
     # stack in the very next instruction, before interrupts are re-enabled
     # or anything else could possibly run on this single core.
     mov [syscall_saved_user_rsp], rsp
@@ -56,7 +53,7 @@ syscall_entry:
     push r14
     push r15
 
-    # Marshal: user args arrived in rdi,rsi,rdx,r10,r8,r9 per the SYSCALL
+    # Marshal. User args arrive in rdi,rsi,rdx,r10,r8,r9 per the SYSCALL
     # ABI. We need them in rdi,rsi,rdx,rcx,r8,r9 for the SysV calling
     # convention. The syscall number is in rax.
     mov r15, r9
@@ -91,7 +88,7 @@ syscall_entry:
     sysretq
 
 # enter_ring3(entry_rip, user_rsp, kernel_rsp, cr3) — enter ring 3 for the
-# first time. Called from c0 (indirectly via RING3INFO_ADDR).
+# first time. Called from c0 by name (`extern int enter_ring3;`).
 #
 # rdi = entry point (user RIP)
 # rsi = user stack top (user RSP)
@@ -116,7 +113,7 @@ enter_ring3:
     mov cr3, rcx
 
     # Build the iretq frame on the kernel stack.
-    # iretq pops: RIP, CS, RFLAGS, RSP, SS (in that order, last pushed first).
+    # iretq pops RIP, CS, RFLAGS, RSP, SS (in that order, last pushed first).
     push 0x2B          # SS = user data selector (GDT index 5, RPL 3)
     push rsi            # RSP = user stack top
     push 0x202          # RFLAGS (IF=1, reserved bit 1 always set)

@@ -1,5 +1,6 @@
 # build artifacts -- everything in the repo is source and the kernel, the
-# ISO and every seed are rebuilt from it
+# ISO and every program are rebuilt from it
+build/
 kmain.s
 *.o
 moonshot.elf
@@ -11,6 +12,8 @@ isoroot*/
 *.bak
 *.panicbak
 *.dfbak
+*.wav
+shell_spawn_id.txt
 disk.img
 moonshot.map
 # written by build.sh after a passing bootstrap audit; describes binaries on

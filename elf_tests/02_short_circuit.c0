@@ -1,13 +1,13 @@
 // expect: 31
 // && and || in every position they can appear, including cases where the
-// short circuit itself has to hold. && / || were miscompiled in --elf mode,
-// and since every ring-3 binary Moonshot runs is built through that path, the
-// demo that found it simply rendered nothing.
+// short circuit itself has to hold. Every ring-3 binary Moonshot runs is
+// built through --elf, so a miscompiled && or || would make a program
+// simply render nothing.
 //
 // The short-circuit half is checked with a counter in allocated memory rather
-// than something like 1/0: a divide-by-zero in ring 3 raises #DE, which
+// than something like 1/0, since a divide-by-zero in ring 3 raises #DE, which
 // reaches the panic handler and takes the whole machine down -- so a
-// regression would abort every remaining test in the boot instead of
+// failure would abort every remaining test in the boot instead of
 // reporting a wrong exit code for this one.
 int bump(int p) {
     store64(p, load64(p) + 1);

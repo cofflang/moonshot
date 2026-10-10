@@ -13,7 +13,7 @@
 # ../c0-coff/run_tests.sh, not a simulation.
 #
 # Boots via a GRUB-built ISO (-cdrom), not QEMU's own `-kernel` multiboot
-# loader: that loader flatly refuses ELF64 images ("give a 32bit one"),
+# loader, and that loader flatly refuses ELF64 images ("give a 32bit one"),
 # and forcing coff-compiled code into a 32-bit ELF container does not work
 # (its instructions unconditionally use 64-bit registers, which need
 # relocation types a 32-bit ELF container cannot represent). GRUB's own
@@ -56,7 +56,7 @@ timeout 5 qemu-system-x86_64 -cdrom moonshot.iso \
 # is that the Multiboot info structure was actually read and parsed into
 # real digits, not that mem_lower/mem_upper equal a specific number.
 #
-# Tick count: requiring at least 3 occurrences (not just "at least 1")
+# Tick count. Requiring at least 3 occurrences (not just "at least 1")
 # proves the timer interrupt fires *repeatedly* -- one stray tick could be
 # a fluke or a handler that runs once then silently breaks (e.g. a missing
 # EOI would still let exactly one IRQ0 through before the PIC withholds
@@ -83,14 +83,14 @@ for v in "$a0" "$a1" "$a2" "$a3" "$r0" "$r1" "$a4"; do
 done
 
 if [ "$pmm_ok" -eq 1 ]; then
-  # bump: strictly increasing, exactly 4096 apart
+  # bump, strictly increasing, exactly 4096 apart
   [ "$((a1 - a0))" -eq 4096 ] || pmm_ok=0
   [ "$((a2 - a1))" -eq 4096 ] || pmm_ok=0
   [ "$((a3 - a2))" -eq 4096 ] || pmm_ok=0
-  # reuse: freed pages come back LIFO (a2 was freed last, so returned first)
+  # reuse, freed pages come back LIFO (a2 was freed last, so returned first)
   [ "$r0" -eq "$a2" ] || pmm_ok=0
   [ "$r1" -eq "$a1" ] || pmm_ok=0
-  # bump2: free-list empty again, so allocation resumes past a3
+  # bump2, free-list empty again, so allocation resumes past a3
   [ "$((a4 - a3))" -eq 4096 ] || pmm_ok=0
 fi
 
@@ -116,7 +116,7 @@ if [ "$heap_ok" -eq 1 ]; then
   [ "$h4" -eq "$h1" ] || heap_ok=0
 fi
 
-# Paging: kmain.c0 builds its own 4-level page tables from jenna-allocated
+# Paging. kmain.c0 builds its own 4-level page tables from jenna-allocated
 # frames, boot.s switches CR3 to them, and paging_verify() (run after the
 # switch) reads a sentinel back through a 4GB virtual address that only the
 # c0-built tables map -- boot.s's own 1GB identity map would fault there.
@@ -129,7 +129,7 @@ if grep -qE "^Paging: built c0 page tables, PML4 at [0-9]+" serial.log \
   paging_ok=1
 fi
 
-# Exceptions / demand paging: kernel_post_init touches a deliberately-
+# Exceptions / demand paging. kernel_post_init touches a deliberately-
 # unmapped 5GB address, the #PF handler (IDT vector 14, reached through the
 # shared trampoline with a real CPU error code + CR2) demand-maps it and
 # returns, so the faulting read succeeds and reads back the seeded sentinel.
@@ -142,13 +142,13 @@ if grep -qE "^page fault: addr=5368709120 errcode=[0-9]+" serial.log \
   fault_ok=1
 fi
 
-# chrone: a real N-task process model. sched_start spawns FOUR
+# chrone, a real N-task process model. sched_start spawns FOUR
 # tasks (ids 0-3) into a heap-allocated task table and they are switched
 # PREEMPTIVELY by the timer ISR -- no task ever yields or calls into the
 # scheduler itself (see thread_worker/thread_exiter), so the interleaving comes
 # entirely from sched_tick's round-robin every SCHED_SWITCH_PERIOD ticks. The
 # exact switch count depends on QEMU timing, so this checks invariants, not an
-# exact sequence:
+# exact sequence
 #   * at least 6 switches happened;
 #   * no task is scheduled twice in a row (prev != cur) -- genuine round-robin
 #     over multiple runnable tasks, not one task "winning" repeatedly;
@@ -156,7 +156,7 @@ fi
 #     successive appearances -- proving a resumed task's full register/stack
 #     state was preserved across more than a hardcoded pair of tasks;
 #   * at least THREE distinct task ids appear -- proving the process model
-#     really runs past the old 2-task limit;
+#     really runs past 2 tasks;
 #   * task 3 (thread_exiter) runs and then EXITS, and the exit line appears --
 #     proving task_exit + sched_pick_next's skip work (the other tasks keep
 #     round-robining after one drops out).
@@ -171,7 +171,7 @@ while read -r task counter; do
     sched_ok=0
   fi
   # Strictly increasing from the second appearance on. A task's FIRST
-  # quantum can legitimately be empty: the launch happens wherever main()
+  # quantum can legitimately be empty, since the launch happens wherever main()
   # happens to be in the 10ms tick period, so the first tick after it can
   # arrive before the task has executed a single increment, and it shows up
   # again still at 0. That is a fact about when the timer fires, not about
@@ -190,7 +190,7 @@ done < <(grep -E "^\[sched\] -> task [0-9]+ \(counter=[0-9]+\)$" serial.log \
 [ "$sched_count" -ge 6 ] || sched_ok=0
 [ "${#seen_task[@]}" -ge 3 ] || sched_ok=0
 grep -qE "^\[sched\] task 3 exited$" serial.log || sched_ok=0
-# Reaper: after task 3 (the boot exiter) exits, sched_reap must free its stack
+# Reaper. After task 3 (the boot exiter) exits, sched_reap must free its stack
 # page from another task's context -- proving the 4KB-per-task leak that exit/
 # kill left behind is now reclaimed. The freed address must match the page
 # task 3 was spawned on (same "stack=" value), i.e. it is really task 3's stack
@@ -200,7 +200,7 @@ reap3=$(grep -oE "^\[sched\] reaped task 3 stack=[0-9]+$" serial.log | head -1 |
 if [ -z "$reap3" ] || [ "$reap3" != "$spawn3" ]; then sched_ok=0; fi
 
 # Pixel-framebuffer text renderer (kmain.c0's fb_clear/fb_print/font_hi/
-# font_lo): "MOONSHOT\nOS\n" is drawn via the real VBE linear framebuffer
+# font_lo). "MOONSHOT\nOS\n" is drawn via the real VBE linear framebuffer
 # GRUB granted (requested via boot.s's Multiboot header, mapped into the
 # live page tables by fb_map), then the top-left 8x8 cell is read back
 # pixel-by-pixel and counted -- must equal exactly 18, 'M's known
@@ -217,13 +217,13 @@ if grep -qE "^fb: corner_bg_match=1$" serial.log; then
   fb_ok=1
 fi
 
-# kakel windowing layer (kakel.c0): after the full-screen banner proof above,
+# kakel windowing layer (kakel.c0). After the full-screen banner proof above,
 # kernel_post_init carves the screen into three tiles and reads real pixels back
-# (see knekt.c0):
+# (see knekt.c0)
 #   win0_fg/win1_fg = 18  -- each shell window's banner 'M' at its own origin
 #   left_bg/right_bg = 1  -- the last row of the shell windows (just above the
 #       log strip) shows win 0's background left of the split and win 1's
-#       DIFFERENT background right: fills covered the right rectangles exactly
+#       DIFFERENT background right, so fills covered the right rectangles exactly
 #   corner_bg = 1         -- shell bottom-right corner is shell-window bg
 #   stats_bg = 1          -- the very last screen row (inside the status bar)
 #       shows the log window's distinct dark background, proving the strip was
@@ -240,7 +240,8 @@ ata_ok=0
 jakel_ok=0
 if grep -qE "^\[ata\] drive detected$" serial.log; then ata_ok=1; fi
 if grep -qE "^\[jakel\] (filesystem ready|loaded)" serial.log \
-   && grep -qE "^\[jakel\] synced " serial.log; then jakel_ok=1; fi
+   && grep -qE "^\[jakel\] synced " serial.log \
+   && grep -qE "^\[jakel\] 2MB self-test: ok$" serial.log; then jakel_ok=1; fi
 
 if grep -q "Hello from Moonshot" serial.log \
    && grep -qE "Lower memory \(KB\): [0-9]+" serial.log \
@@ -257,7 +258,7 @@ if grep -q "Hello from Moonshot" serial.log \
    && [ "$ata_ok" -eq 1 ] \
    && [ "$jakel_ok" -eq 1 ] \
    && [ "$tick_count" -ge 3 ]; then
-  echo "PASS: serial output matched (boot + memory info + memory map + pmm bump/free/reuse (LIFO) + kmalloc/kfree heap (alloc/reuse/coalesce) + c0 paging live (sentinel via 4GB) + #PF demand-paging recovery + preemptive N-task scheduling ($sched_count switches, ${#seen_task[@]} tasks, exit/skip + stack reap) + pixel-framebuffer clear + kakel v2 layout (1 shell + stats bar) + $tick_count timer ticks + ata disk detected + jakel fs ready/synced)"
+  echo "PASS: serial output matched (boot + memory info + memory map + pmm bump/free/reuse (LIFO) + kmalloc/kfree heap (alloc/reuse/coalesce) + c0 paging live (sentinel via 4GB) + #PF demand-paging recovery + preemptive N-task scheduling ($sched_count switches, ${#seen_task[@]} tasks, exit/skip + stack reap) + pixel-framebuffer clear + kakel v2 layout (1 shell + stats bar) + $tick_count timer ticks + ata disk detected + jakel fs ready/synced + 2MB file in jakel's arena)"
   exit 0
 else
   echo "FAIL: expected output not found in serial.log (ticks=$tick_count pmm_ok=$pmm_ok heap_ok=$heap_ok paging_ok=$paging_ok fault_ok=$fault_ok sched_ok=$sched_ok fb_ok=$fb_ok kakel_ok=$kakel_ok ata_ok=$ata_ok jakel_ok=$jakel_ok)"

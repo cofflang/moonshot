@@ -12,13 +12,13 @@
 # Proves that closing the last window does NOT hand back an already
 # authenticated shell.
 #
-# Window ids are reused: closing the last window frees its slot and
+# Window ids are reused. Closing the last window frees its slot and
 # immediately allocates a replacement, which gets the same id back. Every
 # per-session array -- raket's authed flag, skalman's uid and cwd -- is
-# indexed by window id, so the replacement used to inherit `authed = 1` from
-# the session that had just been closed, walking straight past the login gate.
+# indexed by window id, so without a reset the replacement would inherit `authed = 1` from
+# the session that had just been closed and walk straight past the login gate.
 #
-# The check is behavioural rather than a flag readback: after the close, the
+# The check is behavioural rather than a flag readback. After the close, the
 # script types `root` and Enter. If the window is at a login prompt, raket
 # logs a username line for a SECOND session. If it were already authenticated,
 # `root` would instead reach the shell as a command and come back unknown.
@@ -77,7 +77,7 @@ def word(s):
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.0)
 
-# Prove we really are in a shell now: run a command.
+# Prove this really is a shell now by running a command.
 word("tasks"); typ(["ret"]); time.sleep(1.0)
 
 # Close the last window. kakel replaces it with a fresh one, reusing the id.
@@ -106,7 +106,7 @@ if [ "$logins" -lt 2 ]; then
   ok=0
 fi
 
-# The negative half: `root` must never have reached the shell as a command.
+# The negative half. `root` must never have reached the shell as a command.
 if grep -q 'unknown command: root' serial.log; then
   echo "FAIL: 'root' reached the shell as a command, so the window was already authenticated"
   ok=0

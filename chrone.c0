@@ -6,7 +6,7 @@
 // moonshot is free software, distributed under the GNU General Public
 // License version 3 or (at your option) any later version, WITHOUT ANY
 // WARRANTY; see the LICENSE file for the full text.
-// chrone.c0 -- the preemptive scheduler: a task table with spawn/exit and
+// chrone.c0 -- the preemptive scheduler, a task table with spawn/exit and
 // round-robin over however many tasks are runnable. Tasks are switched by
 // the timer ISR itself (isr_common in boot.s) rather than by any task
 // yielding voluntarily -- see sched_tick, and isr_common's own comment in
@@ -22,17 +22,16 @@
 // out. One tick (~10ms) is the finest quantum this timer can express, and is
 // in the range real schedulers use.
 //
-// This was 10 (~0.1s) while nothing on screen moved, where it was invisible.
-// It stopped being invisible as soon as a ring-3 program tried to animate:
-// with four runnable tasks, a 10-tick quantum means each task runs for 100ms
-// and is then frozen for ~300ms. Measured from inside Gnista's demo, its
-// frames arrived in bursts of nine ~10ms apart followed by a ~310ms gap
-// (nothing in between), so the sprite swept forward and then stalled, over
-// and over. That reads as lag, and no amount of tuning inside the ring-3
+// A longer quantum is invisible while nothing on screen moves, and
+// obvious as soon as a ring-3 program animates. With four runnable tasks,
+// a 10-tick quantum would run each task for 100ms and then freeze it for
+// ~300ms, so frames would arrive in bursts followed by a ~300ms gap and
+// a sprite would sweep forward and then stall, over and over. That reads
+// as lag, and no amount of tuning inside the ring-3
 // program can fix it -- nothing can be drawn during the 300ms it is not
 // running.
 //
-// Note the frame RATE is unaffected by this value: a task gets one tick in
+// Note the frame RATE is unaffected by this value, since a task gets one tick in
 // every N with N tasks either way, so ~25fps here regardless. What changes is
 // the distribution -- at one tick per quantum those frames are evenly spaced
 // ~40ms apart instead of arriving in a clump. Shortening it costs one extra
@@ -42,33 +41,32 @@
 int SCHED_SWITCH_PERIOD = 1;
 
 // How many timer ticks between status-bar refreshes. Deliberately NOT tied to
-// the switch period any more: the bar is the most expensive thing drawn on a
+// the switch period any more, since the bar is the most expensive thing drawn on a
 // tick (full-width fill + ~40 glyphs) and only needs to be current to about a
 // tenth of a second, whereas the scheduler now runs every tick.
 int STATS_REFRESH_PERIOD = 10;
 int stats_tick_count = 0;
 
-// Per-task stack size, in 4096-byte pages. Used to be a single page (4096
-// bytes) -- fine for a kernel-context task's own execution, but a real
-// bottleneck once the SAME stack also serves as the kernel stack for a
+// Per-task stack size, in 4096-byte pages. A single page (4096
+// bytes) is fine for a kernel-context task's own execution, but too small
+// once the SAME stack also serves as the kernel stack for a
 // ring-3 task's syscall/interrupt handling (see enter_ring3/syscall_entry
-// in ring3_handlers.s): a syscall handler's own call depth, stacked under
+// in ring3_handlers.s). A syscall handler's own call depth, stacked under
 // an interrupt that lands mid-handler and does real work (int_dispatch ->
 // sched_tick -> sched_stats_update's string formatting and framebuffer
-// draws), overflowed a single page -- silently corrupting whatever
+// draws), would overflow a single page -- silently corrupting whatever
 // physical page happened to sit right below it (another freshly-allocated
 // frame, from jenna's bump allocator, easily one of THIS SAME task's own
 // private page-table frames) and producing a #GP on a LATER, seemingly
-// unrelated iretq once the corrupted mapping was read back. Caught by
-// actually letting a real timer interrupt land mid-syscall-handler, not by
-// inspection. 4 pages (16KB) is an ordinary real-kernel per-task stack
-// size, comfortable headroom over what was actually measured to overflow.
+// unrelated iretq once the corrupted mapping is read back. 4 pages
+// (16KB) is an ordinary real-kernel per-task stack size, with comfortable
+// headroom.
 int TASK_STACK_PAGES = 4;
 int TASK_STACK_SIZE = 16384;
 
 // Task-table sizing. MAX_TASKS is the fixed slot count of the parallel arrays
 // below; NUM_TASKS is how many the boot-time demo actually spawns. Task states
-// (one per slot): FREE = slot unused, RUNNABLE = ready or currently running,
+// (one per slot). FREE = slot unused, RUNNABLE = ready or currently running,
 // EXITED = ran task_exit(), never to be scheduled again.
 int MAX_TASKS = 8;
 int NUM_TASKS = 4;
@@ -135,18 +133,16 @@ int sched_tick_count = 0;
 //                           output stays in its own tile regardless of which
 //                           window the user is focused on. Kernel-context
 //                           tasks (thread_worker, shell_task) keep -1 forever.
-//   task_heap_next_base[i] -- task i's next-free address in its own private
-//                           ring-3 heap, or 0 if it has none (kernel-context
-//                           tasks, or a ring-3 task before its heap region
-//                           is mapped). SYS_ALLOC (syscall.c0) bump-allocates
-//                           from here; there is no free -- a ring-3 process's
-//                           heap lives and dies with the process itself, the
-//                           same "add real free/reuse only once something
-//                           needs it" restraint every other feature here
-//                           follows.
+//   task_heap_next_base[i] -- the frontier of task i's ring-3 heap, so nothing
+//                           at or past it has ever been handed out. 0 if
+//                           the task has no heap (kernel-context tasks, or
+//                           a ring-3 task before its heap region is set
+//                           up). lager.c0 hands memory out below it and
+//                           takes it back with SYS_DEALLOC, and moves it up
+//                           only when nothing below fits.
 //   task_heap_end_base[i] -- one past the last usable byte of task i's heap
 //                           region (0 alongside task_heap_next_base[i] == 0).
-//                           SYS_ALLOC's bounds check is next+n > end.
+//                           lager's bounds check is next+n > end.
 int task_rsp_base = 0;
 int task_state_base = 0;
 int task_counter_base = 0;
@@ -157,9 +153,18 @@ int task_win_base = 0;
 int task_heap_next_base = 0;
 int task_heap_end_base = 0;
 // First virtual address in the task's heap region that is NOT yet backed by
-// a physical page. The ring-3 heap is DEMAND-mapped: the region is reserved
+// a physical page. The ring-3 heap is DEMAND-mapped. The region is reserved
 // at spawn but pages are attached only as SYS_ALLOC hands memory out.
 int task_heap_mapped_base = 0;
+// The tick at which a sleeping task wakes (SYS_SLEEP), or 0 when it is not
+// asleep. sleepers_wake, on every timer tick, makes it runnable again.
+int task_wake_at_base = 0;
+// The arguments a task was started with (spawn3 prog a b), a kmalloc'd
+// block, the count at +0 and then the NUL-terminated strings one after
+// another, or 0 for none. task_argv_user_base is the copy in the task's own
+// heap that SYS_ARGV hands out pointers into, made on first use.
+int task_args_base = 0;
+int task_argv_user_base = 0;
 
 // The window size, in pixels, that SYS_WIN_INFO last REPORTED to task i --
 // packed w * 65536 + h, or 0 if it has never asked. Not the same thing as the
@@ -168,11 +173,11 @@ int task_heap_mapped_base = 0;
 // A graphical program asks once at startup and sizes its frame buffer from the
 // answer, out of a bump heap with no realloc. Its tile then changes size
 // underneath it on every reflow -- another spawn3, a split, a close -- and
-// SYS_PRESENT, which took its row stride from the window, started reading that
-// buffer at the wrong pitch: one `close` next to a running Infecteria widened
-// its tile from half the screen to all of it and the game's frame came out
+// SYS_PRESENT, taking its row stride from the window, would read that
+// buffer at the wrong pitch. One `close` next to a running Infecteria widens
+// its tile from half the screen to all of it, and the game's frame would come out
 // duplicated side by side with the bottom third unpainted. Wider still, and it
-// read clean off the end of the mapped heap and page-faulted in ring 0.
+// would read clean off the end of the mapped heap and page-fault in ring 0.
 //
 // Recording what the program was TOLD lets SYS_PRESENT read the buffer at the
 // pitch the program actually wrote it at, and place that frame in the window
@@ -188,8 +193,25 @@ int task_win_reported_base = 0;
 // uses for interrupt handlers. sched_launch never returns (it iretqs into the
 // task), so neither does this, in normal operation.
 void sched_launch_call(int rsp) {
-    int launch = load64(SCHED_LAUNCH_ADDR);
+    int launch = sched_launch;
     launch(rsp);
+    return;
+}
+
+// Wakes every sleeping task whose tick has come. Called from the timer
+// interrupt before the scheduler picks the next task, so a task that wakes
+// on this tick can be picked on it. Nothing to do before sched_start.
+void sleepers_wake() {
+    if (task_wake_at_base == 0) { return; }
+    int i = 0;
+    while (i < MAX_TASKS) {
+        int w = load64(task_wake_at_base + i * 8);
+        if (w != 0 && pit_ticks >= w) {
+            store64(task_wake_at_base + i * 8, 0);
+            task_wake(i);
+        }
+        i = i + 1;
+    }
     return;
 }
 
@@ -205,7 +227,7 @@ void task_wake(int id) {
 }
 
 // Builds a fresh stack for `entry` that LOOKS like a task isr_common just
-// preempted: 15 general-purpose registers (zeroed -- a fresh task has no prior
+// preempted, 15 general-purpose registers (zeroed -- a fresh task has no prior
 // state), a dummy vector/error-code pair (never read on resume, only discarded
 // by isr_epilogue's `add rsp, 16`), then the 5 qwords `iretq` actually pops in
 // 64-bit mode -- RIP (-> `entry`), CS (0x08, gdt64's flat selector), RFLAGS
@@ -213,7 +235,7 @@ void task_wake(int id) {
 // is what lets the first task launch and every later resume share the exact
 // same code path, see isr_common), RSP (the task's real stack top,
 // `stack_base + TASK_STACK_SIZE`), and SS (0). The RSP/SS fields exist because
-// of a real x86-64 wrinkle: `iretq` unconditionally pops RSP/SS too, even with
+// of a real x86-64 wrinkle, since `iretq` unconditionally pops RSP/SS too, even with
 // no privilege change -- see isr_common's own comment in boot.s for the full
 // story (a fresh, zeroed page reading as RSP=0 there triple-faults, which is
 // exactly why these fields cannot be omitted). 176 bytes total, matching
@@ -239,8 +261,8 @@ int sched_craft_stack(int stack_base, int entry) {
     store64(sp + 128, 0);  // error code (unused on resume)
     store64(sp + 136, entry);                  // RIP -> task entry point
     store64(sp + 144, 0x08);                   // CS = 0x08, gdt64's flat code selector
-    store64(sp + 152, 0x200);                  // RFLAGS: IF (bit 9) set, else clear
-    store64(sp + 160, stack_base + TASK_STACK_SIZE); // RSP: the task's real stack top
+    store64(sp + 152, 0x200);                  // RFLAGS has IF (bit 9) set, else clear
+    store64(sp + 160, stack_base + TASK_STACK_SIZE); // RSP, the task's real stack top
     store64(sp + 168, 0);                      // SS
     return sp;
 }
@@ -248,7 +270,7 @@ int sched_craft_stack(int stack_base, int entry) {
 // Allocates the next FREE task-table slot, gives it a fresh TASK_STACK_PAGES-
 // page stack from jenna, crafts that stack for `entry`, and marks it
 // RUNNABLE. Returns the new task id, or -1 if the table is full. This is the
-// "spawn" half of the process model: the whole table is set up by repeated
+// "spawn" half of the process model. The whole table is set up by repeated
 // task_spawn calls in sched_start.
 //
 // The stack must be physically CONTIGUOUS (sched_craft_stack/isr_common treat
@@ -285,9 +307,13 @@ int task_spawn(int entry) {
             store64(task_heap_end_base + id * 8, 0);
             store64(task_heap_mapped_base + id * 8, 0);
             store64(task_win_reported_base + id * 8, 0);
+            store64(task_wake_at_base + id * 8, 0);
+            store64(task_args_base + id * 8, 0);
+            store64(task_argv_user_base + id * 8, 0);
+            lager_reset(id);
             key_task_reset(id);
             store64(task_state_base + id * 8, TASK_RUNNABLE);
-            // Log the stack page too: paired with the reaper's "reaped ...
+            // Log the stack page too, paired with the reaper's "reaped ...
             // stack=" line, this is what lets test_shell.sh prove a reaped
             // page is genuinely handed back out (a later spawn's stack ==
             // an earlier reaped stack, via pmm's LIFO free list).
@@ -329,7 +355,7 @@ int sched_pick_next(int cur) {
 // running on) that still owns its page. Safe precisely because such a task is
 // NOT executing -- it was switched away, so nothing is on its stack -- while
 // this code runs on `cur`'s stack, never a reaped one. That is also why exit/
-// kill cannot free their own stack inline: a task cannot free the stack it is
+// kill cannot free their own stack inline, since a task cannot free the stack it is
 // standing on, so reclamation is deferred to here, a different task's context.
 // After reclaiming the stack page, the slot is fully reset to FREE so
 // task_spawn can reuse it -- zeroing all five table arrays eliminates any
@@ -376,11 +402,15 @@ void sched_reap(int cur) {
                 // pml4_phys just stops a future reuse of this id from
                 // inheriting a stale pointer before task_spawn overwrites it.
                 store64(task_state_base + r * 8, TASK_FREE);
+                store64(task_wake_at_base + r * 8, 0);
+                if (load64(task_args_base + r * 8) != 0) { kfree(load64(task_args_base + r * 8)); }
+                store64(task_args_base + r * 8, 0);
+                store64(task_argv_user_base + r * 8, 0);
                 store64(task_rsp_base + r * 8, 0);
                 store64(task_counter_base + r * 8, 0);
                 store64(task_runs_base + r * 8, 0);
                 store64(task_cr3_base + r * 8, pml4_phys);
-                // If this task owned a tavla, the window outlives it: the last
+                // If this task owned a tavla, the window outlives it, and the last
                 // frame a graphical program drew stays on screen (unlike a text
                 // window there is nothing to scroll back to, so closing it here
                 // would just make the result unviewable). Marking it ownerless
@@ -392,6 +422,7 @@ void sched_reap(int cur) {
                 store64(task_heap_end_base + r * 8, 0);
                 store64(task_heap_mapped_base + r * 8, 0);
                 store64(task_win_reported_base + r * 8, 0);
+                lager_reset(r);
                 key_task_reset(r);
             }
         }
@@ -404,9 +435,9 @@ void sched_reap(int cur) {
 // live system info. Called from sched_tick each switch period, so about once
 // every 10 timer ticks (~0.1s). Runs in the timer ISR (IF cleared), so it
 // cannot nest with itself or with the keyboard ISR -- safe to touch kakel
-// and the shared .kscratch buffer.
+// and its kakel_scratch buffer.
 //
-// Format: up Xh Xm Xs | tasks N/M | mem free/total
+// Format is up Xh Xm Xs | tasks N/M | mem free/total
 // Cached status-bar values so we only redraw when something actually
 // changes. The bar is the most expensive thing on screen (full-width fill
 // + ~40 glyphs, every STATS_REFRESH_PERIOD ticks), and most ticks nothing
@@ -501,7 +532,7 @@ void sched_tick() {
     }
 
     // Count this scheduling of the incoming task (drives EXIT_AFTER_RUNS, and
-    // proves fair round-robin: every runnable task's run count climbs).
+    // proves fair round-robin, since every runnable task's run count climbs).
     store64(task_runs_base + next * 8, load64(task_runs_base + next * 8) + 1);
 
     int next_counter = load64(task_counter_base + next * 8);
@@ -524,12 +555,12 @@ void sched_tick() {
 }
 
 // The "exit" half of the process model. Marks the current task EXITED so
-// sched_pick_next skips it forever, then parks: we cannot context-switch
-// ourselves here (this runs in ordinary task context, not an ISR), so we idle
+// sched_pick_next skips it forever, then parks. It cannot context-switch
+// itself here (this runs in ordinary task context, not an ISR), so it idles
 // via hlt and wait for the very next timer tick, which will pick_next past this
 // now-exited task and never schedule it again. The task's stack page is
-// intentionally leaked for now -- freeing the *running* task's own stack from
-// on top of it is unsafe, so reclaiming an exited task's stack is a later item.
+// intentionally leaked -- freeing the *running* task's own stack from
+// on top of it is unsafe, so the reaper reclaims it from another task.
 void task_exit() {
     int me = sched_current;
     store64(task_state_base + me * 8, TASK_EXITED);
@@ -542,11 +573,11 @@ void task_exit() {
     return;
 }
 
-// The demo workload's ordinary task body: a tight loop that only increments its
+// The demo workload's ordinary task body, a tight loop that only increments its
 // OWN work counter, deliberately never yielding or calling into the scheduler
 // -- all interleaving comes purely from the timer ISR forcibly switching, which
 // is what makes this PREEMPTIVE (not cooperative). A single generic body serves
-// every worker: while a task runs, sched_current == that task's id, so
+// every worker. While a task runs, sched_current == that task's id, so
 // task_counter[sched_current] is always this task's own slot. (sched_current
 // only changes when the scheduler has switched to a different task, at which
 // point a different task -- not this loop -- is the one running.)
@@ -561,7 +592,7 @@ void thread_worker() {
 
 // Same as thread_worker, but voluntarily exits after being scheduled
 // EXIT_AFTER_RUNS times -- the demo's proof that task_exit + sched_pick_next's
-// skip actually work: the other tasks keep round-robining after this one drops
+// skip actually work, since the other tasks keep round-robining after this one drops
 // out. task_runs[me] only advances when the scheduler switches TO this task, so
 // the loop runs a deterministic number of quanta regardless of QEMU timing.
 void thread_exiter() {
@@ -591,6 +622,9 @@ void sched_start() {
     task_heap_end_base = kmalloc(MAX_TASKS * 8);
     task_heap_mapped_base = kmalloc(MAX_TASKS * 8);
     task_win_reported_base = kmalloc(MAX_TASKS * 8);
+    task_wake_at_base = kmalloc(MAX_TASKS * 8);
+    task_args_base = kmalloc(MAX_TASKS * 8);
+    task_argv_user_base = kmalloc(MAX_TASKS * 8);
 
     // kmalloc does not zero, so every slot starts explicitly FREE before any
     // spawn -- otherwise task_spawn/sched_pick_next would read stale heap bytes
@@ -598,6 +632,9 @@ void sched_start() {
     int i = 0;
     while (i < MAX_TASKS) {
         store64(task_state_base + i * 8, TASK_FREE);
+        store64(task_wake_at_base + i * 8, 0);
+        store64(task_args_base + i * 8, 0);
+        store64(task_argv_user_base + i * 8, 0);
         store64(task_rsp_base + i * 8, 0);
         store64(task_counter_base + i * 8, 0);
         store64(task_runs_base + i * 8, 0);
@@ -610,6 +647,7 @@ void sched_start() {
         store64(task_heap_mapped_base + i * 8, 0);
         i = i + 1;
     }
+    lager_init();
 
     // Demo workload -- ids come back 0,1,2,3. Three identical counter workers
     // plus one exiter proves a real N(>2)-task round-robin AND task exit/skip.

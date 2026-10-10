@@ -6,7 +6,11 @@
 // moonshot is free software, distributed under the GNU General Public
 // License version 3 or (at your option) any later version, WITHOUT ANY
 // WARRANTY; see the LICENSE file for the full text.
-int JAKEL_MAX_NODES = 32;
+// 128 nodes, enough for lira's song files and every test program with room
+// to spare, since a file that cannot get a node fails to be created without
+// a word. The disk keeps the table size in its superblock, so a disk synced
+// with a smaller table still loads (see jakel_load).
+int JAKEL_MAX_NODES = 128;
 int JAKEL_NAME_LEN = 32;
 int JAKEL_TYPE_FREE = 0;
 int JAKEL_TYPE_FILE = 1;
@@ -14,15 +18,51 @@ int JAKEL_TYPE_DIR  = 2;
 
 // Permission modes — named levels, not octal. Owner always has full access
 // (read + write + execute). The level controls what everyone else gets.
-int JAKEL_MODE_LOCKED  = 0;  // others: nothing
-int JAKEL_MODE_PRIVATE = 1;  // others: read only (default)
-int JAKEL_MODE_PUBLIC  = 2;  // others: read + execute
+int JAKEL_MODE_LOCKED  = 0;  // others get nothing
+int JAKEL_MODE_PRIVATE = 1;  // others get read only (default)
+int JAKEL_MODE_PUBLIC  = 2;  // others get read + execute
 
 int jakel_type_base = 0;
 int jakel_name_base = 0;
 int jakel_parent_base = 0;
 int jakel_size_base = 0;
 int jakel_data_base = 0;
+
+// File contents and directory child lists live in jakel's own arena, not in
+// the kernel heap. kmalloc'ing them would put every byte
+// of every file into the same 1MB as the kernel's own structures, the ELF
+// loader and lager's block tables. One 320x240 image is 300KB. Names and
+// short-lived sector buffers stay in the kernel heap, being small.
+//
+// 8MB, since the disk image jakel syncs to is 10MB, so more than this could not be
+// saved anyway. Same first-fit allocator as the kernel heap (jenna's
+// arena_alloc), over a separate range.
+int JAKEL_ARENA_PAGES = 2048;
+int jakel_arena_start = 0;
+int jakel_arena_end = 0;
+
+// Carved at boot right after the kernel heap, while pmm still hands out
+// contiguous pages. See knekt.c0.
+void jakel_arena_init() {
+    jakel_arena_start = arena_carve(JAKEL_ARENA_PAGES, "jakel_arena_init");
+    jakel_arena_end = jakel_arena_start + JAKEL_ARENA_PAGES * 4096;
+    return;
+}
+
+int jakel_dalloc(int n) {
+    int p = arena_alloc(jakel_arena_start, jakel_arena_end, n);
+    if (p == 0 && n > 0) {
+        serial_print("[jakel] out of file space for ");
+        serial_print_int(n);
+        serial_print(" bytes\n");
+    }
+    return p;
+}
+
+void jakel_dfree(int p) {
+    arena_free(jakel_arena_start, jakel_arena_end, p, "[jakel] dfree");
+    return;
+}
 int jakel_created_base = 0;   // creation counter (in-memory only)
 int jakel_creation_counter = 0;
 int jakel_uid_base = 0;       // owner uid (in-memory only)
@@ -46,12 +86,19 @@ int jakel_can_write(int uid, int id) {
 
 int jakel_copy_name(int src) {
     int buf = kmalloc(JAKEL_NAME_LEN);
+    if (buf == 0) { return 0; }
     int i = 0;
     while (i < JAKEL_NAME_LEN - 1) {
         int c = load8(src + i);
         if (c == 0) { break; }
         store8(buf + i, c);
         i = i + 1;
+    }
+    if (i == JAKEL_NAME_LEN - 1 && load8(src + i) != 0) {
+        // The node will be found by its first 31 characters only.
+        serial_print("[jakel] name longer than 31 characters, cut: ");
+        serial_print(src);
+        serial_print("\n");
     }
     store8(buf + i, 0);
     return buf;
@@ -89,6 +136,9 @@ int jakel_alloc_node(int type, int parent, int name_str) {
         }
         id = id + 1;
     }
+    serial_print("[jakel] all ");
+    serial_print_int(JAKEL_MAX_NODES);
+    serial_print(" nodes in use, no new file or directory\n");
     return -1;
 }
 
@@ -96,7 +146,7 @@ void jakel_free_node(int id) {
     int name = load64(jakel_name_base + id * 8);
     if (name != 0) { kfree(name); }
     int data = load64(jakel_data_base + id * 8);
-    if (data != 0) { kfree(data); }
+    if (data != 0) { jakel_dfree(data); }
     store64(jakel_type_base + id * 8, JAKEL_TYPE_FREE);
     store64(jakel_name_base + id * 8, 0);
     store64(jakel_parent_base + id * 8, 0);
@@ -111,14 +161,17 @@ void jakel_add_child(int dir_id, int child_id) {
     int old_size = load64(jakel_size_base + dir_id * 8);
     int old_data = load64(jakel_data_base + dir_id * 8);
     int new_size = old_size + 8;
-    int new_data = kmalloc(new_size);
+    int new_data = jakel_dalloc(new_size);
+    // Out of space, so the child is not linked in. It still exists, unreachable
+    // from this directory, which beats writing its id through a null pointer.
+    if (new_data == 0) { return; }
     int i = 0;
     while (i < old_size) {
         store64(new_data + i, load64(old_data + i));
         i = i + 8;
     }
     store64(new_data + old_size, child_id);
-    if (old_data != 0) { kfree(old_data); }
+    if (old_data != 0) { jakel_dfree(old_data); }
     store64(jakel_data_base + dir_id * 8, new_data);
     store64(jakel_size_base + dir_id * 8, new_size);
     return;
@@ -129,7 +182,10 @@ void jakel_remove_child(int dir_id, int child_id) {
     int old_data = load64(jakel_data_base + dir_id * 8);
     int new_size = old_size - 8;
     int new_data = 0;
-    if (new_size > 0) { new_data = kmalloc(new_size); }
+    if (new_size > 0) {
+        new_data = jakel_dalloc(new_size);
+        if (new_data == 0) { return; }
+    }
     int i = 0;
     int w = 0;
     while (i < old_size) {
@@ -140,7 +196,7 @@ void jakel_remove_child(int dir_id, int child_id) {
         }
         i = i + 8;
     }
-    kfree(old_data);
+    jakel_dfree(old_data);
     store64(jakel_data_base + dir_id * 8, new_data);
     store64(jakel_size_base + dir_id * 8, new_size);
     return;
@@ -172,6 +228,37 @@ int jakel_make_file(int parent, int name_str) {
     if (id < 0) { return -1; }
     jakel_add_child(parent, id);
     return id;
+}
+
+// Creates the file a path names, relative to directory `dir`, inside a
+// directory that must already exist. Returns its id, or -1. Modifies `path`
+// (cuts it at the last '/'), so it must not be jakel_name_scratch, which
+// jakel_open builds each component in.
+int jakel_create_at(int dir, int path) {
+    int slash = -1;
+    int i = 0;
+    while (load8(path + i) != 0) {
+        if (load8(path + i) == '/') { slash = i; }
+        i = i + 1;
+    }
+    int leaf = path;
+    if (slash >= 0) {
+        if (slash == 0) {
+            dir = 0;
+        } else {
+            store8(path + slash, 0);
+            dir = jakel_open(dir, path);
+        }
+        leaf = path + slash + 1;
+        if (dir < 0) { return -1; }
+        if (load64(jakel_type_base + dir * 8) != JAKEL_TYPE_DIR) { return -1; }
+    }
+    // jakel keeps at most JAKEL_NAME_LEN - 1 characters of a name, so a
+    // longer one would be created under a shorter name than asked for and
+    // never be found again by the full one.
+    int n = jakel_str_len(leaf);
+    if (n == 0 || n > JAKEL_NAME_LEN - 1) { return -1; }
+    return jakel_make_file(dir, leaf);
 }
 
 int jakel_remove(int id) {
@@ -206,11 +293,13 @@ int jakel_open(int parent, int path_str) {
         int end = jakel_path_next(path_str, pos);
         if (end < 0) { break; }
         if (end == pos) { break; }
-        int tmp = kscratch_start;
+        int tmp = jakel_name_scratch;
         int ci = 0;
         while (pos < end) {
-            store8(tmp + ci, load8(path_str + pos));
-            ci = ci + 1;
+            // A component longer than any name jakel keeps cannot match
+            // one, so it is cut at the buffer's size rather than written
+            // past it.
+            if (ci < 63) { store8(tmp + ci, load8(path_str + pos)); ci = ci + 1; }
             pos = pos + 1;
         }
         store8(tmp + ci, 0);
@@ -269,8 +358,22 @@ int jakel_write(int id, int offset, int buf, int len) {
     int new_sz = old_sz;
     if (new_end > old_sz) { new_sz = new_end; }
     int new_data = old_data;
+    // A write inside the file's current size goes straight into it. Only a
+    // file that grows is copied into a bigger block. Copying on every write
+    // made filling a large file in pieces cost the whole file per piece.
+    if (old_data != 0 && new_sz == old_sz) {
+        int w = 0;
+        while (w < len) {
+            store8(old_data + offset + w, load8(buf + w));
+            w = w + 1;
+        }
+        return len;
+    }
     if (new_sz > 0) {
-        new_data = kmalloc(new_sz);
+        new_data = jakel_dalloc(new_sz);
+        // Out of file space, so nothing is written and the file keeps what it
+        // had, rather than writing the file through address 0 into low memory.
+        if (new_data == 0) { return 0; }
         int i = 0;
         while (i < offset && i < old_sz) {
             store8(new_data + i, load8(old_data + i));
@@ -287,7 +390,7 @@ int jakel_write(int id, int offset, int buf, int len) {
             i = i + 1;
         }
     }
-    if (old_data != 0 && old_data != new_data) { kfree(old_data); }
+    if (old_data != 0 && old_data != new_data) { jakel_dfree(old_data); }
     store64(jakel_data_base + id * 8, new_data);
     store64(jakel_size_base + id * 8, new_sz);
     return len;
@@ -341,12 +444,13 @@ void jakel_list(int id) {
 }
 
 // Prints the full path of a node by walking its parent chain. Names are
-// collected bottom-up in .kscratch then printed in reverse (root first).
+// collected bottom-up in jakel_path_scratch then printed in reverse (root
+// first). A path deeper than the buffer is cut at the root end.
 void jakel_where(int id) {
-    int buf = kscratch_start + 512;
+    int buf = jakel_path_scratch;
     int pos = 0;
     int cur = id;
-    while (cur != 0) {
+    while (cur != 0 && pos < 1024 - JAKEL_NAME_LEN - 1) {
         int name = load64(jakel_name_base + cur * 8);
         int nl = jakel_str_len(name);
         int i = nl - 1;
@@ -429,10 +533,21 @@ void jakel_load() {
         kfree(sb);
         return;
     }
-    // Read the node table (sectors 1-4, 2048 bytes).
-    int nt = kmalloc(2048);
+    // The node table follows the superblock, as many 64-byte entries as the
+    // superblock says, and the file data starts where it says. Both were
+    // honoured, which is what keeps a disk synced with a different table
+    // size loading.
+    int disk_nodes = sb.node_count;
+    int table_secs = disk_nodes * 64 / 512;
+    if (disk_nodes < 8 || disk_nodes > JAKEL_MAX_NODES || disk_nodes % 8 != 0
+        || sb.first_data_sector != 1 + table_secs) {
+        serial_print("[jakel] superblock describes a node table this kernel cannot read, creating fresh\n");
+        kfree(sb);
+        return;
+    }
+    int nt = kmalloc(table_secs * 512);
     int s = 1;
-    while (s < 5) {
+    while (s < 1 + table_secs) {
         int sector = kmalloc(512);
         ata_read(s, sector);
         int j = 0;
@@ -443,13 +558,13 @@ void jakel_load() {
         kfree(sector);
         s = s + 1;
     }
-    // First pass: create every non-free node, allocating name and data
+    // First pass. Create every non-free node, allocating name and data
     // buffers. File data is read from disk; directory data (child-ID
     // arrays) is rebuilt in the second pass from parent pointers.
     int loaded = 0;
-    int data_sector = 5;
+    int data_sector = sb.first_data_sector;
     int i = 0;
-    while (i < JAKEL_MAX_NODES) {
+    while (i < disk_nodes) {
         int off = i * 64;
         int type = (nt + off).type;
         i = i + 1;
@@ -465,8 +580,11 @@ void jakel_load() {
             j = j + 1;
         }
         store8(name_buf + j, 0);
-        // Allocate the node and fill in its fields.
-        int id = loaded;  // nodes are allocated sequentially from 0
+        // The node goes back into the slot it was saved from, not the next free
+        // one, since the parent ids on disk are slot numbers. Otherwise, after
+        // any removed node every later node would point at the wrong parent and
+        // a file in a directory would be unreadable after a reboot.
+        int id = i - 1;
         store64(jakel_type_base    + id * 8, type);
         store64(jakel_parent_base  + id * 8, parent);
         store64(jakel_name_base    + id * 8, name_buf);
@@ -484,7 +602,15 @@ void jakel_load() {
         } else if (type == JAKEL_TYPE_FILE && sz > 0) {
             node_sz = sz;
             int nsec = (sz + 511) / 512;
-            data_buf = kmalloc(sz);
+            data_buf = jakel_dalloc(sz);
+            if (data_buf == 0) {
+                // No room for this file, so load it empty, but still step over
+                // its sectors, or every file after it would read the wrong
+                // part of the disk.
+                node_sz = 0;
+                data_sector = data_sector + nsec;
+                nsec = 0;
+            }
             int temp = kmalloc(512);
             int pos = 0;
             int si = 0;
@@ -507,13 +633,16 @@ void jakel_load() {
     }
     kfree(nt);
     kfree(sb);
-    // Rebuild directory children from parent pointers: for every non-free
-    // node where parent != node, add it as a child of its parent.
+    // Rebuild directory children from parent pointers. For every non-free
+    // node where parent != node, add it as a child of its parent. Over the
+    // whole table, since loaded nodes keep their slots and gaps stay gaps.
     i = 0;
-    while (i < loaded) {
-        int parent = load64(jakel_parent_base + i * 8);
-        if (parent != i) {
-            jakel_add_child(parent, i);
+    while (i < disk_nodes) {
+        if (load64(jakel_type_base + i * 8) != JAKEL_TYPE_FREE) {
+            int parent = load64(jakel_parent_base + i * 8);
+            if (parent != i) {
+                jakel_add_child(parent, i);
+            }
         }
         i = i + 1;
     }
@@ -524,8 +653,8 @@ void jakel_load() {
 }
 
 // Persist the entire in-memory filesystem state to disk.
-// Writes a superblock (sector 0), the node table (sectors 1-4), and
-// all file data (sectors 5+). Directory child-ID arrays are NOT
+// Writes a superblock (sector 0), the node table (sectors 1-16 for 128
+// nodes), and all file data after it. Directory child-ID arrays are NOT
 // serialised -- they are rebuilt from parent pointers on load.
 // Allocates temporary heap buffers for sector-sized writes and frees
 // them before returning.
@@ -544,12 +673,13 @@ void jakel_sync() {
     sb.version = 1;
     sb.node_count = JAKEL_MAX_NODES;
     sb.name_max = JAKEL_NAME_LEN;
-    sb.first_data_sector = 5;
+    int table_secs = JAKEL_MAX_NODES * 64 / 512;
+    sb.first_data_sector = 1 + table_secs;
     // total_data_sectors filled below
-    // --- Build node table (sectors 1-4, 2048 bytes) ---
-    int nt = kmalloc(2048);
+    // --- Build node table (64 bytes a node, from sector 1) ---
+    int nt = kmalloc(table_secs * 512);
     i = 0;
-    while (i < 2048) { store8(nt + i, 0); i = i + 1; }
+    while (i < table_secs * 512) { store8(nt + i, 0); i = i + 1; }
     int node_count = 0;
     int data_secs = 0;
     i = 0;
@@ -579,10 +709,10 @@ void jakel_sync() {
     // Write superblock
     ata_write(0, sb);
     kfree(sb);
-    // Write node table (4 sectors)
+    // Write the node table
     int sec = 1;
     int ntoff = 0;
-    while (sec < 5) {
+    while (sec < 1 + table_secs) {
         int secbuf = kmalloc(512);
         int j = 0;
         while (j < 512) {
@@ -596,7 +726,7 @@ void jakel_sync() {
     }
     kfree(nt);
     // --- Write file data ---
-    int ds = 5;
+    int ds = 1 + table_secs;
     i = 0;
     while (i < JAKEL_MAX_NODES) {
         int type = load64(jakel_type_base + i * 8);
@@ -637,11 +767,54 @@ void jakel_sync() {
 }
 
 
+// Writes `size` bytes at `data` to directory `dir` as `name`, replacing
+// whatever was there. For the programs kmain.c0 embeds, the bytes are already
+// in memory, so they go straight into the file with no copy in between.
+void jakel_seed_file(int dir, int name, int data, int size) {
+    int stale = jakel_lookup(dir, name);
+    if (stale >= 0) { jakel_remove(stale); }
+    int f = jakel_make_file(dir, name);
+    if (f < 0) {
+        serial_print("[jakel] no node for ");
+        serial_print(name);
+        serial_print("\n");
+        return;
+    }
+    if (jakel_write(f, 0, data, size) != size) {
+        serial_print("[jakel] no file space for ");
+        serial_print(name);
+        serial_print("\n");
+    }
+    return;
+}
+
+// Unpacks build/elf_tests.pack (see bake.c0 for the layout) into `dir`: each
+// program as <name>.elf.
+void jakel_install_pack(int dir, int pack, int size) {
+    if (size < 8) { return; }
+    int count = load64(pack);
+    int p = pack + 8;
+    int i = 0;
+    while (i < count && p + 24 <= pack + size) {
+        int n = load64(p + 16);
+        int nm = jakel_name_scratch;
+        int k = 0;
+        while (k < 15 && load8(p + k) != 0) { store8(nm + k, load8(p + k)); k = k + 1; }
+        store8(nm + k, '.'); store8(nm + k + 1, 'e'); store8(nm + k + 2, 'l');
+        store8(nm + k + 3, 'f'); store8(nm + k + 4, 0);
+        if (p + 24 + n > pack + size) { serial_print("[jakel] elf_tests.pack is cut short\n"); return; }
+        jakel_seed_file(dir, nm, p + 24, n);
+        p = p + 24 + ((n + 7) / 8) * 8;
+        i = i + 1;
+    }
+    return;
+}
+
 // Writes one NUL-terminated string to the root as `name`, replacing whatever
 // was there. Used for the documents utsikt reads, which are re-seeded on
 // every boot like the binaries beside them -- so an edit made from skalman
 // lasts until the next reboot. That is the opposite of the choice demo.c0
-// makes, and on purpose: demo.c0 exists to be edited, these exist to be
+// makes, and on purpose. demo.c0 exists to be edited, these exist to be
 // rendered, and a test that cannot rely on what a page says is not much of a
 // test.
 void jakel_seed_page(int name, int text) {
@@ -680,11 +853,8 @@ void jakel_init() {
     // arrays stay zero-filled and we create a fresh root below.
     jakel_load();
     if (load64(jakel_type_base) == JAKEL_TYPE_FREE) {
-        int root_name = kscratch_start;
-        store8(root_name, '/');
-        store8(root_name + 1, 0);
         store64(jakel_type_base, JAKEL_TYPE_DIR);
-        store64(jakel_name_base, jakel_copy_name(root_name));
+        store64(jakel_name_base, jakel_copy_name("/"));
         store64(jakel_parent_base, 0);
         store64(jakel_size_base, 0);
         store64(jakel_data_base, 0);
@@ -700,7 +870,7 @@ void jakel_init() {
         // No // comments -- the REPL tokenizer treats / as division.
         int demo = jakel_make_file(0, "demo.c0");
         if (demo >= 0) {
-            int b = kscratch_start;
+            int b = kmalloc(256);
             int p = 0;
             // Use distinctive values (777, 888, 999) that will not match earlier
             // test assertions — avoids false positives in the test script.
@@ -723,7 +893,7 @@ void jakel_init() {
             store8(b+p, '9'); p=p+1; store8(b+p, '9'); p=p+1;
             store8(b+p, '9'); p=p+1; store8(b+p, ')'); p=p+1;
             store8(b+p, ';'); p=p+1; store8(b+p, '\n'); p=p+1;
-            jakel_write(demo, 0, b, p);
+            if (b != 0) { jakel_write(demo, 0, b, p); kfree(b); }
             store64(jakel_size_base + demo * 8, p);
         }
     }
@@ -733,22 +903,18 @@ void jakel_init() {
     // Everything below is seeded on EVERY boot, not just the first one, and
     // that placement is the whole point.
     //
-    // All of this used to sit inside the "no filesystem found on disk" branch
-    // that just closed above. Each fixture carefully removes any stale copy
-    // before writing itself -- logic added precisely because disk.img
-    // survives reboots and a rebuilt ELF was being silently ignored. But
-    // inside that branch it could never fire: if the branch runs there is no
-    // filesystem, so there is nothing stale; and if a filesystem loaded, the
-    // branch is skipped entirely and nothing is re-seeded at all. So a test
-    // that reused disk.img ran the PREVIOUS build's ring-3 binaries, and
-    // passing proved nothing about the code just compiled. Confirmed by
-    // booting on a persisted disk: "[jakel] loaded 14 nodes from disk" and
-    // not one "filesystem ready" line.
+    // Seeding only when no filesystem is found on disk would never refresh
+    // anything. Each fixture removes any stale copy before writing itself,
+    // because disk.img survives reboots and a rebuilt ELF must not be
+    // silently ignored, but inside that branch there is never anything stale,
+    // and when a filesystem loads the branch is skipped. A test that reused
+    // disk.img would then run the PREVIOUS build's ring-3 binaries, and
+    // passing would prove nothing about the code just compiled.
     //
     // Out here the remove-then-write is idempotent and actually does its job,
     // so every boot gets the binaries this kernel was built with.
     //
-    // demo.c0 deliberately stays behind, seeded once: it is a file the user
+    // demo.c0 deliberately stays behind, seeded once, since it is a file the user
     // can edit from the REPL, and re-seeding would silently discard that.
     // These are fixtures nobody edits.
     //
@@ -764,7 +930,7 @@ void jakel_init() {
         // demo.c0 plays for the REPL, but for run3/spawn3's file-loading
         // path. elf_test_code() hand-builds the bytes (ELF header + one
         // PT_LOAD program header + a tiny sys_debug_print/sys_exit body)
-        // directly into kscratch, mirroring ring3_test_code's flat-binary
+        // into a kmalloc'd buffer, mirroring ring3_test_code's flat-binary
         // equivalent (syscall.c0).
         int stale_hello = jakel_lookup(tdir, "hello.elf");
         if (stale_hello >= 0) { jakel_remove(stale_hello); }
@@ -778,17 +944,17 @@ void jakel_init() {
         // Seed a coff-compiled ELF executable — the first real program
         // compiled by coff's new --elf mode (Moonshot syscall ABI) rather
         // than the hand-built hello.elf above.  Same "proof the loader
-        // works" role, but this closes the full toolchain loop:
+        // works" role, but this closes the full toolchain loop.
         //   write c0 → coff --elf → spawn3 in a kakel window.
-        // The bytes below were generated by:
+        // The bytes below were generated by
         //   coff --elf hello_elf.c0 hello_elf.bin
-        // where hello_elf.c0 is:
+        // where hello_elf.c0 is
         //   int main() { print("hello from coff elf\n"); return 7; }
         int stale_coff_hello = jakel_lookup(tdir, "coff_hello.elf");
         if (stale_coff_hello >= 0) { jakel_remove(stale_coff_hello); }
         int coff_hello = jakel_make_file(tdir, "coff_hello.elf");
         if (coff_hello >= 0) {
-            int eb = kscratch_start;
+            int eb = kmalloc(1024);
             int eb_p = 0;
             store64(eb + eb_p, 0x00010102464c457f); eb_p = eb_p + 8;
             store64(eb + eb_p, 0x0000000000000000); eb_p = eb_p + 8;
@@ -819,96 +985,29 @@ void jakel_init() {
             store64(eb + eb_p, 0xe900000000000000); eb_p = eb_p + 8;
             store64(eb + eb_p, 0x5dec894800000000); eb_p = eb_p + 8;
             store8(eb + eb_p, 195); eb_p = eb_p + 1;
-            jakel_write(coff_hello, 0, eb, eb_p);
+            if (eb != 0) { jakel_write(coff_hello, 0, eb, eb_p); kfree(eb); }
             store64(jakel_size_base + coff_hello * 8, eb_p);
         }
 
-        // A persisted heart_demo.elf from before that demo was removed would
+        // A persisted heart_demo.elf, from a kernel that still seeded it, would
         // otherwise survive here forever -- disk.img outlives rebuilds, and
         // nothing else deletes a file the kernel no longer seeds.
         int stale_heart = jakel_lookup(tdir, "heart_demo.elf");
         if (stale_heart >= 0) { jakel_remove(stale_heart); }
 
-        // Seed a coff-compiled test verifying layout + sizeof + alloc()
-        // (SYS_ALLOC) end to end in a real ring-3 --elf program -- see
-        // alloc_test_data.c0's own header comment.
-        int existing_alloc = jakel_lookup(tdir, "alloctest.elf");
-        if (existing_alloc >= 0) { jakel_remove(existing_alloc); }
-        int alloc_test = jakel_make_file(tdir, "alloctest.elf");
-        if (alloc_test >= 0) {
-            int asz = seed_alloc_test_size();
-            int aeb = kmalloc(asz);
-            if (aeb != 0) {
-                seed_alloc_test(aeb);
-                jakel_write(alloc_test, 0, aeb, asz);
-                kfree(aeb);
-            }
-        }
-
-        // Seed a coff-compiled test verifying ticks() (SYS_TICKS) end to
-        // end in a real ring-3 --elf program -- see ticks_test_data.c0's
-        // own header comment.
-        int existing_ticks = jakel_lookup(tdir, "tickstest.elf");
-        if (existing_ticks >= 0) { jakel_remove(existing_ticks); }
-        int ticks_test = jakel_make_file(tdir, "tickstest.elf");
-        if (ticks_test >= 0) {
-            int tsz = seed_ticks_test_size();
-            int teb = kmalloc(tsz);
-            if (teb != 0) {
-                seed_ticks_test(teb);
-                jakel_write(ticks_test, 0, teb, tsz);
-                kfree(teb);
-            }
-        }
-
-        // Seed Gnista's own first demo -- see gnista_demo_data.c0's header
-        // comment and programs/gnista.c0.
-        int existing_gnista = jakel_lookup(0, "gnista.elf");
-        if (existing_gnista >= 0) { jakel_remove(existing_gnista); }
-        int gnista_demo = jakel_make_file(0, "gnista.elf");
-        if (gnista_demo >= 0) {
-            int gsz = seed_gnista_demo_size();
-            int geb = kmalloc(gsz);
-            if (geb != 0) {
-                seed_gnista_demo(geb);
-                jakel_write(gnista_demo, 0, geb, gsz);
-                kfree(geb);
-            }
-        }
-
-        // Infecteria, the game. In the root directory, not /test -- it is
-        // something to play, not scaffolding.
-        int stale_inf = jakel_lookup(0, "infecteria.elf");
-        if (stale_inf >= 0) { jakel_remove(stale_inf); }
-        int inf_f = jakel_make_file(0, "infecteria.elf");
-        if (inf_f >= 0) {
-            int isz = seed_infecteria_size();
-            int ibuf = kmalloc(isz);
-            if (ibuf != 0) {
-                seed_infecteria(ibuf);
-                jakel_write(inf_f, 0, ibuf, isz);
-                kfree(ibuf);
-            }
-        }
-
-
-        // utsikt, the browser engine -- see programs/utsikt.c0 and utsikt_data.c0.
-        // Root, not /test: it is something to use, like Infecteria.
-        int stale_uts = jakel_lookup(0, "utsikt.elf");
-        if (stale_uts >= 0) { jakel_remove(stale_uts); }
-        int uts_f = jakel_make_file(0, "utsikt.elf");
-        if (uts_f >= 0) {
-            int usz = seed_utsikt_size();
-            int ubuf = kmalloc(usz);
-            if (ubuf != 0) {
-                seed_utsikt(ubuf);
-                jakel_write(uts_f, 0, ubuf, usz);
-                kfree(ubuf);
-            }
-        }
+        // The ring-3 programs, from the bytes kmain.c0 embeds. Re-seeded
+        // on every boot, so a rebuilt kernel always carries the programs
+        // its build compiled, never a stale copy left on disk.img.
+        jakel_seed_file(tdir, "alloctest.elf", alloc_test_elf, alloc_test_elf_size);
+        jakel_seed_file(tdir, "tickstest.elf", ticks_test_elf, ticks_test_elf_size);
+        jakel_seed_file(0, "gnista.elf", gnista_elf, gnista_elf_size);
+        // Infecteria, utsikt and lira in the root directory, not /test.
+        // they are things to use, not scaffolding.
+        jakel_seed_file(0, "infecteria.elf", infecteria_elf, infecteria_elf_size);
+        jakel_seed_file(0, "utsikt.elf", utsikt_elf, utsikt_elf_size);
 
         // The page utsikt opens, seeded as a real file rather than compiled
-        // into the browser. That is the point: the engine reads a
+        // into the browser. That is the point. The engine reads a
         // document off the filesystem, and a page carried inside the binary
         // would prove nothing about that path -- utsikt has one of those
         // too, and it is what it falls back to when this file is missing.
@@ -918,27 +1017,186 @@ void jakel_init() {
         // second file is the only way to prove that following one reads
         // different bytes rather than re-rendering the same ones.
         jakel_seed_page("about.html", utsikt_about_html());
+        // The picture about.html shows. See jakel_seed_moon.
+        jakel_seed_moon();
+        jakel_seed_file(0, "lira.elf", lira_elf, lira_elf_size);
+        // The song lira starts from. See jakel_seed_demo_song.
+        jakel_seed_demo_song();
 
-        // The full-frame rendering probe -- see fps_probe_data.c0.
-        int stale_fps = jakel_lookup(tdir, "fps.elf");
-        if (stale_fps >= 0) { jakel_remove(stale_fps); }
-        int fps_f = jakel_make_file(tdir, "fps.elf");
-        if (fps_f >= 0) {
-            int fsz2 = seed_fps_probe_size();
-            int fbuf = kmalloc(fsz2);
-            if (fbuf != 0) {
-                seed_fps_probe(fbuf);
-                jakel_write(fps_f, 0, fbuf, fsz2);
-                kfree(fbuf);
-            }
-        }
+        // The full-frame rendering probe (programs/fps_probe.c0 in gnista).
+        jakel_seed_file(tdir, "fps.elf", fps_probe_elf, fps_probe_elf_size);
 
-        // Seed the coff --elf backend test programs (etNN.elf). Generated by
-        // gen_elf_tests.sh from elf_tests/*.c0; one call so this stays put
-        // when a test is added or removed. Run by verify_elf_backend.sh.
-        seed_elf_tests_install(tdir);
+        // The coff --elf test programs (etNN.elf), from the pack
+        // gen_elf_tests.sh builds. Run by verify_elf_backend.sh.
+        jakel_install_pack(tdir, elf_tests_pack, elf_tests_pack_size);
     }
     // Persist the initial filesystem so the next boot finds it.
     jakel_sync();
+    return;
+}
+
+// Boot self-test, a 2MB file, twice the size of the whole kernel heap, so it
+// can only work if file data really lives in jakel's arena. Written in 4KB
+// pieces (one write at the far end sizes it, the rest go in place), read
+// back and checked byte for byte, removed, and then the same 2MB is
+// allocated again to show the space came back. run_qemu.sh checks the line.
+void jakel_big_file_test() {
+    int big = 2097152;
+    int chunk = 4096;
+    int buf = kmalloc(chunk);
+    int id = jakel_make_file(0, "jakel_selftest");
+    if (buf == 0 || id < 0) {
+        serial_print("[jakel] 2MB self-test: could not start\n");
+        return;
+    }
+    int ok = 1;
+    int off = big - chunk;
+    while (off >= 0) {
+        int i = 0;
+        while (i < chunk) {
+            store8(buf + i, ((off + i) * 7 + 3) % 251);
+            i = i + 1;
+        }
+        if (jakel_write(id, off, buf, chunk) != chunk) { ok = 0; }
+        off = off - chunk;
+    }
+    if (load64(jakel_size_base + id * 8) != big) { ok = 0; }
+    off = 0;
+    while (off < big && ok == 1) {
+        jakel_read(id, off, buf, chunk);
+        int i = 0;
+        while (i < chunk) {
+            if (load8(buf + i) != ((off + i) * 7 + 3) % 251) { ok = 0; }
+            i = i + 1;
+        }
+        off = off + chunk;
+    }
+    jakel_remove(id);
+    int again = jakel_dalloc(big);
+    if (again == 0) { ok = 0; }
+    jakel_dfree(again);
+    kfree(buf);
+    if (ok == 1) {
+        serial_print("[jakel] 2MB self-test: ok\n");
+    } else {
+        serial_print("[jakel] 2MB self-test: FAILED\n");
+    }
+    return;
+}
+
+// moon.spr, the image about.html shows. Drawn here at boot for the same
+// reason the pages are seeded here, since Moonshot cannot receive a file from the
+// host. 48x48, one frame, a pale disc with three darker craters, transparent
+// everywhere outside the disc, which is what verify_utsikt_img.sh checks.
+// Colours chosen to appear nowhere else on the page.
+int MOON_SIZE = 48;
+int MOON_LIGHT = 0xF0E6C8;
+int MOON_CRATER = 0xB4A88C;
+
+int moon_in_circle(int x, int y, int cx, int cy, int r) {
+    int dx = x - cx;
+    int dy = y - cy;
+    if (dx * dx + dy * dy <= r * r) { return 1; }
+    return 0;
+}
+
+void jakel_seed_moon() {
+    int n = MOON_SIZE;
+    int size = 24 + n * n * 4;
+    int buf = kmalloc(size);
+    if (buf == 0) { return; }
+    store64(buf, n);
+    store64(buf + 8, n);
+    store64(buf + 16, 1);
+    int y = 0;
+    while (y < n) {
+        int x = 0;
+        while (x < n) {
+            int c = 0;
+            if (moon_in_circle(x, y, 24, 24, 22) == 1) {
+                c = MOON_LIGHT;
+                if (moon_in_circle(x, y, 16, 18, 5) == 1
+                    || moon_in_circle(x, y, 31, 29, 7) == 1
+                    || moon_in_circle(x, y, 20, 34, 3) == 1) { c = MOON_CRATER; }
+            }
+            int p = buf + 24 + (y * n + x) * 4;
+            store8(p, c % 256);
+            store8(p + 1, (c / 256) % 256);
+            store8(p + 2, (c / 65536) % 256);
+            store8(p + 3, 0);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    int stale = jakel_lookup(0, "moon.spr");
+    if (stale >= 0) { jakel_remove(stale); }
+    int f = jakel_make_file(0, "moon.spr");
+    if (f >= 0) { jakel_write(f, 0, buf, size); }
+    kfree(buf);
+    return;
+}
+
+// demo.not, the song lira opens when there is no song.not yet. The first
+// line of "Gubben Noak", the Swedish children's song, as a melody over a
+// bass of C and G. Written here at boot for the same reason as moon.spr, and
+// re-seeded every boot like the pages, because tests read it. A person's own
+// song is song.not, which lira saves and nothing here touches.
+//
+// The bytes are the noter format (programs/lira/noter.c0), a 40-byte header,
+// then 32-byte notes (pitch, start, length, velocity), sorted by start and
+// then pitch, which is why each bass note comes before the melody note that
+// starts with it. 120 beats per minute, four steps a beat. The melody notes
+// are three steps long rather than four so that repeated ones are heard as
+// separate notes rather than one long one.
+int DEMO_SONG_NOTES = 18;
+
+int demo_note(int buf, int i, int start, int pitch, int length, int velocity) {
+    int r = buf + 40 + i * 32;
+    store64(r, pitch);
+    store64(r + 8, start);
+    store64(r + 16, length);
+    store64(r + 24, velocity);
+    return i + 1;
+}
+
+void jakel_seed_demo_song() {
+    int size = 40 + DEMO_SONG_NOTES * 32;
+    int buf = kmalloc(size);
+    if (buf == 0) { return; }
+    int m = "noter";
+    int k = 0;
+    while (k < 8) {
+        if (k < 5) { store8(buf + k, load8(m + k)); } else { store8(buf + k, 0); }
+        k = k + 1;
+    }
+    store64(buf + 8, 1);      // version
+    store64(buf + 16, 4);     // steps per beat
+    store64(buf + 24, 120);   // tempo
+    store64(buf + 32, DEMO_SONG_NOTES);
+    // C C C E | D D D F | E E D D | C, a quarter note (4 steps) each.
+    int i = 0;
+    i = demo_note(buf, i, 0, 48, 15, 90);
+    i = demo_note(buf, i, 0, 60, 3, 110);
+    i = demo_note(buf, i, 4, 60, 3, 110);
+    i = demo_note(buf, i, 8, 60, 3, 110);
+    i = demo_note(buf, i, 12, 64, 3, 110);
+    i = demo_note(buf, i, 16, 55, 15, 90);
+    i = demo_note(buf, i, 16, 62, 3, 110);
+    i = demo_note(buf, i, 20, 62, 3, 110);
+    i = demo_note(buf, i, 24, 62, 3, 110);
+    i = demo_note(buf, i, 28, 65, 3, 110);
+    i = demo_note(buf, i, 32, 48, 7, 90);
+    i = demo_note(buf, i, 32, 64, 3, 110);
+    i = demo_note(buf, i, 36, 64, 3, 110);
+    i = demo_note(buf, i, 40, 55, 7, 90);
+    i = demo_note(buf, i, 40, 62, 3, 110);
+    i = demo_note(buf, i, 44, 62, 3, 110);
+    i = demo_note(buf, i, 48, 48, 8, 90);
+    i = demo_note(buf, i, 48, 60, 8, 110);
+    int stale = jakel_lookup(0, "demo.not");
+    if (stale >= 0) { jakel_remove(stale); }
+    int f = jakel_make_file(0, "demo.not");
+    if (f >= 0) { jakel_write(f, 0, buf, size); }
+    kfree(buf);
     return;
 }

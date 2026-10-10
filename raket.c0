@@ -12,7 +12,7 @@
 // root shell. Named for the boot sequence's own "moonshot" theme -- raket
 // (Swedish for "rocket") is what launches everything else.
 //
-// Deliberately NOT a separate task: shell_task (skalman.c0) already owns
+// Deliberately NOT a separate task, since shell_task (skalman.c0) already owns
 // the per-session input loop (block on empty queue, dequeue a char, hand it
 // to a line-buffer-driven handler on Enter), and every character's
 // echo/backspace/history/tab-complete mechanics are identical whether the
@@ -22,10 +22,10 @@
 // below instead of shell_run, right up until the session authenticates.
 
 // Per-session state, KAKEL_MAX_WIN-sized parallel arrays -- same idiom as
-// skalman's sk_uid_base/sk_cwd_base. raket_authed_base: 0 while still at
+// skalman's sk_uid_base/sk_cwd_base. raket_authed_base is 0 while still at
 // the login prompt, 1 once authenticated and handed off to the shell.
-// raket_stage_base: which field is currently being typed (username or
-// password). raket_pending_uid_base: the uid matched from the typed
+// raket_stage_base says which field is currently being typed (username or
+// password). raket_pending_uid_base is the uid matched from the typed
 // username, kept around across the username->password exchange so the
 // password stage does not need a second lookup, and reset to -1 on any
 // failure so a stale match can never leak into the next attempt.
@@ -57,8 +57,8 @@ void raket_init() {
 // This exists because window ids are REUSED. Closing the last window frees
 // its slot and immediately allocates a replacement, which gets the same id
 // back -- and every per-session array here is indexed by window id. Without
-// this reset the replacement inherited `authed = 1` from the session that was
-// just closed, so `close` on the last window handed back a shell that was
+// this reset the replacement would inherit `authed = 1` from the session that was
+// just closed, so `close` on the last window would hand back a shell that is
 // already logged in, straight past the gate raket exists to be.
 //
 // skalman's own per-session state is reset to the same defaults shell_init
@@ -67,7 +67,7 @@ void raket_init() {
 // sk_cwd_base, and a stale cwd is a jakel node id that the previous session
 // may since have removed.
 //
-// Guarded the same way raket_authed is: kakel_init allocates window 0 before
+// Guarded the same way raket_authed is, since kakel_init allocates window 0 before
 // raket_init and shell_init have allocated any of these arrays, and storing
 // through a null base would write straight to physical address 0.
 void raket_reset_session(int f) {
@@ -133,7 +133,7 @@ void raket_prompt(int f) {
 
 // Called from shell_input's Enter handler (skalman.c0), instead of
 // shell_run, while session f is not yet authenticated. `line` is the
-// just-typed field: a username at RAKET_STAGE_USER, a password at
+// just-typed field, a username at RAKET_STAGE_USER, a password at
 // RAKET_STAGE_PASS. Deliberately does not touch sk_hist_buf -- a typed
 // password has no business sitting in shell command history.
 void raket_login_line(int f, int line) {
@@ -163,7 +163,7 @@ void raket_login_line(int f, int line) {
 
     // Password stage. An account with NO password set (sk_user_has_pass ==
     // 0 -- true for root/guest on a fresh boot, since nothing has ever
-    // called `passwd`) logs in on an EMPTY password line only: there is
+    // called `passwd`) logs in on an EMPTY password line only, since there is
     // nothing to check, so the trivial response is what is accepted, not
     // "any string works." This is also what makes first boot possible at
     // all -- `passwd` itself is a shell command, unreachable before login.

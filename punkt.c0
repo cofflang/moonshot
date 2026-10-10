@@ -6,7 +6,7 @@
 // moonshot is free software, distributed under the GNU General Public
 // License version 3 or (at your option) any later version, WITHOUT ANY
 // WARRANTY; see the LICENSE file for the full text.
-// punkt.c0 -- the pixel-framebuffer subsystem: detecting and mapping the
+// punkt.c0 -- the pixel-framebuffer subsystem, detecting and mapping the
 // real VBE linear framebuffer GRUB grants (or does not), and a custom 8x8
 // bitmap font renderer drawn directly onto it. This is Moonshot's real
 // step toward a graphical interface, not just serial logs -- text mode
@@ -104,12 +104,11 @@ void fb_probe(int mb_info) {
     if (fb_type == 1 && fb_bpp == 32) {
         fb_available = 1;
         // The channel positions GRUB reports here are unreliable under
-        // QEMU: it hands back red=0/green=16/blue=8, but the framebuffer
+        // QEMU. It hands back red=0/green=16/blue=8, but the framebuffer
         // actually behaves as standard XRGB8888 (red bits 16-23, green
         // 8-15, blue 0-7 -- i.e. byte0=blue, byte1=green, byte2=red). This
-        // went unnoticed until the first NON-gray color was drawn (the
-        // panic screen): every earlier fb_rgb use was gray (r==g==b), which
-        // is identical under any channel permutation. Since fb_available is
+        // only shows on a NON-gray color, since a gray (r==g==b) is
+        // identical under any channel permutation. Since fb_available is
         // only ever true for exactly this one format (type 1, 32bpp), we
         // pin the known-correct positions rather than trust the bogus
         // reported ones -- fb_rgb then packs real colors correctly. The
@@ -176,7 +175,7 @@ void fb_map() {
 
 // Writes one pixel -- store32_le already exists (built for IDT entries)
 // and is exactly the right shape for a 32bpp write, no new primitive
-// needed. No bounds check: every caller in this file goes through
+// needed. No bounds check, since every caller in this file goes through
 // fb_draw_char/fb_putc, which already clamp via cell wrapping/scrolling.
 void fb_put_pixel(int x, int y, int color) {
     store32_le(fb_addr + y * fb_pitch + x * 4, color);
@@ -186,7 +185,7 @@ void fb_put_pixel(int x, int y, int color) {
 // Reads one pixel back. The framebuffer is readable memory, so this is just
 // the mirror of fb_put_pixel -- built for klick, which has to save whatever
 // is under the mouse pointer so it can put it back when the pointer moves.
-// Same no-bounds-check contract as fb_put_pixel: klick clamps first.
+// Same no-bounds-check contract as fb_put_pixel, since klick clamps first.
 int fb_get_pixel(int x, int y) {
     return load8(fb_addr + y * fb_pitch + x * 4)
         + load8(fb_addr + y * fb_pitch + x * 4 + 1) * 256
@@ -202,7 +201,7 @@ int fb_get_pixel(int x, int y) {
 // write like fb_scroll's, since the panic/UI paths that use this are not
 // megabyte-scale and clarity wins here.
 void fb_fill_rect(int x, int y, int w, int h, int color) {
-    // Lift klick's pointer out of the way first: it caches the pixels it
+    // Lift klick's pointer out of the way first, since it caches the pixels it
     // covers, and painting over them without lifting either erases the
     // pointer or leaves it restoring stale pixels later. No-op until klick
     // is up, and re-entrant (see klick_lift's depth counter).
@@ -230,7 +229,7 @@ void fb_fill_rect(int x, int y, int w, int h, int color) {
 
 // 1px horizontal / vertical line -- thin wrappers over fb_fill_rect (a line
 // is just a 1-tall / 1-wide fill), so they inherit its bounds clamping. A
-// general diagonal line (Bresenham) is deliberately NOT here yet: nothing
+// general diagonal line (Bresenham) is deliberately NOT here yet, since nothing
 // needs a non-rectilinear line, and this codebase builds primitives when a
 // real feature calls for them, not ahead of time -- add it alongside the
 // first feature that draws a slope.
@@ -243,7 +242,7 @@ void fb_draw_vline(int x, int y, int h, int color) {
     return;
 }
 
-// 1px outline of the rectangle [x, x+w) x [y, y+h): four edges via the
+// 1px outline of the rectangle [x, x+w) x [y, y+h), four edges via the
 // hline/vline primitives above. w/h are the full size, so the right/bottom
 // edges sit at x+w-1 / y+h-1 and a w x h outline exactly bounds a w x h
 // fb_fill_rect of the same x/y/w/h -- the two compose cleanly for a
@@ -260,7 +259,7 @@ void fb_draw_rect(int x, int y, int w, int h, int color) {
 // 32-bit value (row 0 in the highest byte .. row 3 in the lowest, each
 // row's bit 7 the leftmost pixel) -- font_lo below is the bottom half
 // (rows 4-7). Split into two 32-bit halves rather than one packed 64-bit
-// value deliberately, not for style: c0 ints are signed 64-bit with no
+// value deliberately, not for style, since c0 ints are signed 64-bit with no
 // unsigned type, and a glyph whose row 0 has its leftmost pixel lit (most
 // letters) sets bit 63 of the naive single-value packing, making it
 // NEGATIVE -- and `/` is signed truncating division, not a logical shift,
@@ -268,13 +267,10 @@ void fb_draw_rect(int x, int y, int w, int h, int color) {
 // for exactly those glyphs. A 32-bit value is always representable as a
 // positive 64-bit `long` (max 0xFFFFFFFF is nowhere near the 64-bit sign
 // bit), so splitting into two halves sidesteps the problem entirely rather
-// than working around it with sign-bit special-casing. Found by a real,
-// visible bug: `fg_count` (see knekt.c0's kernel_post_init) came back as
-// 63 out of a possible 64 instead of 'M's actual 18 lit pixels -- the
-// corrupted division was effectively drawing foreground almost everywhere.
+// than working around it with sign-bit special-casing.
 //
 // Designed and visually rendered as an image (every glyph eyeballed for
-// correctness before any of it touched this file, given how easy it'd be
+// correctness before any of it touched this file, given how easy it would be
 // to silently transcribe a wrong bitmap and never notice) rather than
 // hand-derived from memory of some existing font. Covers uppercase A-Z,
 // lowercase a-z, digits, and common punctuation -- large/legible/simple
@@ -501,7 +497,7 @@ int font_lo(int ch) {
 // overwrites whatever was there before -- needed for both scrolling and
 // simply typing over old content.
 void fb_draw_char(int x, int y, int ch, int fg, int bg) {
-    // Same reason as fb_fill_rect: lift klick's pointer before painting a
+    // Same reason as fb_fill_rect, lift klick's pointer before painting a
     // glyph over the region it is caching.
     klick_lift();
     int hi = font_hi(ch);
@@ -509,12 +505,12 @@ void fb_draw_char(int x, int y, int ch, int fg, int bg) {
     int row = 7;
     while (row >= 0) {
         if (row == 3) { v = hi; }
-        int rowbyte = v - (v / 256) * 256;
+        int rowbyte = v % 256;
         v = v / 256;
         int b = rowbyte;
         int col = 7;
         while (col >= 0) {
-            int bit = b - (b / 2) * 2;
+            int bit = b % 2;
             b = b / 2;
             int color = bg;
             if (bit == 1) { color = fg; }
@@ -550,7 +546,7 @@ void fb_clear(int bg) {
 
 // Draws (or, called with color == the current background, erases) a 2px
 // underline at the bottom of one character cell -- the pixel-graphics
-// cursor glyph. An underline rather than a solid block: matches VGA text
+// cursor glyph. An underline rather than a solid block, matching VGA text
 // mode's own default hardware cursor shape (a few scanlines at the bottom
 // of the cell, see vga_move_cursor), and does not visually clash with the
 // character about to be drawn into that cell next.
@@ -569,7 +565,7 @@ void fb_draw_cursor(int row, int col, int color) {
 // Moves every pixel row up by FONT_H (8) real pixel rows and blanks the
 // new bottom FONT_H rows -- called when fb_putc runs off the bottom of the
 // screen. Copies 8 bytes at a time (load64/store64), not 1 (unlike
-// vga_scroll's load8/store8): fb_pitch is a clean multiple of 8 here
+// vga_scroll's load8/store8), since fb_pitch is a clean multiple of 8 here
 // (4096), and the sheer size of a real pixel-mode scroll (megabytes, not
 // vga_scroll's few hundred bytes) makes the 8x fewer iterations a real
 // difference, not just tidiness.
@@ -603,7 +599,7 @@ void fb_scroll(int bg) {
 // counterpart to vga_putc, in character CELLS (FONT_W x FONT_H pixels
 // each) the same way vga_row/vga_col were in VGA text-mode cells. Also
 // erases the cursor glyph at its old position and redraws it at the new
-// one, bracketing everything else: the cursor only ever sits on a
+// one, bracketing everything else, since the cursor only ever sits on a
 // not-yet-written cell, so erasing it first (with `bg`) never destroys
 // real character content, no matter whether this call ends up wrapping,
 // newlining, or scrolling.
@@ -660,20 +656,20 @@ void fb_print(int msg, int fg, int bg) {
     return;
 }
 
-// Framebuffer counterpart to serial_print_int: identical digit-extraction
-// idiom and shared kscratch buffer, but emits through fb_putc so
+// Framebuffer counterpart to serial_print_int, with identical digit-extraction
+// idiom with its own punkt_scratch buffer, but emits through fb_putc so
 // numbers can appear in pixel-mode UI (the panic screen's vector/errcode/
 // cr2). It only ever runs sequentially with serial_print_int (never
 // interleaved), so sharing the one scratch buffer is safe.
 void fb_print_int(int v, int fg, int bg) {
-    int tmp = kscratch_start;
+    int tmp = punkt_scratch;
     int neg = 0;
     int i = 31;
     if (v == 0) { fb_putc('0', fg, bg); return; }
     if (v < 0) { neg = 1; v = 0 - v; }
     while (v > 0) {
         i = i - 1;
-        store8(tmp + i, '0' + (v - (v / 10) * 10));
+        store8(tmp + i, '0' + (v % 10));
         v = v / 10;
     }
     if (neg == 1) { i = i - 1; store8(tmp + i, '-'); }
@@ -687,13 +683,13 @@ void fb_print_int(int v, int fg, int bg) {
 // Same shape as fb_print_int but base 16 -- for printing the faulting RIP
 // (and any future hex value) to the pixel framebuffer. No 0x prefix.
 void fb_print_hex(int v, int fg, int bg) {
-    int tmp = kscratch_start;
+    int tmp = punkt_scratch;
     int i = 31;
     int d = 0;
     if (v == 0) { fb_putc('0', fg, bg); return; }
     while (v > 0) {
         i = i - 1;
-        d = v - (v / 16) * 16;
+        d = v % 16;
         if (d < 10) {
             store8(tmp + i, '0' + d);
         } else {

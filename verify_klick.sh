@@ -14,12 +14,12 @@
 #
 # Movement is injected through QEMU's monitor (`mouse_move dx dy`,
 # `mouse_button state`), which drives the emulated i8042's aux port exactly
-# like a physical mouse would, so this exercises the whole path: IRQ12 on the
+# like a physical mouse would, so this exercises the whole path, IRQ12 on the
 # slave PIC, the aux-vs-keyboard status bit, three-byte packet assembly, sign
 # extension, and the pointer's save/restore rendering.
 #
-# Checks:
-#   1. klick comes up: the mouse acknowledges both commands (0xFA = 250).
+# Checks
+#   1. klick comes up, the mouse acknowledges both commands (0xFA = 250).
 #   2. Packets actually arrive -- the counter moves. This is the check that
 #      separates a working IRQ from a pointer that merely sits there, which
 #      look identical on screen.
@@ -27,7 +27,7 @@
 #      including the y inversion (the mouse's y points up, the screen's down).
 #   4. Buttons register.
 #   5. The pointer is really drawn, and -- the part worth checking in pixels
-#      rather than state -- it leaves no trail behind: the pixels it used to
+#      rather than state -- it leaves no trail behind, so the pixels it
 #      cover are restored, not painted over with a background colour.
 
 set -u
@@ -100,7 +100,7 @@ time.sleep(1.0)
 word("mouse"); typ(["ret"]); time.sleep(0.8)
 shot("klick_moved.ppm")
 
-# Buttons: press left, report, release.
+# Buttons. Press left, report, release.
 send("mouse_button 1", settle=0.3)
 time.sleep(0.4)
 word("mouse"); typ(["ret"]); time.sleep(0.8)
@@ -220,7 +220,7 @@ if moved and back:
         print("FAIL: moving back up-left did not decrease both coordinates")
         ok = False
 
-# No trail: exactly one pointer should exist on screen at a time. A
+# No trail, so exactly one pointer should exist on screen at a time. A
 # save/restore bug shows up as pointer-coloured pixels left along the path.
 # The pointer is KLICK_SIZE(6) wide with its last row and column drawn in the
 # edge colour, so the fill colour covers 5x5 = 25 pixels.

@@ -11,15 +11,15 @@
 //
 // The first Gnista demo (gnista.c0) redraws only the small bounding box each
 // entity moved through, which works because its view never moves. This file
-// is the other model: a camera, a world larger than the screen, and a whole
+// is the other model, a camera, a world larger than the screen, and a whole
 // frame composited each tick and handed over in one call. A scrolling game
 // needs it -- when the view moves, every pixel changes, so incremental
 // redraw saves nothing.
 //
-// Measured on real Moonshot before any of this was written (see
-// fps_probe.c0): a full tavla-sized frame costs ~22ms with the two fast
+// Measured on real Moonshot (see
+// fps_probe.c0), a full tavla-sized frame costs ~22ms with the two fast
 // paths below and ~81ms without them. Both matter, and neither is worth
-// anything without the other:
+// anything without the other.
 //
 //   * SPANS ARE WRITTEN TWO PIXELS AT A TIME. One store64 per pixel pair
 //     instead of four store8 per pixel. c0 has no optimizer, so per-pixel
@@ -64,11 +64,13 @@ layout View {
 // its record -- which is exactly what `layout` field access wants -- and the
 // pool is one alloc and a multiply.
 //
-// Unlike the first demo's pool, slots are RECYCLED: `alive` marks a slot free
+// Unlike the first demo's pool, slots are RECYCLED. `alive` marks a slot free
 // and pool_spawn hands the first free one back. Infecteria needs it, because
 // factories emit mini-bacteria continuously and each one dies on contact. The
-// ring-3 heap is bump-only with no free at all, so without slot reuse a
-// long game would exhaust it no matter how large it is.
+// ring-3 heap had no free at all when this was written, so without slot reuse
+// a long game would exhaust it no matter how large it was. Moonshot's lager
+// can take memory back now, but a slot reused in place still costs nothing,
+// where an alloc and a dealloc per bacterium would cost two syscalls.
 
 int pool_alloc(int cap) {
     return alloc(cap * sizeof(Entity));
@@ -159,9 +161,9 @@ int dist2(int a, int b) {
 // to look. win_info() reports the CURRENT size on every call, so looking is
 // one syscall per frame -- nothing next to a full-frame present().
 //
-// What a program cannot do is grow its buffer. alloc() is bump-only with no
-// free, so a view that reallocated on every resize would exhaust the heap
-// after a couple of them. That is what win_max() is for: allocate once for the
+// What a program cannot do is grow its buffer in place. There is no realloc,
+// and a full-size frame freed and allocated again on every resize would be a
+// lot of copying for nothing. That is what win_max() is for. Allocate once for the
 // largest window this machine can ever give out, then treat vw/vh as a
 // sub-rectangle of that allocation. Every renderer in this file already reads
 // vw/vh for its clipping and strides, so moving those two numbers is the whole
@@ -190,9 +192,9 @@ int view_poll_resize(int v) {
 }
 
 // Fills the WHOLE frame with one colour, two pixels per store64. This is the
-// single most important loop in the renderer: it touches every pixel every
+// single most important loop in the renderer, since it touches every pixel every
 // frame, and doing it per-pixel measured 3.6x slower overall.
-// Safe to write in 8-byte pairs without a remainder check: kakel geometry is
+// Safe to write in 8-byte pairs without a remainder check, since kakel geometry is
 // cell-aligned, so vw and vh are both multiples of FONT_W/FONT_H (8) and the
 // pixel count is always even.
 void view_clear(int v, int color) {
@@ -220,7 +222,7 @@ void view_span(int v, int x, int y, int len, int color) {
     int n = x1 - x0;
     int i = 0;
     int pair = color * 4294967296 + color;
-    // No alignment dance: x86 permits unaligned 64-bit stores, so pairing can
+    // No alignment dance, since x86 permits unaligned 64-bit stores, so pairing can
     // start anywhere. Only the odd LAST pixel needs the slow path.
     while (i + 1 < n) {
         store64(base + i * 4, pair);
@@ -236,7 +238,7 @@ void view_span(int v, int x, int y, int len, int color) {
 // One pixel, unpacked into the four bytes the framebuffer expects. c0 has no
 // 32-bit store, and store64 would clobber the neighbour.
 void store32_le_px(int addr, int color) {
-    store8(addr, color - (color / 256) * 256);
+    store8(addr, color % 256);
     store8(addr + 1, (color / 256) - (color / 65536) * 256);
     store8(addr + 2, (color / 65536) - (color / 16777216) * 256);
     store8(addr + 3, 0);
@@ -263,7 +265,7 @@ void view_rect(int v, int wx, int wy, int w, int h, int color) {
 }
 
 // Filled circle in WORLD coordinates. Per-pixel, but only across the
-// circle's own bounding box, which is the rule: per-pixel work belongs where
+// circle's own bounding box, which is the rule. Per-pixel work belongs where
 // the shape is, never across the background.
 //
 // No square root anywhere -- a pixel is inside when dx*dx + dy*dy <= r*r.
@@ -292,11 +294,11 @@ void view_circle(int v, int wx, int wy, int d, int color) {
     return;
 }
 
-// Half-transparent filled circle: each covered pixel becomes the average of
+// Half-transparent filled circle. Each covered pixel becomes the average of
 // what is already there and `color`. This is how Infecteria's cells let you
 // see yourself underneath them.
 //
-// Done here in the game's own frame buffer rather than in the kernel: SYS_BLIT
+// Done here in the game's own frame buffer rather than in the kernel, since SYS_BLIT
 // only knows fully transparent (colour 0) and fully opaque, and teaching it
 // blending would put per-pixel arithmetic back in the syscall that
 // SYS_PRESENT exists to avoid. Blending a handful of small circles costs far
@@ -306,7 +308,7 @@ void view_circle_blend(int v, int wx, int wy, int d, int color) {
     int cx = wx - v.cam_x + r;
     int cy = wy - v.cam_y + r;
     int rr = r * r;
-    int sb = color - (color / 256) * 256;
+    int sb = color % 256;
     int sg = (color / 256) - (color / 65536) * 256;
     int sr = (color / 65536) - (color / 16777216) * 256;
     int dy = 0 - r;
@@ -380,6 +382,27 @@ int sprite_frame(int s, int phase) {
     return phase - (phase / s.sp_frames) * s.sp_frames;
 }
 
+// One frame of an animation clip at time `t` (ticks). A sprite file can hold
+// several clips one after another, an idle loop in frames 0-1 and a run in
+// frames 2-5 say, and a clip is named by its first frame and its length. It
+// advances one frame every `rate` ticks.
+//
+// Every entity passes its own `t`, usually the clock plus something of its
+// own (its pool slot times a few ticks), so that a crowd of the same thing
+// does not move in lockstep. sprite_frame above is the simpler single clock, and
+// stays for games that want exactly that.
+//
+// A sprite that does not have the clip's frames, say a one-frame sprite
+// someone drew in pensel to replace a four-frame default, shows what it has.
+// the clip is cut to the frames that exist, and frame 0 when none do.
+int anim_frame(int s, int first, int count, int rate, int t) {
+    if (first >= s.sp_frames) { return 0; }
+    if (first + count > s.sp_frames) { count = s.sp_frames - first; }
+    if (count <= 1 || rate <= 0) { return first; }
+    if (t < 0) { t = 0; }
+    return first + (t / rate) % count;
+}
+
 // --- sprites --------------------------------------------------------------
 //
 // A sprite here is just w*h*4 bytes of BGR0, the same shape SYS_BLIT and
@@ -387,7 +410,7 @@ int sprite_frame(int s, int phase) {
 // after another in the same allocation, so frame f starts at f * w * h * 4.
 //
 // These two draw into the game's own frame buffer rather than calling
-// SYS_BLIT, for the reason the whole View exists: a scrolling game composites
+// SYS_BLIT, for the reason the whole View exists. A scrolling game composites
 // one frame and presents it with a single syscall, and a blit straight to the
 // framebuffer would both tear and ignore the camera.
 
@@ -425,7 +448,7 @@ void view_sprite(int v, int wx, int wy, int w, int h, int pixels, int frame) {
     return;
 }
 
-// The same, half-transparent: every covered pixel becomes the average of what
+// The same, half-transparent. Every covered pixel becomes the average of what
 // is already there and the sprite's own colour. This is the sprite equivalent
 // of view_circle_blend, and it is what lets Infecteria's cells show the
 // player underneath them once a cell is a drawn membrane rather than a disc.
@@ -463,7 +486,7 @@ void view_sprite_blend(int v, int wx, int wy, int w, int h, int pixels, int fram
     return;
 }
 
-// Tints a sprite as it draws: every non-transparent pixel keeps its own
+// Tints a sprite as it draws. Every non-transparent pixel keeps its own
 // brightness but takes the given hue, by scaling each channel of `color` by
 // the sprite pixel's green channel. Infecteria uses it so one drawn cell
 // serves as the clean cell, the infected cell and the factory, instead of
@@ -478,7 +501,7 @@ void view_sprite_tint(int v, int wx, int wy, int w, int h, int pixels,
     // size of the view.
     if (sx >= v.vw || sy >= v.vh || sx + w <= 0 || sy + h <= 0) { return; }
     int src = pixels + frame * w * h * 4;
-    int tb = color - (color / 256) * 256;
+    int tb = color % 256;
     int tg = (color / 256) - (color / 65536) * 256;
     int tr = (color / 65536) - (color / 16777216) * 256;
     int row = 0;
@@ -491,7 +514,7 @@ void view_sprite_tint(int v, int wx, int wy, int w, int h, int pixels,
                 if (x >= 0 && x < v.vw) {
                     int s = src + (row * w + col) * 4;
                     if (load_px(s) != 0) {
-                        // The green channel is the sprite's shading: the art
+                        // The green channel is the sprite's shading, since the art
                         // is drawn in greys where it is meant to be tinted,
                         // so this reads as "how lit is this pixel".
                         int lum = load8(s + 1);
@@ -518,7 +541,7 @@ void view_sprite_tint(int v, int wx, int wy, int w, int h, int pixels,
     return;
 }
 
-// A progress bar above a world rectangle: dark trough, bright fill, 0..100.
+// A progress bar above a world rectangle, a dark trough, bright fill, 0..100.
 void view_bar(int v, int wx, int wy, int w, int pct, int color) {
     int h = 4;
     view_rect(v, wx, wy - h - 2, w, h, 0x202020);
@@ -557,8 +580,118 @@ int rng_next(int state_addr) {
 int rng_range(int state_addr, int lo, int hi) {
     int span = hi - lo;
     if (span <= 0) { return lo; }
-    // One draw, held in a local: calling rng_next twice would advance the
+    // One draw, held in a local, since calling rng_next twice would advance the
     // state between the two uses and give a value outside [lo, hi).
     int r = rng_next(state_addr);
-    return lo + r - (r / span) * span;
+    return lo + r % span;
+}
+
+// --- text -----------------------------------------------------------------
+//
+// The kernel's own font, asked for once with glyph() and cached, so a game's
+// text and the shell's are one face. Drawn in SCREEN coordinates, not world
+// ones. Text is a title, a score, a message, never something in the world
+// the camera moves past.
+
+int gn_font = 0;
+int gn_cw = 0;
+int gn_ch = 0;
+
+// Returns 1 when the font is ready. Every text call below does nothing until
+// it is, so a game that never draws text never pays for the font.
+int text_init() {
+    if (gn_font != 0) { return 1; }
+    int d = glyph('M', 0);
+    if (d <= 0) { return 0; }
+    gn_cw = d / 65536;
+    gn_ch = d % 65536;
+    if (gn_cw <= 0 || gn_cw > 8 || gn_ch <= 0 || gn_ch > 32) { return 0; }
+    int f = alloc(128 * gn_ch);
+    if (f == 0) { return 0; }
+    int c = 0;
+    while (c < 128) {
+        if (glyph(c, f + c * gn_ch) != d) { return 0; }
+        c = c + 1;
+    }
+    gn_font = f;
+    return 1;
+}
+
+// How wide `s` is at `scale`, in pixels, which is what centring needs.
+int text_width(int s, int scale) {
+    int n = 0;
+    while (load8(s + n) != 0) { n = n + 1; }
+    return n * gn_cw * scale;
+}
+
+// Draws `s` with its top-left at screen (x, y), each font pixel a
+// scale-by-scale square. Lit pixels only, so text sits on whatever is there.
+void view_text(int v, int x, int y, int s, int color, int scale) {
+    if (gn_font == 0) { return; }
+    int i = 0;
+    while (load8(s + i) != 0) {
+        int ch = load8(s + i);
+        int row = 0;
+        while (row < gn_ch) {
+            int b = load8(gn_font + ch * gn_ch + row);
+            int col = 0;
+            int bit = 128;
+            while (col < gn_cw) {
+                if ((b / bit) % 2 == 1) {
+                    // view_rect is in world coordinates; adding the camera
+                    // back makes this screen-fixed.
+                    view_rect(v, v.cam_x + x + col * scale, v.cam_y + y + row * scale,
+                              scale, scale, color);
+                }
+                bit = bit / 2;
+                col = col + 1;
+            }
+            row = row + 1;
+        }
+        x = x + gn_cw * scale;
+        i = i + 1;
+    }
+    return;
+}
+
+// Draws `s` centred across the view at height y.
+void view_text_centred(int v, int y, int s, int color, int scale) {
+    view_text(v, (v.vw - text_width(s, scale)) / 2, y, s, color, scale);
+    return;
+}
+
+// --- scenes ---------------------------------------------------------------
+//
+// A game is more than its playing field. It has a title to start from, the field,
+// a screen for when it is over, and back again. A scene is one of those, and
+// here it is a plain function that takes the game's own state (whatever the
+// game keeps in one block of memory), runs its own loop for as long as it is
+// on screen, and returns the scene to run next, or 0 to end the game.
+//
+// That is the whole contract, and it is deliberately not a framework with
+// enter/update/draw hooks, since each scene keeps its loop and its locals where
+// they are readable, and moving between scenes is a return value.
+void scene_run(int first, int game) {
+    int scene = first;
+    while (scene != 0) {
+        scene = scene(game);
+    }
+    return;
+}
+
+// Reads the waiting key events and returns 1 if one was a press of key `a`
+// (by make code), 2 if one was a press of `b`, and 0 otherwise. Releases are
+// skipped. For scenes that wait on a key, such as a title screen's "space to
+// start"; a game in play tracks held keys itself.
+int key_pressed(int a, int b) {
+    int key = key_poll();
+    while (key >= 0) {
+        int make = key / 2;
+        if (key % 2 == 0) {
+            if (make == a) { return 1; }
+            if (make == b) { return 2; }
+        }
+        key = key_poll();
+    }
+    return 0;
 }

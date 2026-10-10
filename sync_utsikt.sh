@@ -13,13 +13,13 @@
 #
 # utsikt, the browser, is developed in its own repository and carried here
 # as a git subtree, squashed, so that a moonshot clone builds on its own and
-# every byte of the browser the kernel bakes in has its source in this
+# every byte of the browser the kernel embeds has its source in this
 # tree. The subtree merge commits record which utsikt commit each copy came
-# from, which is the provenance a byte array needs.
+# from, which is the provenance an embedded program needs.
 #
 #   ./sync_utsikt.sh [ref]          pull utsikt's ref (default main) into
-#                                   programs/utsikt/, then rebuild the seed
-#                                   and the kernel from it
+#                                   programs/utsikt/, then rebuild the
+#                                   kernel from it
 #   ./sync_utsikt.sh --check [ref]  say whether programs/utsikt/ matches
 #                                   utsikt's ref, and change nothing
 #   ./sync_utsikt.sh --send branch  push the changes made to programs/utsikt/
@@ -83,13 +83,10 @@ case "${1:-}" in
     fi
     git subtree pull --prefix="$prefix" "$UTSIKT_REPO" "$ref" --squash \
       -m "Update utsikt to $ref"
-    # A new utsikt means a new seed, a new seed means a kernel of a new
-    # size, and a kernel of a new size has stale JIT helper addresses until
-    # sync_addrs.sh patches them.
-    ./gen_programs.sh
-    ./sync_addrs.sh
+    # build.sh compiles utsikt from the subtree into build/ and embeds it.
+    ./build.sh
     echo
-    echo "sync_utsikt.sh: utsikt $ref is in $prefix and baked into the kernel."
-    echo "Run the verify_utsikt*.sh tests, then commit utsikt_data.c0 and kmain.c0."
+    echo "sync_utsikt.sh: utsikt $ref is in $prefix and built into the kernel."
+    echo "Run the verify_utsikt*.sh tests."
     ;;
 esac

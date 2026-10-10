@@ -13,7 +13,7 @@
 # renders is a LAYOUT rather than a picture.
 #
 # The difficulty with checking a renderer is that almost any bug still puts
-# pixels on the screen. So every check below is one a broken engine fails:
+# pixels on the screen. So every check below is one a broken engine fails.
 #
 #   1. The page background covers the window. If the CSS never reached the
 #      body element, this is whatever was in the buffer.
@@ -28,7 +28,7 @@
 #      change the picture. A renderer that repainted without re-flowing, or
 #      that scrolled by blitting, fails this differently from one that does
 #      not scroll at all.
-#   5. Home puts it back exactly. Scrolling must not be destructive: the
+#   5. Home puts it back exactly. Scrolling must not be destructive, so the
 #      screen after a scroll down and back has to be the screen before it,
 #      pixel for pixel. This is the check that catches layout state leaking
 #      between frames -- a pen position not reset, a line height carried
@@ -88,7 +88,7 @@ word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
 word("spawn3 utsikt.elf"); typ(["ret"]); time.sleep(4.0)
 # spawn3 leaves focus on the shell, so the scroll keys would go there.
-# Focus FIRST and only then take the reference shot: alt+tab retints both
+# Focus FIRST and only then take the reference shot, since alt+tab retints both
 # windows' title strips, and check 5 compares whole frames.
 typ(["alt-tab"]); time.sleep(1.5)
 shot("utsikt_top.ppm")
@@ -192,7 +192,7 @@ else:
         ok = False
     # Contiguous, every row of it. A filled box with gaps in it is not a
     # cosmetic problem, it is the engine writing somewhere other than where
-    # the kernel reads: the composite buffer is allocated for the biggest
+    # the kernel reads. The composite buffer is allocated for the biggest
     # window the machine can give out but present() packs its rows at the
     # CURRENT window's width, and striding by the wrong one showed every
     # second row of the page with untouched buffer in between. The box was

@@ -8,15 +8,15 @@
 # moonshot is free software, distributed under the GNU General Public
 # License version 3 or (at your option) any later version, WITHOUT ANY
 # WARRANTY; see the LICENSE file for the full text.
-# Shell process-model lifecycle test: drives skalman's `spawn` and `kill`
+# Shell process-model lifecycle test. It drives skalman's `spawn` and `kill`
 # builtins via QEMU `sendkey` and proves BOTH reach chrone at runtime, using the
-# scheduler's own serial log as the witness:
+# scheduler's own serial log as the witness.
 #
 #   spawn -> a new task id (the first FREE slot, which is 3 after slot reuse
 #            recycles the boot exiter's slot) appears in [sched] output. The
 #            spawned id is detected dynamically from the serial log so this
 #            test stays valid regardless of future slot-numbering changes.
-#   kill N -> task N STOPS appearing: after its last [sched] line, many more
+#   kill N -> task N STOPS appearing, so after its last [sched] line, many more
 #            switches happen (to other tasks) with N never again -- proof `kill`
 #            marked it EXITED and sched_pick_next now skips it.
 #
@@ -77,8 +77,8 @@ time.sleep(1.0)
 typ(["s", "p", "a", "w", "n", "ret"])
 time.sleep(1.5)
 
-# Detect which task id was spawned by reading the serial log: boot spawns
-# tasks 0-4 (workers + shell task), so our shell-initiated spawn is the 6th
+# Detect which task id was spawned by reading the serial log. Boot spawns
+# tasks 0-4 (workers + shell task), so the shell-initiated spawn is the 6th
 # "[sched] spawned task" entry. The last such line in the log is ours.
 with open("serial.log") as f:
     content = f.read()
@@ -105,12 +105,12 @@ ok=1
 # Falls back to 4 if the file is not there (should not happen in normal runs).
 shell_id=$(cat shell_spawn_id.txt 2>/dev/null || echo 4)
 
-# spawn: the shell-initiated task must have appeared in the scheduler log.
+# spawn. The shell-initiated task must have appeared in the scheduler log.
 if ! grep -qE "^\[sched\] -> task ${shell_id} \(counter=[0-9]+\)$" serial.log; then
   ok=0
 fi
 
-# reclaim/reuse: the boot exiter (task 3) is reaped BEFORE the shell spawn,
+# reclaim/reuse. The boot exiter (task 3) is reaped BEFORE the shell spawn,
 # freeing its page. Because pmm's free list is LIFO and nothing else frees a
 # page in between, the shell's spawn must get that exact page back. With slot
 # reuse enabled, the shell's spawn lands in slot 3 (the just-freed slot) and
@@ -120,10 +120,10 @@ reap3_stack=$(grep -oE "^\[sched\] reaped task 3 stack=[0-9]+$" serial.log | hea
 spawn_shell_stack=$(grep -oE "^\[sched\] spawned task ${shell_id} stack=[0-9]+$" serial.log | tail -1 | grep -oE "[0-9]+$")
 if [ -z "$reap3_stack" ] || [ "$reap3_stack" != "$spawn_shell_stack" ]; then ok=0; fi
 
-# kill also feeds the reaper: after `kill N`, task N must itself be reaped.
+# kill also feeds the reaper. After `kill N`, task N must itself be reaped.
 if ! grep -qE "^\[sched\] reaped task ${shell_id} stack=[0-9]+$" serial.log; then ok=0; fi
 
-# kill: after the spawned task's LAST scheduler appearance, there must be many
+# kill. After the spawned task's LAST scheduler appearance, there must be many
 # more switches (to other tasks) and none of them the spawned task -- proof
 # `kill` marked it EXITED and sched_pick_next now skips it.
 last_tS=$(grep -nE "^\[sched\] -> task ${shell_id} \(counter=[0-9]+\)$" serial.log | tail -1 | cut -d: -f1)

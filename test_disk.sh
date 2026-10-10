@@ -14,7 +14,7 @@
 # shuts down. Phase 2 reboots against the SAME disk.img and verifies
 # the file is still there and its content survived.
 #
-# Two independent passes: if the first-boot sync did not actually write
+# Two independent passes. If the first-boot sync did not actually write
 # anything, phase 2 has nothing to load and the test fails.
 set -u
 cd "$(dirname "$0")"
@@ -26,7 +26,7 @@ trap cleanup EXIT
 
 ./build.sh || exit 1
 
-# ------ Phase 1: write boot ------
+# ------ Phase 1, write boot ------
 rm -f disk.img serial.log
 dd if=/dev/zero of=disk.img bs=512 count=20480 2>/dev/null
 
@@ -48,7 +48,7 @@ QEMU_PID=$!
 sleep 2
 
 # Wait for the shell prompt to appear (boot sequence is fast).
-# Run commands: make test.txt, write test.txt HelloDisk, sync
+# Run commands make test.txt, write test.txt HelloDisk, sync
 sendkey() {
   python3 -c "
 import socket, sys, time
@@ -107,7 +107,7 @@ time.sleep(1)
 " 2>/dev/null
 wait $QEMU_PID 2>/dev/null || true
 
-# Verify phase 1: sync logged
+# Verify phase 1, sync logged
 if ! grep -qE '^\[jakel\] synced ' serial.log; then
   echo "FAIL (phase 1): [jakel] synced not found in serial output"
   echo "--- serial.log ---"
@@ -115,7 +115,7 @@ if ! grep -qE '^\[jakel\] synced ' serial.log; then
   exit 1
 fi
 
-# ------ Phase 2: read boot ------
+# ------ Phase 2, read boot ------
 # Use the SAME disk.img (still has the synced data).
 rm -f serial.log
 
@@ -134,7 +134,7 @@ sleep 1
 sendkey "\n"
 sleep 1
 
-# Send: echo --file test.txt
+# Send echo --file test.txt
 sendkey "echo --file test.txt"
 sendkey "\n"
 sleep 1
@@ -149,7 +149,7 @@ time.sleep(1)
 " 2>/dev/null
 wait $QEMU_PID 2>/dev/null || true
 
-# Verify phase 2: loaded from disk AND file content survived
+# Verify phase 2, loaded from disk AND file content survived
 if ! grep -qE '^\[jakel\] loaded ' serial.log; then
   echo "FAIL (phase 2): [jakel] loaded not found -- sync didn't persist"
   echo "--- serial.log ---"

@@ -1,0 +1,311 @@
+// lager.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// lager, memory for ring-3 programs that can be given back.
+//
+// A bump pointer over each process's 8MB heap region, with no way to
+// return anything, is enough for a game that allocates its world once,
+// and not enough for utsikt, which builds a whole document on every
+// reload and has to let the old one go.
+//
+// SYS_ALLOC goes through lager_alloc and SYS_DEALLOC (13) through
+// lager_free. The heap region, its demand-mapped pages and the bump frontier
+// (task_heap_next_base) work as a bump allocator would, plus a table of
+// blocks per task, kept in KERNEL memory.
+//
+//   [addr, size, free] per block, sorted by address, covering every byte
+//   from the start of the heap up to the frontier with no gaps.
+//
+// The table lives in the kernel on purpose. jenna's kmalloc keeps each
+// block's header right in front of its payload, which is fine for memory
+// only the kernel can write. Here the payload belongs to a ring-3 program,
+// and a header next to it would be a header the program could rewrite --
+// after which the kernel's own merge step would write wherever the forged
+// sizes told it to. With the table out of reach, the worst a program can do
+// to lager is pass dealloc a bad pointer, and that is refused and logged.
+//
+// Allocation is first fit over the table. A free block that is larger than
+// the request is split. Failing that, a free block at the very end of the
+// heap is grown in place, and failing that the request is bumped onto the
+// frontier the way SYS_ALLOC always worked. Freeing merges the block with
+// free neighbours on both sides, so space comes back in pieces as large as
+// what was given back.
+//
+// Memory comes back zeroed, reused or not. Programs were written against an
+// alloc() whose memory was always fresh zeroed pages, and some depend on it
+// (a new node whose child and sibling fields are 0), so reuse zeroes the
+// block rather than changing what alloc() promises.
+
+layout LagerBlock {
+    int lb_addr;
+    int lb_size;
+    int lb_free;
+}
+
+int LAGER_FIRST_CAP = 64;
+// 16384 blocks is 384KB of table, a third of the kernel heap. A program
+// that needs more than that many live blocks at once is told no (alloc
+// returns 0) and the serial log says why, rather than lager quietly eating
+// the memory the filesystem and the ELF loader also live in.
+int LAGER_MAX_CAP = 16384;
+
+int task_lager_tab_base = 0;  // per task, a kmalloc'd LagerBlock array, or 0
+int task_lager_n_base = 0;    // per task, blocks in use
+int task_lager_cap_base = 0;  // per task, blocks the array has room for
+
+void lager_init() {
+    task_lager_tab_base = kmalloc(MAX_TASKS * 8);
+    task_lager_n_base = kmalloc(MAX_TASKS * 8);
+    task_lager_cap_base = kmalloc(MAX_TASKS * 8);
+    int i = 0;
+    while (i < MAX_TASKS) {
+        store64(task_lager_tab_base + i * 8, 0);
+        store64(task_lager_n_base + i * 8, 0);
+        store64(task_lager_cap_base + i * 8, 0);
+        i = i + 1;
+    }
+    return;
+}
+
+// Drops a task's table. Called when a slot is spawned into and when it is
+// reaped, so a reused task id never inherits another process's blocks. The
+// heap pages themselves go with the process's address space, as before.
+void lager_reset(int tid) {
+    if (task_lager_tab_base == 0) { return; }
+    int tab = load64(task_lager_tab_base + tid * 8);
+    if (tab != 0) { kfree(tab); }
+    store64(task_lager_tab_base + tid * 8, 0);
+    store64(task_lager_n_base + tid * 8, 0);
+    store64(task_lager_cap_base + tid * 8, 0);
+    return;
+}
+
+int lager_at(int tab, int i) {
+    return tab + i * sizeof(LagerBlock);
+}
+
+// Makes room for one more block. Returns the (possibly moved) table, or 0
+// if the kernel heap could not give a bigger one.
+int lager_room(int tid) {
+    int tab = load64(task_lager_tab_base + tid * 8);
+    int n = load64(task_lager_n_base + tid * 8);
+    int cap = load64(task_lager_cap_base + tid * 8);
+    if (n < cap) { return tab; }
+    int ncap = LAGER_FIRST_CAP;
+    if (cap > 0) { ncap = cap * 2; }
+    if (ncap > LAGER_MAX_CAP) {
+        serial_print("[lager] block table full for task ");
+        serial_print_int(tid);
+        serial_print("\n");
+        return 0;
+    }
+    int ntab = kmalloc(ncap * sizeof(LagerBlock));
+    if (ntab == 0) {
+        serial_print("[lager] kernel heap cannot grow the block table for task ");
+        serial_print_int(tid);
+        serial_print("\n");
+        return 0;
+    }
+    int w = 0;
+    while (w < n * 3) {
+        store64(ntab + w * 8, load64(tab + w * 8));
+        w = w + 1;
+    }
+    if (tab != 0) { kfree(tab); }
+    store64(task_lager_tab_base + tid * 8, ntab);
+    store64(task_lager_cap_base + tid * 8, ncap);
+    return ntab;
+}
+
+// Opens a gap at index i by moving every later block up one. The caller has
+// already made room.
+void lager_insert_gap(int tab, int n, int i) {
+    int j = n;
+    while (j > i) {
+        int to = lager_at(tab, j);
+        int from = lager_at(tab, j - 1);
+        to.lb_addr = from.lb_addr;
+        to.lb_size = from.lb_size;
+        to.lb_free = from.lb_free;
+        j = j - 1;
+    }
+    return;
+}
+
+// Closes the slot at index i by moving every later block down one.
+void lager_remove(int tab, int n, int i) {
+    int j = i;
+    while (j < n - 1) {
+        int to = lager_at(tab, j);
+        int from = lager_at(tab, j + 1);
+        to.lb_addr = from.lb_addr;
+        to.lb_size = from.lb_size;
+        to.lb_free = from.lb_free;
+        j = j + 1;
+    }
+    return;
+}
+
+// Backs the heap with physical pages up to (not including) `upto`, zeroed.
+// Returns 1, or 0 when physical memory has run out. This is the page
+// attaching SYS_ALLOC always did, moved here unchanged.
+int lager_attach(int tid, int upto) {
+    int mapped = load64(task_heap_mapped_base + tid * 8);
+    int cr3 = load64(task_cr3_base + tid * 8);
+    while (mapped < upto) {
+        int frame = pmm_alloc_page();
+        if (frame == 0) {
+            // Fail the allocation rather than mapping frame 0, which would
+            // silently corrupt low memory.
+            serial_print("[lager] out of physical pages\n");
+            store64(task_heap_mapped_base + tid * 8, mapped);
+            return 0;
+        }
+        zero_page(frame);
+        map_page_user(cr3, mapped, frame);
+        mapped = mapped + 4096;
+    }
+    store64(task_heap_mapped_base + tid * 8, mapped);
+    return 1;
+}
+
+// Zeroes [addr, addr + n) in the current task's address space. n is a
+// multiple of 8.
+void lager_zero(int addr, int n) {
+    int i = 0;
+    while (i < n) {
+        store64(addr + i, 0);
+        i = i + 8;
+    }
+    return;
+}
+
+// n bytes (rounded up to 8) for task tid, zeroed. Returns the address, or 0
+// on a bad request or when the heap or the table cannot grow.
+int lager_alloc(int tid, int n) {
+    if (n <= 0) { return 0; }
+    n = ((n + 7) / 8) * 8;
+    int top = load64(task_heap_next_base + tid * 8);
+    int end = load64(task_heap_end_base + tid * 8);
+    if (top == 0) { return 0; }
+    int tab = load64(task_lager_tab_base + tid * 8);
+    int cnt = load64(task_lager_n_base + tid * 8);
+
+    // First fit among the free blocks.
+    int i = 0;
+    while (i < cnt) {
+        int e = lager_at(tab, i);
+        if (e.lb_free == 1 && e.lb_size >= n) {
+            if (e.lb_size > n) {
+                // Split, so the rest stays free, right after this block.
+                tab = lager_room(tid);
+                if (tab == 0) { return 0; }
+                e = lager_at(tab, i);
+                lager_insert_gap(tab, cnt, i + 1);
+                int rest = lager_at(tab, i + 1);
+                rest.lb_addr = e.lb_addr + n;
+                rest.lb_size = e.lb_size - n;
+                rest.lb_free = 1;
+                e.lb_size = n;
+                store64(task_lager_n_base + tid * 8, cnt + 1);
+            }
+            e.lb_free = 0;
+            lager_zero(e.lb_addr, n);
+            return e.lb_addr;
+        }
+        i = i + 1;
+    }
+
+    // A free block at the very end can grow into the unused space past it,
+    // instead of being skipped and left behind as a hole.
+    if (cnt > 0) {
+        int last = lager_at(tab, cnt - 1);
+        if (last.lb_free == 1) {
+            int base = last.lb_addr;
+            if (base + n > end) { return 0; }
+            if (lager_attach(tid, base + n) == 0) { return 0; }
+            lager_zero(base, last.lb_size);
+            last.lb_size = n;
+            last.lb_free = 0;
+            store64(task_heap_next_base + tid * 8, base + n);
+            return base;
+        }
+    }
+
+    // Bump onto the frontier. Everything past it has never been handed out,
+    // so the pages attached here are already zero.
+    if (top + n > end) { return 0; }
+    tab = lager_room(tid);
+    if (tab == 0) { return 0; }
+    if (lager_attach(tid, top + n) == 0) { return 0; }
+    int b = lager_at(tab, cnt);
+    b.lb_addr = top;
+    b.lb_size = n;
+    b.lb_free = 0;
+    store64(task_lager_n_base + tid * 8, cnt + 1);
+    store64(task_heap_next_base + tid * 8, top + n);
+    return top;
+}
+
+// Gives back a block lager_alloc returned. 0 is a no-op, like free(NULL).
+// Returns 0, or -1 when ptr is not the start of a live block (never handed
+// out, already freed, or pointing into the middle of one) -- refused and
+// logged, because a silent bad free is how corruption at a distance starts
+// (see kfree in jenna.c0 for the day that cost).
+int lager_free(int tid, int ptr) {
+    if (ptr == 0) { return 0; }
+    int tab = load64(task_lager_tab_base + tid * 8);
+    int cnt = load64(task_lager_n_base + tid * 8);
+    int i = 0;
+    while (i < cnt && lager_at(tab, i).lb_addr < ptr) { i = i + 1; }
+    if (i >= cnt || lager_at(tab, i).lb_addr != ptr || lager_at(tab, i).lb_free == 1) {
+        serial_print("[lager] dealloc: not a live block, refusing: ");
+        serial_print_int(ptr);
+        serial_print("\n");
+        return 0 - 1;
+    }
+    int e = lager_at(tab, i);
+    e.lb_free = 1;
+    // Merge with the next block, then with the previous one.
+    if (i + 1 < cnt && lager_at(tab, i + 1).lb_free == 1) {
+        e.lb_size = e.lb_size + lager_at(tab, i + 1).lb_size;
+        lager_remove(tab, cnt, i + 1);
+        cnt = cnt - 1;
+    }
+    if (i > 0 && lager_at(tab, i - 1).lb_free == 1) {
+        int prev = lager_at(tab, i - 1);
+        prev.lb_size = prev.lb_size + e.lb_size;
+        lager_remove(tab, cnt, i);
+        cnt = cnt - 1;
+    }
+    store64(task_lager_n_base + tid * 8, cnt);
+    return 0;
+}
+
+// Bytes in live (not freed) blocks of task tid's heap.
+int lager_in_use(int tid) {
+    int tab = load64(task_lager_tab_base + tid * 8);
+    int cnt = load64(task_lager_n_base + tid * 8);
+    int sum = 0;
+    int i = 0;
+    while (i < cnt) {
+        int e = lager_at(tab, i);
+        if (e.lb_free == 0) { sum = sum + e.lb_size; }
+        i = i + 1;
+    }
+    return sum;
+}
+
+// How far into its heap region task tid's frontier has moved. Everything
+// lager has ever had to map, freed or not.
+int lager_extent(int tid) {
+    int top = load64(task_heap_next_base + tid * 8);
+    if (top == 0) { return 0; }
+    return top - (load64(task_heap_end_base + tid * 8) - HEAP_PAGES * 4096);
+}

@@ -12,7 +12,7 @@
 # hands control off in 32-bit protected mode with paging disabled. c0/coff
 # only ever emits 64-bit long-mode code (rax/rdi/..., 8-byte pushes), so
 # this stub's whole job is the classic "get to long mode" dance before
-# ever touching anything coff-compiled:
+# ever touching anything coff-compiled.
 #   1. build a minimal identity-mapped page table for the first 1GB
 #      (2MB pages -- one P2 table is enough, no P1 needed)
 #   2. enable PAE, set EFER.LME, enable paging (CR0.PG)
@@ -31,7 +31,7 @@
 .intel_syntax noprefix
 
 .set MB_MAGIC, 0x1BADB002
-# Bit 2 (0x4): request a specific video mode -- GRUB will not set one up
+# Bit 2 (0x4) requests a specific video mode -- GRUB will not set one up
 # unprompted, since it is a real hardware mode-set, not passive info like
 # mem_lower/mmap (which show up regardless of what is requested here). This
 # adds four more header longs (mode_type/width/height/depth) below.
@@ -70,13 +70,12 @@
 # gated on flags bit 16, unused here since ELF loading already gives GRUB
 # everything it needs) still occupy their slots even though bit 16 is not
 # set, so mode_type/width/height/depth land at offset 32, not immediately
-# after the checksum. Getting this wrong the first time (omitting these
-# five and putting mode_type right after checksum) produced a real,
-# instructive failure: GRUB read 4 bytes of unrelated file content as
-# mode_type and errored "unsupported graphical mode type 629997584" --
-# found via an actual QEMU monitor screendump mid-boot (the only way to
-# see GRUB's own text-mode error screen, since -display none/serial-only
-# testing shows nothing before the kernel would start).
+# after the checksum. Omitting these five and putting mode_type right after
+# the checksum makes GRUB read 4 bytes of unrelated file content as
+# mode_type and error out with "unsupported graphical mode type", on its own
+# text-mode screen, which only a QEMU monitor screendump mid-boot shows
+# (-display none/serial-only testing shows nothing before the kernel would
+# start).
 .long 0 # header_addr (unused, flags bit 16 not set)
 .long 0 # load_addr
 .long 0 # load_end_addr
@@ -105,7 +104,7 @@ stack_top:
 
 # 64-bit Task State Segment. In long mode the TSS no longer holds a task
 # context (there is no hardware task switching), but it still carries the
-# Interrupt Stack Table: up to 7 known-good stack pointers a fault handler can
+# Interrupt Stack Table, up to 7 known-good stack pointers a fault handler can
 # be forced onto regardless of the interrupted code's own (possibly corrupt or
 # non-canonical) rsp. Only IST1 is used, for #8 (double fault). 104 bytes is
 # the architectural minimum; IST1 lives at offset 0x24. Zero-filled by the ELF
@@ -218,7 +217,7 @@ long_mode_start:
     or eax, 1
     wrmsr
 
-    # STAR MSR: bits[47:32] = SYSCALL's CS/SS base (CS = this value forced
+    # STAR MSR. bits[47:32] = SYSCALL's CS/SS base (CS = this value forced
     # RPL0, SS = this value+8 forced RPL0); bits[63:48] = SYSRET's CS/SS
     # base in 64-bit mode (CS = this value+16 forced RPL3, SS = this
     # value+8 forced RPL3). Want SYSCALL -> CS=0x08/SS=0x10 (kernel code/
@@ -226,19 +225,13 @@ long_mode_start:
     # code/data, matching enter_ring3's own iretq selectors), so
     # bits[63:48]=0x0020 (0x20+16=0x30|3=0x33, 0x20+8=0x28|3=0x2B).
     #
-    # This was WRONG for a long time (edx=0x0020, eax=0x00080010 -- packing
-    # nothing into bits[47:32] at all, and putting 0x0020 in bits[47:32]
-    # instead of bits[63:48]): every SYSCALL actually entered the kernel
-    # with CS=0x0020, SS=0x0028 -- 0x0020 being the upper half of the GDT's
-    # 16-byte TSS descriptor, not a real code segment at all. It "worked"
-    # for a single trivial syscall+immediate-sysret round trip purely by
-    # accident (long mode barely re-validates CS once already loaded), but
-    # #GP'd the instant a genuinely separate interrupt (the timer) tried to
-    # resume kernel code with that CS/SS still live -- masked until now by
-    # the SFMASK/IF bug above ensuring no interrupt could ever land mid-
-    # syscall in any earlier test. Caught by actually letting a ring-3
-    # process's syscall handler run long enough to overlap a real timer
-    # tick, not by inspection.
+    # Putting 0x0020 in bits[47:32] instead of bits[63:48] would make every
+    # SYSCALL enter the kernel with CS=0x0020, SS=0x0028 -- 0x0020 being the
+    # upper half of the GDT's 16-byte TSS descriptor, not a real code
+    # segment at all. A trivial syscall+immediate-sysret round trip would
+    # still "work" (long mode barely re-validates CS once already loaded),
+    # but the first interrupt (the timer) to resume kernel code with that
+    # CS/SS still live would #GP.
     mov ecx, 0xC0000081
     mov edx, 0x00200008
     mov eax, 0x00000000
@@ -255,93 +248,10 @@ long_mode_start:
     xor edx, edx
     wrmsr
 
-    # Stash isr_timer_entry's and isr_keyboard_entry's addresses in the
-    # .isrinfo hand-off slot (linker.ld pins it at 1048584/0x100008, two
-    # consecutive quads) -- kmain.c0 needs these addresses as data values
-    # to populate the IDT, but c0 has no way to reference an externally-
-    # defined (hand-written-asm) symbol at all, not even via the function-
-    # reference feature (that only covers functions declared in the same
-    # c0 file). The assembler/linker already know these addresses; `lea`
-    # gets them, same "resolve it once in asm, hand off through a fixed
-    # memory slot" technique as .mbinfo (EBX), just in the other direction.
-    lea rax, [isr_timer_entry]
-    mov [0x100008], rax
-    lea rax, [isr_keyboard_entry]
-    mov [0x100010], rax
-    # klick's IRQ12 stub, in its own .mouseinfo slot (1049432/0x100358)
-    # rather than a third .isrinfo quad, so no fixed address above shifts.
-    lea rax, [isr_mouse_entry]
-    mov [0x100358], rax
-    # Same hand-off for the exception trampolines (.excinfo, base 1048624/
-    # 0x100030) -- kmain.c0 reads these back to install IDT vectors 14 (#PF),
-    # 0 (#DE), 6 (#UD), 13 (#GP). Slots are 8 bytes apart.
-    lea rax, [isr_pagefault_entry]
-    mov [0x100030], rax
-    lea rax, [isr_divide_entry]
-    mov [0x100038], rax
-    lea rax, [isr_invalidop_entry]
-    mov [0x100040], rax
-    lea rax, [isr_gpf_entry]
-    mov [0x100048], rax
-    # Second batch of exception trampolines (.excinfo2, base 1048752/
-    # 0x1000B0 -- placed after .sched, not by growing .excinfo, so none of
-    # the addresses above shifted -- see linker.ld), for the remaining CPU
-    # exception vectors now routed to the generic panic_handler. Slots are
-    # 8 bytes apart, in vector order: #1 #2 #3 #4 #5 #7 #10 #11 #12 #16 #17
-    # #18 #19.
-    lea rax, [isr_debug_entry]
-    mov [0x1000B0], rax
-    lea rax, [isr_nmi_entry]
-    mov [0x1000B8], rax
-    lea rax, [isr_breakpoint_entry]
-    mov [0x1000C0], rax
-    lea rax, [isr_overflow_entry]
-    mov [0x1000C8], rax
-    lea rax, [isr_boundrange_entry]
-    mov [0x1000D0], rax
-    lea rax, [isr_devnotavail_entry]
-    mov [0x1000D8], rax
-    lea rax, [isr_invalidtss_entry]
-    mov [0x1000E0], rax
-    lea rax, [isr_segnotpresent_entry]
-    mov [0x1000E8], rax
-    lea rax, [isr_stackfault_entry]
-    mov [0x1000F0], rax
-    lea rax, [isr_fpuerror_entry]
-    mov [0x1000F8], rax
-    lea rax, [isr_alignment_entry]
-    mov [0x100100], rax
-    lea rax, [isr_machinecheck_entry]
-    mov [0x100108], rax
-    lea rax, [isr_simdfp_entry]
-    mov [0x100110], rax
-    # #8 double-fault trampoline hand-off (.dfinfo, 0x100338 -- a new section
-    # after .sctable, so no earlier fixed address shifted). c0 reads this back
-    # to install vector 8's IDT entry (with IST1 selected -- see knekt.c0).
-    lea rax, [isr_doublefault_entry]
-    mov [0x100338], rax
-    # Ring-3 trampoline hand-off (.ring3info, 0x100340) — same pattern as
-    # .isrinfo/.excinfo above. c0 reads enter_ring3's address back to call
-    # it indirectly when launching a ring-3 binary.
-    lea rax, [enter_ring3]
-    mov [0x100340], rax
-    # Hand sched_launch's address to c0 via the .sched slot (1048728/
-    # 0x100098) -- c0 calls it indirectly, exactly once, to transfer control
-    # into the first preemptive task (see kmain.c0's sched_launch_call).
-    lea rax, [sched_launch]
-    mov [0x100098], rax
-    # Hand halt_cpu's address to c0 via the .haltinfo slot (0x100130) -- c0
-    # calls it indirectly (see kmain.c0's halt()), the same wall/solution as
-    # sched_launch above.
-    lea rax, [halt_cpu]
-    mov [0x100130], rax
-    # Hand enable_interrupts's address to c0 via the .stiinfo slot
-    # (0x100350) -- same wall/solution as halt_cpu above. Called once by
-    # sys_dispatch's SYS_EXIT handler (syscall.c0) before its intentional
-    # infinite halt loop, since SYSCALL's SFMASK cleared IF on entry and
-    # that handler never reaches SYSRET to get it back.
-    lea rax, [enable_interrupts]
-    mov [0x100350], rax
+    # No addresses are handed to c0 here. Every stub and routine
+    # below is reached from c0 by name (`extern int isr_timer_entry;` in
+    # kmain.c0 evaluates to its address), since smed links this file and the
+    # kernel as one.
 
     lea rsp, [stack_top]
     call main
@@ -361,12 +271,12 @@ long_mode_start:
     call paging_verify
 
     # main() has finished building the IDT/IDTR/PIC/PIT/dispatch-table
-    # state in memory (pure c0: memory writes and outb, no new
+    # state in memory (pure c0, memory writes and outb, no new
     # instructions needed) and returned. Loading the IDT and enabling
     # interrupts needs `lidt`/`sti`, which c0 cannot execute directly --
     # rather than exposing them as separate asm functions callable from c0
     # (which would need c0 to call an externally-defined symbol, a problem
-    # coff0's resolve() has no path for: the only recognized calls are
+    # coff0's resolve() has no path for, since the only recognized calls are
     # builtins, functions declared in the same c0 file, or indirect calls
     # through a variable -- none of which fit "trust me, this exists in
     # another object file"), boot.s just does them itself right here,
@@ -376,7 +286,7 @@ long_mode_start:
     lidt [0x100018]
 
     # Run post-init kernel work that depends on a live IDT but must NOT race
-    # hardware IRQs on the shared serial scratch buffer: the demand-paging
+    # hardware IRQs on the shared serial scratch buffer, since the demand-paging
     # test deliberately faults, and CPU exceptions (#PF) fire regardless of
     # the interrupt flag, so it works with IRQs still masked. sti comes
     # after, once the one-shot fault test is done.
@@ -385,8 +295,8 @@ long_mode_start:
     # sched_start crafts two tasks' stacks and hands
     # off to sched_launch, which iretqs into task 0 with interrupts already
     # enabled (RFLAGS' IF bit is set in the crafted frame -- see
-    # sched_craft_stack) -- there is no explicit `sti` in this path at all,
-    # unlike the old cooperative demo. sched_start therefore never returns
+    # sched_craft_stack) -- there is no explicit `sti` in this path at all.
+    # sched_start therefore never returns
     # in normal operation; every subsequent task switch happens transparently
     # inside the timer ISR (isr_common). The hang loop below is unreachable
     # in normal operation -- kept as a trap in case a crafted frame is ever
@@ -399,7 +309,7 @@ hang:
 
 # Two thin per-vector stubs funneling into one shared trampoline
 # (isr_common), rather than a full register-save/restore/iretq per
-# handled interrupt: each just pushes its own vector number (plus 8 bytes
+# handled interrupt. Each just pushes its own vector number (plus 8 bytes
 # of alignment padding -- see isr_common's comment for why) and jumps into
 # the shared body, which reads the vector back off the stack and calls a
 # single c0 dispatcher (int_dispatch) that looks the real handler up in a
@@ -429,11 +339,19 @@ isr_mouse_entry:
     push 44
     jmp isr_common
 
+# Sound Blaster 16 (IRQ5, vector 37) -- oljud. On the master PIC, so one
+# EOI is enough; oljud_irq sends it.
+.global isr_oljud_entry
+isr_oljud_entry:
+    push 0
+    push 37
+    jmp isr_common
+
 # Page fault (#PF, vector 14) -- a CPU exception, not a hardware IRQ. The
 # CPU pushes a real error code before entering here, so unlike the IRQ stubs
-# above this one does NOT push a dummy 0: it only pushes the vector, leaving
+# above this one does NOT push a dummy 0. It only pushes the vector, leaving
 # the stack in the exact same [vector][error-code][RIP...] shape isr_common
-# expects. (Alignment still works out: in 64-bit mode the CPU's own frame is
+# expects. (Alignment still works out, since in 64-bit mode the CPU's own frame is
 # 40 bytes -- SS/RSP/RFLAGS/CS/RIP, all 5 pushed unconditionally, see
 # isr_common. For IRQs the stub adds a dummy errcode + vector, 16 more; for
 # #PF the CPU also pushed a real error code and the stub pushes only the
@@ -469,7 +387,7 @@ isr_gpf_entry:
 
 # Double fault (#8) -- like #PF/#GP the CPU pushes a real error code (always 0
 # for #DF), so this stub pushes only the vector. What is special about #8 is not
-# the stub (identical shape to the others) but its IDT entry: knekt.c0 sets that
+# the stub (identical shape to the others) but its IDT entry, since knekt.c0 sets that
 # entry's IST field to 1, so the CPU switches to the dedicated IST1 stack
 # (tss64's IST1 -> df_stack_top) on entry, BEFORE running any of this. That is
 # the whole point -- a double fault typically means the interrupted stack is
@@ -483,7 +401,7 @@ isr_doublefault_entry:
 # panic_handler (see kmain.c0's main, dispatch_set) same as #DE/#UD/#GP
 # above -- one two-line stub each, cheap to add in bulk once panic_handler
 # existed. Which push a dummy 0 error code vs. only the vector follows the
-# same rule as every stub above: CPUs push a real error code for
+# same rule as every stub above, since CPUs push a real error code for
 # #10/#11/#12/#17, nothing for the rest.
 .global isr_debug_entry
 isr_debug_entry: # #1, no error code
@@ -573,17 +491,17 @@ isr_simdfp_entry: # #19, no error code
 # restored around the call into int_dispatch(vector), a c0 function that
 # looks up and calls the real handler.
 #
-# Stack alignment: at kernel entry stack_top was aligned to 16 bytes
+# Stack alignment. At kernel entry stack_top was aligned to 16 bytes
 # (`.balign 16` below), and kmain.c0's main() never touches rsp after
 # that (it just busy-loops) -- so RSP at interrupt time is exactly
 # stack_top, still 16-aligned. The CPU's 3-qword push (24 bytes) plus the
-# per-vector stub's 2-qword push (16 bytes: vector + padding) plus this
+# per-vector stub's 2-qword push (16 bytes, vector + padding) plus this
 # stub's 15-register push (120 bytes) = 160 bytes, a multiple of 16, so
 # RSP is correctly 16-aligned right before `call int_dispatch`, satisfying
 # the SysV ABI's "16-aligned at the point of CALL" requirement. (The
 # padding qword only exists to keep this a multiple of 16 -- without it,
 # the vector-number push alone would leave it 8 bytes short.) This is a
-# known simplification, not a general solution: it holds because nothing
+# known simplification, not a general solution, and it holds because nothing
 # currently running before interrupts are enabled ever leaves RSP
 # misaligned, not because this stub defensively re-aligns it. Revisit
 # (e.g. a dedicated interrupt stack via the IST mechanism, or defensive
@@ -605,7 +523,7 @@ isr_common:
     push r14
     push r15
 
-    # A real x86-64 fact this ISR relies on rather than fights: in 64-bit
+    # A real x86-64 fact this ISR relies on rather than fights. In 64-bit
     # long mode the CPU pushes ALL FIVE qwords (SS/RSP/RFLAGS/CS/RIP, 40
     # bytes) on interrupt entry UNCONDITIONALLY, even with no privilege
     # change -- unlike legacy 32-bit protected mode, which only pushed
@@ -615,26 +533,19 @@ isr_common:
     # exact right values -- the CPU put them there.
     #
     # After the 15 register pushes above, rsp = orig_rsp - 176, and the
-    # frame reads, relative to rsp: regs @0-112, vector @120, errcode @128,
+    # frame reads, relative to rsp, regs @0-112, vector @120, errcode @128,
     # RIP @136, CS @144, RFLAGS @152, RSP @160, SS @168 -- identical in
     # shape AND offsets to what sched_craft_stack (chrone.c0) builds for a
     # freshly-launched task, so isr_epilogue's single pop-then-iretq path
     # serves a real resume and a first launch alike. NOTHING else is needed
-    # here: no reserve, no shift, no synthesized RSP/SS.
+    # here, with no reserve, no shift, no synthesized RSP/SS.
     #
-    # Why this block is this simple, not ~50 lines of sub/shift/synthesize:
-    # an earlier version wrongly believed the CPU pushed only 3 qwords on
-    # entry (the 32-bit mental model) while iretq popped 5, and tried to
-    # manufacture the "missing" RSP/SS itself -- first by writing them
-    # above orig_rsp (which clobbered the task's own stack), then by
-    # reserving 16 bytes via `sub rsp,16` plus a 20-qword shift and
-    # computing RSP as `rsp + 176`. But post-shift rsp was orig_rsp - 192,
-    # so rsp + 176 = orig_rsp - 16: each resume landed the task 16 bytes
-    # low, and since the next cycle reconstructed from that already-low
-    # rsp, the error COMPOUNDED 16 bytes per interrupt -- a slow downward
-    # stack drift that eventually walked rsp off the task's page and froze
-    # the kernel. Deleting the whole apparatus (the CPU already does the
-    # work correctly) is the fix.
+    # Why this block is this simple, with no sub/shift/synthesize. In
+    # 64-bit mode the CPU pushes all 5 qwords that iretq pops, RSP and SS
+    # included, so there is nothing "missing" to manufacture. Synthesizing
+    # RSP/SS here would land each resume a little off, and the error would
+    # compound per interrupt into a stack drift that walks rsp off the
+    # task's page.
 
     # The vector number sits just above the 15 saved registers (120 bytes),
     # with the error code slot just above that (128) -- see the per-vector
@@ -658,13 +569,12 @@ isr_common:
     # (1048712/0x100088) holds the incoming task's saved rsp. Swapping rsp
     # HERE -- between this stub's own register push above and the pop below
     # -- means the pop+iretq sequence below resumes whichever task is now
-    # current: this exact 176-byte frame (15 registers + vector/errcode +
+    # current, this exact 176-byte frame (15 registers + vector/errcode +
     # RIP/CS/RFLAGS/RSP/SS) is both what gets saved for the outgoing task and what
     # was already saved (or, for a task's first run, crafted by
-    # sched_craft_stack) for the incoming one. This is the real difference
-    # from the old cooperative context_switch it replaces: that one swapped
-    # 6 callee-saved registers at an ordinary call boundary; this swaps the
-    # FULL interrupt frame, because the switch happens inside an interrupt
+    # sched_craft_stack) for the incoming one. Unlike a cooperative context
+    # switch, which swaps 6 callee-saved registers at an ordinary call
+    # boundary, this swaps the FULL interrupt frame, because the switch happens inside an interrupt
     # handler where any register -- not just callee-saved ones -- may be
     # live in the preempted task.
     mov rax, [0x100090]
@@ -677,12 +587,12 @@ isr_common:
 
     # Reload CR3 from the incoming task's saved page-table root
     # (SCHED_NEXT_CR3, 0x1000A0 -- see chrone.c0's task_cr3_base). Needed
-    # for real per-process isolation: a ring-3 task's private pml4 (built by
+    # for real per-process isolation, since a ring-3 task's private pml4 (built by
     # pt_create(), syscall.c0) must be live again the moment it resumes, not
     # whichever address space happened to be current when this interrupt
     # fired. Kernel-context tasks all share task_cr3_base == pml4_phys, so
     # this is a same-value reload for them -- harmless, just a wasted TLB
-    # flush, same cost isr_common already paid once per switch before this.
+    # flush.
     mov rax, [0x1000A0]
     mov cr3, rax
 
@@ -720,12 +630,12 @@ isr_epilogue:
     add rsp, 16 # discard the vector number + its alignment padding
     iretq
 
-# Launches the very first preemptive task: called once (indirectly, from
+# Launches the very first preemptive task. It is called once (indirectly, from
 # kmain.c0's sched_start via the SCHED_LAUNCH_ADDR hand-off) with rdi = that
 # task's crafted initial rsp (see sched_craft_stack). Just loads rsp and
 # falls into isr_common's own epilogue -- from the CPU's point of view this
 # is indistinguishable from "resuming from a preemption," which is exactly
-# the point: sched_craft_stack builds a stack that LOOKS like a preempted
+# the point, since sched_craft_stack builds a stack that LOOKS like a preempted
 # task's saved frame, RFLAGS included, so this one epilogue path serves both
 # the first launch and every later resume. RFLAGS' IF bit, set in that
 # crafted frame, is what actually enables interrupts here -- there is no
@@ -752,7 +662,7 @@ halt_cpu:
     ret
 
 # Callable from c0 (indirectly, via .stiinfo -- see syscall.c0's sys_dispatch
-# SYS_EXIT handler), same wall as halt_cpu/sched_launch above: c0 cannot
+# SYS_EXIT handler), same wall as halt_cpu/sched_launch above, since c0 cannot
 # execute a privileged instruction directly. `sti` takes effect after the
 # NEXT instruction (`ret`, here), matching the CPU's own one-instruction
 # interrupt-shadow rule, so no interrupt can land mid-return.
@@ -761,12 +671,21 @@ enable_interrupts:
     sti
     ret
 
-# Test-only: deliberately provoke a #8 double fault, to prove the IST stack
+# cli; ret -- the other half. A syscall that enables interrupts to wait
+# (SYS_SLEEP) must disable them again before returning, since syscall_entry's exit
+# path puts the user's rsp back before sysretq, and an interrupt taken in
+# that window would run on the user's stack.
+.global disable_interrupts
+disable_interrupts:
+    cli
+    ret
+
+# Test-only, deliberately provoking a #8 double fault, to prove the IST stack
 # actually works (a #DF handler that runs and panics, vs. a silent triple-fault
 # reboot). Reachable only when test_doublefault.sh temporarily injects a
 # `call trigger_doublefault` into the boot path -- nothing calls it in a normal
 # boot, exactly like the divide-by-zero test_panic.sh injects is absent from
-# normal c0. Mechanism: point rsp at a non-canonical address, then push. The
+# normal c0. The mechanism is to point rsp at a non-canonical address, then push. The
 # push faults (#SS/#GP); delivering THAT fault also has to push onto the same
 # bad rsp, which faults again -- the CPU escalates the fault-during-fault to
 # #8. Because #8's IDT entry selects IST1, the CPU switches to df_stack_top and

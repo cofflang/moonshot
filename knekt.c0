@@ -6,7 +6,7 @@
 // moonshot is free software, distributed under the GNU General Public
 // License version 3 or (at your option) any later version, WITHOUT ANY
 // WARRANTY; see the LICENSE file for the full text.
-// knekt.c0 -- the kernel core: main() (the actual entry point boot.s
+// knekt.c0 -- the kernel core, main() (the actual entry point boot.s
 // calls), the post-paging-switch init step, the halt primitive, and the
 // generic byte-manipulation helpers (load32/store16_le/store32_le) every
 // other subsystem builds on.
@@ -25,13 +25,13 @@ int load32(int addr) {
 // always guaranteed < 65536 by the caller (see interrupts.c0's idt_set),
 // so v/256 alone (no re-masking) is already < 256.
 void store16_le(int addr, int v) {
-    store8(addr, v - (v / 256) * 256);
+    store8(addr, v % 256);
     store8(addr + 1, v / 256);
     return;
 }
 
 void store32_le(int addr, int v) {
-    store16_le(addr, v - (v / 65536) * 65536);
+    store16_le(addr, v % 65536);
     store16_le(addr + 2, v / 65536);
     return;
 }
@@ -43,14 +43,14 @@ void store32_le(int addr, int v) {
 // interrupts.c0's panic_handler, its only caller, for why it is called in
 // a loop rather than trusted to never return.
 void halt() {
-    int h = load64(HALTINFO_ADDR);
+    int h = halt_cpu;
     h();
     return;
 }
 
 // Run by boot.s AFTER lidt (so the #PF handler is installed) but BEFORE sti
-// (so no hardware IRQ can race this code's serial output on the shared
-// .kscratch buffer -- CPU exceptions like #PF fire regardless of the
+// (so no hardware IRQ can race this code's serial output on
+// serial_scratch -- CPU exceptions like #PF fire regardless of the
 // interrupt flag, so demand paging still works with IRQs masked). Touches a
 // deliberately-unmapped address to trigger a real page fault; if the
 // handler recovers correctly, this read returns FAULT_SENTINEL.
@@ -80,10 +80,10 @@ void kernel_post_init() {
 
     // Carve the screen into kakel's windows (two side-by-side tiles)
     // and give each a banner. This deliberately runs AFTER the full-screen
-    // banner + readback above: that block keeps proving punkt's own
+    // banner + readback above, since that block keeps proving punkt's own
     // full-screen path exactly as before, then kakel paints over it and
     // the checks below prove the windowed path on top. Window 1's banner
-    // starts with 'M' on purpose: its cell has never been drawn by
+    // starts with 'M' on purpose. Its cell has never been drawn by
     // anything else (the full-screen banner's M sits in window 0's
     // territory), so its fg count is a genuine first write through
     // kakel_putc's clipped coordinates.
@@ -93,7 +93,7 @@ void kernel_post_init() {
         // cleared after the check so the shell starts with a clean screen.
         kakel_putc(0, 'M');
 
-        // Readback proof: the 'M' at the window's origin must read
+        // Readback proof. The 'M' at the window's origin must read
         // back exactly 18 lit pixels, and a pixel far from any text must
         // show the window's background. The very last screen row must show
         // the status bar's own distinct background.
@@ -157,13 +157,18 @@ void kernel_post_init() {
     // Bring up the in-memory filesystem after the shell, so any filesystem
     // errors print through the shell's output path (already live).
     jakel_init();
+    jakel_big_file_test();
 
-    // klick last: it draws the pointer as soon as it comes up, so everything
+    // klick last, since it draws the pointer as soon as it comes up, so everything
     // that paints the initial screen -- the window layout, each session's
     // banner and prompt -- has to have happened first, or the pointer's
     // backing store would capture pixels that are about to be overwritten
     // and put stale ones back on the first move.
     klick_init();
+
+    // oljud after klick, since klick writes the master PIC's whole mask, and
+    // oljud only clears its own bit in whatever mask it finds.
+    oljud_init();
     return;
 }
 
@@ -177,7 +182,7 @@ int main() {
         // Light grey text on black, same look VGA_DEFAULT_ATTR aimed for --
         // computed via fb_rgb (not a literal) since it depends on
         // fb_probe's real, just-read channel positions, not an assumption.
-        // Cannot actually DRAW yet: fb_addr is far outside both the low
+        // Cannot actually DRAW yet, since fb_addr is far outside both the low
         // 16MB c0's own tables will cover AND boot.s's original static 1GB
         // map, so pixel writes only become safe after boot.s's CR3 switch
         // and fb_map (see kernel_post_init, where the real drawing and
@@ -186,7 +191,7 @@ int main() {
         FB_BG = fb_rgb(0, 0, 0);
     } else {
         // No usable framebuffer granted -- fall back to VGA text mode,
-        // which (unlike the pixel framebuffer) IS safe to use immediately:
+        // which (unlike the pixel framebuffer) IS safe to use immediately.
         // 0xB8000 sits inside boot.s's original static identity map.
         // VGA_DEFAULT_ATTR (7 = VGA_COLOR_BLACK*16 + VGA_COLOR_LIGHTGREY,
         // the classic default text-mode look) is a global, not a local, so
@@ -218,10 +223,10 @@ int main() {
     scancode_init();
 
     int flags = load32(mb_info);
-    // bit 0 of flags: mem_lower/mem_upper are valid. No bitwise & in c0
+    // bit 0 of flags means mem_lower/mem_upper are valid. No bitwise & in c0
     // yet -- flags - (flags/2)*2 isolates the low bit the same way the
     // rest of this codebase avoids needing % (see serial_print_int above).
-    int has_mem = flags - (flags / 2) * 2;
+    int has_mem = flags % 2;
     if (has_mem == 1) {
         int mem_lower = load32(mb_info + 4);
         int mem_upper = load32(mb_info + 8);
@@ -238,13 +243,13 @@ int main() {
     // Verification, in three parts, each printed so run_qemu.sh can check
     // the arithmetic directly rather than just "some numbers that did not
     // crash":
-    //   1. bump: four fresh pages, strictly increasing and exactly 4096
+    //   1. bump, four fresh pages, strictly increasing and exactly 4096
     //      bytes apart (the original allocator's whole behavior).
-    //   2. reuse: free two of them (a1 then a2), then allocate two more --
+    //   2. reuse, free two of them (a1 then a2), then allocate two more --
     //      they must come back LIFO (a2 first, then a1), proving the
     //      free-list actually recycles freed pages instead of always
     //      bumping upward.
-    //   3. bump2: with the free-list empty again, the next allocation must
+    //   3. bump2, with the free-list empty again, the next allocation must
     //      resume bumping past a3 (a3 + 4096), proving the fallback still
     //      works after reuse.
     int a0 = pmm_alloc_page();
@@ -294,26 +299,29 @@ int main() {
     // addresses, let run_qemu.sh check the arithmetic" discipline as the pmm
     // test above, proving three real behaviours, not just "it returned
     // non-zero":
-    //   alloc:    three 64-byte blocks, each exactly 80 bytes apart (64
+    //   alloc     three 64-byte blocks, each exactly 80 bytes apart (64
     //             payload + the 16-byte header), proving sequential packing.
-    //   reuse:    free the middle one, re-request 64 -- first-fit must return
+    //   reuse     free the middle one, re-request 64 -- first-fit must return
     //             the exact same address, proving freed blocks are recycled.
-    //   coalesce: free that block AND its neighbour, then request 128 -- too
+    //   coalesce  free that block AND its neighbour, then request 128 -- too
     //             big for either freed 64-byte block alone, so landing back
     //             at the lower address proves the two merged into one.
-    // 256 pages (1MB), not the original 6 (24KB) -- that was sized for the
-    // three-block alloc/reuse/coalesce test right below and never revisited
-    // as real content landed on top of it (compiled ELF demos with embedded
-    // sprite data, each needing its own temp buffer AND jakel_write's own
-    // persistent-copy buffer at the same time). kmalloc fails silently
+    // 256 pages (1MB). Compiled ELF programs with embedded sprite data each
+    // need their own temp buffer AND jakel_write's own persistent-copy
+    // buffer at the same time.
+    // kmalloc fails
     // (returns 0, no error) when the heap is exhausted, and most callers
     // do not check for it -- jakel_write's own new_data buffer does not, so
-    // real world found this the hard way: Gnista's first demo (~13.6KB,
-    // twice over) silently corrupted low memory instead of erroring, no
-    // crash, no message, just wrong. Generous headroom past current need,
+    // an exhausted heap silently corrupts low memory instead of erroring,
+    // with no crash and no message. Generous headroom past current need,
     // same sizing philosophy used everywhere else in this codebase (still
     // a small fraction of the ~132MB this kernel already sees as usable).
     heap_init(256);
+    // jakel's file arena right behind it, while pmm is still bumping and so
+    // still handing out contiguous pages. See jakel_arena_init.
+    jakel_arena_init();
+    // oljud's DMA page and sound queue, for the same contiguity reason.
+    oljud_mem_init();
     int h0 = kmalloc(64);
     int h1 = kmalloc(64);
     int h2 = kmalloc(64);
@@ -342,19 +350,15 @@ int main() {
     kfree(h0);
     kfree(h4);
 
-    int timer_stub = load64(ISRINFO_TIMER_ADDR);
-    int keyboard_stub = load64(ISRINFO_KEYBOARD_ADDR);
-    int pagefault_stub = load64(EXCINFO_PF_ADDR);
-    int divide_stub = load64(EXCINFO_DIV_ADDR);
-    int invop_stub = load64(EXCINFO_INVOP_ADDR);
-    int gpf_stub = load64(EXCINFO_GPF_ADDR);
-    idt_set(0, divide_stub);     // #DE divide error (no error code)
-    idt_set(6, invop_stub);      // #UD invalid opcode (no error code)
-    idt_set(13, gpf_stub);       // #GP general protection (error code)
-    idt_set(14, pagefault_stub); // #PF page fault (error code + CR2)
-    idt_set(32, timer_stub);
-    idt_set(33, keyboard_stub);
-    idt_set(44, load64(MOUSEINFO_ADDR));  // IRQ12, klick
+    // boot.s's stubs, by name (see kmain.c0).
+    idt_set(0, isr_divide_entry);       // #DE divide error (no error code)
+    idt_set(6, isr_invalidop_entry);    // #UD invalid opcode (no error code)
+    idt_set(13, isr_gpf_entry);         // #GP general protection (error code)
+    idt_set(14, isr_pagefault_entry);   // #PF page fault (error code + CR2)
+    idt_set(32, isr_timer_entry);
+    idt_set(33, isr_keyboard_entry);
+    idt_set(44, isr_mouse_entry);       // IRQ12, klick
+    idt_set(37, isr_oljud_entry);       // IRQ5, oljud
 
     // Remaining CPU exception vectors, all routed to the same generic
     // panic_handler as #0/#6/#13 below -- a generic handler is enough since
@@ -362,29 +366,29 @@ int main() {
     // does. #8 (double fault) needs special IST handling, set up separately
     // below; #9/#15 are reserved/obsolete vectors Intel says not to use, so
     // 0-31 is complete.
-    idt_set(1, load64(EXCINFO_DEBUG_ADDR));         // #DB debug (no error code)
-    idt_set(2, load64(EXCINFO_NMI_ADDR));            // NMI (no error code)
-    idt_set(3, load64(EXCINFO_BREAKPOINT_ADDR));     // #BP breakpoint (no error code)
-    idt_set(4, load64(EXCINFO_OVERFLOW_ADDR));       // #OF overflow (no error code)
-    idt_set(5, load64(EXCINFO_BOUNDRANGE_ADDR));     // #BR bound range exceeded (no error code)
-    idt_set(7, load64(EXCINFO_DEVNOTAVAIL_ADDR));    // #NM device not available (no error code)
-    idt_set(10, load64(EXCINFO_INVALIDTSS_ADDR));    // #TS invalid TSS (error code)
-    idt_set(11, load64(EXCINFO_SEGNOTPRESENT_ADDR)); // #NP segment not present (error code)
-    idt_set(12, load64(EXCINFO_STACKFAULT_ADDR));    // #SS stack-segment fault (error code)
-    idt_set(16, load64(EXCINFO_FPUERROR_ADDR));      // #MF x87 FPU error (no error code)
-    idt_set(17, load64(EXCINFO_ALIGNMENT_ADDR));     // #AC alignment check (error code, always 0)
-    idt_set(18, load64(EXCINFO_MACHINECHECK_ADDR));  // #MC machine check (no error code)
-    idt_set(19, load64(EXCINFO_SIMDFP_ADDR));        // #XF SIMD FP exception (no error code)
+    idt_set(1, isr_debug_entry);         // #DB debug (no error code)
+    idt_set(2, isr_nmi_entry);            // NMI (no error code)
+    idt_set(3, isr_breakpoint_entry);     // #BP breakpoint (no error code)
+    idt_set(4, isr_overflow_entry);       // #OF overflow (no error code)
+    idt_set(5, isr_boundrange_entry);     // #BR bound range exceeded (no error code)
+    idt_set(7, isr_devnotavail_entry);    // #NM device not available (no error code)
+    idt_set(10, isr_invalidtss_entry);    // #TS invalid TSS (error code)
+    idt_set(11, isr_segnotpresent_entry); // #NP segment not present (error code)
+    idt_set(12, isr_stackfault_entry);    // #SS stack-segment fault (error code)
+    idt_set(16, isr_fpuerror_entry);      // #MF x87 FPU error (no error code)
+    idt_set(17, isr_alignment_entry);     // #AC alignment check (error code, always 0)
+    idt_set(18, isr_machinecheck_entry);  // #MC machine check (no error code)
+    idt_set(19, isr_simdfp_entry);        // #XF SIMD FP exception (no error code)
 
     // #8 double fault (error code, always 0). Unlike every vector above, #8
-    // must run on a dedicated stack: a double fault typically means the
+    // must run on a dedicated stack, since a double fault typically means the
     // interrupted stack is unusable, so a same-stack handler would just
     // re-fault into a triple fault (silent CPU reset). idt_set installs it
     // normally, then we set that entry's IST field to 1 -- the IST byte is at
     // offset 4 within the 16-byte IDT entry, which idt_set wrote as 0 (no IST).
     // boot.s set up TSS.IST1 -> a dedicated 4KB stack and loaded the task
     // register, so IST index 1 makes the CPU switch to that stack on #8 entry.
-    idt_set(8, load64(EXCINFO_DF_ADDR));
+    idt_set(8, isr_doublefault_entry);
     store8(idt_start + 8 * 16 + 4, 1);
 
     store16_le(IDTR_ADDR, 4095); // limit = 256 entries * 16 bytes - 1
@@ -414,6 +418,7 @@ int main() {
     dispatch_set(32, timer_tick);
     dispatch_set(33, keyboard_handler);
     dispatch_set(44, klick_handler);
+    dispatch_set(37, oljud_irq);
 
     pic_remap();
     pit_configure(1193182 / 100); // ~100 Hz

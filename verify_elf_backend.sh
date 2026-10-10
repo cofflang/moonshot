@@ -11,15 +11,10 @@
 #
 # Runs coff's ring-3 output on the real kernel and checks the answers.
 #
-# This began as the only verification the `--elf` machine-code backend had:
-# c0-coff's differential suite compares coff against coff0.c, and coff0.c had
-# only the text backend, so nothing checked the path every ring-3 binary was
-# built through, and three silent-wrong-code bugs were found in it by eye (a
-# label collision that sent false branches into function epilogues, arg4
-# passed in rcx instead of r10, miscompiled && / ||). That backend is now
-# gone: --elf is the text backend with Moonshot's syscall numbers,
-# coff0.c has the same target, and run_tests.sh diffs the two over every
-# ring-3 program. What this script still proves is the part no diff can: that
+# c0-coff's differential suite compares coff against coff0.c over every
+# ring-3 program, since --elf is the text backend with Moonshot's syscall
+# numbers and coff0.c has the same target. What this script proves is the
+# part no diff can, that
 # the target's syscall sequences, smed's image and the kernel's loader agree,
 # end to end, with real exit codes.
 #
@@ -31,11 +26,15 @@
 #
 # A wrong answer here is a compiler bug, not a kernel bug -- which is the
 # whole point of keeping the programs small and arithmetic.
+#
+# The machine has a Sound Blaster 16 (playing into nothing) because
+# 13_oljud.c0 checks sound()'s answers, which need a card. What it actually
+# plays is verify_oljud.sh's business.
 
 set -u
 cd "$(dirname "$0")"
 
-# Regenerate first: the checked-in elf_tests_data.c0 is only as fresh as the
+# Regenerate first, since the packed tests are only as fresh as the
 # last run, and a stale one would test the previous compiler's output.
 ./gen_elf_tests.sh || exit 1
 
@@ -59,8 +58,8 @@ if [ ! -f moonshot.iso ]; then
   exit 1
 fi
 
-# A fresh disk every run. jakel now re-seeds its fixtures on every boot, so a
-# reused disk.img would no longer serve stale binaries -- but starting clean
+# A fresh disk every run. jakel re-seeds its fixtures on every boot, so a
+# reused disk.img would not serve stale binaries -- but starting clean
 # keeps the run deterministic (a known node count, no leftovers from whatever
 # ran last), which matters for a suite whose whole job is to be trustworthy.
 rm -f disk.img
@@ -71,6 +70,7 @@ rm -f serial.log "$sockfile"
 qemu-system-x86_64 -cdrom moonshot.iso \
   -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
   -serial file:serial.log -display none -no-reboot -m 128 \
+  -audiodev none,id=snd0 -device sb16,audiodev=snd0 \
   -monitor unix:"$sockfile",server,nowait &
 qemu_pid=$!
 cleanup() { kill "$qemu_pid" 2>/dev/null; wait "$qemu_pid" 2>/dev/null; rm -f "$sockfile"; }
@@ -93,7 +93,7 @@ def send(cmd, settle=0.05):
     time.sleep(settle)
     sock.recv(65536)
 
-def typ(keys, gap=0.06):
+def typ(keys, gap=0.04):
     for k in keys:
         send("sendkey " + k)
         time.sleep(gap)
@@ -114,17 +114,50 @@ typ(["ret"]); time.sleep(1.5)
 # first test would run and the other six would have nothing left to type
 # into. spawn3 runs each program in its own task instead.
 #
-# Each spawn opens a tavla, so close it before the next one: Alt+Tab onto it,
+# Each spawn opens a tavla, so close it before the next one. Alt+Tab onto it,
 # Alt+W to close. Without that the layout fills after four and later spawns
 # get no window. It also keeps the run honest about the orphaned-tavla path,
 # since by then the program has already exited.
+# Counts exit lines incrementally, since serial.log grows to megabytes of
+# scheduler lines, and rereading it whole every poll cost more time than the
+# fixed sleeps this replaced. A marker split across two reads is caught by
+# keeping the last few bytes of the previous read.
+seen = {"pos": 0, "count": 0, "tail": b""}
+def exits():
+    try:
+        with open("serial.log", "rb") as f:
+            f.seek(seen["pos"])
+            new = f.read()
+    except OSError:
+        return seen["count"]
+    seen["pos"] += len(new)
+    chunk = seen["tail"] + new
+    marker = b"[syscall] exit code="
+    seen["count"] += chunk.count(marker)
+    keep = len(marker) - 1
+    tail = chunk[-keep:] if len(chunk) >= keep else chunk
+    # A marker already counted must not be counted again from the tail.
+    seen["tail"] = b"" if marker in tail else tail
+    return seen["count"]
+
 for name in sys.argv[2:]:
-    word("spawn3 test/%s.elf" % name)
+    # Two arguments for every test, since 16_args_sleep checks it receives them,
+    # and the rest never look.
+    # Wait for this program's exit line on serial rather than a fixed two
+    # seconds; most finish in a fraction of that. 16_args_sleep sleeps half
+    # a second and 13_oljud plays sound for several, hence the long limit.
+    # Counted BEFORE the command is typed, since a fast program has exited before
+    # typing returns, and counting after it would wait for an exit that
+    # already happened.
+    before = exits()
+    word("spawn3 test/%s.elf one two" % name)
     typ(["ret"])
-    time.sleep(2.0)
-    send("sendkey alt-tab", settle=0.4)
-    send("sendkey alt-w", settle=0.6)
-    time.sleep(0.5)
+    t0 = time.time()
+    while exits() == before and time.time() - t0 < 15:
+        time.sleep(0.1)
+    send("sendkey alt-tab", settle=0.3)
+    send("sendkey alt-w", settle=0.4)
+    time.sleep(0.2)
 
 sock.close()
 EOF
@@ -140,7 +173,7 @@ grep '\[syscall\] exit code=' serial.log || true
 echo
 
 # Exit codes appear in spawn order, so walk both lists together rather than
-# grepping for each value: two tests could legitimately share a code, and a
+# grepping for each value, since two tests could legitimately share a code, and a
 # missing run would otherwise shift every later match without being noticed.
 mapfile -t codes < <(grep -o '\[syscall\] exit code=-\?[0-9]*' serial.log | sed 's/.*=//')
 

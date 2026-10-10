@@ -17,9 +17,9 @@
 # Needs a QEMU UI backend package installed -- `qemu-system-x86` alone
 # only ships the "none" backend (confirmed via `qemu-system-x86_64
 # -display help` -- if that still only lists "none" after installing one
-# of these, something else is off). On Arch:
+# of these, something else is off). On Arch
 #   sudo pacman -S qemu-ui-gtk
-# (or qemu-ui-sdl if you'd rather have that one -- either works with
+# (or qemu-ui-sdl if you would rather have that one -- either works with
 # `-display gtk`/`-display sdl` below, change DISPLAY_BACKEND to match).
 set -eu
 cd "$(dirname "$0")"
@@ -30,9 +30,8 @@ DISPLAY_BACKEND=gtk
 # mouse is a PS/2 device, which is a relative pointer, and GTK under native
 # Wayland delivers clicks to a relative-mode guest but almost no motion, so
 # the pointer sits still while the serial log happily reports button
-# changes. That is what was chased through klick for a month (2026-08 to
-# 2026-09) before the A/B that found it: same binary, GDK_BACKEND=x11, and
-# the pointer moved. Nothing in the kernel was ever wrong. Harmless on an
+# changes, which looks exactly like a klick bug. With the same binary and
+# GDK_BACKEND=x11, the pointer moves, so nothing in the kernel is wrong. Harmless on an
 # X11 session, where this is already the backend.
 export GDK_BACKEND="${GDK_BACKEND:-x11}"
 

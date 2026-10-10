@@ -23,28 +23,27 @@
 # script is the evidence for that paragraph in the source.
 #
 # The measurement is the .note div's painted band, for the same reason
-# verify_utsikt.sh uses it: its background colour appears in exactly one CSS
+# verify_utsikt.sh uses it, since its background colour appears in exactly one CSS
 # rule, so every pixel of it is attributable. The band is a block box holding
 # a fixed amount of text, so its two dimensions answer two different
-# questions:
+# questions.
 #
 #   1. The band gets WIDER. That only proves the box was re-laid out to the
 #      new content width -- a renderer that re-flowed boxes but not text
 #      would pass this.
-#   2. The band gets SHORTER. This is the one that proves re-wrap: the same
+#   2. The band gets SHORTER. This is the one that proves re-wrap, since the same
 #      sentence at double the width needs fewer lines, so the box that holds
 #      it loses height.
 #
-# Check 2 is NOT sufficient on its own, and the first version of this script
-# was wrong to think it was. "Nothing but re-wrapping makes a block box shrink
-# vertically while growing horizontally" is false: a PITCH MISMATCH does
-# exactly that. If the buffer stays strided at the old width while present()
-# reads it at the new one, each output row swallows two source rows, so the
-# page appears at double width and half height -- 1004x31 against a true
-# re-wrap's 1004x38. Measured, not reasoned: a deliberately pinned view_w
-# produced precisely that and check 2 reported PASS.
+# Check 2 is NOT sufficient on its own. "Nothing but re-wrapping makes a
+# block box shrink vertically while growing horizontally" is false, since a
+# PITCH MISMATCH does exactly that. If the buffer stays strided at the old
+# width while present() reads it at the new one, each output row swallows
+# two source rows, so the page appears at double width and half height --
+# 1004x31 against a true re-wrap's 1004x38. A deliberately pinned view_w
+# produces precisely that, and check 2 reports PASS.
 #
-# So check 0 runs first and the band checks only mean anything after it:
+# So check 0 runs first and the band checks only mean anything after it.
 #
 #   0. COVERAGE. The page background must still reach the BOTTOM of the
 #      widened window. Under the pitch artifact the content is squeezed into
@@ -52,13 +51,12 @@
 #      that separates "re-laid out" from "read at the wrong stride". It is
 #      the same assertion verify_resize.sh settled on, for the same reason.
 #
-# Validated by breaking it, twice, because the first break did not exercise
-# every check:
-#   - Remove the `ww != last_w || wh != last_h` test in utsikt.c0's main loop:
-#     the program never re-renders, never presents, and the widened tile keeps
+# Two deliberate breaks show what each check catches.
+#   - Remove the `ww != last_w || wh != last_h` test in utsikt.c0's main loop.
+#     The program never re-renders, never presents, and the widened tile keeps
 #     kakel's reflow clear. The band vanishes; checks 0 and 2 fail.
 #   - Pin the layout width (`view_w`) to the first value seen while still
-#     repainting: the pitch artifact above. Check 0 fails; checks 1 and 2 both
+#     repainting, the pitch artifact above. Check 0 fails; checks 1 and 2 both
 #     report PASS, which is exactly why check 0 has to gate them.
 set -u
 cd "$(dirname "$0")"
@@ -116,11 +114,11 @@ def word(s):
 def shot(name):
     send("screendump %s" % name, settle=0.9)
 
-# raket login gate: root, then an empty password.
+# raket login gate, root, then an empty password.
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
 
-# utsikt takes a tavla beside the shell tile: the right half of the screen.
+# utsikt takes a tavla beside the shell tile, the right half of the screen.
 word("spawn3 utsikt.elf"); typ(["ret"]); time.sleep(4.5)
 shot("uresize_half.ppm")
 
@@ -135,8 +133,8 @@ EOF
 sleep 1
 
 python3 - <<'PY'
-BODY_BG = (240, 239, 232)     # body { background: #f0efe8 }
-NOTE_BG = (200, 224, 200)     # .note { background: #c8e0c8 }
+BODY_BG = (240, 239, 232)     # body background #f0efe8
+NOTE_BG = (200, 224, 200)     # .note background #c8e0c8
 MIN_BAND_PX = 20              # a row inside the band has far more than this
 BOTTOM_ROWS = 40              # how deep to sample for the coverage check
 MIN_COVERAGE = 0.50           # a true re-wrap measures ~1.0 here, the pitch
@@ -167,7 +165,7 @@ def px(buf, w, x, y):
     return (buf[off], buf[off+1], buf[off+2])
 
 # Measure the band inside the tavla only. x0 differs between the two shots
-# because the window itself moved: half-width tavla on the right, full-width
+# because the window itself moved, from a half-width tavla on the right, full-width
 # tavla spanning the screen. y stays clear of the title strip and status bar.
 def band(path, x0):
     w, h, buf = read_ppm(path)
@@ -220,8 +218,8 @@ if fw == 0 or fh == 0:
     ok = False
 
 if ok:
-    # 0. Coverage, FIRST: the band measurements below are only meaningful
-    # once we know the frame is being read at the right stride.
+    # 0. Coverage, FIRST. The band measurements below are only meaningful
+    # once it is known the frame is being read at the right stride.
     cov = bottom_coverage("uresize_full.ppm", 0)
     print("bottom %d rows of the widened tavla: %.2f page background"
           % (BOTTOM_ROWS, cov))

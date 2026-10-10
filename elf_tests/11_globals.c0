@@ -1,17 +1,14 @@
 // expect: 137
-// Globals in ring 3. These only became possible when the separate --elf
-// machine-code backend was deleted and `coff --elf` became the ordinary
-// text backend aimed at Moonshot: the old backend refused a global
-// outright, so every ring-3 program written before then is all-locals,
-// and none of them was changed afterwards. That left the feature compiled
-// but never once executed under the kernel's loader -- which is the part
+// Globals in ring 3. Most ring-3 programs here are all-locals, so
+// the feature is compiled
+// but otherwise not executed under the kernel's loader -- which is the part
 // that is not obviously fine. A global with an
 // initialiser lives in .data, and .data is memory the ELF loader has to
 // map, copy and leave writable. This test is here because nothing else
 // would notice if it did not.
 //
-// So: read an initialised global, write one, read it back through a
-// function that never saw it as an argument, and take the address of a
+// So it reads an initialised global, writes one, reads it back through a
+// function that never saw it as an argument, and takes the address of a
 // zero-initialised one (.bss, a different section with a file size of zero
 // and a memory size that is not).
 int counter = 40;

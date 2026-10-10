@@ -14,14 +14,11 @@
 #
 # The panic HANDLERS themselves ship in the normal kernel (installed for
 # #0/#6/#13 in main(), knekt.c0); only the fault TRIGGER is test-only, so
-# production code is never polluted with a deliberate bug. Because every
-# fixed-slot address is hardcoded in kmain.c0/sync_addrs.sh's targets and
-# injecting the fault changes the compiled size (shifting those addresses),
-# this temporarily edits knekt.c0 (where kernel_post_init actually lives,
-# since Moonshot's kernel code got split across subsystem files -- see
-# kmain.c0's own comment), re-syncs the addresses via sync_addrs.sh,
-# builds+boots that variant, then ALWAYS restores the pristine knekt.c0 --
-# a trap guarantees restoration even if the build or boot fails midway.
+# production code is never polluted with a deliberate bug. This temporarily
+# edits knekt.c0 (where kernel_post_init lives), builds and boots that
+# variant, then ALWAYS restores the pristine knekt.c0 -- a trap guarantees
+# restoration even if the build or boot fails midway. The kernel reaches
+# every address by name, so the injected code needs no address patching.
 set -u
 cd "$(dirname "$0")"
 
@@ -29,7 +26,6 @@ cp knekt.c0 knekt.c0.panicbak
 restore() {
   if [ -f knekt.c0.panicbak ]; then
     mv -f knekt.c0.panicbak knekt.c0
-    ./sync_addrs.sh >/dev/null 2>&1 || true
   fi
 }
 trap restore EXIT
@@ -55,15 +51,9 @@ assert marker in s, "kernel_post_init marker not found in knekt.c0"
 open(p, 'w').write(s.replace(marker, marker + inject, 1))
 PY
 
-if ! ./sync_addrs.sh >/dev/null 2>&1; then
-  # sync_addrs may need a second pass if the first one shifted addresses
-  # (the fixed-width-immediate assumption can break when injection changes
-  # .text size and JIT helper addresses are patched from 0 to their real
-  # values). A second pass converges.
-  if ! ./sync_addrs.sh >/dev/null 2>&1; then
-    echo "FAIL: building the panic variant (sync_addrs) failed"
-    exit 1
-  fi
+if ! ./build.sh >/dev/null 2>&1; then
+  echo "FAIL: building the panic variant failed"
+  exit 1
 fi
 
 isodir=isoroot-panic

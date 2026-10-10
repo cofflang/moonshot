@@ -8,31 +8,25 @@
 # moonshot is free software, distributed under the GNU General Public
 # License version 3 or (at your option) any later version, WITHOUT ANY
 # WARRANTY; see the LICENSE file for the full text.
-# Builds moonshot.elf: kmain.c0 compiled by coff1 -- the self-hosted c0
-# compiler (built from c0/coff.c0) -- not coff0.c, the C-based reference
+# Builds moonshot.elf. kmain.c0 is compiled by coff1 -- the self-hosted c0
+# compiler (built from c0/coff.c0) -- not by coff0.c, the C-based reference
 # implementation. The result, boot.s (hand-written 32/64-bit mixed asm) and
 # ring3_handlers.s are then assembled and linked by smed -- the project's
 # own assembler and linker, also written in c0 -- reading the same
-# linker.ld that GNU ld used to, so the kernel lands at 1MiB with the same
-# fixed hand-off slots. No GNU tool touches the kernel any more; as and ld
-# are needed once, to produce the very first smed, exactly as a C compiler
-# is needed once for coff0.
+# linker.ld GNU ld reads, so the kernel lands at 1MiB. No GNU tool touches
+# the kernel; as and ld are needed once, to produce the very first smed,
+# exactly as a C compiler is needed once for coff0.
 #
-# Why coff1, not coff0: coff0.c is legacy bootstrap scaffolding from before
-# coff achieved self-hosting -- it stays only as the differential-testing
-# oracle inside c0-coff's own test suite (verifying coff.c0/coff1's output
-# stays correct), not as the thing that actually compiles Moonshot.
-# Building the kernel through coff0 would mean depending on gcc and the
-# whole C toolchain at build time, even though the *output* kernel binary
-# is freestanding -- exactly the dependency this project wants minimized.
-# coff1 needs gcc/coff0 only once, to bootstrap itself (below); every build
-# after that needs nothing but the c0 compiler.
+# Why coff1, not coff0. coff0.c is the bootstrap compiler, kept as the
+# differential-testing oracle inside c0-coff's own test suite, not as the
+# thing that compiles Moonshot. Building the kernel through coff0 would mean
+# depending on a C compiler at build time, even though the *output* kernel
+# binary is freestanding -- exactly the dependency this project wants
+# minimized. coff1 needs a C compiler and coff0 only once, to bootstrap
+# itself (below); every build after that needs nothing but the c0 compiler.
 #
 # `coff0 kmain.c0 out.s` and `coff1 kmain.c0 out.s` produce byte-identical
-# assembly output, not just "compiles equally well." Getting there needed
-# one real fix: coff.c0's `main()` read source through a fixed 65536-byte
-# buffer, which silently truncated kmain.c0 mid-file -- see c0-coff's
-# c0/coff.c0 (and the same fix in lex.c0/parse.c0) for the full story.
+# assembly output, not just "compiles equally well."
 set -eu
 cd "$(dirname "$0")"
 
@@ -48,7 +42,7 @@ MANIFEST=$COFF_DIR/BOOTSTRAP.sha256
 # manifest that changed whenever you built would fail on every fresh
 # clone); only the private dev tree, which commits both binaries, carries
 # their lines there. So the hashes the kernel build gates on are recorded
-# HERE, by this script, at the one moment they are known to be true: right
+# HERE, by this script, at the one moment they are known to be true, right
 # after the full audit passed. Same line format as the manifest, so one
 # lookup serves both. Gitignored -- it describes binaries on this machine,
 # not source.
@@ -63,27 +57,25 @@ audit_or_die() {
 }
 
 # Trusting-trust gate. This kernel is compiled by a binary, and a binary is
-# exactly where Ken Thompson's 1984 attack lives: a compiler that recognises
+# exactly where Ken Thompson's 1984 attack lives, a compiler that recognises
 # its own source and reinserts a backdoor into every compiler it builds,
-# leaving no trace in any source file. coff1 was previously trusted on an
-# mtime comparison -- `[ "$COFF_SRC" -nt "$COFF1" ]` -- which answers "was
-# this file written after that one", a question a tampered binary answers
-# correctly. git does not preserve mtimes, `touch` defeats it, and a binary
-# diff inside a commit named "Backup" is not something anyone reads.
+# leaving no trace in any source file. An mtime comparison --
+# `[ "$COFF_SRC" -nt "$COFF1" ]` -- only answers "was this file written after
+# that one", a question a tampered binary answers correctly. git does not
+# preserve mtimes, `touch` defeats it, and a binary diff inside a commit is
+# not something anyone reads.
 #
-# So the gate is now: verify the bytes of the compiler against a recorded
-# hash on EVERY build, and rebuild from source whenever the source moves.
-# Fails closed -- no kernel is produced from an unverified compiler.
+# So the gate verifies the bytes of the compiler against a recorded hash on
+# EVERY build, and rebuilds from source whenever the source moves. It fails
+# closed, so no kernel is produced from an unverified compiler.
 #
-# The staleness half is kept because it caught a real bug: an unrelated
-# coff.c0 edit (a debug print, added then reverted) left coff1 out of date,
-# and running it against the exact same input that succeeded moments
-# earlier via coff0 gave a bare PARSEERROR with zero indication the binary
-# itself was the problem.
+# The staleness half matters too. A coff1 left out of date by an unrelated
+# coff.c0 edit would compile the same input differently from coff0, with no
+# indication that the binary itself is the problem.
 rebuilt=0
 if [ ! -x "$COFF1" ] || [ "$COFF_SRC" -nt "$COFF1" ]; then
   COFF0=$COFF_DIR/coff0
-  # CC selects the seed compiler. tcc is preferred when present: it is
+  # CC selects the seed compiler. tcc is preferred when present, since it is
   # reachable from the 357-byte hex0 seed through the stage0/M2-Planet/Mes
   # bootstrap chain, and gcc is reachable from nothing. A coff1
   # bootstrapped entirely through tcc is byte-identical to the gcc one and
@@ -101,11 +93,11 @@ if [ ! -x "$COFF1" ] || [ "$COFF_SRC" -nt "$COFF1" ]; then
   rebuilt=1
 fi
 
-# smed has the same standing as coff1: a binary on the critical path,
+# smed has the same standing as coff1, a binary on the critical path,
 # rebuilt whenever its source moves. Its assembly comes from coff1; the
 # bytes come from the smed already here when there is one, and from as+ld
 # only when there is no smed at all -- the one-time seed that coff's
-# README describes. Either way the assembly then runs twice: the smed
+# README describes. Either way the assembly then runs twice. The smed
 # already here assembles the new source, then that result assembles it
 # again. When a change alters how smed encodes something (RIP-relative
 # addressing did), or when the smed here came from as+ld, the first
@@ -130,7 +122,7 @@ if [ "$rebuilt" -eq 1 ]; then
   # sha256sum, so the new binaries are checked against source before they
   # are blessed rather than merely recorded.
   # --write-manifest only where the manifest tracks binaries (the dev tree,
-  # recognisable by its coff1 line): there a rebuilt coff1 makes the
+  # recognisable by its coff1 line). There a rebuilt coff1 makes the
   # committed line stale and the refresh is what keeps the audit green.
   # A released coff's manifest is a fixed committed file; rewriting it
   # would only dirty the clone.
@@ -144,19 +136,19 @@ if [ "$rebuilt" -eq 1 ]; then
   sha256sum "$COFF1" "$SMED" | sed 's|  .*/|  |' > "$TOOL_RECORD"
 fi
 
-# Cheap per-build integrity check: hashing two small files costs nothing
+# Cheap per-build integrity check. Hashing two small files costs nothing
 # and needs no gcc, so it runs even on the every-build path where the whole
 # point is that nothing but coff and smed themselves are required. Catches
 # a binary that was altered after it was verified.
 #
-# Where the expected hash comes from, in order: the coff manifest's own
+# Where the expected hash comes from, in order, is the coff manifest's own
 # line for the binary (dev tree), else this script's record from the last
 # passing audit. A binary with neither -- typically one bootstrapped by
 # hand from a public clone, following coff's README -- is not "tampered",
 # it is unverified, so it gets the full audit now and is recorded on
 # success. A binary that HAS a record and does not match it is the case the
 # gate exists for, and that one fails closed with no automatic
-# re-verification: a human has to look.
+# re-verification, since a human has to look.
 gate() { # name path
   local name="$1" path="$2" expected_src expected actual
   if [ -f "$MANIFEST" ] && grep -qE "^[0-9a-f]{64}  $name\$" "$MANIFEST"; then
@@ -186,6 +178,13 @@ gate() { # name path
 gate coff1 "$COFF1"
 gate smed "$SMED"
 
+# The ring-3 programs and the ELF test pack the kernel embeds, built into
+# build/ from source by the gated coff1 and smed, every time. kmain.c0's
+# `embed` lines name these files; nothing generated is committed, so the
+# kernel cannot carry a stale program.
+./gen_programs.sh >/dev/null
+./gen_elf_tests.sh >/dev/null
+
 "$COFF1" kmain.c0 kmain.s
 # kmain.c0's `include`s pull knekt.c0/interrupts.c0/jenna.c0/chrone.c0/
 # vga.c0/punkt.c0/keyboard.c0 in before compilation even starts (see
@@ -196,17 +195,17 @@ gate smed "$SMED"
 # everything is one translation unit, which is all it is ever been used
 # for) -- any c0 function boot.s calls into from a separate object file
 # needs to be visible, so it is added here rather than as a coff language/
-# codegen change. main (knekt.c0): called from boot.s's long_mode_start.
-# int_dispatch (interrupts.c0): called from boot.s's isr_common trampoline
+# codegen change. main (knekt.c0) is called from boot.s's long_mode_start.
+# int_dispatch (interrupts.c0) is called from boot.s's isr_common trampoline
 # (see boot.s for why the trampoline itself has to be hand-written asm,
-# not c0). paging_verify (jenna.c0): called from boot.s right after it
-# loads CR3 with the c0-built page tables. kernel_post_init (knekt.c0):
+# not c0). paging_verify (jenna.c0) is called from boot.s right after it
+# loads CR3 with the c0-built page tables. kernel_post_init (knekt.c0) is
 # called from boot.s after lidt (needs a live IDT for the demand-paging
 # fault test) -- also test_panic.sh's injection target, see that script.
-# timer_tick/keyboard_handler/page_fault_handler do NOT need this: boot.s
+# timer_tick/keyboard_handler/page_fault_handler do NOT need this, since boot.s
 # never calls them by name -- kmain.c0's expanded content only references
 # them internally (dispatch_set(32, timer_tick), etc.), a same-object-file
-# reference that needs no `.global` at all. sched_start (chrone.c0): called
+# reference that needs no `.global` at all. sched_start (chrone.c0) is called
 # from boot.s as scheduler task A (thread_b/sched_launch_call stay internal
 # -- thread_b is only referenced by address via c0's function-reference
 # feature, and sched_launch itself is called indirectly through the
@@ -217,8 +216,8 @@ sed -i '1i .global main\n.global int_dispatch\n.global paging_verify\n.global ke
 # files to combine. The .global lines above are kept for as, which still
 # builds the same inputs as the differential oracle (see verify_smed_kernel
 # in the test scripts); smed itself sees every symbol regardless.
-# moonshot.map lists every symbol's final address; sync_addrs.sh reads the
-# JIT helper addresses from it, which is what nm used to be for.
+# moonshot.map lists every symbol's final address, for reading a crash
+# address back to a function.
 "$SMED" -T linker.ld -m moonshot.map boot.s kmain.s ring3_handlers.s moonshot.elf
 
 echo "built moonshot.elf"

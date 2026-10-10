@@ -1,0 +1,75 @@
+// expect: 10
+// oljud -- sound() (SYS_SOUND 14) on real moonshot, with QEMU's SB16. Each
+// check that holds adds one, so the exit code counts them.
+//
+// It plays one second of a 441 Hz square wave, 22050 samples a second, a
+// period of 50 samples, 25 high and 25 low. verify_oljud.sh records what the
+// card played to a wav file and measures that tone. This program checks the
+// syscall's answers and that the queue drains at the card's pace.
+int main() {
+    int ok = 0;
+
+    // 1. Nothing is queued before anyone has played anything.
+    if (sound(0, 0) == 0) { ok = ok + 1; }
+
+    // 2. A buffer in kernel memory is refused, and so is a negative length.
+    if (sound(4096, 10) == 0 - 1) { ok = ok + 1; }
+    int tone = alloc(22050);
+    if (sound(tone, 0 - 1) == 0 - 1) { ok = ok + 1; }
+
+    // 3. One second of tone fits in the queue whole.
+    int i = 0;
+    while (i < 22050) {
+        if (i % 50 < 25) { store8(tone + i, 192); } else { store8(tone + i, 64); }
+        i = i + 1;
+    }
+    if (sound(tone, 22050) == 22050) { ok = ok + 1; }
+
+    // 4. ...and is waiting there right after.
+    if (sound(0, 0) > 0) { ok = ok + 1; }
+
+    // 5. It drains, and at the card's pace, since one second of sound cannot be
+    // gone in much less than a second (100 ticks), and should be gone well
+    // inside two plus the two halves of latency.
+    int t0 = ticks();
+    while (sound(0, 0) > 0 && ticks() - t0 < 400) { }
+    int took = ticks() - t0;
+    if (sound(0, 0) == 0) { ok = ok + 1; }
+    if (took >= 80 && took <= 200) { ok = ok + 1; }
+    // The queue is empty, but the last of the tone is still in the card's
+    // DMA page, two halves at most (0.19 s). Let it finish before the flush
+    // below, which would otherwise silence it too.
+    t0 = ticks();
+    while (ticks() - t0 < 30) { }
+
+    // 6. The queue holds 64KB and no more, and the rest is the caller's to retry.
+    int quiet = alloc(70000);
+    i = 0;
+    while (i < 70000) { store8(quiet + i, 128); i = i + 1; }
+    if (sound(quiet, 70000) == 65536) { ok = ok + 1; }
+
+    // 7. sound(0, -1) stops everything, and the queue it just filled is dropped
+    // (all of it but what an interrupt or two moved to the card meanwhile)
+    // and nothing is waiting after.
+    int dropped = sound(0, 0 - 1);
+    if (dropped >= 65536 - 4096 && sound(0, 0) == 0) { ok = ok + 1; }
+
+    // 8. ...including in the middle of a sound. A second tone, 882 Hz this
+    // time (period 25), a second long, is cut off after about 0.3 s.
+    // verify_oljud.sh checks the recording, since this tone must be short. Half a
+    // second of quiet first, so the recording shows two separate tones.
+    t0 = ticks();
+    while (ticks() - t0 < 50) { }
+    i = 0;
+    while (i < 22050) {
+        if (i % 25 < 13) { store8(tone + i, 192); } else { store8(tone + i, 64); }
+        i = i + 1;
+    }
+    sound(tone, 22050);
+    t0 = ticks();
+    while (ticks() - t0 < 30) { }
+    dropped = sound(0, 0 - 1);
+    if (dropped > 0 && dropped < 22050 && sound(0, 0) == 0) { ok = ok + 1; }
+
+    return ok;
+}

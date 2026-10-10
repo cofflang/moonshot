@@ -9,17 +9,14 @@
 # License version 3 or (at your option) any later version, WITHOUT ANY
 # WARRANTY; see the LICENSE file for the full text.
 # Proves fb_scroll for real. The boot banner is only 2 lines -- nowhere
-# near fb_height/FONT_H = 96 rows -- so the scroll path has never actually
-# run in the normal kernel.
+# near fb_height/FONT_H = 96 rows -- so the scroll path does not
+# run in a normal boot.
 #
-# An earlier version of this proof lived PERMANENTLY in knekt.c0's
-# kernel_post_init, floating 93 forced newlines into every single boot.
-# That was a mistake: it visibly wrecked the "MOONSHOT\nOS\n" banner on
-# every real boot and screenshot from then on (leaving only "OS"/a stray
-# marker glyph on screen, not "MOONSHOT") -- a real regression, caught by
-# the user actually looking at the running kernel, not by any automated
-# check (none of run_qemu.sh's assertions look at the banner's own
-# pixels). Fixed by moving it here: same temporary-injection,
+# The proof lives here rather than permanently in knekt.c0's
+# kernel_post_init, where 93 forced newlines in every boot would wreck the
+# "MOONSHOT\nOS\n" banner on every real boot and screenshot, and none of
+# run_qemu.sh's assertions look at the banner's own pixels. It uses the same
+# temporary-injection,
 # always-restore-via-trap discipline as test_panic.sh/test_vga_scroll.sh,
 # so the proof still runs and still asserts real pixel displacement, but
 # the normal kernel's boot screen is never touched.
@@ -30,17 +27,16 @@ cp knekt.c0 knekt.c0.panicbak
 restore() {
   if [ -f knekt.c0.panicbak ]; then
     mv -f knekt.c0.panicbak knekt.c0
-    ./sync_addrs.sh >/dev/null 2>&1 || true
   fi
 }
 trap restore EXIT
 
 # Draw a marker glyph at the cursor (row 2, col 0, where the banner leaves
 # it), then push newlines until fb_putc's own scroll check triggers
-# exactly once: from row 3 (marker + one newline), 93 more newlines lands
+# exactly once, since from row 3 (marker + one newline), 93 more newlines lands
 # exactly on row 96 (96*FONT_H >= fb_height), which scrolls and settles
 # back to row 95 -- one scroll, not zero, not several. A real scroll
-# shifts every pixel row up by FONT_H (8): the marker (drawn at pixel rows
+# shifts every pixel row up by FONT_H (8), so the marker (drawn at pixel rows
 # 16-23, char-row 2) must now read back at pixel rows 8-15 (char-row 1),
 # and char-row 2's OLD spot -- never touched by anything after the marker
 # -- must now be background (whatever char-row 3, always blank, shifted
@@ -57,11 +53,9 @@ s = s.replace(marker, marker + inject, 1)
 open(p, 'w').write(s)
 PY
 
-if ! ./sync_addrs.sh >/dev/null 2>&1; then
-  if ! ./sync_addrs.sh >/dev/null 2>&1; then
-    echo "FAIL: building the fb-scroll variant (sync_addrs) failed"
-    exit 1
-  fi
+if ! ./build.sh >/dev/null 2>&1; then
+  echo "FAIL: building the fb-scroll variant failed"
+  exit 1
 fi
 
 isodir=isoroot-fbscroll

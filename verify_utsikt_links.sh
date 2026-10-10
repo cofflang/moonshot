@@ -9,11 +9,11 @@
 # License version 3 or (at your option) any later version, WITHOUT ANY
 # WARRANTY; see the LICENSE file for the full text.
 #
-# Proves that utsikt FOLLOWS a link: that clicking painted words loads a
+# Proves that utsikt FOLLOWS a link, that clicking painted words loads a
 # different file off jakel and renders it, and that Backspace comes back.
 #
 # Four separate claims sit behind one click, and the script is built so that
-# each of them can fail on its own:
+# each of them can fail on its own.
 #
 #   1. The parser kept the href. Nothing on screen says so directly, but a
 #      link is painted in the default stylesheet's link colour and underlined
@@ -37,14 +37,14 @@
 # than the screen is wide in both axes, which klick clamps, and absolute
 # positions are then reached by tracked deltas.
 #
-# Validated by breaking it, twice, at the two ends of the chain:
-#   - link_box_add() made a no-op: the run is painted and located, the click
+# Two deliberate breaks, at the two ends of the chain, show what it catches.
+#   - link_box_add() made a no-op. The run is painted and located, the click
 #     lands on it, and nothing is under it as far as the hit test knows.
-#   - the parsed href dropped on the floor in dom.c0: the anchor is still
+#   - the parsed href dropped on the floor in dom.c0. The anchor is still
 #     styled as a link, because the stylesheet matches the tag rather than
 #     the attribute, so the run is still found and still clicked.
 # Both leave the first page on screen and fail check 3. The second is the
-# reason check 1 cannot be "we found blue text, so the href survived".
+# reason check 1 cannot be "blue text was found, so the href survived".
 set -u
 cd "$(dirname "$0")"
 
@@ -76,7 +76,7 @@ sleep 2
 python3 - "$sockfile" <<'EOF'
 import socket, sys, time
 
-LINK_RGB = (0, 64, 192)      # default stylesheet: a { color: #0040c0 }
+LINK_RGB = (0, 64, 192)      # default stylesheet, a color #0040c0
 
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 sock.connect(sys.argv[1])
@@ -139,7 +139,7 @@ def move_to(x, y):
         pos[0] += dx
         pos[1] += dy
 
-# raket login gate: root, then an empty password.
+# raket login gate, root, then an empty password.
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
 
@@ -189,8 +189,8 @@ EOF
 sleep 1
 
 python3 - <<'PY'
-FIRST_BG  = (240, 239, 232)   # index.html: body { background: #f0efe8 }
-SECOND_BG = (232, 224, 244)   # about.html: body { background: #e8e0f4 }
+FIRST_BG  = (240, 239, 232)   # index.html body background #f0efe8
+SECOND_BG = (232, 224, 244)   # about.html body background #e8e0f4
 MIN_SHARE = 0.40              # a rendered page covers its whole viewport, so
                               # the page on screen measures far above this and
                               # the other one far below
@@ -214,7 +214,7 @@ def read_ppm(path):
     w, h, _ = fields
     return w, h, data[pos:]
 
-# Measure inside the tavla only: it is the right half of the screen, and the
+# Measure inside the tavla only, since it is the right half of the screen, and the
 # shell beside it would otherwise dilute every fraction.
 def shares(path):
     w, h, buf = read_ppm(path)

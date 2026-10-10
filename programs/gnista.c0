@@ -9,7 +9,7 @@
 //
 // gnista -- a game engine for Moonshot, written in c0.
 //
-// Where this is: a real entity pool (not one hand-named entity), a general
+// It has a real entity pool (not one hand-named entity), a general
 // AABB overlap test callable between any two entities, all-pairs collision
 // resolution, and per-entity compositing. Movement, animation, arrow-key
 // input and window-edge bouncing carry over from the first demo.
@@ -20,13 +20,9 @@
 // used as the fallback, so the demo runs on a machine where nobody has drawn
 // anything yet.
 //
-// That fallback is the whole of what used to be here: before SYS_READFILE a
-// ring-3 program could not read a file at all, so every sprite was baked in
-// by a host script and changing one pixel meant rebuilding the kernel.
-//
 // Drawing is composited into a small local buffer and presented with a
-// SINGLE blit() per entity, not separate fill()+fill()+blit() calls. Found
-// the hard way: fill()/blit() write straight to the live framebuffer with
+// SINGLE blit() per entity, not separate fill()+fill()+blit() calls,
+// because fill()/blit() write straight to the live framebuffer with
 // no double-buffering, and each syscall is individually atomic (SYSCALL's
 // SFMASK clears RFLAGS.IF for its duration) but the scheduler CAN preempt
 // a task BETWEEN two separate syscalls -- so a multi-call draw sequence
@@ -46,7 +42,7 @@ layout Entity {
     int sprite;
     int frame;
     int frame_ticks;
-    // Immovable: collided against and drawn, but never moved or bounced.
+    // Immovable, collided against and drawn, but never moved or bounced.
     // This is what lets a static block be an ordinary pool member instead
     // of a separate kind of thing with its own layout, its own collision
     // path and its own drawing path -- see the header on aabb_hit.
@@ -63,21 +59,18 @@ layout Sprite {
     int pixels;  // address of frames * width * height * 4 raw BGR0 bytes
 }
 
-// Field names deliberately do not collide with Entity's x/y/w/h: coff.c0
+// Field names deliberately do not collide with Entity's x/y/w/h, since coff.c0
 // keeps one flat field-name -> offset table shared across every `layout`
 // (see field_declare_or_check), so a shared name must land at the same
 // offset in every layout that uses it. Entity's w/h sit after prev_x/
 // prev_y/vx/vy (offset 48/56); a same-named w/h here would sit right after
 // x/y (offset 16/24) -- a real offset conflict, not a naming preference.
-// Hit this directly: it compiles to a bare CODEGENERROR with no further
-// detail, so this is not a hypothetical to guard against speculatively.
+// The compiler refuses it.
 
 include "sprite_demo_data.c0";
+include "moon.c0";
 
-// Not globals: when this was written --elf had no support for
-// global-variable reads. It does now (it is the ordinary assembly
-// backend); these stay as locals/params because nothing is
-// gained by moving them.
+// These are locals and params rather than globals, which costs nothing.
 
 int make_sprite_demo() {
     int s;
@@ -98,7 +91,7 @@ int make_sprite_demo() {
 // This is what SYS_READFILE was added for. Until it existed a ring-3 program
 // could not read a file at all, so the sprite below had to be compiled in by
 // a host script and changing one pixel meant rebuilding the kernel. Now the
-// loop closes on the machine itself: draw it in pensel, spawn the game, see
+// loop closes on the machine itself. Draw it in pensel, spawn the game, see
 // it.
 //
 // The file's layout is deliberately the shape this `Sprite` already has --
@@ -133,9 +126,8 @@ int load_sprite(int name) {
 // no arrays and no pointer types -- an entity "reference" is just the
 // address of its record, which is exactly what `layout` field access already
 // expects -- so a pool is one alloc and a multiply, and iterating it is a
-// loop over indices. Allocated once at startup: SYS_ALLOC's ring-3 heap is
-// bump-only with no free, so anything allocated per frame would exhaust it
-// within seconds.
+// loop over indices. Allocated once at startup, since anything allocated
+// per frame would cost an alloc and a dealloc every frame.
 int pool_alloc(int count) {
     return alloc(count * sizeof(Entity));
 }
@@ -192,7 +184,7 @@ int aabb_hit(int a, int b) {
 
 // Bounces `e` off `other`, which it is known to overlap. Resolution picks
 // the axis of SHALLOWEST penetration and reverses only that one, rather than
-// reversing both: reversing both is what the one-obstacle demo did, and with
+// reversing both, since with
 // several entities it makes a glancing corner hit send things back the way
 // they came on both axes, which reads as entities sticking to each other.
 //
@@ -227,7 +219,7 @@ void bounce_off(int e, int other) {
     return;
 }
 
-// All-pairs collision across the pool: every unordered pair tested once
+// All-pairs collision across the pool, every unordered pair tested once
 // (j starts at i+1). O(n^2), which is the right amount of machinery at this
 // scale -- a broad phase would be a real cost in code and a real risk of
 // being subtly wrong, to save comparisons that are not being felt. Revisit
@@ -266,7 +258,7 @@ void buf_put_pixel(int buf, int off, int color) {
     int b;
     int g;
     int r;
-    b = color - (color / 256) * 256;
+    b = color % 256;
     g = (color / 256) - (color / 65536) * 256;
     r = (color / 65536) - (color / 16777216) * 256;
     store8(buf + off, b);
@@ -279,7 +271,7 @@ void buf_put_pixel(int buf, int off, int color) {
 // Draws entity `e` into the compose buffer, clipped to the box
 // [bx, bx+bw) x [by, by+bh) in screen coordinates. Used both for the entity
 // being presented and for any OTHER entity that overlaps its box -- which is
-// what keeps the pool from erasing itself: compositing entity A's box paints
+// what keeps the pool from erasing itself, since compositing entity A's box paints
 // background over whatever was there, and if B happened to be inside it, B
 // would vanish until its own turn came round. Drawing every intersecting
 // entity into the box means the box is always correct when it lands.
@@ -344,8 +336,7 @@ void draw_entity_into(int e, int buf, int bx, int by, int bw, int bh) {
 // see every tick individually; it can see a handful at once, in bursts),
 // the loop would grow with the SQUARE of the gap and just keep grinding --
 // not just slow for this demo, but stealing real CPU time from every other
-// task on the system. Found exactly this way: letting the box grow unbounded
-// visibly slowed down the whole OS, not just this window. When the real box
+// task on the system. When the real box
 // would exceed the cap, fall back to just the entity's own (small, fixed)
 // footprint at its new position -- the old position does not get cleanly
 // erased in that rare case (a brief visual ghost, not a crash or a
@@ -468,7 +459,7 @@ int main() {
         if (i == 3) { e.vx = 0 - SPEED; e.vy = 0 - SPEED; }
         // Stagger the animation so they do not all twinkle in lockstep --
         // but never past the sprite's real frame count.
-        e.frame = i - (i / 2) * 2;
+        e.frame = i % 2;
         if (e.frame >= spr.frames) { e.frame = 0; }
         i = i + 1;
     }
@@ -525,7 +516,7 @@ int main() {
             key = key_poll();
         }
 
-        // The mouse: while the left button is held over the window, entity 0
+        // The mouse. While the left button is held over the window, entity 0
         // is steered toward the pointer (one axis at a time is enough to
         // read as "it comes to me"), and stops once it arrives. Polled state
         // rather than events -- mouse_poll() returns -1 outside the window
@@ -534,8 +525,8 @@ int main() {
         // the pointer, and what verify_mouse.sh checks.
         m = mouse_poll();
         if (m >= 0) {
-            buttons = m - (m / 8) * 8;
-            if (buttons - (buttons / 2) * 2 == 1) {
+            buttons = m % 8;
+            if (buttons % 2 == 1) {
                 mx = (m / 8) / 1024;
                 my = (m / 8) - mx * 1024;
                 e = pool_at(pool, 0);
@@ -551,41 +542,38 @@ int main() {
 
         t = ticks();
         dt = t - prev_ticks;
+        // Nothing moves until the clock does; sleep the tick out rather
+        // than spin, so the CPU goes to everything else meanwhile.
+        if (dt <= 0) { sleep(1); }
         if (dt > 0) {
             dt_real = dt;
             prev_ticks = t;
 
             // Movement advances by a fixed amount per RENDERED frame,
-            // not by elapsed time. This is a deliberate reversal of the
-            // frame-rate-independent movement this demo started with, and
-            // it is worth being precise about why.
+            // not by elapsed time, and it is worth being precise about why.
             //
-            // Measured on real Moonshot: with a scheduler quantum of 10
-            // ticks and several runnable tasks, this process rendered
-            // roughly 10 frames in a row (one per tick, moving one pixel
-            // each) and was then descheduled for about 30 ticks. Honest
-            // dt-based movement has to make that time up, so the next frame
-            // jumped the whole way at once: about 70% of all motion happened
-            // in a single frame out of eleven. That is what read as jerky --
-            // the step sizes were wildly irregular, not merely large. (The
-            // quantum is 1 tick now, which spaces frames evenly, but the
-            // reasoning holds for any future scheduling gap.)
+            // When this task is descheduled for a while, honest dt-based
+            // movement has to make that time up, so the next frame jumps the
+            // whole way at once. With a scheduler quantum of 10 ticks and
+            // several runnable tasks, about 70% of all motion would happen in a
+            // single frame out of eleven. That reads as jerky, because the step
+            // sizes are wildly irregular, not merely large.
             //
             // Nothing can be drawn during the time this task is not running,
             // so correct wall-clock speed and even motion cannot both be
-            // had: catching up after a gap IS the lurch. For a demo, even
+            // had, since catching up after a gap IS the lurch. For a demo, even
             // motion wins, so the step is pinned to one tick's worth and the
             // speed set per step instead.
             //
             // dt_real (below) keeps the UNCLAMPED elapsed time, so the
             // animation timer stays wall-clock correct even though movement
-            // no longer is.
+            // is not.
             dt = MAX_STEP;
 
-            // Re-read the window before bouncing anything off its edges: a
+            // Re-read the window before bouncing anything off its edges, since a
             // tile is resized by any reflow (a `split` typed in another
             // window, a spawn3, a close) and nothing announces it. Without
-            // this, entities kept bouncing off the boundaries of a window
+            // this, entities would keep bouncing off the boundaries of a window
             // that no longer exists -- off-screen in a shrunken tile, or in
             // mid-air well short of the edge in an enlarged one.
             //
@@ -631,7 +619,7 @@ int main() {
             }
 
             // Collisions AFTER every entity has moved, not interleaved with
-            // movement: resolving as each one moves would test entity 0
+            // movement, since resolving as each one moves would test entity 0
             // against entity 3's position from the previous frame, so the
             // result would depend on pool order.
             resolve_collisions(pool, count);

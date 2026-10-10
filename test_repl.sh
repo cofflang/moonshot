@@ -42,7 +42,7 @@ sendkey() {
 import socket, time
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.connect('repl_test.sock')
-time.sleep(0.3)
+time.sleep(0.05)
 for c in '$1':
     name = {
         ' ': 'spc', '\n': 'ret', '/': 'slash', '.': 'dot', '-': 'minus',
@@ -58,17 +58,16 @@ for c in '$1':
     }.get(c, c)
     s.send(f'sendkey {name}\n'.encode())
     time.sleep(0.03)
-time.sleep(0.5)
+time.sleep(0.1)
 " 2>/dev/null
 }
 
 # Byte offset into serial.log taken just before the current command was sent,
 # so a check only ever looks at output that command produced.
 #
-# check() used to grep the whole cumulative log, which means a test could pass
-# on a value some EARLIER test had printed -- `check '\[repl] 5'` is satisfied
-# by any of the several earlier expressions that also produce 5. Nothing was
-# known to be passing spuriously, but the suite could not have told us.
+# Grepping the whole cumulative log would let a test pass
+# on a value some EARLIER test had printed -- `check '\[repl] 5'` would be satisfied
+# by any of the several earlier expressions that also produce 5.
 mark=0
 serial_size() { if [ -f serial.log ]; then wc -c < serial.log; else echo 0; fi; }
 
@@ -80,7 +79,7 @@ serial_size() { if [ -f serial.log ]; then wc -c < serial.log; else echo 0; fi; 
 #
 # The kernel could print atomically instead, but only by disabling interrupts
 # around every debug print, which is a real cost to pay for a test's
-# convenience. Normalising here is the cheaper half of that trade: delete the
+# convenience. Normalising here is the cheaper half of that trade. Delete the
 # async messages wherever they land, INCLUDING mid-line, drop what that leaves
 # empty, then glue a dangling `[repl] `/`[jit] ` prefix back onto the value
 # below it.
@@ -117,10 +116,10 @@ sys.stdout.write(text)
 window() { tail -c "+$((mark + 1))" serial.log 2>/dev/null | normalize; }
 
 # What the guest ACTUALLY received, rebuilt from the kernel's own per-character
-# echo. This is the check that would have saved a session: when `-(5 + 3)` came
-# back as -6, the natural reading was a compiler bug, and the first thing that
-# had to be ruled out was the harness dropping or mis-shifting a keystroke.
-# Now the harness answers that question itself, every command, instead of
+# echo. A wrong answer such as `-(5 + 3)` coming
+# back as -6 reads like a compiler bug, and the first thing that
+# has to be ruled out is the harness dropping or mis-shifting a keystroke.
+# The harness answers that question itself, every command, instead of
 # leaving it to be reconstructed by hand afterwards.
 typed_since() {
   tail -c "+$((mark + 1))" serial.log 2>/dev/null \
@@ -136,11 +135,34 @@ print(out.replace('\n', ''), end='')
 failures=0
 last_cmd=""
 
+# Waits for the shell to say it is ready again, "[sh] prompt" on serial after
+# the mark (the kernel mirrors the shell to serial; see skalman.c0's
+# sk_putc), rather than a flat sleep per command, which would make this
+# by far the slowest script in the suite. Gives up after 6 s, and the check that follows
+# then fails on whatever did arrive.
+wait_prompt() {
+  local i=0
+  while [ "$i" -lt 60 ]; do
+    if window | grep -q '^\[sh\] prompt'; then return 0; fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
 type_cmd() {
   mark=$(serial_size)
   last_cmd="$1"
-  sendkey "$1"
-  sendkey "\n"
+  sendkey "$1\n"
+  wait_prompt
+}
+
+# The login lines are answered by raket, whose prompts are not the shell's,
+# so these keep a fixed wait.
+type_login() {
+  mark=$(serial_size)
+  last_cmd="$1"
+  sendkey "$1\n"
   sleep 1
 }
 
@@ -169,8 +191,8 @@ check() {
 # Log in as root (raket's boot-time login gate) before any shell command can
 # reach shell_run -- root has no password set at boot, so an empty password
 # line is what logs in. See raket.c0.
-type_cmd "root"
-type_cmd ""
+type_login "root"
+type_login ""
 
 # Arithmetic
 type_cmd "eval 2 + 3 * 4"
@@ -211,13 +233,13 @@ check "print(99)" '\[repl] 99'
 type_cmd "eval 1 / 0"
 check "1/0 error" 'division by zero'
 
-# --- REPL v2: control flow ---
+# --- control flow ---
 
-# if/else: then-branch
+# if/else, then-branch
 type_cmd "eval if (1) { print(77); }"
 check "if(1) print(77)" '\[repl] 77'
 
-# if/else: else-branch
+# if/else, else-branch
 type_cmd "eval if (0) { print(1); } else { print(88); }"
 check "if(0) else print(88)" '\[repl] 88'
 
@@ -225,7 +247,7 @@ check "if(0) else print(88)" '\[repl] 88'
 type_cmd "eval c = 3; while (c > 0) { c = c - 1; } print(c)"
 check "while countdown" '\[repl] 0'
 
-# --- REPL v3: for loops ---
+# --- for loops ---
 
 # for loop counting up (short var names, no spaces for faster sendkey)
 type_cmd "eval for(a=0;a<3;a=a+1){print(a);}"
@@ -239,11 +261,11 @@ check "for condition-only" '\[repl] 2'
 check "for condition-only" '\[repl] 1'
 
 # A for loop that is NOT the last statement. Every for test above has the
-# loop last, which is the one arrangement that cannot show this: ND_FOR kept
-# its body in the `next` slot, and `next` is also the slot the statement
-# chain uses, so the parser overwrote the loop's body with whatever came
-# after it. The loop then ran the following statement once per iteration and
-# the real body never ran at all -- and freeing the tree afterwards freed
+# loop last, which is the one arrangement that cannot show this. If ND_FOR
+# kept its body in the `next` slot, which is also the slot the statement
+# chain uses, the parser would overwrite the loop's body with whatever comes
+# after it. The loop would then run the following statement once per iteration and
+# the real body would never run -- and freeing the tree afterwards would free
 # that statement twice, once as the loop's body and once as the next link in
 # the chain, which is a double free into the kernel heap.
 type_cmd "eval for(d=0;d<2;d=d+1){print(d);}print(7)"
@@ -251,7 +273,7 @@ check "for then stmt: body ran (0)" '\[repl] 0'
 check "for then stmt: body ran (1)" '\[repl] 1'
 check "for then stmt: the statement after ran" '\[repl] 7'
 
-# --- REPL v4: break / continue ---
+# --- break / continue ---
 
 # break in while
 type_cmd "eval while(1){print(1);break;}print(2)"
@@ -351,7 +373,7 @@ type_cmd "eval -c undefined_var + 1"
 check "jit undefined var" 'unknown variable'
 
 # JIT print() — calls into jit_print_helper via JIT_PRINT_ADDR.
-# Extra sleep: JIT compilation + execution needs time before the check.
+# Extra sleep, since JIT compilation + execution needs time before the check.
 type_cmd "eval -c print(77)"
 sleep 2
 check "jit print 77" '\[jit] 77'
@@ -378,7 +400,7 @@ sleep 2
 type_cmd "run demo.c0"
 sleep 2
 check "demo.c0 print(777)" '\[repl] 777'
-# n=888 is not auto-printed: repl_eval only prints the LAST statement
+# n=888 is not auto-printed, since repl_eval only prints the LAST statement
 # in a multi-statement block, and print(n+999) is last. The value is
 # verified indirectly — print(n+999) → 1887 proves n was set correctly.
 check "demo.c0 print(n+999)" '\[repl] 1887'

@@ -11,12 +11,12 @@
 // /about.html, the one it links to.
 //
 // It lives in the kernel because Moonshot has no way to receive a file from
-// the host: everything that has to exist as a file on jakel is seeded by the
+// the host, so everything that has to exist as a file on jakel is seeded by the
 // kernel itself, the same way the ring-3 binaries are. It is a string rather
 // than a baked byte array because it is text, and a byte array nobody can
 // read in a diff would be a worse version of the same thing.
 //
-// The content is chosen to exercise the engine, not to say something: every
+// The content is chosen to exercise the engine, not to say something, since every
 // property utsikt's CSS subset supports appears here, the colours are
 // distinct enough for verify_utsikt.sh to find by pixel, and it is long
 // enough that a window has to scroll to reach the end.
@@ -124,7 +124,7 @@ Esc quits, and alt+w closes the window.</p>
 </html>";
 }
 
-// The page /index.html links to. Short on purpose: its job is to be
+// The page /index.html links to. Short on purpose, since its job is to be
 // unmistakably NOT the first page, from one screendump, without scrolling.
 // The background is the only place #e8e0f4 appears anywhere in the system,
 // which is what lets verify_utsikt_links.sh say which page is on screen by
@@ -160,12 +160,15 @@ you are reading stays where it is.</p>
 <tr><td>Blocks and inline text</td><td>yes</td></tr>
 <tr><td>Margins, collapsed</td><td>yes</td></tr>
 <tr><td>Tables</td><td>this one</td></tr>
-<tr><td>Images</td><td>not yet</td></tr>
+<tr><td>Images</td><td>yes, see below</td></tr>
 </table>
 
 <p>The table above is laid out by the same engine as everything else. Its
 columns are equal width rather than sized to their contents, which is a
 simplification written down in the source rather than an accident.</p>
+
+<p>An image, the moon the kernel draws into <code>moon.spr</code> at boot:
+<img src=\"moon.spr\"> It sits on the line like a word.</p>
 
 <p><a href=\"index.html\">Back to the first page</a>, the long way.</p>
 

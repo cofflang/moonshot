@@ -1,0 +1,152 @@
+// synth.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// synth -- turns a noter song into sound oljud can play, 8-bit unsigned mono
+// at 22050 samples a second, 128 being silence. A ring-3 library, included
+// after noter.c0.
+//
+// Every note is a square wave. Its loudness is its velocity, scaled so that
+// eight notes at full velocity add up to exactly the 8-bit range, so up to eight
+// voices never clip, at the cost of one note alone being fairly quiet. Each
+// note ramps in and out over SYNTH_RAMP samples (3ms), because a square wave
+// switched on or off mid-swing clicks.
+//
+// There is no per-voice state. A note's phase at sample t is simply
+// (t - its first sample) times its phase step, so any stretch of a song can
+// be rendered on its own, in any order, and comes out the same. That is what
+// lets a player hand the song to oljud a block at a time, since oljud's queue holds
+// about three seconds and a song can be longer.
+//
+// Only integers. Pitch to frequency goes through a table of one octave in
+// millihertz, doubled or halved for the others.
+
+int SYNTH_RATE = 22050;
+int SYNTH_RAMP = 64;          // samples, about 3ms
+int SYNTH_AMP = 16;           // a full-velocity voice swings +-16
+int SYNTH_ONE = 4294967296;   // one whole cycle of phase
+
+// MIDI 60-71 (C4 to B4) in millihertz, equal temperament, A4 = 440 Hz.
+int synth_mhz(int n) {
+    if (n == 0) { return 261626; }
+    if (n == 1) { return 277183; }
+    if (n == 2) { return 293665; }
+    if (n == 3) { return 311127; }
+    if (n == 4) { return 329628; }
+    if (n == 5) { return 349228; }
+    if (n == 6) { return 369994; }
+    if (n == 7) { return 391995; }
+    if (n == 8) { return 415305; }
+    if (n == 9) { return 440000; }
+    if (n == 10) { return 466164; }
+    return 493883;
+}
+
+// The phase step per sample for a MIDI pitch, the fraction of a cycle one
+// sample advances, out of SYNTH_ONE. Worked out at octave 4 and shifted, so
+// every C is exactly twice the C below it.
+int synth_step(int pitch) {
+    int inc = synth_mhz(pitch % 12) * SYNTH_ONE / (SYNTH_RATE * 1000);
+    int oct = pitch / 12 - 5;
+    while (oct > 0) { inc = inc * 2; oct = oct - 1; }
+    while (oct < 0) { inc = inc / 2; oct = oct + 1; }
+    return inc;
+}
+
+// The sample at which grid step k begins. Computed from k every time rather
+// than by adding up a per-step length, so a long song does not drift. At 120
+// beats per minute a sixteenth is 2756.25 samples, and the quarter would
+// otherwise be lost on every step.
+int synth_at(int s, int k) {
+    return k * SYNTH_RATE * 60 / (s.nh_tempo * s.nh_steps);
+}
+
+// How many samples the whole song lasts, to the end of its last note.
+int synth_length(int s) {
+    int end = 0;
+    int i = 0;
+    while (i < s.nh_count) {
+        int r = noter_note(s, i);
+        if (r.nn_start + r.nn_length > end) { end = r.nn_start + r.nn_length; }
+        i = i + 1;
+    }
+    return synth_at(s, end);
+}
+
+// Renders samples [from, from + n) of the song into `out`, one byte each.
+// `mix` is scratch space for n int64 sums, owned by the caller so a player
+// rendering block after block allocates it once.
+void synth_render(int s, int from, int n, int out, int mix) {
+    int i = 0;
+    while (i < n) { store64(mix + i * 8, 0); i = i + 1; }
+    int to = from + n;
+    int k = 0;
+    while (k < s.nh_count) {
+        int r = noter_note(s, k);
+        int a = synth_at(s, r.nn_start);
+        if (a >= to) { break; }   // sorted by start, so nothing later sounds here
+        int b = synth_at(s, r.nn_start + r.nn_length);
+        if (b > from) {
+            int amp = r.nn_velocity * SYNTH_AMP / 127;
+            int inc = synth_step(r.nn_pitch);
+            int t = a;
+            if (t < from) { t = from; }
+            int stop = b;
+            if (stop > to) { stop = to; }
+            while (t < stop) {
+                int v = amp;
+                if ((t - a) * inc % SYNTH_ONE >= SYNTH_ONE / 2) { v = 0 - amp; }
+                // The ramps, in and out, so the edges do not click.
+                if (t - a < SYNTH_RAMP) { v = v * (t - a) / SYNTH_RAMP; }
+                if (b - t < SYNTH_RAMP) { v = v * (b - t) / SYNTH_RAMP; }
+                int p = mix + (t - from) * 8;
+                store64(p, load64(p) + v);
+                t = t + 1;
+            }
+        }
+        k = k + 1;
+    }
+    i = 0;
+    while (i < n) {
+        int v = load64(mix + i * 8) + 128;
+        // Only a song with more than eight notes at once can get here; lira
+        // does not let one be made, but a file from elsewhere could.
+        if (v < 0) { v = 0; }
+        if (v > 255) { v = 255; }
+        store8(out + i, v);
+        i = i + 1;
+    }
+    return;
+}
+
+// Plays the song through oljud from start to end and returns when the last
+// of it is queued. `block` bytes are rendered at a time; while oljud's queue
+// has no room for the next block, this waits. Returns 0 if there is no sound
+// card or no memory, 1 otherwise.
+int synth_play(int s, int block) {
+    int out = alloc(block);
+    int mix = alloc(block * 8);
+    if (out == 0 || mix == 0) { return 0; }
+    int len = synth_length(s);
+    int at = 0;
+    while (at < len) {
+        int n = block;
+        if (len - at < n) { n = len - at; }
+        synth_render(s, at, n, out, mix);
+        int sent = 0;
+        while (sent < n) {
+            int got = sound(out + sent, n - sent);
+            if (got < 0) { dealloc(out); dealloc(mix); return 0; }
+            sent = sent + got;
+        }
+        at = at + n;
+    }
+    dealloc(out);
+    dealloc(mix);
+    return 1;
+}

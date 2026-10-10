@@ -9,10 +9,10 @@
 // repl.c0 — c0 expression evaluator (interpret mode) for the skalman shell.
 // Parses a subset of c0, builds an AST in kernel heap memory, walks the tree
 // to compute a 64-bit result, and prints it. No machine code emission — pure
-// interpretation. Supports if/else, while loops, and blocks.
-// Deferred: function calls, strings, indexing.
+// interpretation. Supports if/else, while and for loops, break and continue,
+// blocks, strings and calls. Indexing is not supported.
 //
-// Entry point: repl_eval(src) — called from skalman's `eval <expr>` builtin.
+// The entry point is repl_eval(src) — called from skalman's `eval <expr>` builtin.
 
 // --- token kinds -----------------------------------------------------------
 int TK_NUM   = 1;
@@ -129,7 +129,15 @@ int repl_assign(int name, int len, int value) {
         store64(repl_var_values + idx * 8, value);
         return value;
     }
-    if (repl_var_count >= REPL_MAX_VARS) { return value; }
+    if (repl_var_count >= REPL_MAX_VARS) {
+        // The value is still the expression's result, but the variable is
+        // not created, so the next use of it fails. Say so now.
+        serial_print("[repl] all ");
+        serial_print_int(REPL_MAX_VARS);
+        serial_print(" variables in use, assignment not stored\n");
+        sk_print("repl: no room for another variable, not stored\n");
+        return value;
+    }
     // Allocate and copy the name.
     int name_buf = kmalloc(len + 1);
     int j = 0;
@@ -209,7 +217,7 @@ int repl_tokenize(int src, int count_ptr) {
         if (c == ' ' || c == '\t' || c == '\n' || c == 13) { p = p + 1; continue; }
         if (n >= max_tok) { break; }
         int off = n * sizeof(Token);
-        // Digit: parse integer literal (decimal or hex).
+        // A digit starts an integer literal (decimal or hex).
         if (repl_is_digit(c) == 1) {
             int v = 0;
             int base = 10;
@@ -240,7 +248,7 @@ int repl_tokenize(int src, int count_ptr) {
             n = n + 1;
             continue;
         }
-        // String literal: " ... "
+        // String literal, " ... "
         if (c == '"') {
             p = p + 1;  // skip opening quote
             int str_start = src + p;
@@ -270,46 +278,31 @@ int repl_tokenize(int src, int count_ptr) {
             // Check for keywords.
             int is_kw = 0;
             // print
-            int kw = kscratch_start;
-            store8(kw, 'p'); store8(kw + 1, 'r'); store8(kw + 2, 'i');
-            store8(kw + 3, 'n'); store8(kw + 4, 't'); store8(kw + 5, 0);
-            if (repl_word_is(start, len, kw) == 1) {
+            if (repl_word_is(start, len, "print") == 1) {
                 (toks + off).kind = TK_PRINT; is_kw = 1;
             }
             // if
-            store8(kw, 'i'); store8(kw + 1, 'f'); store8(kw + 2, 0);
-            if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
+            if (is_kw == 0 && repl_word_is(start, len, "if") == 1) {
                 (toks + off).kind = TK_IF; is_kw = 1;
             }
             // else
-            store8(kw, 'e'); store8(kw + 1, 'l'); store8(kw + 2, 's');
-            store8(kw + 3, 'e'); store8(kw + 4, 0);
-            if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
+            if (is_kw == 0 && repl_word_is(start, len, "else") == 1) {
                 (toks + off).kind = TK_ELSE; is_kw = 1;
             }
             // while
-            store8(kw, 'w'); store8(kw + 1, 'h'); store8(kw + 2, 'i');
-            store8(kw + 3, 'l'); store8(kw + 4, 'e'); store8(kw + 5, 0);
-            if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
+            if (is_kw == 0 && repl_word_is(start, len, "while") == 1) {
                 (toks + off).kind = TK_WHILE; is_kw = 1;
             }
             // for
-            store8(kw, 'f'); store8(kw + 1, 'o'); store8(kw + 2, 'r');
-            store8(kw + 3, 0);
-            if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
+            if (is_kw == 0 && repl_word_is(start, len, "for") == 1) {
                 (toks + off).kind = TK_FOR; is_kw = 1;
             }
             // break
-            store8(kw, 'b'); store8(kw + 1, 'r'); store8(kw + 2, 'e');
-            store8(kw + 3, 'a'); store8(kw + 4, 'k'); store8(kw + 5, 0);
-            if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
+            if (is_kw == 0 && repl_word_is(start, len, "break") == 1) {
                 (toks + off).kind = TK_BREAK; is_kw = 1;
             }
             // continue
-            store8(kw, 'c'); store8(kw + 1, 'o'); store8(kw + 2, 'n');
-            store8(kw + 3, 't'); store8(kw + 4, 'i'); store8(kw + 5, 'n');
-            store8(kw + 6, 'u'); store8(kw + 7, 'e'); store8(kw + 8, 0);
-            if (is_kw == 0 && repl_word_is(start, len, kw) == 1) {
+            if (is_kw == 0 && repl_word_is(start, len, "continue") == 1) {
                 (toks + off).kind = TK_CONTINUE; is_kw = 1;
             }
             if (is_kw == 0) {
@@ -399,18 +392,16 @@ layout Node {
     int extra;
     int next;
     // The body of a for loop, and nothing else. It has a slot of its own
-    // because `next` could not be shared: `next` is what chains one statement
+    // because `next` cannot be shared. `next` is what chains one statement
     // to the following one inside a block, and a for loop is a statement. A
-    // loop that was not the last statement therefore had its body
-    // OVERWRITTEN by whatever came after it, ran that statement once per
-    // iteration instead of its own body, and then had it freed twice -- once
-    // as the loop's body and once as the next link in the chain. Every for
-    // test in test_repl.sh had the loop last, which is the single
-    // arrangement in which none of that can happen.
+    // loop that is not the last statement would have its body
+    // OVERWRITTEN by whatever comes after it, run that statement once per
+    // iteration instead of its own body, and then have it freed twice -- once
+    // as the loop's body and once as the next link in the chain. A test with
+    // the loop last would never see any of that.
     //
-    // while and if were never affected: their bodies live in child2 and
-    // child2/extra. for is the only node that needed a fifth child, and
-    // taking `next` for it was the mistake.
+    // while and if do not need it, since their bodies live in child2 and
+    // child2/extra. for is the only node that needs a fifth child.
     int nd_body;
 }
 
@@ -458,7 +449,7 @@ int repl_p_primary(int toks) {
         int name_ptr = repl_tok_name(toks, repl_tpos);
         int name_len = repl_tok_len(toks, repl_tpos);
         repl_tpos = repl_tpos + 1;
-        // Check for function call: name '(' expr [',' expr]* ')'
+        // Check for a function call, name '(' expr [',' expr]* ')'
         if (repl_tok_kind(toks, repl_tpos) == TK_LPAREN) {
             repl_tpos = repl_tpos + 1;  // skip '('
             int nd = repl_node(ND_CALL);
@@ -753,7 +744,7 @@ int repl_p_stmt(int toks) {
         }
         return block;
     }
-    // Expression statement: expr [;]
+    // Expression statement, expr [;]
     int expr = repl_p_expr(toks);
     if (repl_tok_kind(toks, repl_tpos) == TK_SEMI) {
         repl_tpos = repl_tpos + 1;
@@ -802,14 +793,11 @@ int repl_eval_node(int nd) {
         int arg   = repl_eval_node(right);  // evaluate argument
         // Dispatch known builtins.
         // load8
-        int kw = kscratch_start;
-        store8(kw,'l');store8(kw+1,'o');store8(kw+2,'a');store8(kw+3,'d');store8(kw+4,'8');store8(kw+5,0);
-        if (repl_word_is(fname, flen, kw) == 1) {
+        if (repl_word_is(fname, flen, "load8") == 1) {
             return load8(arg);
         }
         // store8(addr, val)
-        store8(kw,'s');store8(kw+1,'t');store8(kw+2,'o');store8(kw+3,'r');store8(kw+4,'e');store8(kw+5,'8');store8(kw+6,0);
-        if (repl_word_is(fname, flen, kw) == 1) {
+        if (repl_word_is(fname, flen, "store8") == 1) {
             int addr_arg = arg;
             int val_arg  = addr_arg.next;  // second arg via sibling
             if (val_arg == 0) { serial_print("[repl] store8 needs two arguments\n"); return 0; }
@@ -817,13 +805,11 @@ int repl_eval_node(int nd) {
             return 0;
         }
         // load64
-        store8(kw,'l');store8(kw+1,'o');store8(kw+2,'a');store8(kw+3,'d');store8(kw+4,'6');store8(kw+5,'4');store8(kw+6,0);
-        if (repl_word_is(fname, flen, kw) == 1) {
+        if (repl_word_is(fname, flen, "load64") == 1) {
             return load64(arg);
         }
         // store64(addr, val)
-        store8(kw,'s');store8(kw+1,'t');store8(kw+2,'o');store8(kw+3,'r');store8(kw+4,'e');store8(kw+5,'6');store8(kw+6,'4');store8(kw+7,0);
-        if (repl_word_is(fname, flen, kw) == 1) {
+        if (repl_word_is(fname, flen, "store64") == 1) {
             int addr_arg = arg;
             int val_arg  = addr_arg.next;
             if (val_arg == 0) { serial_print("[repl] store64 needs two arguments\n"); return 0; }
@@ -1007,9 +993,8 @@ void repl_free_tree(int nd) {
     } else if (kind == ND_CALL) {
         // left = function name pointer (in source buffer, do not free)
         // The arguments are a chain through `next`, the same shape a block's
-        // statements have, so they need the same walk. This used to free
-        // `right` alone, with a comment claiming it covered the sibling
-        // chain, and every argument after the first leaked.
+        // statements have, so they need the same walk. Freeing `right` alone
+        // would leak every argument after the first.
         int arg = right;
         while (arg != 0) {
             int nxt_arg = arg.next;
@@ -1061,7 +1046,7 @@ void repl_eval(int src) {
     repl_break_flag = 0;
     repl_continue_flag = 0;
     repl_loop_depth = 0;
-    int tok_count_ptr = kscratch_start;
+    int tok_count_ptr = repl_scratch;
     int toks = repl_tokenize(src, tok_count_ptr);
     int ntok = load64(tok_count_ptr);
     if (toks == 0 || ntok == 0) {
@@ -1132,7 +1117,7 @@ void repl_eval_ret(int src) {
     repl_break_flag = 0;
     repl_continue_flag = 0;
     repl_loop_depth = 0;
-    int tok_count_ptr = kscratch_start;
+    int tok_count_ptr = repl_scratch;
     int toks = repl_tokenize(src, tok_count_ptr);
     int ntok = load64(tok_count_ptr);
     if (toks == 0 || ntok == 0) {
@@ -1165,7 +1150,7 @@ void repl_eval_jit(int src) {
     repl_break_flag = 0;
     repl_continue_flag = 0;
     repl_loop_depth = 0;
-    int tok_count_ptr = kscratch_start;
+    int tok_count_ptr = repl_scratch;
     int toks = repl_tokenize(src, tok_count_ptr);
     int ntok = load64(tok_count_ptr);
     if (toks == 0 || ntok == 0) {

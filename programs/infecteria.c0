@@ -11,15 +11,15 @@
 //
 // You are a bacterium. You move with the arrow keys through a world larger
 // than the screen, so the view follows you and you have to explore to find
-// anything. Scattered around are cells: half-transparent, twice your size,
+// anything. Scattered around are cells, half-transparent, twice your size,
 // and you can see yourself through them when you are inside one. Being
 // inside a cell slows you slightly and slowly infects it, shown by a bar
-// above it. Once a cell is fully infected you choose what it becomes:
+// above it. Once a cell is fully infected you choose what it becomes.
 //
 //   e -- absorb it. The cell is consumed and gone.
 //   q -- convert it into a factory, which periodically emits mini-bacteria.
 //
-// Mini-bacteria are the point of factories: they seek out uninfected cells on
+// Mini-bacteria are the point of factories. They seek out uninfected cells on
 // their own, add a little infection, and are spent on arrival. If one meets
 // an antibacterium it goes for that instead -- they are the only thing that
 // can hurt one.
@@ -44,24 +44,22 @@
 
 include "engine.c0";
 include "infecteria_art.c0";
+include "moon.c0";
 
-// NOTHING here is a global, for a reason that no longer holds: --elf was
-// once a separate machine-code backend with no support for
-// global-variable reads, so every constant lives as a local in main and is
-// passed down. --elf is the ordinary assembly backend now and globals work
-// in ring 3; this layout stays because it is not wrong, only historical.
+// NOTHING here is a global. Every constant lives as a local in main and
+// is passed down.
 //
-// Entity kinds, as used below: 1 player, 2 cell, 3 factory, 4 mini, 5 anti.
+// Entity kinds, as used below, are 1 player, 2 cell, 3 factory, 4 mini, 5 anti.
 //
 // Per-kind meaning of the engine's scratch fields, so the reads are not a
-// guessing game:
+// guessing game.
 //   cell / factory:  a1 = infection 0..100, a2 = emit cooldown (factory)
 //   mini:            a1 = lifetime left in ticks
 //   anti:            a1 = health, dropped by mini-bacteria
 //   player:          a1 = 1 once dead
 
 // Moves one step toward a target, one axis at a time. Deliberately not
-// normalised: c0 has no square root, and diagonal movement being slightly
+// normalised, since c0 has no square root, and diagonal movement being slightly
 // faster is not something this game notices.
 void step_toward(int e, int target, int speed) {
     int ex = e.x + e.w / 2;
@@ -116,7 +114,7 @@ void clamp_world(int e, int world_w, int world_h) {
 
 // A drawn sprite when one is there and it is the size the game uses, and the
 // default drawn by infecteria_art.c0 otherwise. The size check is the reason
-// this exists rather than a bare sprite_from_file: an entity's dimensions
+// this exists rather than a bare sprite_from_file. An entity's dimensions
 // decide what it collides with, so a 40x40 player drawn in pensel must not
 // silently become a 40x40 hitbox, and stretching the picture to fit would be
 // worse than ignoring it.
@@ -125,13 +123,59 @@ void clamp_world(int e, int world_w, int world_h) {
 // address, so the default is passed in rather than chosen here by name, and
 // the two halves of "where does this sprite come from" stay in one place per
 // sprite at the call site.
+// Where the world's random layout comes from. infecteria.seed, if there is
+// one, holds a number in decimal and the same number always builds the same
+// world. A layout worth replaying can be kept, and a test can know where
+// everything starts. Without the file the layout comes from the clock, as it
+// always did.
+int world_seed() {
+    int buf = alloc(32);
+    int n = readfile("infecteria.seed", buf, 31);
+    int v = 0;
+    int digits = 0;
+    int i = 0;
+    while (i < n) {
+        int c = load8(buf + i);
+        if (c >= '0' && c <= '9') {
+            v = v * 10 + (c - '0');
+            digits = digits + 1;
+        } else {
+            if (digits > 0) { i = n; }
+        }
+        i = i + 1;
+    }
+    dealloc(buf);
+    if (digits == 0) { return ticks() + 12345; }
+    return v;
+}
+
 int art_load(int name, int w, int h, int draw_fn) {
     int s = sprite_from_file(name);
     if (s != 0 && s.sp_w == w && s.sp_h == h) { return s; }
     return draw_fn();
 }
 
-int main() {
+// What the scenes share, everything made once at startup, and the last game's
+// result for the screen that shows it.
+layout Game {
+    int g_v;
+    int g_seed;
+    int g_pool;
+    int g_sp_player;
+    int g_sp_cell;
+    int g_sp_factory;
+    int g_sp_anti;
+    int g_sp_mini;
+    int g_ticks;        // how long the last game lasted, in ticks
+    int g_absorbed;     // cells absorbed with e
+    int g_factories;    // cells turned into factories with q
+    int g_killed;       // antibacteria destroyed by mini-bacteria
+}
+
+// The playing field. It
+// builds a fresh world on every call, so "play again" is just calling it
+// again. Returns over_scene when the player dies and 0 on Esc.
+int play_scene(int g) {
     int v;
     int pool;
     int player;
@@ -166,6 +210,8 @@ int main() {
     int COL_READY;
     int sp_player; int sp_cell; int sp_factory; int sp_anti; int sp_mini;
     int phase;
+    int moving;
+    int started;
 
     K_PLAYER = 1; K_CELL = 2; K_FACTORY = 3; K_MINI = 4; K_ANTI = 5;
     WORLD_W = 2400; WORLD_H = 1800;
@@ -193,42 +239,21 @@ int main() {
     COL_ANTI = 0xE04040; COL_BAR = 0x40E060; COL_READY = 0xFFFFA0;
     COL_HP = 0x40C0FF;
 
-    winfo = win_info();
-    if (winfo == 0) { return 200; }
+    v = g.g_v;
+    seed = g.g_seed;
+    pool = g.g_pool;
+    sp_player = g.g_sp_player;
+    sp_cell = g.g_sp_cell;
+    sp_factory = g.g_sp_factory;
+    sp_anti = g.g_sp_anti;
+    sp_mini = g.g_sp_mini;
+    g.g_absorbed = 0;
+    g.g_factories = 0;
+    g.g_killed = 0;
 
-    v = alloc(sizeof(View));
-    v.vw = winfo / 65536;
-    v.vh = winfo - (winfo / 65536) * 65536;
-    v.cam_x = 0;
-    v.cam_y = 0;
-    // Sized for the LARGEST window this machine can hand out, not for the one
-    // we happen to have been given. The tile can be resized under us at any
-    // time (see view_poll_resize, called each frame) and alloc() cannot grow
-    // an allocation afterwards -- so the only buffer that is always big enough
-    // is one that was always big enough.
-    v.buf = view_alloc_max(v);
-    if (v.buf == 0) { return 201; }
-
-    // The art. Each one is the drawn file when there is a usable one on the
-    // filesystem and the baked-in default otherwise, so the game runs on a
-    // machine where nobody has opened pensel and improves on one where
-    // somebody has.
-    sp_player = art_load("player.spr", PLAYER_D, PLAYER_D, draw_player);
-    sp_cell = art_load("cell.spr", CELL_D, CELL_D, draw_cell);
-    sp_factory = art_load("factory.spr", CELL_D, CELL_D, draw_factory);
-    sp_anti = art_load("anti.spr", ANTI_D, ANTI_D, draw_anti);
-    sp_mini = art_load("mini.spr", MINI_D, MINI_D, draw_mini);
-    if (sp_player == 0 || sp_cell == 0 || sp_factory == 0
-        || sp_anti == 0 || sp_mini == 0) {
-        print("infecteria: out of memory loading art\n");
-        return 203;
-    }
-
-    seed = alloc(8);
-    store64(seed, ticks() + 12345);
-
-    pool = pool_alloc(POOL_CAP);
-    if (pool == 0) { return 202; }
+    // A new world every game, from the seed file when there is one, so a
+    // playtest can replay the same world as often as it likes.
+    store64(seed, world_seed());
     pool_clear(pool, POOL_CAP);
 
     // The player starts in the middle of the world.
@@ -254,7 +279,7 @@ int main() {
         e.a1 = 0;
     }
 
-    // The rest, scattered. No overlap test: cells sitting on each other is not
+    // The rest, scattered. No overlap test, since cells sitting on each other is not
     // harmful here, and rejection sampling would be a loop that can fail to
     // terminate on a crowded world.
     i = 0;
@@ -286,7 +311,7 @@ int main() {
             e.color = COL_ANTI;
             e.a1 = ANTI_HEALTH;
             // Keep it at least a full screen away from where the player
-            // starts. A bounded re-roll rather than one corrective push: the
+            // starts. A bounded re-roll rather than one corrective push, since the
             // push moved a half-world and wrapped, which lands inside the
             // exclusion zone again whenever the first roll was roughly a
             // half-world away to begin with, and the only thing stopping that
@@ -319,12 +344,13 @@ int main() {
 
     print("infecteria: running\n");
     prev = ticks();
+    started = prev;
     up = 0; down = 0; left = 0; right = 0;
 
     while (1) {
         // --- input ---------------------------------------------------------
         // Arrow keys are tracked as HELD state via make/break, not as
-        // one-shot events: the player should keep moving while a key is down.
+        // one-shot events, since the player should keep moving while a key is down.
         key = key_poll();
         while (key >= 0) {
             make_code = key / 2;
@@ -334,7 +360,7 @@ int main() {
             if (make_code == 75) { left = 1 - is_break; }
             if (make_code == 77) { right = 1 - is_break; }
             if (is_break == 0) {
-                if (make_code == 1) { exit(0); }         // Esc
+                if (make_code == 1) { return 0; }        // Esc quits
                 // e / q act on the cell you are standing in, and only once it
                 // is fully infected.
                 if (make_code == 18 || make_code == 16) {
@@ -346,11 +372,13 @@ int main() {
                             // standing still near an antibacterium.
                             player.a1 = player.a1 + ABSORB_HEAL;
                             if (player.a1 > PLAYER_MAX_HP) { player.a1 = PLAYER_MAX_HP; }
-                            pool_kill(here);              // e: absorb
+                            pool_kill(here);              // e absorbs
+                            g.g_absorbed = g.g_absorbed + 1;
                         } else {
-                            here.kind = K_FACTORY;        // q: convert
+                            here.kind = K_FACTORY;        // q converts
                             here.color = COL_FACTORY;
                             here.a2 = FACTORY_PERIOD;
+                            g.g_factories = g.g_factories + 1;
                         }
                     }
                 }
@@ -362,14 +390,16 @@ int main() {
         dt = t - prev;
         if (dt <= 0) {
             // Nothing to do until the clock moves -- and specifically, do NOT
-            // poll input here. An earlier version called key_poll() and threw
-            // the result away, which silently ate one event per spin. When the
-            // eaten event was a key RELEASE, the direction flag stayed set and
-            // the player kept moving on its own: a stuck key. It also made the
-            // game nearly unplayable in a subtler way, by drifting you out of
-            // the cell you were trying to stand still in, so infections never
-            // completed and e/q appeared to do nothing.
-            prev = prev;
+            // poll input here. Calling key_poll() and throwing the result away
+            // would silently eat one event per spin. When the eaten event is a
+            // key RELEASE, the direction flag stays set and the player keeps
+            // moving on its own, a stuck key. It would also drift you out of
+            // the cell you are trying to stand still in, so infections would
+            // never complete and e/q would appear to do nothing.
+            //
+            // Sleeping the tick out gives the CPU to everything else instead
+            // of spinning on ticks() until it moves.
+            sleep(1);
         } else {
             prev = t;
 
@@ -397,7 +427,7 @@ int main() {
                 e = pool_at(pool, i);
                 if (e.alive == 1) {
                     if (e.kind == K_FACTORY) {
-                        // By dt, not by 1: the update runs once per FRAME,
+                        // By dt, not by 1, since the update runs once per FRAME,
                         // and a frame is several ticks at this frame rate.
                         // Decrementing by one made every constant below mean
                         // "frames" while being named in ticks, and the first
@@ -419,14 +449,17 @@ int main() {
                         }
                     }
                     if (e.kind == K_MINI) {
-                        // Antibacteria first: a mini that finds one goes for
+                        // Antibacteria first, since a mini that finds one goes for
                         // it instead of looking for a cell.
                         target = nearest_of_kind(pool, POOL_CAP, e, K_ANTI);
                         if (target != 0 && dist2(e, target) < 260 * 260) {
                             step_toward(e, target, SPD_MINI);
                             if (aabb_hit(e, target) == 1) {
                                 target.a1 = target.a1 - MINI_DAMAGE;
-                                if (target.a1 <= 0) { pool_kill(target); }
+                                if (target.a1 <= 0) {
+                                    pool_kill(target);
+                                    g.g_killed = g.g_killed + 1;
+                                }
                                 pool_kill(e);
                             }
                         } else {
@@ -455,8 +488,8 @@ int main() {
                         if (aabb_hit(e, player) == 1) {
                             player.a1 = player.a1 - ANTI_DPS * dt;
                             if (player.a1 <= 0) {
-                                print("infecteria: you died\n");
-                                exit(0);
+                                g.g_ticks = t - started;
+                                return over_scene;
                             }
                         }
                     }
@@ -474,16 +507,18 @@ int main() {
             view_follow(v, player, WORLD_W, WORLD_H);
             view_clear(v, COL_BG);
 
-            // One animation clock for the whole world rather than a phase per
-            // entity. Everything that animates here is a flagellum or a set
-            // of spikes, and having them all whip together at five beats a
-            // second looks like life rather than like a mistake.
-            phase = (t / 20) - ((t / 20) / 2) * 2;
+            // Every animated thing runs its own clip on the shared clock,
+            // offset by its pool slot so that a crowd does not pulse in
+            // lockstep. The player's tail beats fast while it swims and
+            // slowly while it waits.
+            moving = up + down + left + right;
+            phase = 24;
+            if (moving > 0) { phase = 6; }
 
             // Opaque things first, so the half-transparent cells blend over
             // them and you can see yourself underneath.
             view_sprite(v, player.x, player.y, PLAYER_D, PLAYER_D,
-                        sp_player.sp_pixels, sprite_frame(sp_player, phase));
+                        sp_player.sp_pixels, anim_frame(sp_player, 0, 4, phase, t));
             view_bar(v, player.x, player.y, PLAYER_D,
                      player.a1 * 100 / PLAYER_MAX_HP, COL_HP);
             i = 0;
@@ -492,11 +527,11 @@ int main() {
                 if (e.alive == 1) {
                     if (e.kind == K_MINI) {
                         view_sprite(v, e.x, e.y, MINI_D, MINI_D,
-                                    sp_mini.sp_pixels, sprite_frame(sp_mini, phase));
+                                    sp_mini.sp_pixels, anim_frame(sp_mini, 0, 2, 12, t + i * 5));
                     }
                     if (e.kind == K_ANTI) {
                         view_sprite(v, e.x, e.y, ANTI_D, ANTI_D,
-                                    sp_anti.sp_pixels, sprite_frame(sp_anti, phase));
+                                    sp_anti.sp_pixels, anim_frame(sp_anti, 0, 2, 20, t + i * 7));
                         view_bar(v, e.x, e.y, ANTI_D, e.a1 * 100 / ANTI_HEALTH, COL_ANTI);
                     }
                 }
@@ -506,7 +541,7 @@ int main() {
             // Then the cells and factories, with their infection bars on top.
             // A cell is blended so you can see yourself inside one, which is
             // the feedback that tells you the infection is running. A factory
-            // is not: it has stopped being something you can be inside and
+            // is not. It has stopped being something you can be inside and
             // become a thing that stands there, and looking solid is how it
             // says so without a label.
             i = 0;
@@ -524,7 +559,7 @@ int main() {
                                          sp_cell.sp_pixels, 0, col, 1);
                     }
                     if (e.kind == K_CELL && e.a1 > 0) {
-                        // A full bar gets its own colour: without it there is
+                        // A full bar gets its own colour, since without it there is
                         // no way to tell that e/q have become available, and
                         // pressing them early does nothing at all.
                         bc = COL_BAR;
@@ -538,5 +573,152 @@ int main() {
             present(v.buf);
         }
     }
+    return 0;
+}
+
+// --- the other scenes -------------------------------------------------------
+
+int COL_TITLE = 0x40FF80;
+int COL_TEXT = 0xC8D8E0;
+int COL_DIM_TEXT = 0x7890A0;
+int COL_SCREEN = 0x101820;
+
+// Shared by the title and the end screen. It clears, follows resizes, and
+// draws a slowly swimming player in the middle.
+void card_begin(int g, int t) {
+    int v = g.g_v;
+    view_poll_resize(v);
+    v.cam_x = 0;
+    v.cam_y = 0;
+    view_clear(v, COL_SCREEN);
+    int sp = g.g_sp_player;
+    view_sprite(v, v.vw / 2 - 8, v.vh / 2 - 8, 16, 16, sp.sp_pixels,
+                anim_frame(sp, 0, 4, 10, t));
+    return;
+}
+
+int title_scene(int g) {
+    int v = g.g_v;
+    int last = 0 - 1;
+    while (1) {
+        int k = key_pressed(57, 1);                   // space, Esc
+        if (k == 1) { return play_scene; }
+        if (k == 2) { return 0; }
+        int t = ticks();
+        if (t == last) { sleep(1); }
+        if (t != last) {
+            last = t;
+            card_begin(g, t);
+            view_text_centred(v, v.vh / 2 - 80, "INFECTERIA", COL_TITLE, 4);
+            view_text_centred(v, v.vh / 2 + 30, "arrows move   e absorb a cell   q make it a factory", COL_TEXT, 1);
+            view_text_centred(v, v.vh / 2 + 50, "outrun the red ones: only your factories can hurt them", COL_DIM_TEXT, 1);
+            view_text_centred(v, v.vh / 2 + 80, "space to start   esc to quit", COL_TEXT, 1);
+            present(v.buf);
+        }
+    }
+    return 0;
+}
+
+// Appends the decimal digits of n to the text at buf, from position at, and
+// returns the new end.
+int put_num(int buf, int at, int n) {
+    int d = alloc(24);
+    int k = 0;
+    if (n == 0) { store8(d, '0'); k = 1; }
+    while (n > 0) { store8(d + k, '0' + n % 10); n = n / 10; k = k + 1; }
+    while (k > 0) { k = k - 1; store8(buf + at, load8(d + k)); at = at + 1; }
+    store8(buf + at, 0);
+    dealloc(d);
+    return at;
+}
+
+int put_str(int buf, int at, int s) {
+    int i = 0;
+    while (load8(s + i) != 0) { store8(buf + at, load8(s + i)); at = at + 1; i = i + 1; }
+    store8(buf + at, 0);
+    return at;
+}
+
+int over_scene(int g) {
+    int v = g.g_v;
+    int line = alloc(96);
+    int n = put_str(line, 0, "you lasted ");
+    n = put_num(line, n, g.g_ticks / 100);
+    n = put_str(line, n, " seconds");
+    int line2 = alloc(96);
+    int m = put_num(line2, 0, g.g_absorbed);
+    m = put_str(line2, m, " absorbed   ");
+    m = put_num(line2, m, g.g_factories);
+    m = put_str(line2, m, " factories   ");
+    m = put_num(line2, m, g.g_killed);
+    m = put_str(line2, m, " antibacteria destroyed");
+    int last = 0 - 1;
+    int next = 0 - 1;
+    while (next < 0) {
+        int k = key_pressed(57, 1);                   // space, Esc
+        if (k == 1) { next = play_scene; }
+        if (k == 2) { next = 0; }
+        int t = ticks();
+        if (next < 0 && t == last) { sleep(1); }
+        if (next < 0 && t != last) {
+            last = t;
+            card_begin(g, t);
+            view_text_centred(v, v.vh / 2 - 80, "CLEARED", 0xE04040, 4);
+            view_text_centred(v, v.vh / 2 + 30, line, COL_TEXT, 1);
+            view_text_centred(v, v.vh / 2 + 50, line2, COL_TEXT, 1);
+            view_text_centred(v, v.vh / 2 + 80, "space to play again   esc to quit", COL_DIM_TEXT, 1);
+            present(v.buf);
+        }
+    }
+    dealloc(line);
+    dealloc(line2);
+    return next;
+}
+
+// Everything made once, the frame buffer, the art, the world's memory. Then
+// the scenes take over. The sizes passed to art_load are the ones play_scene
+// gives the entities (PLAYER_D, CELL_D, ANTI_D, MINI_D). A drawn sprite of
+// any other size is refused, because size decides what collides.
+int main() {
+    int winfo = win_info();
+    if (winfo == 0) { return 200; }
+    int g = alloc(sizeof(Game));
+    int v = alloc(sizeof(View));
+    if (g == 0 || v == 0) { return 202; }
+    v.vw = winfo / 65536;
+    v.vh = winfo % 65536;
+    v.cam_x = 0;
+    v.cam_y = 0;
+    // Sized for the LARGEST window this machine can hand out, not for the one
+    // we happen to have been given. The tile can be resized under us at any
+    // time (see view_poll_resize, called each frame) and alloc() cannot grow
+    // an allocation afterwards -- so the only buffer that is always big enough
+    // is one that was always big enough.
+    v.buf = view_alloc_max(v);
+    if (v.buf == 0) { return 201; }
+    g.g_v = v;
+
+    // The art. Each one is the drawn file when there is a usable one on the
+    // filesystem and the baked-in default otherwise, so the game runs on a
+    // machine where nobody has opened pensel and improves on one where
+    // somebody has.
+    g.g_sp_player = art_load("player.spr", 16, 16, draw_player);
+    g.g_sp_cell = art_load("cell.spr", 32, 32, draw_cell);
+    g.g_sp_factory = art_load("factory.spr", 32, 32, draw_factory);
+    g.g_sp_anti = art_load("anti.spr", 18, 18, draw_anti);
+    g.g_sp_mini = art_load("mini.spr", 8, 8, draw_mini);
+    if (g.g_sp_player == 0 || g.g_sp_cell == 0 || g.g_sp_factory == 0
+        || g.g_sp_anti == 0 || g.g_sp_mini == 0) {
+        print("infecteria: out of memory loading art\n");
+        return 203;
+    }
+    g.g_seed = alloc(8);
+    g.g_pool = pool_alloc(160);
+    if (g.g_seed == 0 || g.g_pool == 0) { return 202; }
+    if (text_init() == 0) {
+        print("infecteria: the kernel would not hand over its font\n");
+        return 204;
+    }
+    scene_run(title_scene, g);
     return 0;
 }

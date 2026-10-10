@@ -1,0 +1,273 @@
+// oljud.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// oljud -- the Sound Blaster 16 driver. Ring 3 hands it PCM, it plays it.
+//
+// The SB16 is an ISA card, which is the reason it was picked over AC'97 and
+// HDA, since everything is at fixed addresses, so there is no PCI bus to walk.
+// The DSP sits at 0x220, the card raises IRQ 5 (vector 37 after pic_remap),
+// and the samples reach it through the ISA DMA controller on 8-bit channel 1.
+// Those are the card's factory defaults and QEMU's `-device sb16` defaults.
+//
+// One format only, 8-bit unsigned mono at 22050 Hz, where 128 is silence.
+// That is enough for a piano roll, and every ring-3 program can build it
+// with store8 and nothing else.
+//
+// How playback works. The DMA controller can only reach the first 16MB of
+// physical memory and cannot cross a 64KB boundary, so the card reads from
+// one 4KB page (a page-aligned page never crosses 64KB) taken from pmm at
+// boot. The page is a ring of two halves. The DMA runs in auto-init mode, so
+// it wraps around the page forever with no help from the CPU, and the DSP is
+// told the block size is one half, so it raises IRQ 5 each time it finishes
+// a half. By then it is reading the OTHER half, so oljud_irq refills the one
+// just finished, from the queue if there is anything in it, with silence if
+// not. Playback starts at boot and never stops. An idle card plays silence,
+// which costs one interrupt every 93ms.
+//
+// The queue is a 64KB ring (about three seconds of sound) between the
+// syscall and the interrupt. SYS_SOUND copies into it and returns how many
+// bytes fit, so a program that has more to say tries again later, and
+// sound(0, -1) empties it and silences the card at once. It is one
+// queue for the whole machine, so two programs playing at once are played one
+// after the other, not mixed. Mixing is for when there is a second program
+// that wants to make sound.
+//
+// The latency is the queue's depth plus up to two halves (about 190ms) for a
+// sample submitted to an empty queue.
+
+int OLJUD_RESET  = 0x226;  // write 1, wait, write 0 to reset the DSP
+int OLJUD_READ   = 0x22A;  // DSP read data
+int OLJUD_WRITE  = 0x22C;  // DSP write command/data; bit 7 on read = busy
+int OLJUD_STATUS = 0x22E;  // bit 7 = data waiting; reading it acks an 8-bit IRQ
+
+int OLJUD_RATE  = 22050;
+int OLJUD_HALF  = 2048;    // bytes per half of the DMA page, one IRQ each
+int OLJUD_QSIZE = 65536;   // the queue, about three seconds
+int OLJUD_QPAGES = 16;
+
+int oljud_active = 0;      // 1 once the card is found and playing
+int oljud_dma = 0;         // the DMA page (physical = virtual, identity map)
+int oljud_q = 0;           // the queue's first byte
+int oljud_qhead = 0;       // where the next byte to play is
+int oljud_qcount = 0;      // how many bytes are waiting
+int oljud_irqs = 0;        // halves finished, which also says which half is next
+int oljud_played = 0;      // queue bytes moved into the DMA page, ever
+
+// Takes the DMA page and the queue's pages. Runs early in main, right after
+// jakel's arena, while pmm still bumps through contiguous pages, because the
+// queue is one unbroken range. It is done whether or not there is a card
+// (that is not known yet), and costs 68KB of the machine's 128MB.
+void oljud_mem_init() {
+    oljud_dma = pmm_alloc_page();
+    oljud_q = pmm_alloc_page();
+    int expect = oljud_q + 4096;
+    int i = 1;
+    while (i < OLJUD_QPAGES) {
+        int pg = pmm_alloc_page();
+        if (pg != expect) {
+            serial_print("[oljud] NON-CONTIGUOUS pmm page, no queue\n");
+            oljud_q = 0;
+            return;
+        }
+        expect = expect + 4096;
+        i = i + 1;
+    }
+    return;
+}
+
+// Waits until the DSP will take a byte, then writes it. Returns 0 if the DSP
+// never became ready, so a card that dies halfway through setup is reported
+// rather than hung on.
+int oljud_dsp_write(int v) {
+    int i = 0;
+    while (i < 100000) {
+        if (inb(OLJUD_WRITE) / 128 == 0) {
+            outb(OLJUD_WRITE, v);
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Waits for a byte from the DSP. Returns -1 on timeout.
+int oljud_dsp_read() {
+    int i = 0;
+    while (i < 100000) {
+        if (inb(OLJUD_STATUS) / 128 == 1) { return inb(OLJUD_READ); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Fills one half of the DMA page, queued sound first, silence after it.
+void oljud_fill(int half) {
+    int dst = oljud_dma + half * OLJUD_HALF;
+    int i = 0;
+    while (i < OLJUD_HALF && oljud_qcount > 0) {
+        store8(dst + i, load8(oljud_q + oljud_qhead));
+        oljud_qhead = (oljud_qhead + 1) % OLJUD_QSIZE;
+        oljud_qcount = oljud_qcount - 1;
+        oljud_played = oljud_played + 1;
+        i = i + 1;
+    }
+    while (i < OLJUD_HALF) {
+        store8(dst + i, 128);
+        i = i + 1;
+    }
+    return;
+}
+
+// Finds the card and starts it playing silence. Returns 1 if it is playing.
+//
+// The reset handshake is the detection, since a real DSP answers a reset with
+// 0xAA, and an empty ISA slot reads back 0xFF from every port, so it never
+// does.
+int oljud_init() {
+    if (oljud_dma == 0 || oljud_q == 0) { return 0; }
+    if (oljud_dma + 4096 > 16777216) {
+        serial_print("[oljud] DMA page above 16MB, ISA DMA cannot reach it\n");
+        return 0;
+    }
+    outb(OLJUD_RESET, 1);
+    // The DSP wants the reset line held for at least 3 microseconds. A
+    // hundred port reads take longer than that on any machine.
+    int d = 0;
+    while (d < 100) { inb(OLJUD_STATUS); d = d + 1; }
+    outb(OLJUD_RESET, 0);
+    int ack = oljud_dsp_read();
+    if (ack != 0xAA) {
+        serial_print("[oljud] no Sound Blaster 16 at 0x220\n");
+        return 0;
+    }
+    // DSP version 4.x is an SB16. The older cards have no 0x41 rate command
+    // and no 0xC6, so they are refused rather than half driven.
+    oljud_dsp_write(0xE1);
+    int major = oljud_dsp_read();
+    int minor = oljud_dsp_read();
+    if (major < 4) {
+        serial_print("[oljud] DSP ");
+        serial_print_int(major);
+        serial_print(" is not a Sound Blaster 16, not using it\n");
+        return 0;
+    }
+
+    oljud_fill(0);
+    oljud_fill(1);
+
+    // ISA DMA channel 1, 8-bit. Mask the channel while it is programmed,
+    // clear the controller's byte flip-flop so the low byte goes first,
+    // then. Mode 0x59 = single transfer, auto-init, memory to device,
+    // channel 1. The address register takes bits 0-15, the page register
+    // (0x83 for channel 1) bits 16-23. The count is one less than the bytes.
+    outb(0x0A, 0x05);
+    outb(0x0C, 0);
+    outb(0x0B, 0x59);
+    outb(0x02, oljud_dma % 256);
+    outb(0x02, (oljud_dma / 256) % 256);
+    outb(0x83, (oljud_dma / 65536) % 256);
+    outb(0x03, (2 * OLJUD_HALF - 1) % 256);
+    outb(0x03, (2 * OLJUD_HALF - 1) / 256);
+    outb(0x0A, 0x01);
+
+    // IRQ 5 is bit 5 of the master PIC's mask. Read and clear just that bit.
+    // klick writes the whole mask, and this must not undo its cascade line.
+    int mask = inb(0x21);
+    if ((mask / 32) % 2 == 1) { outb(0x21, mask - 32); }
+    oljud_active = 1;
+
+    // Speaker on, output rate, then 0xC6, 8-bit output, auto-init, FIFO on.
+    // Mode byte 0x00 is mono unsigned. The block length is one half, less one.
+    oljud_dsp_write(0xD1);
+    oljud_dsp_write(0x41);
+    oljud_dsp_write(OLJUD_RATE / 256);
+    oljud_dsp_write(OLJUD_RATE % 256);
+    oljud_dsp_write(0xC6);
+    oljud_dsp_write(0x00);
+    oljud_dsp_write((OLJUD_HALF - 1) % 256);
+    int ok = oljud_dsp_write((OLJUD_HALF - 1) / 256);
+    if (ok == 0) {
+        serial_print("[oljud] DSP stopped answering during setup\n");
+        oljud_active = 0;
+        return 0;
+    }
+    serial_print("[oljud] Sound Blaster 16, DSP ");
+    serial_print_int(major);
+    serial_print(".");
+    serial_print_int(minor);
+    serial_print(", ");
+    serial_print_int(OLJUD_RATE);
+    serial_print(" Hz 8-bit mono, DMA page ");
+    serial_print_int(oljud_dma);
+    serial_print("\n");
+    return 1;
+}
+
+// IRQ 5, dispatched through vector 37. The DSP has finished a half and moved
+// on to the other one, so this half is free to refill. Reading the status
+// port is the card's acknowledgement, and without it the card raises no further
+// interrupts, while the DMA goes on looping the same 4KB.
+void oljud_irq() {
+    inb(OLJUD_STATUS);
+    if (oljud_active == 1) {
+        oljud_fill(oljud_irqs % 2);
+        oljud_irqs = oljud_irqs + 1;
+    }
+    outb(0x20, 0x20);
+    return;
+}
+
+// Stops the sound now. It drops everything queued and fills BOTH halves of the
+// DMA page with silence, including the one the card is reading at this
+// moment, so even the sound already handed to the card stops within the
+// card's FIFO rather than after up to two halves (190ms). Returns how many
+// queued bytes were dropped. This is sound(0, -1).
+int oljud_flush() {
+    int dropped = oljud_qcount;
+    oljud_qhead = 0;
+    oljud_qcount = 0;
+    int i = 0;
+    while (i < 2 * OLJUD_HALF) {
+        store8(oljud_dma + i, 128);
+        i = i + 1;
+    }
+    return dropped;
+}
+
+// SYS_SOUND(buf, len). Queues up to len bytes from the caller's memory and
+// returns how many fit. buf == 0 returns how many bytes are still waiting,
+// so a program can tell when its sound has been played, and buf == 0 with
+// len -1 stops everything (oljud_flush). -1 when there is no
+// card, or for a buffer outside the caller's own memory, since the kernel only
+// reads through it, but reading kernel memory out of the speaker is still a
+// leak.
+//
+// No locking, since SYSCALL clears IF on entry, so oljud_irq cannot run halfway
+// through this.
+int oljud_submit(int buf, int len) {
+    if (oljud_active == 0) { return 0 - 1; }
+    if (buf == 0 && len < 0) { return oljud_flush(); }
+    if (buf == 0) { return oljud_qcount; }
+    if (len < 0) { return 0 - 1; }
+    if (buf < USER_VIRT_BASE) {
+        serial_print("[oljud] sound: refusing a non-user buffer\n");
+        return 0 - 1;
+    }
+    int n = OLJUD_QSIZE - oljud_qcount;
+    if (len < n) { n = len; }
+    int tail = (oljud_qhead + oljud_qcount) % OLJUD_QSIZE;
+    int i = 0;
+    while (i < n) {
+        store8(oljud_q + tail, load8(buf + i));
+        tail = (tail + 1) % OLJUD_QSIZE;
+        i = i + 1;
+    }
+    oljud_qcount = oljud_qcount + n;
+    return n;
+}

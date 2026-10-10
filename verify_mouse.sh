@@ -9,7 +9,7 @@
 # License version 3 or (at your option) any later version, WITHOUT ANY
 # WARRANTY; see the LICENSE file for the full text.
 #
-# Proves the two things that make klick useful rather than merely correct:
+# Proves the two things that make klick useful rather than merely correct.
 # click-to-focus in kakel, and the ring-3 mouse syscall.
 #
 # The scene is a shell tile on the left and Gnista's demo in a tavla on the
@@ -38,7 +38,7 @@
 # either side of one button release, and they must disagree. That is what
 # makes this a test of the rule rather than of the demo.
 #
-# Screendumps are analysed by pixel, the way the other graphical checks are:
+# Screendumps are analysed by pixel, the way the other graphical checks are.
 # the pointer by its exact fill colour, the sprite by its two frame colours.
 set -u
 cd "$(dirname "$0")"
@@ -97,7 +97,7 @@ typ(["ret"]); time.sleep(1.2)
 word("spawn3 gnista.elf"); typ(["ret"]); time.sleep(3.0)
 
 # 1. Press over the unfocused tavla. This focuses it, and that is ALL it
-#    may do: the press is held for four seconds, and the demo must not
+#    may do, since the press is held for four seconds, and the demo must not
 #    steer anything with it.
 move(14, 0, 10)                          # ~140 px right, into the tavla
 move(0, 6, 10)                           # and a little down
@@ -119,7 +119,7 @@ shot("mouse_held2.ppm")
 send("mouse_button 0", settle=0.3)
 time.sleep(0.5)
 
-# 3. Click the shell tile: focus must come back.
+# 3. Click the shell tile, and focus must come back.
 move(-14, 0, 30)                         # ~420 px left, into the shell tile
 time.sleep(0.5)
 shot("mouse_shell.ppm")

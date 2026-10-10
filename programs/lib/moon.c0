@@ -1,0 +1,27 @@
+// moon.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// moon -- the ring-3 library, named wrappers for Moonshot's syscalls that
+// coff has no builtin for. `include "moon.c0";` finds it when the program is
+// compiled with `-I programs/lib`, which gen_programs.sh and gen_elf_tests.sh
+// pass, from any directory.
+//
+// Why a library and not builtins. Every builtin is a change to BOTH
+// compilers, a rebuilt coff1 and a re-audited toolchain. With the generic
+// syscall(n, a, b, c, d, e) builtin, a new syscall is a kernel change and
+// one line here. The older syscalls keep their builtins (win_info, fill,
+// readfile, sound, ...) so existing programs do not change.
+
+// Gives the CPU away for `t` ticks (hundredths of a second). A program that
+// waits for time to pass should call this rather than spin on ticks(), since a
+// spinning program keeps the CPU from everything else for its whole time
+// slice. Returns 0.
+int sleep(int t) {
+    return syscall(16, t, 0, 0, 0, 0);
+}

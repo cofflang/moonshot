@@ -13,7 +13,7 @@
 # which meant the renderer could be rewritten with nothing but a screenshot
 # and an opinion to say whether it still worked.
 #
-# What it checks, and why each one is a thing that can actually break:
+# What it checks, and why each one is a thing that can actually break.
 #
 #   1. The player is drawn, in its own exact colours. The sprites are drawn
 #      by code at startup (infecteria_art.c0) rather than loaded from a byte
@@ -23,7 +23,7 @@
 #      go through view_sprite_tint, a different path from the player's flat
 #      view_sprite, and the tint is what carries the game state.
 #   3. Standing in a cell infects it, and the tint changes to match. This is
-#      the core mechanic and the whole point of the tint path: one grey
+#      the core mechanic and the whole point of the tint path, one grey
 #      sprite has to be able to read as clean and as infected.
 #
 # The colours below are computed, not sampled. A cell's membrane is drawn at
@@ -85,13 +85,21 @@ def shot(name):
 
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
+# A fixed world. Infecteria builds its layout from infecteria.seed when the
+# file exists, so every run of this test plays the same world, and no
+# layout can make checks below fail
+# for reasons that have nothing to do with the game being broken.
+word("make infecteria.seed"); typ(["ret"]); time.sleep(0.6)
+word("write infecteria.seed 1"); typ(["ret"]); time.sleep(0.6)
 word("spawn3 infecteria.elf"); typ(["ret"]); time.sleep(4.0)
 # spawn3 leaves focus on the shell, so the arrow keys would drive the shell.
 typ(["alt-tab"]); time.sleep(1.5)
+# The game opens on its title scene; space starts the world.
+typ(["spc"]); time.sleep(1.5)
 shot("infect_clean.ppm")
 
 # Walk onto the cell below the start. QEMU's sendkey takes a hold time in
-# milliseconds, which is the only way to give the game a HELD key: it tracks
+# milliseconds, which is the only way to give the game a HELD key, since it tracks
 # make and break, and a default 100ms tap barely moves the player at all.
 send("sendkey down 1200", settle=1.8)
 # Then stand still. Infection only runs while the player's centre is inside
@@ -181,7 +189,37 @@ if dirty[DIRTY_MEMBRANE] < 100:
     print("FAIL: standing in the cell did not infect it -- the mechanic, the "
           "tint switch or the held key is broken")
     ok = False
-if dirty[PLAYER_BODY] < 30:
+# Any body pixels at all, not the 30 the first screenshot needs. That one
+# proves the sprite is drawn; this one only asks whether the player is still
+# there. A second cell can
+# overlap the one the player walks into. Cells are drawn after the
+# player and blended, so its membrane covers part of the body.
+# That is the game working, not the player vanishing.
+# Cells are drawn after the player and blended over it, so a player standing
+# inside one shows through in tinted colours rather than its own. Every such
+# colour is computable, the same way view_sprite_tint makes it, each cell
+# sprite brightness (infecteria_art.c0's draw_cell), each tint, one or two
+# cells deep. A layout can put
+# the whole player under a cell, which leaves zero exact player pixels
+# while the player is alive
+# and drawn. Counting the blended colours too keeps "the player is still
+# drawn" meaning exactly that.
+CELL_LUMS = [255, 150, 225, 200, 195, 205, 190]
+def under(dst, tint, lum):
+    return tuple((d + t * lum // 255) // 2 for d, t in zip(dst, tint))
+player_seen = {PLAYER_BODY, PLAYER_RIM}
+for base in (PLAYER_BODY, PLAYER_RIM):
+    for t1 in (COL_CELL, COL_INFECT):
+        for l1 in CELL_LUMS:
+            once = under(base, t1, l1)
+            player_seen.add(once)
+            for t2 in (COL_CELL, COL_INFECT):
+                for l2 in CELL_LUMS:
+                    player_seen.add(under(once, t2, l2))
+seen = count("infect_dirty.ppm", list(player_seen))
+visible = sum(seen.values())
+print("player pixels after, exact or seen through a cell: %d" % visible)
+if visible < 30:
     print("FAIL: the player vanished while standing in a cell")
     ok = False
 

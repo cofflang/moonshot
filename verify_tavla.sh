@@ -10,7 +10,7 @@
 # WARRANTY; see the LICENSE file for the full text.
 #
 # Proves the tavla window kind works on real pixels, not just that the
-# kernel builds. A tavla is the window a graphical ring-3 program gets: a
+# kernel builds. A tavla is the window a graphical ring-3 program gets, a
 # kakel-owned title strip above a client area the program cannot draw over.
 #
 # Everything here is checked against a QEMU screendump rather than the draw
@@ -18,21 +18,20 @@
 # bouncing off an edge nobody could see) looked perfectly correct in source
 # and only showed up in pixels.
 #
-# Checks, in one boot:
+# Checks, in one boot
 #   1. spawn3 gnista.elf creates a tavla, and its title strip renders DIM
 #      while focus is still on the shell.
-#   2. Alt+Tab onto the tavla turns the same strip BRIGHT -- the fix for
-#      focus being invisible on a window that draws no text cursor, which
-#      is what made a shell window and a graphical one look equally focused
-#      at the same time.
-#   3. The client area is inset BELOW the strip: the program's own pixels
+#   2. Alt+Tab onto the tavla turns the same strip BRIGHT, so focus is
+#      visible on a window that draws no text cursor, and a shell window
+#      and a graphical one never look equally focused at the same time.
+#   3. The client area is inset BELOW the strip, so the program's own pixels
 #      never appear in the strip row.
 #   4. Alt+W closes the focused tavla and kills its owning task.
-#   5. The stuck case: with a tavla open, closing skalman's own window
+#   5. The stuck case. With a tavla open, closing skalman's own window
 #      leaves the tavla as the only window -- Alt+W must still get a
-#      working shell back. This used to be unrecoverable: a tavla swallowed
-#      every keystroke, so with no shell window left there was nothing on
-#      screen that could accept input.
+#      working shell back, even though a tavla swallows
+#      every keystroke, so with no shell window left there is nothing on
+#      screen that can accept input.
 
 set -u
 cd "$(dirname "$0")"
@@ -92,27 +91,27 @@ def word(s):
 def shot(name):
     send("screendump %s" % name, settle=0.6)
 
-# raket login gate: root, then an empty password.
+# raket login gate, root, then an empty password.
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.0)
 
-# 1+3: spawn a graphical program. Focus stays on the shell, so the tavla's
+# 1+3, spawn a graphical program. Focus stays on the shell, so the tavla's
 # strip must be dim.
 word("spawn3 gnista.elf"); typ(["ret"])
 time.sleep(3.0)
 shot("tavla_unfocused.ppm")
 
-# 2: Alt+Tab onto the tavla -- the strip must go bright.
+# 2, Alt+Tab onto the tavla -- the strip must go bright.
 send("sendkey alt-tab", settle=0.8)
 time.sleep(0.5)
 shot("tavla_focused.ppm")
 
-# 4: Alt+W closes it and kills the program.
+# 4, Alt+W closes it and kills the program.
 send("sendkey alt-w", settle=0.8)
 time.sleep(1.0)
 shot("tavla_closed.ppm")
 
-# 5: the stuck case. Spawn again, close skalman's own window so only the
+# 5, the stuck case. Spawn again, close skalman's own window so only the
 # tavla is left, then Alt+W to get a shell back -- and prove the shell is
 # really alive by running a command in it.
 word("spawn3 gnista.elf"); typ(["ret"])
@@ -139,9 +138,9 @@ sleep 1
 python3 - <<'EOF'
 import sys
 
-# Title-strip colors, from kakel_init: KAKEL_TAVLA_BAR = fb_rgb(48,48,128),
+# Title-strip colors, from kakel_init, KAKEL_TAVLA_BAR = fb_rgb(48,48,128),
 # KAKEL_TAVLA_BAR_DIM = fb_rgb(24,24,40). The only other colors legally
-# present in a title strip are the two the title text itself is drawn in:
+# present in a title strip are the two the title text itself is drawn in.
 # FB_FG = fb_rgb(200,200,200) (knekt.c0) when focused, KAKEL_DIM =
 # fb_rgb(100,100,100) when not.
 BAR       = (48, 48, 128)
@@ -207,7 +206,7 @@ if not (b_fo > b_un and d_un > d_fo):
     print("FAIL: the strip did not actually flip between the two screendumps")
     ok = False
 
-# 3: the client area is inset below the strip. Gnista's demo paints its
+# 3, the client area is inset below the strip. Gnista's demo paints its
 # whole window; if the inset were missing, the strip row would be full of
 # the demo's own background instead of bar color.
 w, h, buf = read_ppm("tavla_focused.ppm")
@@ -224,7 +223,7 @@ if foreign:
     print("FAIL: the program is drawing into its own title strip -- inset is wrong")
     ok = False
 
-# 4+5: after Alt+W the layout is back to a single full-width window, so the
+# 4+5, after Alt+W the layout is back to a single full-width window, so the
 # top-right corner is no longer any bar color at all.
 for shot in ("tavla_closed.ppm", "tavla_recovered.ppm"):
     w, h, buf = read_ppm(shot)
@@ -234,7 +233,7 @@ for shot in ("tavla_closed.ppm", "tavla_recovered.ppm"):
         print("FAIL: %s still shows a tavla title strip -- alt+w did not close it" % shot)
         ok = False
 
-# 5, corroboration: the recovered window has content below its greeting. On
+# 5, corroboration. The recovered window has content below its greeting. On
 # its own this proves less than it looks like -- the login prompt draws a line
 # there with no input at all -- so the real proof that keystrokes reach the
 # shell again is the second raket login line checked on serial below.
@@ -269,7 +268,7 @@ echo "alt+w tavla closes: $closes"
 [ "$closes" -ge 2 ] || { echo "FAIL: expected 2 tavla closes, got $closes"; ok=0; }
 
 # The real proof that input reaches the shell again after recovering from the
-# stuck case: raket only logs a username line when a completed line of typed
+# stuck case, since raket only logs a username line when a completed line of typed
 # text arrives. Two of them means the boot login AND the post-recovery one.
 logins=$(grep -c "\[raket\] session .* username='root'" serial.log || true)
 echo "logins completed: $logins"
@@ -279,7 +278,7 @@ echo "logins completed: $logins"
 }
 
 # That the shell is genuinely alive after the stuck case is proven by
-# tavla_recovered.ppm above: `tasks` was typed into the replacement window and
+# tavla_recovered.ppm above, since `tasks` was typed into the replacement window and
 # its output is on screen, which can only happen if keystrokes reach skalman
 # again. Nothing to assert on serial here -- shell command output goes to the
 # window, not the serial port.

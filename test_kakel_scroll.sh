@@ -8,7 +8,7 @@
 # moonshot is free software, distributed under the GNU General Public
 # License version 3 or (at your option) any later version, WITHOUT ANY
 # WARRANTY; see the LICENSE file for the full text.
-# Proves kakel's scroll works in v2 by injecting a call to kakel_test_scroll
+# Proves kakel's scroll works by injecting a call to kakel_test_scroll
 # (defined in kakel.c0, dead code in normal boots) into kernel_post_init.
 # The injected call writes a marker, floods newlines to trigger one scroll,
 # and reads back the pixel proof.
@@ -30,11 +30,9 @@ s = s.replace(marker, marker + inject, 1)
 open(p, 'w').write(s)
 PY
 
-if ! ./sync_addrs.sh >/dev/null 2>&1; then
-  if ! ./sync_addrs.sh >/dev/null 2>&1; then
-    echo "FAIL: building the kakel-scroll variant (sync_addrs) failed"
-    exit 1
-  fi
+if ! ./build.sh >/dev/null 2>&1; then
+  echo "FAIL: building the kakel-scroll variant failed"
+  exit 1
 fi
 
 isodir=isoroot-kakelscroll

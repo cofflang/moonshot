@@ -17,14 +17,14 @@
 # identical -- the x86_64 emulation, framebuffer, keyboard, and disk I/O
 # work the same way on macOS as on Linux.
 #
-# Prerequisites on macOS:
+# Prerequisites on macOS
 #   brew install qemu
 #
 # That single package ships qemu-system-x86_64 with the cocoa display
 # backend. No other dependencies are needed at runtime -- the ISO and
 # disk.img are self-contained.
 #
-# To build the ISO (done on Linux, checked into the repo or scp'd over):
+# To build the ISO (done on Linux, checked into the repo or scp'd over)
 #   ./build.sh && ./run_graphical_mac.sh
 set -eu
 cd "$(dirname "$0")"

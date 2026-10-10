@@ -3,7 +3,7 @@
 # verify_alloc.sh — prove that layout + sizeof + alloc() (SYS_ALLOC) work end
 # to end in a real ring-3 --elf program, not just at the compiler level.
 #
-# Checks:
+# Checks
 #   1. "alloc test ok" reaches serial (the program ran past both allocations
 #      and both sets of field writes without faulting)
 #   2. "[syscall] exit code=114" (5+6+1+2+100 -- proves the two Entity

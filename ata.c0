@@ -15,13 +15,13 @@
 
 // Primary bus I/O ports
 int ATA_DATA    = 0x1F0;  // 16-bit data register (inw/outw)
-int ATA_ERROR   = 0x1F1;  // read: error register
+int ATA_ERROR   = 0x1F1;  // read, error register
 int ATA_NSECT   = 0x1F2;  // sector count
 int ATA_LBA_LO  = 0x1F3;  // LBA bits 7:0
 int ATA_LBA_MID = 0x1F4;  // LBA bits 15:8
 int ATA_LBA_HI  = 0x1F5;  // LBA bits 23:16
 int ATA_DRIVE   = 0x1F6;  // drive/head select (0xE0 = master, LBA mode)
-int ATA_STATUS  = 0x1F7;  // read: status; write: command
+int ATA_STATUS  = 0x1F7;  // read gives status, write takes a command
 int ATA_COMMAND = 0x1F7;  // same port as STATUS
 
 // Status register bits
@@ -38,9 +38,9 @@ int CMD_FLUSH       = 0xE7;  // FLUSH CACHE
 int ata_present = 0;  // 1 if a drive was detected at init
 
 // Extracts a single bit from an 8-bit status value. `bit` must be a
-// power of 2 (1, 2, 4, 8, 16, 32, 64, 128). Uses pure arithmetic
-// (no bitwise ops in c0): (v/bit) - ((v/(bit*2))*2) isolates the bit.
-// Example: v=88 (0x58 = DRDY|DRQ|SERV), bit=8 → 88/8=11, 88/16=5*2=10,
+// power of 2 (1, 2, 4, 8, 16, 32, 64, 128). Uses arithmetic,
+// (v/bit) - ((v/(bit*2))*2) isolates the bit.
+// For example v=88 (0x58 = DRDY|DRQ|SERV), bit=8 → 88/8=11, 88/16=5*2=10,
 // 11-10=1 → DRQ is set.
 int ata_bit(int v, int bit) {
     return (v / bit) - ((v / (bit * 2)) * 2);
@@ -56,7 +56,7 @@ int ata_wait_not_busy() {
     return 0;
 }
 
-// Poll until the drive is ready for a data transfer: BSY must be clear
+// Poll until the drive is ready for a data transfer. BSY must be clear
 // and DRQ must be set. Returns 0 on timeout or error, 1 on success.
 int ata_wait_drq() {
     int i = 0;
@@ -71,7 +71,7 @@ int ata_wait_drq() {
     return 0;
 }
 
-// Initialise the ATA driver: detect whether a drive is present on the
+// Initialise the ATA driver. Detect whether a drive is present on the
 // primary bus. Writes 0xE0 to the drive register (select master, LBA
 // mode), then reads status. 0xFF means the bus is floating (no drive
 // at all); 0x00 means no drive responded. Anything else means a drive
@@ -107,7 +107,7 @@ void ata_read(int lba, int buf) {
     outb(ATA_NSECT, 1);
 
     // LBA bits 7:0
-    outb(ATA_LBA_LO, lba - (lba / 256) * 256);
+    outb(ATA_LBA_LO, lba % 256);
 
     // LBA bits 15:8
     outb(ATA_LBA_MID, (lba / 256) - ((lba / 65536) * 256));
@@ -115,8 +115,8 @@ void ata_read(int lba, int buf) {
     // LBA bits 23:16
     outb(ATA_LBA_HI, (lba / 65536) - ((lba / 16777216) * 256));
 
-    // Drive select: master (0xE0) | LBA mode (0x40) | top nibble
-    // 0xE0 already includes the LBA-mode bit, so: 0xE0 + (lba >> 24 & 0x0F)
+    // Drive select, master (0xE0) | LBA mode (0x40) | top nibble
+    // 0xE0 already includes the LBA-mode bit, so 0xE0 + (lba >> 24 & 0x0F)
     outb(ATA_DRIVE, 0xE0 + lba / 16777216);
 
     // Issue READ SECTORS
@@ -131,7 +131,7 @@ void ata_read(int lba, int buf) {
     int i = 0;
     while (i < 256) {
         int w = inw(ATA_DATA);
-        store8(buf + i * 2,       w - (w / 256) * 256);  // low byte
+        store8(buf + i * 2,       w % 256);  // low byte
         store8(buf + i * 2 + 1,   w / 256);               // high byte
         i = i + 1;
     }
@@ -149,7 +149,7 @@ void ata_write(int lba, int buf) {
     outb(ATA_NSECT, 1);
 
     // LBA bytes
-    outb(ATA_LBA_LO,  lba - (lba / 256) * 256);
+    outb(ATA_LBA_LO,  lba % 256);
     outb(ATA_LBA_MID, (lba / 256) - ((lba / 65536) * 256));
     outb(ATA_LBA_HI,  (lba / 65536) - ((lba / 16777216) * 256));
 

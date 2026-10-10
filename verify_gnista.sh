@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
 # verify_gnista.sh — prove Gnista runs for real on Moonshot, not just that
-# it compiles: an entity pool of animated movers plus static blocks,
+# it compiles, an entity pool of animated movers plus static blocks,
 # arrow-key input, ticks()-based timing, and all-pairs AABB collision.
 #
-# Checks:
+# Checks
 #   1. "[elf] windowed spawn wid=" — spawn3 succeeded, got a window
 #   2. "gnista demo running" reaches serial — sprite alloc, pool alloc,
 #      win_info(), and ticks() all succeeded before the main loop started
 #   3. The scheduler keeps advancing after spawn (proves the demo's tight
 #      draw loop is not wedging the kernel — a real risk for any busy loop
 #      running at ring 3 alongside the scheduler)
-#   4. In pixels, from two screendumps seconds apart: several INDEPENDENT
+#   4. In pixels, from two screendumps seconds apart, several INDEPENDENT
 #      entities are on screen (counted as connected clusters of sprite
 #      colour, so two that overlap merge into one and are not miscounted),
 #      both static blocks are drawn, no entity is ever found inside a block
@@ -117,12 +117,12 @@ fi
 
 # --- the entity pool, checked in pixels -----------------------------------
 # Everything above proves the program runs. These checks prove it is running
-# the ENGINE: several independent entities, static blocks that are collided
+# the ENGINE, several independent entities, static blocks that are collided
 # against rather than passed through, and motion between two screendumps.
 python3 - <<'PY'
 import sys
 
-# Sprite frame colours from gen_sprite.c0, as RGB: frame 0 orange, frame 1
+# Sprite frame colours from gen_sprite.c0, as RGB. Frame 0 orange, frame 1
 # yellow. Static blocks are 0x606060.
 SPRITE = ((255, 140, 0), (255, 220, 0))
 BLOCK = (96, 96, 96)
@@ -186,7 +186,7 @@ sprite_a = pixels_of(a, w, h, SPRITE)
 sprite_b = pixels_of(b, w, h, SPRITE)
 groups_a = clusters(sprite_a)
 groups_b = clusters(sprite_b)
-# Only count groups big enough to be a sprite, not a stray edge pixel: the
+# Only count groups big enough to be a sprite, not a stray edge pixel, since the
 # 12x12 circle is ~100 pixels, so half of one is a safe floor and still
 # catches two sprites that have merged visually while overlapping.
 big_a = [g for g in groups_a if len(g) >= 50]
@@ -197,7 +197,7 @@ if len(big_a) < 2 or len(big_b) < 2:
           "found %d/%d -- the pool is not rendering" % (len(big_a), len(big_b)))
     ok = False
 
-# The blocks: find them by colour, and require both to be present.
+# The blocks. Find them by colour, and require both to be present.
 block_px = pixels_of(a, w, h, {BLOCK})
 block_groups = [g for g in clusters(block_px) if len(g) >= 100]
 print("static blocks: %d" % len(block_groups))
@@ -205,7 +205,7 @@ if len(block_groups) < 2:
     print("FAIL: expected 2 static blocks, found %d" % len(block_groups))
     ok = False
 
-# Collision, the real check: no sprite pixel may sit inside a block's
+# Collision, the real check. No sprite pixel may sit inside a block's
 # rectangle. The movers start outside them and bounce off, so a sprite found
 # inside one means the AABB test or its resolution is not working.
 for g in block_groups:
@@ -218,7 +218,7 @@ for g in block_groups:
         print("FAIL: an entity is inside a static block -- collision is not holding")
         ok = False
 
-# Motion: the two shots are seconds apart, so the sprite pixels must differ.
+# Motion. The two shots are seconds apart, so the sprite pixels must differ.
 if sprite_a == sprite_b:
     print("FAIL: nothing moved between the two screendumps")
     ok = False

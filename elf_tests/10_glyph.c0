@@ -16,7 +16,7 @@
 //    proves they arrived in the right order.
 // 3. Row order and bit order. Row 0 is the first byte and bit 7 of a byte is
 //    the LEFTMOST pixel. '/' is the one glyph in the font that is different
-//    along both axes at once: 0x01020408 over rows 0..3, so its top row is
+//    along both axes at once, 0x01020408 over rows 0..3, so its top row is
 //    the rightmost column and each row below moves one column left. Reading
 //    the rows backwards, or the bits mirrored, changes this sum.
 //
@@ -31,7 +31,7 @@ int main() {
     int cols = d / 65536;
     int rows = d - cols * 65536;
 
-    // Nothing may be written through a null buffer: if the size query also
+    // Nothing may be written through a null buffer. If the size query also
     // copied, this byte would have changed.
     store8(buf, 0xAB);
     d = glyph('M', 0);
@@ -43,7 +43,7 @@ int main() {
     while (i < rows) {
         int b = load8(buf + i);
         while (b > 0) {
-            lit = lit + b - (b / 2) * 2;
+            lit = lit + b % 2;
             b = b / 2;
         }
         i = i + 1;
@@ -61,7 +61,7 @@ int main() {
         i = i + 1;
     }
 
-    // '/' rises to the right: row r has exactly one pixel, at column
+    // '/' rises to the right, so row r has exactly one pixel, at column
     // cols - 1 - r for the top four rows. Summing the column index of the
     // single lit pixel in rows 0..3 gives 7 + 6 + 5 + 4 = 22 if the order is
     // right, and 4 + 5 + 6 + 7 read backwards is the same -- so the rows are
@@ -77,12 +77,12 @@ int main() {
             int shifted = b;
             int k = 0;
             while (k < 7 - col) { shifted = shifted / 2; k = k + 1; }
-            if (shifted - (shifted / 2) * 2 == 1) { sum = sum + col * (i + 1); }
+            if (shifted % 2 == 1) { sum = sum + col * (i + 1); }
             col = col + 1;
         }
         i = i + 1;
     }
-    // rows 0..3 lit at columns 7,6,5,4 weighted by row+1: 7 + 12 + 15 + 16.
+    // rows 0..3 lit at columns 7,6,5,4 weighted by row+1, 7 + 12 + 15 + 16.
     if (sum != 50) { return 300 + sum; }
 
     return lit + cols;

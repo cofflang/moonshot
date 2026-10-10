@@ -3,7 +3,7 @@
 # verify_windowed_ring3.sh — prove that spawn3 creates a dedicated kakel window
 # for the ring-3 process and routes output there.
 #
-# Checks:
+# Checks
 #   1. Serial log shows "[ring3] windowed spawn wid=N" (kakel_split called)
 #   2. "hello from ring 3" reaches serial (syscall output is correct)
 #   3. Two sequential spawn3 calls each get their own window
@@ -80,7 +80,7 @@ sleep 2
 
 ok=1
 
-# Check 1: windowed spawn messages for flat binary
+# Check 1, windowed spawn messages for flat binary
 ring3_win=$(grep -c '\[ring3\] windowed spawn wid=' serial.log || true)
 echo "ring3 windowed spawn messages: $ring3_win"
 if [ "$ring3_win" -lt 2 ]; then
@@ -88,7 +88,7 @@ if [ "$ring3_win" -lt 2 ]; then
   ok=0
 fi
 
-# Check 2: windowed spawn message for ELF
+# Check 2, windowed spawn message for ELF
 elf_win=$(grep -c '\[elf\] windowed spawn wid=' serial.log || true)
 echo "elf windowed spawn messages: $elf_win"
 if [ "$elf_win" -lt 1 ]; then
@@ -96,7 +96,7 @@ if [ "$elf_win" -lt 1 ]; then
   ok=0
 fi
 
-# Check 3: output reached serial
+# Check 3, output reached serial
 ring3_hello=$(grep -c 'hello from ring 3' serial.log || true)
 echo "hello from ring 3 count: $ring3_hello"
 if [ "$ring3_hello" -lt 2 ]; then
@@ -111,7 +111,7 @@ if [ "$elf_hello" -lt 1 ]; then
   ok=0
 fi
 
-# Check 4: no crash
+# Check 4, no crash
 panic=$(grep -c 'PANIC' serial.log || true)
 doublefault=$(grep -c 'double fault' serial.log || true)
 echo "panics: $panic, double faults: $doublefault"

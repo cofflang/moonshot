@@ -10,13 +10,11 @@
 // Infecteria's default sprites, DRAWN AT STARTUP rather than baked in as
 // pixel data.
 //
-// The first version of this was a generator that wrote the pixels out as a
-// c0 byte array, the way bake writes an ELF and gen_sprite.c0 writes Gnista's
-// demo sprite. Thirteen kilobytes of pixels became a hundred and twenty-two
-// kilobytes of program, because c0 has no optimizer and every eight bytes of
-// data compiled to a whole store64 sequence -- and the resulting kernel was
-// large enough that smed refused it outright. Drawing the same sprites from
-// the code that describes them costs about two kilobytes instead, and the
+// Writing the pixels out as a c0 byte array, the way gen_sprite.c0 writes
+// Gnista's demo sprite, would turn thirteen kilobytes of pixels into about a
+// hundred and twenty kilobytes of program, because c0 has no optimizer and
+// every eight bytes of data compile to a whole store64 sequence. Drawing the
+// same sprites from the code that describes them costs about two kilobytes, and the
 // code is a better record of the art than the pixels are anyway. This is a
 // picture of five organisms, not a table of numbers that happens to be one.
 //
@@ -25,7 +23,7 @@
 // are there, so anything drawn in pensel replaces one of them with no rebuild
 // anywhere. These are what it falls back to.
 //
-// Everything works in DOUBLED coordinates: a 16-pixel sprite's centre falls
+// Everything works in DOUBLED coordinates, so a 16-pixel sprite's centre falls
 // between pixel 7 and pixel 8, and doubling makes that centre the whole
 // number 15 rather than a half. Radii are doubled too, so a radius written as
 // 11 is five and a half pixels.
@@ -35,7 +33,7 @@
 // cell, the infected cell and the factory rather than three near-identical
 // sprites that would all have to be redrawn together.
 
-// The sprite being drawn: its dimensions, frame count and pixel buffer.
+// The sprite being drawn, its dimensions, frame count and pixel buffer.
 int SW = 0;
 int SH = 0;
 int SF = 0;
@@ -56,14 +54,14 @@ void sprite_begin(int w, int h, int frames) {
 void put(int f, int x, int y, int color) {
     if (x < 0 || y < 0 || x >= SW || y >= SH) { return; }
     int p = data + (f * SW * SH + y * SW + x) * 4;
-    store8(p, color - (color / 256) * 256);
+    store8(p, color % 256);
     store8(p + 1, (color / 256) - (color / 65536) * 256);
     store8(p + 2, (color / 65536) - (color / 16777216) * 256);
     store8(p + 3, 0);
     return;
 }
 
-// A shade of grey as a colour. These run high on purpose: view_sprite_tint
+// A shade of grey as a colour. These run high on purpose, since view_sprite_tint
 // scales the tint by the sprite pixel's own brightness, and a cell is then
 // blended half and half with the background, so a membrane drawn at 235
 // arrives on a dark screen at barely a third of its colour. 255 means "this
@@ -111,7 +109,7 @@ void ring_ellipse(int f, int cx, int cy, int rx, int ry, int thick, int color) {
 }
 
 // A straight run of pixels from one whole-pixel point to another, stepping on
-// whichever axis is longer. Not an anti-aliased line: at these sizes every
+// whichever axis is longer. Not an anti-aliased line, since at these sizes every
 // pixel is a deliberate decision and a smoothed edge would just look muddy.
 void line(int f, int x0, int y0, int x1, int y1, int color) {
     int dx = x1 - x0;
@@ -146,17 +144,18 @@ int art_sprite() {
 
 // --- the sprites ----------------------------------------------------------
 
-// The player: a bacterium. An oval body with a darker membrane and a lit
-// upper left, and a flagellum that whips to the other side between the two
-// frames, which is the whole of the animation and reads as swimming.
+// The player, a bacterium. An oval body with a darker membrane and a lit
+// upper left, and a flagellum that sweeps right, straight, left, straight
+// over four frames, the swim cycle. infecteria plays it fast while the
+// player moves and slowly while it waits.
 int draw_player() {
-    sprite_begin(16, 16, 2);
+    sprite_begin(16, 16, 4);
     int body = 0x40FF80;
     int rim = 0x1E8C4A;
     int lit = 0xC8FFDC;
     int tail = 0x2FBE68;
     int f = 0;
-    while (f < 2) {
+    while (f < 4) {
         // Centre x 7.5, centre y 6.0, so the bottom four rows are free for
         // the flagellum.
         fill_ellipse(f, 15, 12, 11, 12, rim);
@@ -169,7 +168,9 @@ int draw_player() {
     // single-pixel line that moved two pixels between frames and the
     // animation was invisible at this size.
     flagellum(0, 1, tail);
-    flagellum(1, 0 - 1, tail);
+    flagellum(1, 0, tail);
+    flagellum(2, 0 - 1, tail);
+    flagellum(3, 0, tail);
     return art_sprite();
 }
 
@@ -183,7 +184,7 @@ void flagellum(int f, int dir, int color) {
     return;
 }
 
-// An antibacterium: a red core with eight spikes that lengthen and shorten
+// An antibacterium, a red core with eight spikes that lengthen and shorten
 // between the frames. Spikes rather than a smooth disc because it is the one
 // thing in the world that can hurt you, and it should not look like food.
 int draw_anti() {
@@ -221,17 +222,23 @@ int draw_anti() {
     return art_sprite();
 }
 
-// A mini-bacterium: the player in miniature, small enough that a body and a
-// two-pixel tail is all there is room for.
+// A mini-bacterium, the player in miniature, small enough that a body and a
+// two-pixel tail is all there is room for. The tail flicks between two
+// frames.
 int draw_mini() {
-    sprite_begin(8, 8, 1);
-    fill_ellipse(0, 7, 6, 6, 7, 0x2FBE68);
-    fill_ellipse(0, 7, 6, 4, 5, 0x80FFC0);
+    sprite_begin(8, 8, 2);
+    int f = 0;
+    while (f < 2) {
+        fill_ellipse(f, 7, 6, 6, 7, 0x2FBE68);
+        fill_ellipse(f, 7, 6, 4, 5, 0x80FFC0);
+        f = f + 1;
+    }
     line(0, 4, 6, 3, 7, 0x2FBE68);
+    line(1, 3, 6, 4, 7, 0x2FBE68);
     return art_sprite();
 }
 
-// A cell, in grey so that infecteria can tint it: a bright membrane, a dimmer
+// A cell, in grey so that infecteria can tint it. It has a bright membrane, a dimmer
 // cytoplasm, a nucleus a little off centre and four organelles. Off centre
 // because a nucleus dead in the middle reads as a target reticle rather than
 // as something alive.
@@ -241,7 +248,7 @@ int draw_cell() {
     fill_ellipse(0, 31, 31, 26, 26, grey(150));
     fill_ellipse(0, 27, 27, 10, 10, grey(225));
     ring_ellipse(0, 27, 27, 10, 10, 3, grey(255));
-    // Organelles, placed by hand rather than by a loop: four positions that
+    // Organelles, placed by hand rather than by a loop, four positions that
     // look scattered are not four positions a formula produces.
     fill_ellipse(0, 44, 22, 5, 5, grey(200));
     fill_ellipse(0, 40, 46, 4, 4, grey(195));
@@ -250,7 +257,7 @@ int draw_cell() {
     return art_sprite();
 }
 
-// A factory: the same membrane, with the inside replaced by machinery. Four
+// A factory, the same membrane, with the inside replaced by machinery. Four
 // buds around the rim are where mini-bacteria come out, so the sprite says
 // what the building does without a label.
 int draw_factory() {

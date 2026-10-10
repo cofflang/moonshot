@@ -14,35 +14,31 @@
 #
 # A kakel tile is not a fixed size. Any reflow (`split`, `close`, another
 # `spawn3`) hands every visible window new geometry, and nothing tells the
-# program. Before this worked, a running Infecteria whose tile widened kept
-# presenting a buffer written at the OLD row pitch, and SYS_PRESENT read it at
-# the NEW one. At double the width that means each screen row swallowed two
-# source rows, so the frame came out interleaved and vertically squashed into
-# the top half of the tile -- and past the last row the buffer had, it read
-# clean off the mapped part of the task's heap: an unmapped read in ring 0,
+# program. A running Infecteria whose tile widens could keep
+# presenting a buffer written at the OLD row pitch while SYS_PRESENT reads it at
+# the NEW one. At double the width each screen row would swallow two
+# source rows, so the frame would come out interleaved and vertically squashed into
+# the top half of the tile -- and past the last row the buffer has, it would read
+# clean off the mapped part of the task's heap, an unmapped read in ring 0,
 # inside a syscall.
 #
 # Checked in pixels rather than in source, for the reason every other verify
-# script here gives: the wrong-pitch frame looked entirely plausible in the
-# draw code, and only a screendump showed it stopping halfway down the window.
+# script here gives. A wrong-pitch frame looks entirely plausible in the
+# draw code, and only a screendump shows it stopping halfway down the window.
 #
-# The check that does the work is COVERAGE, deliberately. An earlier draft
-# also asserted the two halves of the window were not pixel-identical, on the
-# theory that a doubled pitch duplicates the frame side by side. Running this
-# script against a deliberately un-fixed kernel showed that theory was wrong
-# -- reading at double pitch interleaves rows, it does not mirror them -- so
-# that check could never have fired and has been removed rather than kept as
-# reassurance. Coverage was the assertion that actually caught it.
+# The check that does the work is COVERAGE, deliberately. Reading at double
+# pitch interleaves rows rather than mirroring them, so a check that the two
+# halves of the window differ would never fire.
 #
-# Checks, in one boot:
+# Checks, in one boot
 #   1. GROW. spawn3 Infecteria into half the screen, then close the shell
 #      window so the tavla becomes the only one and doubles in width. The
 #      bottom of the window must then be painted with the game's own
-#      background, not left as kakel's reflow clear. Verified to FAIL on a
-#      kernel with the fix backed out (bottom row: 0.00 game background
-#      against 1.00 with it), which is the only evidence that a regression
-#      test is worth having.
-#   2. The un-resized baseline: while the tile was still half-width, the game
+#      background, not left as kakel's reflow clear. It fails on a
+#      kernel that presents at the window's pitch (bottom row 0.00 game
+#      background against 1.00), which is the evidence that the test is
+#      worth having.
+#   2. The un-resized baseline. While the tile was still half-width, the game
 #      must already have been filling it top to bottom, so a pass on 1 cannot
 #      be explained by the game simply painting everything everywhere.
 
@@ -102,11 +98,11 @@ def word(s):
 def shot(name):
     send("screendump %s" % name, settle=0.8)
 
-# raket login gate: root, then an empty password.
+# raket login gate, root, then an empty password.
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.0)
 
-# 1: spawn the game into half the screen, let it render a few frames, then
+# 1, spawn the game into half the screen, let it render a few frames, then
 # close the shell window beside it so its tile doubles in width.
 word("spawn3 infecteria.elf"); typ(["ret"])
 time.sleep(4.0)
@@ -154,7 +150,7 @@ def row(buf, w, y, x0, x1):
 ok = True
 
 w, h, grown = read_ppm("resize_grown.ppm")
-# The tavla is now the only window: full width, from below its title strip
+# The tavla is now the only window, full width, from below its title strip
 # down to the status bar.
 top = TITLE_ROWS * FONT_H
 bot = h - KAKEL_LOG_ROWS * FONT_H
@@ -198,7 +194,7 @@ if f_up < 0.5:
     print("FAIL: the game is not painting its enlarged tile at all")
     ok = False
 
-# 2. The un-resized baseline, from the same boot's first screendump: while the
+# 2. The un-resized baseline, from the same boot's first screendump. While the
 # tile was still half-width, the game must already have been filling it top to
 # bottom. Without this, check 1 could be satisfied by a game that paints
 # everything everywhere regardless of geometry.

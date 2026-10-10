@@ -7,12 +7,11 @@
 // License version 3 or (at your option) any later version, WITHOUT ANY
 // WARRANTY; see the LICENSE file for the full text.
 //
-// Verifies ticks() (SYS_TICKS) end to end from ring 3: reads the counter,
+// Verifies ticks() (SYS_TICKS) end to end from ring 3. It reads the counter,
 // spins long enough for the timer to fire, reads it again, and exits 1 if the
 // second read is strictly greater. verify_ticks.sh looks for that exit code
-// and for the line printed below. Baked into the kernel as ticks_test_data.c0
-// by gen_programs.sh; the original of this file was lost and this is a
-// rewrite from the shipped machine code.
+// and for the line printed below. gen_programs.sh compiles it into build/
+// and the kernel embeds it.
 int main() {
     int t0 = 0;
     int t1 = 0;

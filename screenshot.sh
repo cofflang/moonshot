@@ -10,9 +10,9 @@
 # WARRANTY; see the LICENSE file for the full text.
 # Boots moonshot.elf headlessly, waits for it to settle, and saves a real
 # screenshot of whatever is on screen into screenshots/ -- a running visual
-# record of the project (deliberately committed to git, not gitignored:
+# record of the project (deliberately committed to git, not gitignored,
 # the whole point is looking back at it later, not a throwaway build
-# artifact). Meant to be run:
+# artifact). Meant to be run
 #   - by hand, any time (./screenshot.sh, or ./screenshot.sh a-label)
 #   - right after landing a new graphical feature (a real screendump each
 #     time, not a description of one -- same "run the actual thing"
@@ -58,7 +58,7 @@ sockfile="screenshot.sock"
 ppmfile="screenshot.ppm"
 rm -f "$sockfile" "$ppmfile" serial.log
 
-# Budget: initial wait + 0.3s per sendkey (they are sent one at a time,
+# The budget is the initial wait + 0.3s per sendkey (they are sent one at a time,
 # 300ms apart -- see the Python block below) + a few seconds of slack for
 # the screendump itself and monitor round-trips. Too tight a timeout here
 # kills QEMU mid-key-send once there are more than a couple of keys, which

@@ -6,7 +6,7 @@
 // moonshot is free software, distributed under the GNU General Public
 // License version 3 or (at your option) any later version, WITHOUT ANY
 // WARRANTY; see the LICENSE file for the full text.
-// jenna.c0 -- memory management: the physical-page allocator (a bump
+// jenna.c0 -- memory management, the physical-page allocator (a bump
 // allocator with an intrusive LIFO free-list) and the 4-level page tables
 // c0 builds and switches to.
 
@@ -19,10 +19,18 @@
 // SENTINEL_VIRT is a high virtual address deliberately ABOVE boot.s's 1GB
 // identity map, mapped a second time to a sentinel page as a liveness
 // proof (see paging_init) -- 4GB, hence 0x100000000. SENTINEL_VALUE stays
-// decimal: it is an arbitrary human-recognizable magic number for
+// decimal. It is an arbitrary human-recognizable magic number for
 // eyeballing in the serial log, not a hardware-meaningful constant.
 int PRESENT_WRITE = 0x3;
 int IDMAP_PAGES = 4096;
+// The identity map reaches as far as the memory jenna hands out, up to
+// this ceiling (256MB). A smaller map than pmm's range would make every
+// place that touches a frame by its physical address (zero_page when a
+// ring-3 heap grows, for one) fault on the first frame above it. The ceiling
+// keeps a machine with gigabytes from spending its boot building page
+// tables, and pmm_limit is clamped to it so no frame is ever handed out that
+// the kernel cannot reach.
+int IDMAP_MAX_PAGES = 65536;
 int SENTINEL_VIRT = 0x100000000;
 int SENTINEL_VALUE = 1234567890;
 int pml4_phys = 0;
@@ -30,15 +38,14 @@ int pml4_phys = 0;
 // PRESENT_WRITE_USER additionally sets bit 2 (U/S) -- present|writable|user.
 //
 // USER_VIRT_BASE (2GB) is the private per-process virtual range every
-// pt_create()'d address space gets. Two constraints pin it here, discovered
-// by actually booting two ring-3 processes rather than assumed:
+// pt_create()'d address space gets. Two constraints pin it here.
 //
 // 1. It must be < 4GB. The existing ring-3 test binary (ring3_test_code)
 //    passes its syscall string argument via `mov edi, imm32` -- a 32-bit
 //    immediate, zero-extended into rdi -- so any virtual address at or
-//    above 4GB is simply unrepresentable by it. An earlier attempt at
-//    512GB (a PML4 index the kernel never touches at all) faulted for
-//    exactly this reason: the patched immediate silently truncated.
+//    above 4GB is simply unrepresentable by it. 512GB (a PML4 index the
+//    kernel never touches at all) would fault for
+//    exactly this reason, since the patched immediate would truncate.
 // 2. Since every representable address is < 4GB, it unavoidably falls
 //    inside PML4 index 0 -- the SAME top-level entry the kernel's own 16MB
 //    identity map lives in (one PML4 entry spans 512GB). pt_create()
@@ -51,10 +58,10 @@ int pml4_phys = 0;
 //    entry's permissions in place rather than trusting it as-is.
 //
 // 2GB (PDPT index 2 within that shared PML4[0]) is chosen specifically
-// clear of the kernel's actual populated ranges: the 16MB identity map
+// clear of the kernel's actual populated ranges. The 16MB identity map
 // (PDPT index 0), the 4GB sentinel and 5GB demand-paging test address
 // (both >= 4GB, excluded by constraint 1 anyway). Setting U on the shared
-// PML4[0] entry is safe -- it is a permission CEILING, not a grant: the
+// PML4[0] entry is safe -- it is a permission CEILING, not a grant, and the
 // kernel's own leaf PTEs (built via plain map_page, never map_page_user)
 // keep U unset, so kernel pages stay inaccessible from ring 3 regardless.
 // Only the fresh, process-private PDPT[2]/PD/PT chain map_page_user builds
@@ -62,7 +69,7 @@ int pml4_phys = 0;
 int PRESENT_WRITE_USER = 0x7;
 int USER_VIRT_BASE = 0x80000000;
 
-// Demand-paging test (see page_fault_handler/knekt.c0's kernel_post_init):
+// Demand-paging test (see page_fault_handler/knekt.c0's kernel_post_init).
 // a virtual address deliberately left unmapped (5GB, hence 0x140000000 --
 // above the 16MB identity map and the 4GB paging sentinel, so touching it
 // is a guaranteed page fault), and the value the fault handler seeds the
@@ -97,9 +104,9 @@ int pmm_free_count = 0;
 // so this uses load64 directly -- no load32 reconstruction needed here.
 void pmm_init(int mb_info) {
     int flags = load32(mb_info);
-    // bit 6 of flags: mmap_addr/mmap_length valid. Same isolate-one-bit
+    // bit 6 of flags means mmap_addr/mmap_length valid. Same isolate-one-bit
     // arithmetic as the mem_lower/upper check in knekt.c0's main() (bit 0),
-    // just shifted: (flags/64) - (flags/128)*2 keeps only bit 6.
+    // just shifted, so (flags/64) - (flags/128)*2 keeps only bit 6.
     int has_mmap = (flags / 64) - (flags / 128) * 2;
     if (has_mmap != 1) {
         serial_print("No memory map from bootloader\n");
@@ -130,9 +137,9 @@ void pmm_init(int mb_info) {
             int region_start = base;
             if (region_start < _kernel_end) { region_start = _kernel_end; }
             // Round up to a 4096-byte page boundary (same no-bitwise-ops
-            // idiom as everywhere else: only round up if not already
+            // idiom as everywhere else, only round up if not already
             // aligned, using the remainder from integer division).
-            int rem = region_start - (region_start / 4096) * 4096;
+            int rem = region_start % 4096;
             int aligned = region_start;
             if (rem != 0) { aligned = region_start + (4096 - rem); }
             if (aligned + 4096 <= base + len) {
@@ -154,7 +161,7 @@ void pmm_init(int mb_info) {
 }
 
 // Returns a 4096-byte physical page to the allocator by pushing it onto an
-// intrusive free-list: the page is free, so its own first 8 bytes are ours
+// intrusive free-list. The page is free, so its own first 8 bytes are ours
 // to reuse as the link to the previous free-list head -- no separate
 // bookkeeping array or bitmap needed. LIFO, so the most recently freed page
 // is the next one handed back out (pmm_alloc_page pops from this same head).
@@ -169,7 +176,7 @@ void pmm_free_page(int addr) {
 // popping the most recently freed page, whose stored link becomes the new
 // head -- and only bumps the watermark upward through the region when the
 // free-list is empty. This is what makes jenna a real allocator rather than
-// a pure bump arena: freed pages actually get reused. Returns 0 on true
+// a pure bump arena, since freed pages actually get reused. Returns 0 on true
 // exhaustion (free-list empty AND the watermark has reached the region
 // limit); a richer out-of-memory story (spanning multiple regions, eviction)
 // is a later problem.
@@ -218,26 +225,24 @@ void zero_page(int addr) {
     return;
 }
 
-// --- Kernel heap: kmalloc / kfree -------------------------------------
+// --- Kernel heap, kmalloc / kfree -------------------------------------
 // The first thing in Moonshot that hands out sub-page, variable-size memory
 // -- pmm_alloc_page only ever gives whole 4096-byte pages, which is too
 // coarse the moment anything wants many small, differently-sized pieces
 // (shell line/argument buffers now; a filesystem's nodes later). A plain
 // first-fit allocator over one contiguous arena carved from jenna.
 //
-// Layout: the arena is a packed sequence of blocks, each an implicit-list
+// Layout. The arena is a packed sequence of blocks, each an implicit-list
 // node with a 16-byte header -- [block+0] = payload size in bytes,
 // [block+8] = free flag (1 free / 0 used) -- immediately followed by its
 // payload. The NEXT block always sits at (block + 16 + size), so no explicit
-// next-pointer is stored: the list is walked by address. That address-order
+// next-pointer is stored, since the list is walked by address. That address-order
 // walk is also what lets kfree coalesce neighbours (a separate free-list
 // would throw away the adjacency information). Payloads stay 8-aligned
 // because heap_start is page-aligned, the header is 16 bytes, and every
 // requested size is rounded up to a multiple of 8.
-// HEAP_HDR used to be a hand-maintained "16" duplicating this shape; a
-// global initializer in c0 can only be a literal constant (not an
-// expression like sizeof(...)), so callers now use sizeof(HeapBlock)
-// directly instead of a separate constant that could drift out of sync.
+// Callers use sizeof(HeapBlock) directly rather than a separate HEAP_HDR
+// constant, so the header size cannot drift out of sync with this shape.
 layout HeapBlock {
     int size;
     int free;
@@ -245,43 +250,50 @@ layout HeapBlock {
 int heap_start = 0;
 int heap_end = 0;
 
-// Carves `num_pages` contiguous pages out of jenna and lays the whole arena
-// down as a single big free block. MUST be called early, while pmm's
-// free-list is still empty, so pmm_alloc_page takes its bump path and
-// returns physically-contiguous pages -- the implicit list requires one
-// unbroken address range. Contiguity is asserted, not assumed: a loud
-// serial warning fires if it ever stops holding.
-void heap_init(int num_pages) {
+// Lays `num_pages` contiguous pages out of jenna as one big free block and
+// returns the first page. MUST be called early, while pmm's free-list is
+// still empty, so pmm_alloc_page takes its bump path and returns physically
+// contiguous pages -- an arena's implicit list requires one unbroken address
+// range. Contiguity is asserted, not assumed, and a loud serial warning fires if
+// it ever stops holding. `who` names the arena in that warning.
+int arena_carve(int num_pages, int who) {
     int first = pmm_alloc_page();
-    heap_start = first;
     int expect = first + 4096;
     int i = 1;
     while (i < num_pages) {
         int pg = pmm_alloc_page();
         if (pg != expect) {
-            serial_print("heap_init: NON-CONTIGUOUS pmm page, heap broken\n");
+            serial_print(who);
+            serial_print(": NON-CONTIGUOUS pmm page, arena broken\n");
         }
         expect = expect + 4096;
         i = i + 1;
     }
-    heap_end = first + num_pages * 4096;
-    heap_start.size = heap_end - heap_start - sizeof(HeapBlock); // one big block...
-    heap_start.free = 1;                                          // ...marked free
+    int end = first + num_pages * 4096;
+    first.size = end - first - sizeof(HeapBlock); // one big block...
+    first.free = 1;                               // ...marked free
+    return first;
+}
+
+// The kernel heap is one arena. jakel's file data is another (see
+// jakel_arena_init), kept apart so a big file cannot starve the kernel.
+void heap_init(int num_pages) {
+    heap_start = arena_carve(num_pages, "heap_init");
+    heap_end = heap_start + num_pages * 4096;
     return;
 }
 
-// Allocates `n` usable bytes (rounded up to 8), first-fit across the arena.
-// When the chosen block is big enough to ALSO hold another header plus a
-// minimal 8-byte payload, it splits, leaving the remainder as a smaller
-// free block so the slack stays reusable instead of being lost to internal
-// fragmentation. Returns the payload address, or 0 if nothing fits -- this
-// is a fixed arena; growing it with more (necessarily non-contiguous) pmm
-// pages is a later problem.
-int kmalloc(int n) {
+// Allocates `n` usable bytes (rounded up to 8), first-fit across the arena
+// [start, end). When the chosen block is big enough to ALSO hold another
+// header plus a minimal 8-byte payload, it splits, leaving the remainder as
+// a smaller free block so the slack stays reusable instead of being lost to
+// internal fragmentation. Returns the payload address, or 0 if nothing fits
+// -- an arena is fixed in size.
+int arena_alloc(int start, int end, int n) {
     if (n <= 0) { return 0; }
     n = ((n + 7) / 8) * 8;
-    int b = heap_start;
-    while (b < heap_end) {
+    int b = start;
+    while (b < end) {
         int size = b.size;
         int free = b.free;
         if (free == 1 && size >= n) {
@@ -299,19 +311,31 @@ int kmalloc(int n) {
     return 0;
 }
 
+// Returns 0 when the 1MB kernel heap has no room, and a number of callers
+// never check, so running out is said here, where every one of them passes.
+int kmalloc(int n) {
+    int p = arena_alloc(heap_start, heap_end, n);
+    if (p == 0 && n > 0) {
+        serial_print("[jenna] kmalloc: no room for ");
+        serial_print_int(n);
+        serial_print(" bytes in the kernel heap\n");
+    }
+    return p;
+}
+
 // Merges every run of adjacent free blocks into one, walking the arena once
-// in address order. Called after each kfree so freed neighbours recombine
+// in address order. Called after each free so freed neighbours recombine
 // into blocks big enough for later, larger requests -- without it, repeated
-// split/free would ratchet the heap into ever-smaller unusable fragments.
+// split/free would ratchet the arena into ever-smaller unusable fragments.
 // Absorbing a block deliberately does NOT advance the cursor, so a whole run
 // of adjacent free blocks collapses in this single pass.
-void heap_coalesce() {
-    int b = heap_start;
-    while (b < heap_end) {
+void arena_coalesce(int start, int end) {
+    int b = start;
+    while (b < end) {
         int size = b.size;
         int free = b.free;
         int nxt = b + sizeof(HeapBlock) + size;
-        if (free == 1 && nxt < heap_end && nxt.free == 1) {
+        if (free == 1 && nxt < end && nxt.free == 1) {
             b.size = size + sizeof(HeapBlock) + nxt.size;
         } else {
             b = nxt;
@@ -320,10 +344,15 @@ void heap_coalesce() {
     return;
 }
 
-// Frees a block returned by kmalloc -- its header sits just below the
+void heap_coalesce() {
+    arena_coalesce(heap_start, heap_end);
+    return;
+}
+
+// Frees a block returned by arena_alloc -- its header sits just below the
 // payload -- then coalesces. A null pointer is a safe no-op, same as
-// free(NULL) in C.
-void kfree(int ptr) {
+// free(NULL) in C. `who` prefixes the refusal messages below.
+void arena_free(int start, int end, int ptr, int who) {
     if (ptr == 0) { return; }
     // Two guards, both of which exist because of one bug and the day it cost.
     //
@@ -337,26 +366,33 @@ void kfree(int ptr) {
     // wild store of the number 1 is a very good way to turn -(5 + 3) into
     // -(5 + 1), which is -6, which is what the REPL once answered.
     //
-    // Neither guard makes a double free correct. They make it LOUD: an
+    // Neither guard makes a double free correct. They make it LOUD. An
     // allocator that refuses a pointer it never handed out turns a silent
     // corruption at a distance into a line in the serial log naming the
     // caller's bad value, which is the difference between an afternoon and
     // a month.
-    if (ptr < heap_start + sizeof(HeapBlock) || ptr >= heap_end) {
-        serial_print("[jenna] kfree: pointer outside the heap, refusing: ");
+    if (ptr < start + sizeof(HeapBlock) || ptr >= end) {
+        serial_print(who);
+        serial_print(": pointer outside the heap, refusing: ");
         serial_print_int(ptr);
         serial_print("\n");
         return;
     }
     int b = ptr - sizeof(HeapBlock);
     if (b.free == 1) {
-        serial_print("[jenna] kfree: double free at ");
+        serial_print(who);
+        serial_print(": double free at ");
         serial_print_int(ptr);
         serial_print("\n");
         return;
     }
     b.free = 1;
-    heap_coalesce();
+    arena_coalesce(start, end);
+    return;
+}
+
+void kfree(int ptr) {
+    arena_free(heap_start, heap_end, ptr, "[jenna] kfree");
     return;
 }
 
@@ -368,7 +404,7 @@ void kfree(int ptr) {
 // same no-bitwise-ops arithmetic as the rest of this file.
 int next_table(int table, int index) {
     int e = load64(table + index * 8);
-    int present = e - (e / 2) * 2;
+    int present = e % 2;
     if (present == 1) {
         return (e / 4096) * 4096;
     }
@@ -381,16 +417,16 @@ int next_table(int table, int index) {
 // Maps one 4096-byte virtual page `virt` to physical page `phys` in the
 // 4-level hierarchy rooted at `pml4` (a physical address), creating any
 // missing PDPT/PD/PT tables along the way. Index extraction is pure
-// arithmetic (no shifts/masks): the linear page number split into five
+// arithmetic (no shifts/masks). The linear page number split into five
 // 9-bit (0..511) fields by repeated divide-and-remainder, the same idiom
 // serial_print_int uses for decimal digits.
 void map_page(int pml4, int virt, int phys) {
     int page = virt / 4096;
-    int pt_i = page - (page / 512) * 512;
+    int pt_i = page % 512;
     int pd_n = page / 512;
-    int pd_i = pd_n - (pd_n / 512) * 512;
+    int pd_i = pd_n % 512;
     int pdpt_n = pd_n / 512;
-    int pdpt_i = pdpt_n - (pdpt_n / 512) * 512;
+    int pdpt_i = pdpt_n % 512;
     int pml4_i = pdpt_n / 512;
 
     int pdpt = next_table(pml4, pml4_i);
@@ -400,7 +436,7 @@ void map_page(int pml4, int virt, int phys) {
     return;
 }
 
-// Same as next_table, but every table on this path is user-accessible: a
+// Same as next_table, but every table on this path is user-accessible, since a
 // freshly-created intermediate table gets U/S set (PRESENT_WRITE_USER)
 // instead of kernel-only PRESENT_WRITE, AND an already-present entry that
 // does NOT yet have U set gets upgraded in place. The CPU checks U/S at
@@ -408,14 +444,14 @@ void map_page(int pml4, int virt, int phys) {
 // kernel-only entry anywhere in the chain -- including one this process's
 // table merely shares a pointer to via pt_create()'s top-level copy -- would
 // deny the whole walk even if every level below it is correctly marked
-// user. The upgrade is safe as a general policy: it only ever raises an
+// user. The upgrade is safe as a general policy, since it only ever raises an
 // intermediate directory's permission CEILING, never touches a leaf PTE, so
 // it cannot expose any actual page that was not already reachable through a
-// user-marked leaf entry elsewhere. See USER_VIRT_BASE's comment for the
-// real fault this fixed.
+// user-marked leaf entry elsewhere. See USER_VIRT_BASE's comment for why
+// the user range shares index 0 with the kernel.
 int next_table_user(int table, int index) {
     int e = load64(table + index * 8);
-    int present = e - (e / 2) * 2;
+    int present = e % 2;
     if (present == 1) {
         int us = (e / 4) - ((e / 4) / 2) * 2;
         if (us == 0) {
@@ -438,11 +474,11 @@ int next_table_user(int table, int index) {
 // into them.
 void map_page_user(int pml4, int virt, int phys) {
     int page = virt / 4096;
-    int pt_i = page - (page / 512) * 512;
+    int pt_i = page % 512;
     int pd_n = page / 512;
-    int pd_i = pd_n - (pd_n / 512) * 512;
+    int pd_i = pd_n % 512;
     int pdpt_n = pd_n / 512;
-    int pdpt_i = pdpt_n - (pdpt_n / 512) * 512;
+    int pdpt_i = pdpt_n % 512;
     int pml4_i = pdpt_n / 512;
 
     int pdpt = next_table_user(pml4, pml4_i);
@@ -455,21 +491,20 @@ void map_page_user(int pml4, int virt, int phys) {
 // Creates a fresh, process-private PML4. Starts as a shallow copy of all 512
 // top-level entries from the kernel's own page tables (pml4_phys) BY VALUE
 // -- every process shares the kernel's mappings (the 16MB identity map,
-// kscratch, IDT, dispatch, the heap, the 4GB sentinel) without re-walking or
+// the scratch buffers, IDT, dispatch, the heap, the 4GB sentinel) without re-walking or
 // re-allocating a single frame for them, since copying a PML4 entry copies
 // only a pointer to the existing PDPT frame, not its contents.
 //
 // PML4 index 0 then gets special treatment, and this is NOT optional the
-// way it might look: USER_VIRT_BASE has to sit under 4GB (see its own
+// way it might look. USER_VIRT_BASE has to sit under 4GB (see its own
 // comment), which puts it inside this exact same index 0 the kernel's
 // identity map lives in. A plain pointer copy, like every other index gets,
 // would leave every process sharing the SAME physical PDPT frame for index
 // 0 -- meaning USER_VIRT_BASE's own PDPT slot underneath it would be shared
-// too, not private. This was caught by booting two ring-3 processes back to
-// back: the second one's map_page_user call found the first one's PD frame
-// already present at that PDPT slot and silently reused it instead of
-// building its own -- both processes' "private" code page would have lived
-// in the same page table. The fix: give index 0 its own private PDPT frame
+// too, not private. The second process's map_page_user call would find
+// the first one's PD frame already present at that PDPT slot and silently
+// reuse it instead of building its own -- both processes' "private" code
+// page would live in the same page table. So index 0 gets its own private PDPT frame
 // here, seeded with the SAME 512 entries the kernel's PDPT has (so the
 // identity map, sentinel, and fault-test region all stay reachable) except
 // for USER_VIRT_BASE's own slot, deliberately left absent so map_page_user
@@ -510,14 +545,23 @@ void paging_init() {
     pml4_phys = pmm_alloc_page();
     zero_page(pml4_phys);
 
+    int pages = pmm_limit / 4096;
+    if (pages > IDMAP_MAX_PAGES) {
+        pages = IDMAP_MAX_PAGES;
+        pmm_limit = pages * 4096;
+    }
+    if (pages < IDMAP_PAGES) { pages = IDMAP_PAGES; }
     int i = 0;
-    while (i < IDMAP_PAGES) {
+    while (i < pages) {
         int p = i * 4096;
         map_page(pml4_phys, p, p);
         i = i + 1;
     }
+    serial_print("Paging: identity map covers ");
+    serial_print_int(pages * 4);
+    serial_print(" KB\n");
 
-    // Liveness proof: stash a sentinel in a fresh physical page, then map
+    // Liveness proof. Stash a sentinel in a fresh physical page, then map
     // that page a SECOND time at a high virtual address boot.s's 1GB
     // identity map does not cover. If paging_verify() (run by boot.s right
     // after it switches CR3) can read the sentinel back through
@@ -540,7 +584,7 @@ void paging_init() {
 
 // Called from boot.s immediately after it loads CR3 with the c0-built PML4.
 // Reads the sentinel back through the high virtual address that only exists
-// in these tables: returning without faulting AND matching the value proves
+// in these tables, so returning without faulting AND matching the value proves
 // the switch to c0-built paging is live. boot.s runs this before enabling
 // interrupts, so nothing else is competing for the serial port.
 void paging_verify() {
@@ -555,14 +599,14 @@ void paging_verify() {
 
 // Installed at IDT vector 14 (see knekt.c0's main) and reached through the
 // shared ISR trampoline + dispatch table like any other handler. This is a
-// RECOVERING handler, not a panic: it demand-maps the faulting page and
+// RECOVERING handler, not a panic. It demand-maps the faulting page and
 // returns, so the instruction that faulted re-executes and succeeds. `cr2`
 // is the faulting linear address (read off CR2 by boot.s's isr_common and
 // handed in); `errcode` is the CPU's page-fault error code. The page is
 // aligned down to a 4KB boundary, backed by a fresh zeroed frame from
 // jenna, seeded with FAULT_SENTINEL so the recovered read is independently
 // verifiable, and mapped into the live c0 page tables (pml4_phys). No
-// explicit TLB flush is needed: x86 never caches a non-present translation,
+// explicit TLB flush is needed, since x86 never caches a non-present translation,
 // so the re-walk after iretq sees the new entry. A real kernel would
 // consult a VMA list to decide map-vs-kill here; this always-map path
 // proves the fault path and recovery mechanics that any real demand-paging
@@ -575,12 +619,12 @@ void page_fault_handler(int vector, int errcode, int cr2) {
     serial_print("\n");
     int page_base = (cr2 / 4096) * 4096;
 
-    // Check errcode bit 0: if the page was NOT present, this is a genuine
+    // Check errcode bit 0. If the page was NOT present, this is a genuine
     // demand-paging request — allocate a frame and map it. If the page WAS
     // present, the fault is a permission violation. Do NOT allocate on a
     // present page — overwriting it with a fresh zeroed frame would destroy
     // whatever was there (e.g., JIT-compiled code).
-    int bit0 = errcode - (errcode / 2) * 2;
+    int bit0 = errcode % 2;
     if (bit0 == 0) {
         int frame = pmm_alloc_page();
         zero_page(frame);

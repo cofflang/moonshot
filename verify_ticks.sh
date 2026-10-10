@@ -3,7 +3,7 @@
 # verify_ticks.sh — prove that ticks() (SYS_TICKS) works end to end in a
 # real ring-3 --elf program, not just at the compiler level.
 #
-# Checks:
+# Checks
 #   1. "ticks test ok" reaches serial (the program ran the whole busy loop
 #      without faulting)
 #   2. "[syscall] exit code=1" (the program's own check that a second

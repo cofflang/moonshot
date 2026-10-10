@@ -8,7 +8,7 @@
 // WARRANTY; see the LICENSE file for the full text.
 // skrift.c0 — text editor for Moonshot, running in a kakel window.
 // Named "skrift" (Swedish for "writing/script").
-// Architecture: runs directly in the keyboard IRQ handler (like skalman v1),
+// It runs directly in the keyboard IRQ handler,
 // not as a separate scheduled task. Buffer ops are fast; file I/O only at
 // launch (shell task context) and quit (IRQ context — jakel_write for a small
 // buffer is one kmalloc + memcpy).
@@ -31,7 +31,7 @@ int skrift_filename     = 0;   // kmalloc'd NUL-terminated name
 int skrift_filename_len = 0;
 int skrift_scroll_row   = 0;   // first visible buffer line (0-indexed)
 int skrift_col_hint     = 0;   // remembered column for up/down
-int skrift_cmd_pending  = 0;   // command-mode prefix: 'd' for dd, 'g' for gg
+int skrift_cmd_pending  = 0;   // command-mode prefix, 'd' for dd, 'g' for gg
 int skrift_cmd_count    = 0;   // digit prefix for N+G goto-line
 int skrift_yank_buf     = 0;   // kmalloc'd yank buffer (freed on next yank)
 int skrift_yank_len     = 0;   // length of yanked text
@@ -89,7 +89,7 @@ int skrift_advance_line(int cursor, int delta) {
     if (delta == 0) { return cursor; }
     int target_col = skrift_col_hint;
     if (delta < 0) {
-        // Move up: go to start of current line, then back past the previous '\n'.
+        // Move up. Go to the start of current line, then back past the previous '\n'.
         int p = skrift_line_start(cursor);
         if (p == 0) { return 0; }  // already on first line
         p = p - 1;  // step back past the '\n' before this line
@@ -109,7 +109,7 @@ int skrift_advance_line(int cursor, int delta) {
         }
         return p;
     }
-    // Move down: go to end of current line, step past '\n', repeat.
+    // Move down. Go to the end of current line, step past '\n', repeat.
     int p = skrift_line_end(cursor);
     int i = 0;
     while (i < delta && p < skrift_size) {
@@ -141,7 +141,7 @@ int skrift_bytes_eq(int a, int b, int len) {
     return 1;
 }
 
-// Forward search: move cursor to the start of the first occurrence of the
+// Forward search. Move the cursor to the start of the first occurrence of the
 // last-saved search term after the current cursor position. Wraps around
 // to the beginning of the buffer if not found before the end.
 void skrift_search_forward() {
@@ -155,7 +155,7 @@ void skrift_search_forward() {
         }
         pos = pos + 1;
     }
-    // Wrap: search from start.
+    // Wrap, searching from the start.
     pos = 0;
     while (pos <= skrift_cursor) {
         if (skrift_bytes_eq(skrift_last_search,
@@ -168,7 +168,7 @@ void skrift_search_forward() {
     return;
 }
 
-// Backward search: move cursor to the start of the last occurrence before
+// Backward search. Move the cursor to the start of the last occurrence before
 // the current cursor position.
 void skrift_search_backward() {
     if (skrift_last_search == 0 || skrift_last_search_len == 0) { return; }
@@ -245,7 +245,7 @@ void skrift_save_undo() {
 void skrift_undo() {
     if (skrift_undo_size == 0) { return; }
     if (skrift_undo_buf == 0) { return; }
-    // Swap: copy current → undo_buf (for redo), restore undo_buf → current.
+    // Swap. Copy current → undo_buf (for redo), restore undo_buf → current.
     // For single-level undo, just restore and invalidate.
     int i = 0;
     while (i < skrift_undo_size && i < SKRIFT_BUF_MAX) {
@@ -330,7 +330,7 @@ void skrift_insert_tab() {
     int col = skrift_line_col(skrift_cursor);
     int target = SKRIFT_TAB_WIDTH;
     // target = ((col / SKRIFT_TAB_WIDTH) + 1) * SKRIFT_TAB_WIDTH
-    // In c0 with no bitwise ops: col / tab * tab is the current stop.
+    // col / tab * tab is the current stop.
     int cur_stop = (col / SKRIFT_TAB_WIDTH) * SKRIFT_TAB_WIDTH;
     target = cur_stop + SKRIFT_TAB_WIDTH;
     while (col < target) {
@@ -621,11 +621,11 @@ void skrift_draw_from_row(int win_row) {
 // kakel cursor position, using dim text. Used in the status bar.
 void skrift_status_int(int win, int v) {
     if (v == 0) { kakel_putc_dim(win, '0'); return; }
-    int buf = kscratch_start + 32;
+    int buf = skrift_scratch + 32;
     int di = 0;
     int val = v;
     while (val > 0) {
-        store8(buf + di, '0' + (val - (val / 10) * 10));
+        store8(buf + di, '0' + (val % 10));
         val = val / 10;
         di = di + 1;
     }
@@ -750,7 +750,7 @@ void skrift_draw_status() {
 // Overlay the most recent repl_eval_ret result at the right end of the status
 // bar row. Does NOT redraw the normal status bar content — call
 // skrift_draw_status first (or after) to paint the full bar. The overlay is
-// temporary: the next keystroke that triggers a normal status-bar redraw
+// temporary, since the next keystroke that triggers a normal status-bar redraw
 // overwrites it.
 void skrift_show_eval_result() {
     int win = skrift_win;
@@ -777,10 +777,10 @@ void skrift_show_eval_result() {
         if (v < 0) { kakel_putc_dim(win, '-'); v = 0 - v; }
         if (v == 0) { kakel_putc_dim(win, '0'); }
         else {
-            int db = kscratch_start + 32;
+            int db = skrift_scratch + 32;
             int di = 0;
             while (v > 0) {
-                store8(db + di, '0' + (v - (v / 10) * 10));
+                store8(db + di, '0' + (v % 10));
                 v = v / 10;
                 di = di + 1;
             }
@@ -857,10 +857,10 @@ int skrift_run_file() {
     int v = lines;
     if (v == 0) { kakel_putc_dim(win, '0'); }
     else {
-        int db = kscratch_start + 32;
+        int db = skrift_scratch + 32;
         int di = 0;
         while (v > 0) {
-            store8(db + di, '0' + (v - (v / 10) * 10));
+            store8(db + di, '0' + (v % 10));
             v = v / 10;
             di = di + 1;
         }
@@ -930,10 +930,10 @@ int skrift_run_file_from_cursor() {
     int v = lines;
     if (v == 0) { kakel_putc_dim(win, '0'); }
     else {
-        int db = kscratch_start + 32;
+        int db = skrift_scratch + 32;
         int di = 0;
         while (v > 0) {
-            store8(db + di, '0' + (v - (v / 10) * 10));
+            store8(db + di, '0' + (v % 10));
             v = v / 10;
             di = di + 1;
         }
@@ -1006,7 +1006,7 @@ void skrift_render() {
 // --- key dispatch ------------------------------------------------------------
 
 // Called from keyboard_handler (IRQ context) for every key press while the
-// editor is active. Uses incremental redraw: only the changed region is
+// editor is active. Uses incremental redraw, so only the changed region is
 // updated, not the whole window.
 
 void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int shift_down) {
@@ -1016,7 +1016,7 @@ void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int 
 
     // --- Ctrl chords (work in both modes) ---
     if (ctrl_down == 1) {
-        // Ctrl+A — Home: go to beginning of current line.
+        // Ctrl+A — Home, go to the beginning of current line.
         if (ascii == 'a') {
             skrift_sel_anchor = -1;
             skrift_erase_cursor();
@@ -1026,7 +1026,7 @@ void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int 
             else { skrift_show_cursor(); skrift_draw_status(); }
             return;
         }
-        // Ctrl+E — End: go to end of current line (before '\n').
+        // Ctrl+E — End, go to the end of current line (before '\n').
         if (ascii == 'e') {
             skrift_sel_anchor = -1;
             skrift_erase_cursor();
@@ -1036,7 +1036,7 @@ void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int 
             else { skrift_show_cursor(); skrift_draw_status(); }
             return;
         }
-        // Ctrl+K — Kill: delete from cursor to end of line (or
+        // Ctrl+K — Kill, delete from cursor to end of line (or
         // delete selection if one is active).
         if (ascii == 'k') {
             if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
@@ -1106,7 +1106,7 @@ void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int 
         // Unrecognized Ctrl chord — fall through to normal handling.
     }
 
-    // --- search mode: capture input for the search term ---
+    // --- search mode, capture input for the search term ---
     if (skrift_search_mode == 1) {
         // Escape or 'q' cancels search.
         if (make_code == 1 || ascii == 'q') {
@@ -1162,14 +1162,14 @@ void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int 
         return;
     }
 
-    // --- arrow keys: move cursor, optionally extend selection ---
+    // --- arrow keys, move the cursor, optionally extend selection ---
     if (was_e0 == 1) {
         if (make_code != 72 && make_code != 80
             && make_code != 75 && make_code != 77) { return; }
         int old_cur = skrift_cursor;
         skrift_erase_cursor();
-        // Shift+arrow: start or extend selection.
-        // Arrow without shift: clear any existing selection.
+        // Shift+arrow starts or extends selection.
+        // Arrow without shift clears any existing selection.
         if (shift_down == 0) {
             skrift_sel_anchor = -1;
         } else {
@@ -1203,7 +1203,7 @@ void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int 
         return;
     }
 
-    // --- Escape: toggle mode (status bar only) ---
+    // --- Escape, toggle mode (status bar only) ---
     if (make_code == 1) {
         if (skrift_mode == SKRIFT_MODE_INSERT) {
             skrift_mode = SKRIFT_MODE_COMMAND;
@@ -1220,7 +1220,7 @@ void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int 
         if (ascii >= '0' && ascii <= '9') {
             skrift_cmd_count = skrift_cmd_count * 10 + (ascii - '0');
             skrift_cmd_pending = 0;
-            skrift_draw_status();  // could echo the count — skip for now
+            skrift_draw_status();  // could echo the count, but does not
             return;
         }
         // 'd' — delete selection if active, otherwise pend for dd.
@@ -1268,7 +1268,7 @@ void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int 
             skrift_cmd_count = 0;
             return;
         }
-        // 'c' — change: delete and enter insert mode. Selection → delete it.
+        // 'c' — change, delete and enter insert mode. Selection → delete it.
         // cc = change current line. cw = change to end of word (handled in 'w').
         if (ascii == 'c') {
             if ((skrift_sel_anchor >= 0 && skrift_sel_anchor != skrift_cursor)) {
@@ -1547,7 +1547,7 @@ void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int 
                     kfree(tmp);
                 }
                 // Build comment string "// => N" in the scratch area.
-                int cmt = kscratch_start;
+                int cmt = skrift_scratch;
                 store8(cmt + 0, '/'); store8(cmt + 1, '/');
                 store8(cmt + 2, ' '); store8(cmt + 3, '=');
                 store8(cmt + 4, '>'); store8(cmt + 5, ' ');
@@ -1563,10 +1563,10 @@ void skrift_handle_key(int make_code, int ascii, int was_e0, int ctrl_down, int 
                         store8(cmt + cmt_len, '0');
                         cmt_len = cmt_len + 1;
                     } else {
-                        int db = kscratch_start + 32;
+                        int db = skrift_scratch + 32;
                         int di = 0;
                         while (v > 0) {
-                            store8(db + di, '0' + (v - (v / 10) * 10));
+                            store8(db + di, '0' + (v % 10));
                             v = v / 10;
                             di = di + 1;
                         }
@@ -1951,9 +1951,9 @@ void skrift_start(int win, int filename_str) {
     return;
 }
 
-// Quit the editor: write the buffer back to jakel, free memory, restore the
+// Quit the editor. Write the buffer back to jakel, free memory, restore the
 // shell prompt. Called from skrift_handle_key (keyboard IRQ context).
-// Same as pensel_window_closed, one editor over: kakel_close_id calls this
+// Same as pensel_window_closed, one editor over, since kakel_close_id calls this
 // before freeing a window so skrift does not keep editing an id that is about
 // to belong to somebody else. The file is saved, since the user closing a
 // window is not the user discarding their edits.

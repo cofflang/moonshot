@@ -1,10 +1,9 @@
 // expect: 42
 // exit() from deep inside nested loops and conditionals.
 //
-// Written after Infecteria printed a death message 253 times and never
-// terminated: print() at that exact spot reached serial, exit() at the same
-// spot produced no [syscall] exit code line at all. Both are builtins
-// compiled by the same backend, so the difference is worth pinning down.
+// print() and exit() are builtins compiled by the same backend, and a
+// program that keeps running after exit() looks like a print loop that
+// never ends, so the exit has to be checked from deep inside.
 int main() {
     int i;
     int j;

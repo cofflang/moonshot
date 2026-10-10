@@ -12,17 +12,16 @@
 # fault and checking the panic handler runs (vector=8 diagnostic) instead of the
 # CPU silently triple-faulting and resetting.
 #
-# Why a double fault needs its own test, distinct from test_panic.sh's #DE: a
+# Why a double fault needs its own test, distinct from test_panic.sh's #DE? A
 # double fault typically means the interrupted stack is unusable, so a #8
 # handler that tried to run on that stack would just re-fault into a triple
-# fault. The fix (a TSS with IST1 -> a dedicated stack, and #8's IDT entry
+# fault. The remedy (a TSS with IST1 -> a dedicated stack, and #8's IDT entry
 # selecting it) ships in the normal kernel (boot.s + knekt.c0); only the fault
 # TRIGGER is test-only. boot.s's trigger_doublefault (corrupt rsp -> push ->
 # fault-during-fault -> #8) is unreachable in a normal boot; this test
 # temporarily injects a `call trigger_doublefault` into the boot path just
-# before the scheduler starts, re-syncs the fixed addresses (the injected call
-# shifts .text), boots that variant, then ALWAYS restores pristine boot.s via a
-# trap. If the IST were absent/wrong, the same trigger would triple-fault and
+# before the scheduler starts, rebuilds, boots that variant, then ALWAYS
+# restores pristine boot.s via a trap. If the IST were absent/wrong, the same trigger would triple-fault and
 # QEMU (-no-reboot) would exit with no vector=8 line -> this test FAILs.
 set -u
 cd "$(dirname "$0")"
@@ -31,7 +30,6 @@ cp boot.s boot.s.dfbak
 restore() {
   if [ -f boot.s.dfbak ]; then
     mv -f boot.s.dfbak boot.s
-    ./sync_addrs.sh >/dev/null 2>&1 || true
   fi
 }
 trap restore EXIT
@@ -49,11 +47,9 @@ assert marker in s, "call sched_start marker not found in boot.s"
 open(p, 'w').write(s.replace(marker, inject + marker, 1))
 PY
 
-if ! ./sync_addrs.sh >/dev/null 2>&1; then
-  if ! ./sync_addrs.sh >/dev/null 2>&1; then
-    echo "FAIL: building the double-fault variant (sync_addrs) failed"
-    exit 1
-  fi
+if ! ./build.sh >/dev/null 2>&1; then
+  echo "FAIL: building the double-fault variant failed"
+  exit 1
 fi
 
 isodir=isoroot-df
@@ -74,7 +70,7 @@ timeout 5 qemu-system-x86_64 -cdrom df.iso \
   -drive file=disk.img,format=raw,if=ide,index=0,media=disk
 
 # The double fault must land in panic_handler as vector 8. Reaching the handler
-# AT ALL is the proof the IST worked: without a valid dedicated stack the CPU
+# AT ALL is the proof the IST worked, since without a valid dedicated stack the CPU
 # would have triple-faulted before any handler ran, and this line would be
 # absent.
 if grep -qE "^KERNEL PANIC: exception vector=8 errcode=[0-9]+ cr2=[0-9]+ rip=0x[0-9a-f]+" df-serial.log; then
