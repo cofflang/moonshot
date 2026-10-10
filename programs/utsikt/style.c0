@@ -9,8 +9,8 @@
 //
 // style.c0 -- a stylesheet parser and the cascade.
 //
-// The subset is chosen by what changes what a page LOOKS like at this stage,
-// not by what is easy: colours, backgrounds, text size and weight,
+// The subset is chosen by what changes what a page LOOKS like, not by what
+// is easy. That means colours, backgrounds, text size and weight,
 // alignment, the block/inline distinction, and the two boxes-model numbers
 // (margin and padding) that make a document stop looking like one long
 // paragraph. Everything else in CSS either refines those or needs a layout
@@ -19,13 +19,13 @@
 //
 // Selectors are type (`p`), class (`.lead`) and the two together
 // (`p.lead`), in comma-separated lists, plus a descendant selector of two
-// such compounds (`.note code`). A longer chain (`div p span`) is not here:
-// it needs a list of ancestors rather than one, which is a different shape
+// such compounds (`.note code`). A longer chain (`div p span`) is not here,
+// since it needs a list of ancestors rather than one, which is a different shape
 // of code, not a longer version of this one.
 //
 // The default stylesheet at the bottom is written in the same CSS this
 // parser reads, rather than as c0 setting fields. That is a test as much as
-// a convenience: every page rendered exercises the parser against a
+// a convenience, since every page rendered exercises the parser against a
 // stylesheet that uses every property it supports.
 
 int DISPLAY_INLINE = 0;
@@ -74,14 +74,14 @@ int rules_tail;
 int SPEC_MAX = 34;
 
 // The stylesheet cursor. A second set of globals rather than reusing dom.c0's
-// `src`/`pos`: the HTML parser is still holding those when the <style> blocks
+// `src`/`pos`, because the HTML parser is still holding those when the <style> blocks
 // it collected get parsed.
 int css_src;
 int css_len;
 int css_pos;
 
 int props_new() {
-    int p = alloc(sizeof(Props));
+    int p = doc_alloc(sizeof(Props));
     if (p == 0) { return 0; }
     p.p_color = -1;
     p.p_bg = -1;
@@ -95,7 +95,7 @@ int props_new() {
 }
 
 // Copies every value that was actually set in `from` over `into`. This is
-// the whole of the cascade's override step: a later rule wins on the
+// the whole of the cascade's override step. A later rule wins on the
 // properties it mentions and leaves the rest alone.
 void props_merge(int into, int from) {
     if (from.p_color >= 0)   { into.p_color = from.p_color; }
@@ -136,10 +136,10 @@ int parse_color(int s) {
         }
         if (n == 6) { return v; }
         if (n == 3) {
-            // #abc means #aabbcc: each digit doubled.
+            // #abc means #aabbcc, each digit doubled.
             int r = v / 256;
             int g = (v / 16) - r * 16;
-            int b = v - (v / 16) * 16;
+            int b = v % 16;
             return (r * 17) * 65536 + (g * 17) * 256 + b * 17;
         }
         return -1;
@@ -314,7 +314,7 @@ int parse_compound(int i, int stop) {
 }
 
 void rule_add(int tag, int class_name, int atag, int aclass, int props) {
-    int r = alloc(sizeof(Rule));
+    int r = doc_alloc(sizeof(Rule));
     if (r == 0) { return; }
     r.r_tag = tag;
     r.r_class = class_name;
@@ -349,7 +349,7 @@ void css_parse(int text) {
         if (css_pos >= css_len) { break; }
         // An at-rule (@media, @import) is skipped whole, including a block
         // if it has one. Rendering its contents unconditionally would be
-        // worse than ignoring it: @media print exists to NOT apply here.
+        // worse than ignoring it, since @media print exists to NOT apply here.
         if (css_src[css_pos] == '@') {
             while (css_pos < css_len && css_src[css_pos] != '{'
                    && css_src[css_pos] != ';') { css_pos = css_pos + 1; }
@@ -370,7 +370,7 @@ void css_parse(int text) {
             // Collect the selector list first, then parse ONE block and give
             // every selector in the list its own rule pointing at the same
             // Props. Sharing rather than copying is not a saving here, it is
-            // the definition: `h1, h2 { color: red }` is one declaration.
+            // the definition, since `h1, h2 { color: red }` is one declaration.
             int sel_start = css_pos;
             while (css_pos < css_len && css_src[css_pos] != '{') {
                 css_pos = css_pos + 1;
@@ -391,7 +391,7 @@ void css_parse(int text) {
                 int got_one = 0;
                 if (i > tstart) { got_one = 1; }
                 // A second compound after whitespace makes this a descendant
-                // selector, and the part read FIRST is the ancestor: in
+                // selector, and the part read FIRST is the ancestor. In
                 // `div p` the subject is `p`, which is what the rule has to
                 // match against, while `div` is only a condition on where it
                 // sits.
@@ -414,13 +414,13 @@ void css_parse(int text) {
                 // attribute, or a third compound like `div p span`, which
                 // needs a list of ancestors rather than one.
                 //
-                // The rule is DROPPED in that case, not added. It used to be
-                // added with whatever it had managed to parse, which is
-                // worse than useless: `div > p { color: red }` parsed as
-                // `div`, so a selector meant for some paragraphs coloured
-                // every div instead. Refusing it means an unsupported
-                // selector does nothing, which is wrong in the direction a
-                // reader can see and reason about.
+                // The rule is DROPPED in that case, not added. Adding it
+                // with whatever had parsed would be worse than useless, since
+                // `div > p { color: red }` would parse as `div` and a
+                // selector meant for some paragraphs would colour every div.
+                // Refusing it means an unsupported selector does nothing,
+                // which is wrong in the direction a reader can see and
+                // reason about.
                 int rest = i;
                 while (rest < sel_end && is_space(css_src[rest]) == 1) {
                     rest = rest + 1;
@@ -490,19 +490,17 @@ int rule_matches(int node, int rule) {
     return 0;
 }
 
-// Computes one element's style: what it inherits, then every matching rule,
+// Computes one element's style, meaning what it inherits, then every matching rule,
 // least specific first and in document order within each level.
 //
 // One walk of the rule list per specificity level rather than a sorted list.
 // The list is short (a default sheet plus whatever the page carries), the
 // levels are few, and the alternative is a sort with a comparison function
-// and a stability requirement, which is more to get wrong than a loop. It
-// was two hardcoded passes, type selectors then class selectors, until
-// descendant selectors arrived and made four levels out of two.
+// and a stability requirement, which is more to get wrong than a loop.
 int style_compute(int node, int parent_props) {
     int p = props_new();
     if (p == 0) { return 0; }
-    // Inherited: what the text looks like. NOT inherited: the box. A child
+    // Inherited is what the text looks like. NOT inherited is the box. A child
     // of a box with a background does not get its own copy of it, and this
     // is the line that says so.
     if (parent_props != 0) {

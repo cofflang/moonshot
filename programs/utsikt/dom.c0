@@ -13,13 +13,13 @@
 // machines the HTML spec describes. The spec's tokenizer exists to make the
 // pathological cases interoperable across browsers written by people who
 // did not talk to each other, and that is a problem utsikt does not have
-// yet. What it does have is the shape that matters: a stack of open
+// yet. What it does have is the shape that matters, a stack of open
 // elements, elements that close themselves, elements that close the one
 // before them, and text runs whose whitespace collapses.
 //
 // The tolerance rules here are deliberate rather than accidental. Real
 // documents have unclosed <p>, stray </div> and tags nobody recognises, and
-// a parser that stops at the first one renders nothing at all. So: an end
+// a parser that stops at the first one renders nothing at all. So an end
 // tag with no matching open element is dropped, everything still open at
 // the end of the file is closed, and an unknown tag becomes an ordinary
 // inline element instead of an error.
@@ -51,6 +51,7 @@ int TAG_TABLE   = 23;
 int TAG_TR      = 24;
 int TAG_TD      = 25;
 int TAG_TH      = 26;
+int TAG_IMG     = 27;
 
 int KIND_ELEM = 0;
 int KIND_TEXT = 1;
@@ -62,7 +63,7 @@ layout Node {
     int n_text;    // NUL-terminated content, for text nodes
     int n_class;   // the class attribute, or 0
     int n_href;    // the href attribute, or 0. Not lowercased, unlike every
-                   // other attribute value here: a class is matched against
+                   // other attribute value here. A class is matched against
                    // a stylesheet and a href is handed to the filesystem,
                    // and jakel's names are not case-folded.
     int n_first;
@@ -71,12 +72,15 @@ layout Node {
     int n_parent;
     int n_style;   // computed Props, filled in by the cascade
     // Where the box landed, filled in by the measure pass and read by the
-    // paint pass. Document coordinates: y grows down the whole page, not
+    // paint pass. In document coordinates y grows down the whole page, not
     // down the window.
     int n_x;
     int n_y;
     int n_w;
     int n_h;
+    int n_src;     // <img> src attribute, raw like n_href, or 0
+    int n_img;     // <img> loaded .spr (header and pixels), or 0 when
+                   // the file is missing or not a sprite (see img_load)
 }
 
 // <style> blocks, collected in document order and handed to the stylesheet
@@ -96,7 +100,7 @@ int src_len;
 int pos;
 
 int node_new(int kind, int tag) {
-    int n = alloc(sizeof(Node));
+    int n = doc_alloc(sizeof(Node));
     if (n == 0) { return 0; }
     n.n_kind = kind;
     n.n_tag = tag;
@@ -159,6 +163,7 @@ int tag_id(int name) {
     if (str_eq(name, "tr") == 1) { return TAG_TR; }
     if (str_eq(name, "td") == 1) { return TAG_TD; }
     if (str_eq(name, "th") == 1) { return TAG_TH; }
+    if (str_eq(name, "img") == 1) { return TAG_IMG; }
     // tbody, thead and tfoot are not here on purpose. They are grouping
     // elements a browser inserts whether or not the author wrote them, and
     // this engine finds rows by walking the table's descendants rather than
@@ -167,17 +172,17 @@ int tag_id(int name) {
     return TAG_UNKNOWN;
 }
 
-// Elements that never have children and never get an end tag. <br> and <hr>
-// are the two this subset has; anything else written as <x/> is handled by
-// the self-closing slash in the tag itself.
+// Elements that never have children and never get an end tag, which are
+// <br>, <hr> and <img>. Anything else written as <x/> is handled by the self-closing
+// slash in the tag itself.
 int is_void_tag(int tag) {
-    if (tag == TAG_BR || tag == TAG_HR) { return 1; }
+    if (tag == TAG_BR || tag == TAG_HR || tag == TAG_IMG) { return 1; }
     return 0;
 }
 
 // Elements that end an open <p>. In HTML a paragraph is closed by the next
 // block-level thing whether or not anyone wrote </p>, and leaving that out
-// is very visible: every following block nests one level deeper and inherits
+// is very visible, since every following block nests one level deeper and inherits
 // the paragraph's style.
 int closes_paragraph(int tag) {
     if (tag == TAG_P || tag == TAG_DIV || tag == TAG_UL || tag == TAG_LI) { return 1; }
@@ -280,7 +285,7 @@ int read_text() {
     while (pos < src_len && src[pos] != '<') { pos = pos + 1; }
     int n = pos - start;
     if (n == 0) { return 0; }
-    int out = alloc(n + 1);
+    int out = doc_alloc(n + 1);
     if (out == 0) { return 0; }
     int save = pos;
     pos = start;
@@ -290,14 +295,15 @@ int read_text() {
         int c = src[pos];
         if (is_space(c) == 1) {
             // One space per run of whitespace. A LEADING space is kept, and
-            // that is not an oversight: a text node does not know whether it
-            // begins a block or follows an inline element. Dropping it here
-            // turned "is <b>jakel</b> and the" into "is jakeland the" --
-            // the space after the </b> was the leading space of the next
-            // text node. Whether a space at the front matters is a question
-            // about the LINE, not about the node, so the line breaker
-            // answers it: flow_text ignores a space when the pen is at the
-            // left edge, which is the same rule and the right place for it.
+            // that is not an oversight. A text node does not know whether it
+            // begins a block or follows an inline element, and dropping it
+            // here would turn "is <b>jakel</b> and the" into "is jakeland
+            // the", since the space after the </b> is the leading space of
+            // the next text node. Whether a space at the front matters is a
+            // question about the LINE, not about the node, so the line
+            // breaker answers it. flow_text ignores a space when the pen is
+            // at the left edge, which is the same rule and the right place
+            // for it.
             if (len == 0 || out[len - 1] != ' ') { out[len] = ' '; len = len + 1; }
             pos = pos + 1;
         } else {
@@ -331,12 +337,14 @@ int read_text() {
 // Returns the class attribute string, or 0. The href goes out through
 // attr_href instead, because c0 returns one value and a second global is a
 // smaller price than a struct nobody else would use. Read it immediately
-// after the call: the next start tag overwrites it.
+// after the call, since the next start tag overwrites it.
 int attr_href;
+int attr_src;      // <img src>, raw bytes for the same reason as href
 
 int read_attrs() {
     int class_val = 0;
     attr_href = 0;
+    attr_src = 0;
     while (pos < src_len) {
         while (pos < src_len && is_space(src[pos]) == 1) { pos = pos + 1; }
         if (pos >= src_len) { break; }
@@ -344,7 +352,7 @@ int read_attrs() {
         int nstart = pos;
         while (pos < src_len && is_name_char(src[pos]) == 1) { pos = pos + 1; }
         if (pos == nstart) {
-            // Not a name and not the end of the tag: junk. Skip one byte so
+            // Not a name and not the end of the tag, so junk. Skip one byte so
             // this cannot loop forever on malformed markup.
             pos = pos + 1;
         } else {
@@ -380,13 +388,16 @@ int read_attrs() {
             if (str_eq(name, "href") == 1 && vlen > 0) {
                 attr_href = str_dup(src, vpos, vlen);
             }
+            if (str_eq(name, "src") == 1 && vlen > 0) {
+                attr_src = str_dup(src, vpos, vlen);
+            }
         }
     }
     return class_val;
 }
 
 // Reads the raw contents of a <style> element and adds it to the list the
-// stylesheet parser will work through. Raw because CSS is not HTML: a '<'
+// stylesheet parser will work through. Raw because CSS is not HTML. A '<'
 // inside a stylesheet is an operator, not a tag, so the only thing that ends
 // the element is the literal </style>.
 void read_style_block() {
@@ -398,7 +409,7 @@ void read_style_block() {
     int text = str_dup(src, start, pos - start);
     skip_to_after(">");
     if (text == 0) { return; }
-    int b = alloc(sizeof(StyleBlock));
+    int b = doc_alloc(sizeof(StyleBlock));
     if (b == 0) { return; }
     b.sb_text = text;
     b.sb_next = 0;
@@ -414,7 +425,7 @@ void read_style_block() {
 
 // Walks up from `open` looking for an element with this tag and closes it,
 // along with everything still open inside it. Returns the new open element.
-// An end tag matching nothing open is dropped: `open` comes back unchanged.
+// An end tag matching nothing open is dropped, and `open` comes back unchanged.
 int close_tag(int open, int tag) {
     int n = open;
     while (n != 0) {
@@ -462,6 +473,7 @@ int html_parse(int text) {
             int tag = tag_id(name);
             int class_val = read_attrs();
             int href_val = attr_href;
+            int src_val = attr_src;
             int self_closing = 0;
             if (pos < src_len && src[pos] == '/') { self_closing = 1; pos = pos + 1; }
             if (pos < src_len && src[pos] == '>') { pos = pos + 1; }
@@ -490,6 +502,10 @@ int html_parse(int text) {
             e.n_name = name;
             e.n_class = class_val;
             e.n_href = href_val;
+            e.n_src = src_val;
+            // Loaded while the document is parsed, into memory the document
+            // owns, so an image is given back with the page it was on.
+            if (tag == TAG_IMG && src_val != 0) { e.n_img = img_load(src_val); }
             node_append(open, e);
             if (tag == TAG_STYLE) {
                 read_style_block();
@@ -506,8 +522,8 @@ int html_parse(int text) {
             pos = pos + 1;
         }
     }
-    // Anything still open is closed by the end of the file. Nothing to do:
-    // the tree is already built, and every unclosed element simply keeps the
+    // Anything still open is closed by the end of the file. There is nothing
+    // to do, since the tree is already built, and every unclosed element simply keeps the
     // children it collected.
     return root;
 }

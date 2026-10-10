@@ -13,28 +13,26 @@
 # then boots it or runs its tests there.
 #
 # utsikt is a ring-3 program and moonshot cannot receive a file from the
-# host, so the only way to run it is to compile it, bake it into the kernel
-# as a byte array and boot that kernel. moonshot's gen_programs.sh already
-# does all of that and takes UTSIKT_DIR to say where the sources are; this
-# script points it here, so you can edit in this repository and never copy a
-# file by hand.
+# host, so the only way to run it is to compile it, embed it in the kernel
+# and boot that kernel. moonshot's build.sh already does all of that and
+# takes UTSIKT_DIR to say where the sources are; this script points it here,
+# so you can edit in this repository and never copy a file by hand.
 #
-#   ./dev.sh build   bake this utsikt into the kernel and build it (default)
+#   ./dev.sh build   build the kernel with this utsikt in it (default)
 #   ./dev.sh run     build, then boot a QEMU window and type spawn3 utsikt.elf
 #   ./dev.sh test    build, then run every verify_utsikt*.sh in moonshot
 #   ./dev.sh test X  build, then run only verify_utsikt_X.sh
 #
 # The layout it expects is the one moonshot's README describes, with this
-# repository beside the other two:
+# repository beside the other two.
 #
 #   c0-coff/    the compiler and assembler (cofflang/coff)
 #   moonshot/   the kernel (cofflang/moonshot)
 #   utsikt/     this
 #
-# MOONSHOT_DIR overrides where moonshot is. Building rewrites moonshot's
-# utsikt_data.c0 (and every other seed, which should come out unchanged),
-# so that checkout will show a diff afterwards. That is expected; it is what
-# "the kernel now runs your utsikt" looks like.
+# MOONSHOT_DIR overrides where moonshot is. The compiled programs go into
+# moonshot's build/ directory, which git ignores, so that checkout stays
+# clean.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -50,12 +48,8 @@ MOONSHOT_DIR=$(cd "$MOONSHOT_DIR" && pwd)
 cd "$MOONSHOT_DIR"
 
 build() {
-  echo "== baking $here into $MOONSHOT_DIR"
-  UTSIKT_DIR="$here" ./gen_programs.sh
-  # A new seed changes the kernel's size, which moves the JIT helpers, and a
-  # kernel with stale helper addresses crashes at boot without saying why.
-  # sync_addrs.sh builds, patches the addresses if they moved, and rebuilds.
-  ./sync_addrs.sh
+  echo "== building $MOONSHOT_DIR with the utsikt in $here"
+  UTSIKT_DIR="$here" ./build.sh
 }
 
 case "$cmd" in
