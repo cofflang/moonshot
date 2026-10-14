@@ -112,6 +112,7 @@ extern int sched_launch;
 extern int halt_cpu;
 extern int enable_interrupts;
 extern int disable_interrupts;
+extern int flush_tlb;
 
 include "serial.c0";
 include "interrupts.c0";
@@ -122,6 +123,9 @@ include "vga.c0";
 include "punkt.c0";
 include "kakel.c0";
 include "skalman.c0";
+// The debug commands, or none. build.sh writes this file, see
+// skalman_debug.c0.
+include "build/debug.c0";
 include "raket.c0";
 include "keyboard.c0";
 include "klick.c0";
@@ -135,11 +139,14 @@ include "jakel.c0";
 // assembler copies them in (.incbin).
 embed alloc_test_elf "build/alloc_test.elf";
 embed ticks_test_elf "build/ticks_test.elf";
-embed gnista_elf "build/gnista.elf";
+embed crash_test_elf "build/crash_test.elf";
+embed mouse_probe_elf "build/mouse_probe.elf";
+embed tone_elf "build/tone.elf";
 embed infecteria_elf "build/infecteria.elf";
 embed fps_probe_elf "build/fps_probe.elf";
 embed utsikt_elf "build/utsikt.elf";
 embed lira_elf "build/lira.elf";
+embed hylla_elf "build/hylla.elf";
 embed elf_tests_pack "build/elf_tests.pack";
 include "index_html.c0";
 include "jit.c0";

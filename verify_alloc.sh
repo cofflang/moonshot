@@ -62,9 +62,9 @@ time.sleep(0.5)
 typ(["ret"])  # empty password
 time.sleep(1.0)
 
-# spawn3 test/alloctest.elf -- fixtures live in /test, not the root
+# start test/alloctest.elf -- fixtures live in /test, not the root
 # directory, so `list` shows real content rather than scaffolding.
-typ(["s","p","a","w","n","3","spc","t","e","s","t","slash","a","l","l","o","c","t","e","s","t","dot","e","l","f","ret"])
+typ(["s","t","a","r","t","spc","t","e","s","t","slash","a","l","l","o","c","t","e","s","t","dot","e","l","f","ret"])
 time.sleep(1.5)
 
 sock.close()

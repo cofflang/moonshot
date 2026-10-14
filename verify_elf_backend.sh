@@ -109,10 +109,10 @@ def word(s):
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.5)
 
-# spawn3, not run3. run3 executes in the CALLING task, so the program's
-# SYS_EXIT marks the shell's own task EXITED and the shell is gone -- the
+# start, not run3. run3 (a debug command) runs in the CALLING task, so the
+# program's SYS_EXIT marks the shell's own task EXITED and the shell is gone -- the
 # first test would run and the other six would have nothing left to type
-# into. spawn3 runs each program in its own task instead.
+# into. start runs each program in its own task instead.
 #
 # Each spawn opens a tavla, so close it before the next one. Alt+Tab onto it,
 # Alt+W to close. Without that the layout fills after four and later spawns
@@ -150,7 +150,7 @@ for name in sys.argv[2:]:
     # typing returns, and counting after it would wait for an exit that
     # already happened.
     before = exits()
-    word("spawn3 test/%s.elf one two" % name)
+    word("start test/%s.elf one two" % name)
     typ(["ret"])
     t0 = time.time()
     while exits() == before and time.time() - t0 < 15:

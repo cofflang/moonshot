@@ -21,7 +21,7 @@
 .global syscall_entry
 syscall_entry:
     # Switch to this task's own kernel stack (TSS.RSP0 -- the same field
-    # enter_ring3 sets, and isr_common's scheduler-switch path now keeps
+    # enter_ring3 sets, and isr_common's scheduler-switch path keeps
     # correct for whichever task is current, see boot.s/chrone.c0) BEFORE
     # touching anything else. SYSCALL, unlike an interrupt gate, does NOT
     # switch stacks automatically. Running this handler on the calling

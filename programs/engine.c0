@@ -9,10 +9,8 @@
 //
 // engine -- Gnista's engine layer for full-frame, scrolling games.
 //
-// The first Gnista demo (gnista.c0) redraws only the small bounding box each
-// entity moved through, which works because its view never moves. This file
-// is the other model, a camera, a world larger than the screen, and a whole
-// frame composited each tick and handed over in one call. A scrolling game
+// A camera, a world larger than the screen, and a whole frame composited
+// each tick and handed over in one call. A scrolling game
 // needs it -- when the view moves, every pixel changes, so incremental
 // redraw saves nothing.
 //
@@ -30,8 +28,8 @@
 //     from four bytes to do it. A full frame has no holes, so present()
 //     copies whole rows and skips all of it.
 //
-// c0 has no shift operator, so packing two pixels into one 64-bit word is a
-// multiply by 2^32.
+// Two pixels are packed into one 64-bit word by shifting the high one into
+// the upper half.
 
 layout Entity {
     int x;          // world coordinates, top-left
@@ -64,13 +62,11 @@ layout View {
 // its record -- which is exactly what `layout` field access wants -- and the
 // pool is one alloc and a multiply.
 //
-// Unlike the first demo's pool, slots are RECYCLED. `alive` marks a slot free
-// and pool_spawn hands the first free one back. Infecteria needs it, because
-// factories emit mini-bacteria continuously and each one dies on contact. The
-// ring-3 heap had no free at all when this was written, so without slot reuse
-// a long game would exhaust it no matter how large it was. Moonshot's lager
-// can take memory back now, but a slot reused in place still costs nothing,
-// where an alloc and a dealloc per bacterium would cost two syscalls.
+// Slots are RECYCLED. `alive` marks a slot free and pool_spawn hands the
+// first free one back. Infecteria needs it, because factories emit
+// mini-bacteria continuously and each one dies on contact. Moonshot's lager
+// can take memory back, but a slot reused in place costs nothing, where an
+// alloc and a dealloc per bacterium would cost two syscalls.
 
 int pool_alloc(int cap) {
     return alloc(cap * sizeof(Entity));
@@ -82,10 +78,9 @@ int pool_at(int pool, int i) {
 
 void pool_clear(int pool, int cap) {
     int i = 0;
-    while (i < cap) {
+    for (i = 0; i < cap; i += 1) {
         int e = pool_at(pool, i);
         e.alive = 0;
-        i = i + 1;
     }
     return;
 }
@@ -95,7 +90,7 @@ void pool_clear(int pool, int cap) {
 // eventually, and that is normal, not an error.
 int pool_spawn(int pool, int cap) {
     int i = 0;
-    while (i < cap) {
+    for (i = 0; i < cap; i += 1) {
         int e = pool_at(pool, i);
         if (e.alive == 0) {
             e.alive = 1;
@@ -105,7 +100,6 @@ int pool_spawn(int pool, int cap) {
             e.a1 = 0; e.a2 = 0; e.a3 = 0;
             return e;
         }
-        i = i + 1;
     }
     return 0;
 }
@@ -173,18 +167,18 @@ int dist2(int a, int b) {
 // cached from the view's dimensions), 0 if it did not.
 int view_alloc_max(int v) {
     int m = win_max();
-    if (m == 0) { return 0; }
-    int mw = m / 65536;
-    int mh = m - mw * 65536;
+    if (!m) { return 0; }
+    int mw = m >> 16;
+    int mh = m & 65535;
     v.buf = alloc(mw * mh * 4);
     return v.buf;
 }
 
 int view_poll_resize(int v) {
     int wi = win_info();
-    if (wi == 0) { return 0; }
-    int w = wi / 65536;
-    int h = wi - w * 65536;
+    if (!wi) { return 0; }
+    int w = wi >> 16;
+    int h = wi & 65535;
     if (w == v.vw && h == v.vh) { return 0; }
     v.vw = w;
     v.vh = h;
@@ -200,11 +194,10 @@ int view_poll_resize(int v) {
 void view_clear(int v, int color) {
     int buf = v.buf;
     int nbytes = v.vw * v.vh * 4;
-    int pair = color * 4294967296 + color;
+    int pair = (color << 32) | color;
     int off = 0;
-    while (off < nbytes) {
+    for (off = 0; off < nbytes; off += 8) {
         store64(buf + off, pair);
-        off = off + 8;
     }
     return;
 }
@@ -221,34 +214,28 @@ void view_span(int v, int x, int y, int len, int color) {
     int base = v.buf + (y * v.vw + x0) * 4;
     int n = x1 - x0;
     int i = 0;
-    int pair = color * 4294967296 + color;
+    int pair = (color << 32) | color;
     // No alignment dance, since x86 permits unaligned 64-bit stores, so pairing can
     // start anywhere. Only the odd LAST pixel needs the slow path.
     while (i + 1 < n) {
         store64(base + i * 4, pair);
-        i = i + 2;
+        i += 2;
     }
     while (i < n) {
         store32_le_px(base + i * 4, color);
-        i = i + 1;
+        i += 1;
     }
     return;
 }
 
-// One pixel, unpacked into the four bytes the framebuffer expects. c0 has no
-// 32-bit store, and store64 would clobber the neighbour.
+// One pixel in the framebuffer's order, 0xRRGGBB with the top byte zero.
 void store32_le_px(int addr, int color) {
-    store8(addr, color % 256);
-    store8(addr + 1, (color / 256) - (color / 65536) * 256);
-    store8(addr + 2, (color / 65536) - (color / 16777216) * 256);
-    store8(addr + 3, 0);
+    store32(addr, color & 0xFFFFFF);
     return;
 }
 
 int load_px(int addr) {
-    return load8(addr)
-        + load8(addr + 1) * 256
-        + load8(addr + 2) * 65536;
+    return load32(addr) & 0xFFFFFF;
 }
 
 // Filled rectangle in WORLD coordinates -- the camera offset is applied here,
@@ -257,9 +244,8 @@ void view_rect(int v, int wx, int wy, int w, int h, int color) {
     int sx = wx - v.cam_x;
     int sy = wy - v.cam_y;
     int r = 0;
-    while (r < h) {
+    for (r = 0; r < h; r += 1) {
         view_span(v, sx, sy + r, w, color);
-        r = r + 1;
     }
     return;
 }
@@ -274,22 +260,20 @@ void view_circle(int v, int wx, int wy, int d, int color) {
     int cx = wx - v.cam_x + r;
     int cy = wy - v.cam_y + r;
     int rr = r * r;
-    int dy = 0 - r;
-    while (dy <= r) {
+    int dy = 0;
+    for (dy = 0 - r; dy <= r; dy += 1) {
         int y = cy + dy;
         if (y >= 0 && y < v.vh) {
             // Widest x at this row, found by walking in rather than by a
             // square root. The circles here are small, so this is cheap.
-            int dx = 0 - r;
-            while (dx <= r) {
+            int dx = 0;
+            for (dx = 0 - r; dx <= r; dx += 1) {
                 if (dx * dx + dy * dy <= rr) { break; }
-                dx = dx + 1;
             }
             if (dx <= 0) {
                 view_span(v, cx + dx, y, (0 - dx) * 2 + 1, color);
             }
         }
-        dy = dy + 1;
     }
     return;
 }
@@ -308,15 +292,15 @@ void view_circle_blend(int v, int wx, int wy, int d, int color) {
     int cx = wx - v.cam_x + r;
     int cy = wy - v.cam_y + r;
     int rr = r * r;
-    int sb = color % 256;
-    int sg = (color / 256) - (color / 65536) * 256;
-    int sr = (color / 65536) - (color / 16777216) * 256;
-    int dy = 0 - r;
-    while (dy <= r) {
+    int sb = color & 255;
+    int sg = (color >> 8) & 255;
+    int sr = (color >> 16) & 255;
+    int dy = 0;
+    for (dy = 0 - r; dy <= r; dy += 1) {
         int y = cy + dy;
         if (y >= 0 && y < v.vh) {
-            int dx = 0 - r;
-            while (dx <= r) {
+            int dx = 0;
+            for (dx = 0 - r; dx <= r; dx += 1) {
                 int x = cx + dx;
                 if (x >= 0 && x < v.vw && dx * dx + dy * dy <= rr) {
                     int addr = v.buf + (y * v.vw + x) * 4;
@@ -327,10 +311,8 @@ void view_circle_blend(int v, int wx, int wy, int d, int color) {
                     store8(addr + 1, (dg + sg) / 2);
                     store8(addr + 2, (dr + sr) / 2);
                 }
-                dx = dx + 1;
             }
         }
-        dy = dy + 1;
     }
     return;
 }
@@ -357,10 +339,10 @@ int sprite_from_file(int name) {
     // The header plus at least one pixel.
     if (size < 28) { return 0; }
     int buf = alloc(size);
-    if (buf == 0) { return 0; }
+    if (!buf) { return 0; }
     if (readfile(name, buf, size) != size) { return 0; }
     int s = alloc(sizeof(Sprite));
-    if (s == 0) { return 0; }
+    if (!s) { return 0; }
     s.sp_w = load64(buf);
     s.sp_h = load64(buf + 8);
     s.sp_frames = load64(buf + 16);
@@ -379,7 +361,7 @@ int sprite_from_file(int name) {
 // tick counter rather than tracked per entity.
 int sprite_frame(int s, int phase) {
     if (s.sp_frames <= 1) { return 0; }
-    return phase - (phase / s.sp_frames) * s.sp_frames;
+    return phase % s.sp_frames;
 }
 
 // One frame of an animation clip at time `t` (ticks). A sprite file can hold
@@ -427,11 +409,11 @@ void view_sprite(int v, int wx, int wy, int w, int h, int pixels, int frame) {
     if (sx >= v.vw || sy >= v.vh || sx + w <= 0 || sy + h <= 0) { return; }
     int src = pixels + frame * w * h * 4;
     int row = 0;
-    while (row < h) {
+    for (row = 0; row < h; row += 1) {
         int y = sy + row;
         if (y >= 0 && y < v.vh) {
             int col = 0;
-            while (col < w) {
+            for (col = 0; col < w; col += 1) {
                 int x = sx + col;
                 if (x >= 0 && x < v.vw) {
                     int s = src + (row * w + col) * 4;
@@ -440,10 +422,8 @@ void view_sprite(int v, int wx, int wy, int w, int h, int pixels, int frame) {
                         store32_le_px(v.buf + (y * v.vw + x) * 4, c);
                     }
                 }
-                col = col + 1;
             }
         }
-        row = row + 1;
     }
     return;
 }
@@ -462,11 +442,11 @@ void view_sprite_blend(int v, int wx, int wy, int w, int h, int pixels, int fram
     if (sx >= v.vw || sy >= v.vh || sx + w <= 0 || sy + h <= 0) { return; }
     int src = pixels + frame * w * h * 4;
     int row = 0;
-    while (row < h) {
+    for (row = 0; row < h; row += 1) {
         int y = sy + row;
         if (y >= 0 && y < v.vh) {
             int col = 0;
-            while (col < w) {
+            for (col = 0; col < w; col += 1) {
                 int x = sx + col;
                 if (x >= 0 && x < v.vw) {
                     int s = src + (row * w + col) * 4;
@@ -478,10 +458,8 @@ void view_sprite_blend(int v, int wx, int wy, int w, int h, int pixels, int fram
                         store8(addr + 2, (load8(addr + 2) + load8(s + 2)) / 2);
                     }
                 }
-                col = col + 1;
             }
         }
-        row = row + 1;
     }
     return;
 }
@@ -501,15 +479,15 @@ void view_sprite_tint(int v, int wx, int wy, int w, int h, int pixels,
     // size of the view.
     if (sx >= v.vw || sy >= v.vh || sx + w <= 0 || sy + h <= 0) { return; }
     int src = pixels + frame * w * h * 4;
-    int tb = color % 256;
-    int tg = (color / 256) - (color / 65536) * 256;
-    int tr = (color / 65536) - (color / 16777216) * 256;
+    int tb = color & 255;
+    int tg = (color >> 8) & 255;
+    int tr = (color >> 16) & 255;
     int row = 0;
-    while (row < h) {
+    for (row = 0; row < h; row += 1) {
         int y = sy + row;
         if (y >= 0 && y < v.vh) {
             int col = 0;
-            while (col < w) {
+            for (col = 0; col < w; col += 1) {
                 int x = sx + col;
                 if (x >= 0 && x < v.vw) {
                     int s = src + (row * w + col) * 4;
@@ -533,10 +511,8 @@ void view_sprite_tint(int v, int wx, int wy, int w, int h, int pixels,
                         }
                     }
                 }
-                col = col + 1;
             }
         }
-        row = row + 1;
     }
     return;
 }
@@ -572,7 +548,7 @@ void view_follow(int v, int e, int world_w, int world_h) {
 // scattered, nothing here is cryptographic.
 int rng_next(int state_addr) {
     int s = load64(state_addr);
-    s = (s * 1664525 + 1013904223) - ((s * 1664525 + 1013904223) / 2147483648) * 2147483648;
+    s = (s * 1664525 + 1013904223) % 2147483648;
     store64(state_addr, s);
     return s;
 }
@@ -603,15 +579,14 @@ int text_init() {
     if (gn_font != 0) { return 1; }
     int d = glyph('M', 0);
     if (d <= 0) { return 0; }
-    gn_cw = d / 65536;
-    gn_ch = d % 65536;
+    gn_cw = d >> 16;
+    gn_ch = d & 65535;
     if (gn_cw <= 0 || gn_cw > 8 || gn_ch <= 0 || gn_ch > 32) { return 0; }
     int f = alloc(128 * gn_ch);
-    if (f == 0) { return 0; }
+    if (!f) { return 0; }
     int c = 0;
-    while (c < 128) {
+    for (c = 0; c < 128; c += 1) {
         if (glyph(c, f + c * gn_ch) != d) { return 0; }
-        c = c + 1;
     }
     gn_font = f;
     return 1;
@@ -620,19 +595,19 @@ int text_init() {
 // How wide `s` is at `scale`, in pixels, which is what centring needs.
 int text_width(int s, int scale) {
     int n = 0;
-    while (load8(s + n) != 0) { n = n + 1; }
+    while (load8(s + n) != 0) { n += 1; }
     return n * gn_cw * scale;
 }
 
 // Draws `s` with its top-left at screen (x, y), each font pixel a
 // scale-by-scale square. Lit pixels only, so text sits on whatever is there.
 void view_text(int v, int x, int y, int s, int color, int scale) {
-    if (gn_font == 0) { return; }
+    if (!gn_font) { return; }
     int i = 0;
-    while (load8(s + i) != 0) {
+    for (i = 0; load8(s + i) != 0; i += 1) {
         int ch = load8(s + i);
         int row = 0;
-        while (row < gn_ch) {
+        for (row = 0; row < gn_ch; row += 1) {
             int b = load8(gn_font + ch * gn_ch + row);
             int col = 0;
             int bit = 128;
@@ -643,13 +618,11 @@ void view_text(int v, int x, int y, int s, int color, int scale) {
                     view_rect(v, v.cam_x + x + col * scale, v.cam_y + y + row * scale,
                               scale, scale, color);
                 }
-                bit = bit / 2;
-                col = col + 1;
+                bit /= 2;
+                col += 1;
             }
-            row = row + 1;
         }
-        x = x + gn_cw * scale;
-        i = i + 1;
+        x += gn_cw * scale;
     }
     return;
 }

@@ -19,7 +19,7 @@
 # and only showed up in pixels.
 #
 # Checks, in one boot
-#   1. spawn3 gnista.elf creates a tavla, and its title strip renders DIM
+#   1. start test/mouse.elf creates a tavla, and its title strip renders DIM
 #      while focus is still on the shell.
 #   2. Alt+Tab onto the tavla turns the same strip BRIGHT, so focus is
 #      visible on a window that draws no text cursor, and a shell window
@@ -85,7 +85,7 @@ def typ(keys, gap=0.06):
 def word(s):
     # QEMU's monitor has no bare `sendkey _`, and a dropped character
     # silently renames the file being spawned -- so only send what maps.
-    keymap = {".": "dot", " ": "spc", "-": "minus"}
+    keymap = {".": "dot", " ": "spc", "-": "minus", "/": "slash"}
     typ([keymap.get(c, c) for c in s])
 
 def shot(name):
@@ -97,7 +97,7 @@ typ(["ret"]); time.sleep(1.0)
 
 # 1+3, spawn a graphical program. Focus stays on the shell, so the tavla's
 # strip must be dim.
-word("spawn3 gnista.elf"); typ(["ret"])
+word("start test/mouse.elf"); typ(["ret"])
 time.sleep(3.0)
 shot("tavla_unfocused.ppm")
 
@@ -114,7 +114,7 @@ shot("tavla_closed.ppm")
 # 5, the stuck case. Spawn again, close skalman's own window so only the
 # tavla is left, then Alt+W to get a shell back -- and prove the shell is
 # really alive by running a command in it.
-word("spawn3 gnista.elf"); typ(["ret"])
+word("start test/mouse.elf"); typ(["ret"])
 time.sleep(3.0)
 word("close"); typ(["ret"])
 time.sleep(1.5)
@@ -175,7 +175,7 @@ def px(buf, w, x, y):
 
 def strip_counts(path):
     """Count BAR vs BAR_DIM pixels in the top character row of the RIGHT
-    half of the screen -- where spawn3's tavla lands (kakel_split inserts
+    half of the screen -- where start's tavla lands (kakel_split inserts
     the new window after the focused one, so the shell keeps the left)."""
     w, h, buf = read_ppm(path)
     bright = dim = 0
@@ -206,9 +206,9 @@ if not (b_fo > b_un and d_un > d_fo):
     print("FAIL: the strip did not actually flip between the two screendumps")
     ok = False
 
-# 3, the client area is inset below the strip. Gnista's demo paints its
+# 3, the client area is inset below the strip. mouse_probe paints its
 # whole window; if the inset were missing, the strip row would be full of
-# the demo's own background instead of bar color.
+# the program's own background instead of bar color.
 w, h, buf = read_ppm("tavla_focused.ppm")
 allowed = (BAR, BAR_DIM, FG, DIM)
 foreign = {}

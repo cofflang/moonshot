@@ -12,8 +12,7 @@
 //
 // It answers one question Infecteria is built on.
 // A scrolling game has a camera, so every pixel of the view
-// moves every frame, so the incremental bounding-box redraw Gnista's first demo
-// used buys nothing, and the game must composite a full frame into its own
+// moves every frame, so an incremental bounding-box redraw buys nothing, and the game must composite a full frame into its own
 // buffer and present it in one call. That is ~380k pixels written in c0
 // -- which has no optimizer at all -- plus the same again inside the kernel's
 // SYS_BLIT loop, every frame.
@@ -45,8 +44,8 @@ int main() {
     int winmax;
 
     winfo = win_info();
-    ww = winfo / 65536;
-    wh = winfo - ww * 65536;
+    ww = winfo >> 16;
+    wh = winfo & 65535;
     if (ww <= 0 || wh <= 0) { return 200; }
 
     print("fps_probe: start\n");
@@ -59,9 +58,9 @@ int main() {
     // safe size is the maximum. Costs address space, not accuracy, since the timed
     // loop below still writes exactly the current window's worth of pixels.
     winmax = win_max();
-    if (winmax == 0) { return 202; }
-    buf = alloc((winmax / 65536) * (winmax % 65536) * 4);
-    if (buf == 0) {
+    if (!winmax) { return 202; }
+    buf = alloc((winmax >> 16) * (winmax & 65535) * 4);
+    if (!buf) {
         print("fps_probe: alloc failed -- heap too small for a full frame\n");
         return 201;
     }
@@ -85,17 +84,14 @@ int main() {
         // machine instructions against a stack slot.
         //
         // Packing two pixels into one 64-bit word costs a compare, a store
-        // and an add per PAIR. c0 has no shift operator, so the high pixel is
-        // placed by multiplying by 2^32.
-        pix = shade + 40 * 256 + 80 * 65536;
-        pair = pix * 4294967296 + pix;
-        off = 0;
-        while (off < nbytes) {
+        // and an add per PAIR. The high pixel is shifted into the upper half.
+        pix = (80 << 16) | (40 << 8) | shade;
+        pair = (pix << 32) | pix;
+        for (off = 0; off < nbytes; off += 8) {
             store64(buf + off, pair);
-            off = off + 8;
         }
         present(buf);
-        frames = frames + 1;
+        frames += 1;
     }
     t1 = ticks();
 

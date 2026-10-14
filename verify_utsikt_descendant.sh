@@ -86,7 +86,7 @@ def shot(name):
 
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
-word("spawn3 utsikt.elf"); typ(["ret"]); time.sleep(4.5)
+word("start utsikt.elf"); typ(["ret"]); time.sleep(4.5)
 shot("udesc_page.ppm")
 sock.close()
 EOF2

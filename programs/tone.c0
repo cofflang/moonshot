@@ -1,0 +1,53 @@
+// tone.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// Plays a square wave through sound() for six seconds and exits.
+// `start test/tone.elf 330` plays 330 Hz. verify_oljud_mix.sh starts two
+// at different pitches, one shortly after the other, and listens for both
+// at once. Exits 0, or 1 without a usable frequency, or 2 without a card.
+include "moon.c0";
+
+int RATE = 22050;
+int SECONDS = 6;
+
+int number(int s) {
+    int v = 0;
+    int i = 0;
+    for (i = 0; load8(s + i) >= '0' && load8(s + i) <= '9'; i += 1) {
+        v = v * 10 + load8(s + i) - '0';
+    }
+    return v;
+}
+
+int main() {
+    if (argc() < 2) { return 1; }
+    int freq = number(argv(1));
+    if (freq <= 0 || freq >= RATE / 2) { return 1; }
+    int n = RATE * SECONDS;
+    int buf = alloc(n);
+    if (!buf) { return 1; }
+    // High for the first half of each period, low for the second. The
+    // period is RATE / freq samples, which is rarely whole, so the half a
+    // sample sits in is worked out from its own index.
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        if (((i * freq * 2) / RATE) % 2 == 0) { store8(buf + i, 128 + 40); }
+        else { store8(buf + i, 128 - 40); }
+    }
+    // The queue holds about three seconds, so the rest goes in as it drains.
+    int sent = 0;
+    while (sent < n) {
+        int took = sound(buf + sent, n - sent);
+        if (took < 0) { return 2; }
+        sent += took;
+        if (sent < n) { sleep(10); }
+    }
+    while (sound(0, 0) > 0) { sleep(10); }
+    return 0;
+}

@@ -16,7 +16,7 @@ int scratch = 0;
 int table;
 
 int bump(int by) {
-    counter = counter + by;
+    counter += by;
     return counter;
 }
 
@@ -42,7 +42,7 @@ int main() {
     // the memory behind it actually used. alloc() is the only ring-3 source
     // of memory, so this is the shape every real program needs.
     table = alloc(32);
-    if (table == 0) { return 106; }
+    if (!table) { return 106; }
     store64(table, 88);
     store64(table + 8, 0 - 1);
     if (load64(table) != 88) { return 107; }

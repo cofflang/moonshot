@@ -1,0 +1,282 @@
+// infecteria_sound.c0 — part of gnista, a game engine for the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of gnista, a game engine written in c0 for moonshot.
+// gnista is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// Infecteria's music and sound effects.
+//
+// The music is a noter song (the format lira edits) played on a loop by the
+// same synth lira uses. infecteria.not, when there is one, is played
+// instead of the one built below, so the soundtrack can be rewritten in lira
+// the way the sprites can be redrawn in pensel.
+//
+// A program has one sound queue, so the effects are mixed into the music
+// here before it is handed over. snd_pump, called every frame, keeps the
+// queue topped up to SND_AHEAD samples, a block of SND_BLOCK at a time. A
+// short queue is what keeps an effect close to the moment it belongs to;
+// the card itself adds up to two of its halves, about 190ms, on top.
+//
+// An effect is a function of how many samples it has been playing, so a
+// voice is only its kind and its age. Everything here is a global, unlike
+// the game's constants in play_scene, since the sound has to outlive any
+// one scene and every scene pumps it.
+
+int SND_BLOCK = 512;     // samples rendered at a time
+int SND_AHEAD = 1536;    // samples kept queued, about 70ms
+int SND_VOICES = 8;      // effects that can sound at once
+int SND_LOOP_STEPS = 128;
+
+// Effect kinds.
+int SFX_READY = 1;    // a cell is fully infected
+int SFX_EAT = 2;      // e absorbs a cell
+int SFX_FACTORY = 3;  // q makes a factory
+int SFX_KILL = 4;     // mini-bacteria destroy an antibacterium
+int SFX_HURT = 5;     // an antibacterium is touching the player
+int SFX_ARRIVE = 6;   // a new antibacterium arrives
+int SFX_WIN = 7;
+int SFX_LOSE = 8;
+
+int snd_on = 0;        // 1 while there is a card to play to
+int snd_song = 0;      // the music, a noter song, or 0 for none
+int snd_loop = 0;      // the music's loop length in samples
+int snd_pos = 0;       // where in the loop the next block starts
+int snd_music = 0;     // 1 while the music plays
+int snd_bytes = 0;     // one block of samples as the card takes them
+int snd_mix = 0;       // synth_render's scratch, one int per sample
+int snd_kind = 0;      // per voice, its kind, 0 when free
+int snd_age = 0;       // per voice, samples played
+
+// One note into the built-in song.
+void snd_note(int s, int start, int pitch, int len, int vel, int inst) {
+    noter_add_with(s, 256, pitch, start, len, vel, inst);
+    return;
+}
+
+// The built-in soundtrack, eight bars at 132 beats a minute in E minor. A
+// drum on every beat, a sawtooth bass in eighths on Em, C, G and D, and a
+// triangle melody over it, played twice with a different ending. noter keeps
+// one note per start and pitch, so the drums sit on pitches (30 for the
+// kick, 62 for the snare) that no bass or melody note uses.
+int snd_build_song() {
+    int s = noter_new(256, 4, 132);
+    if (!s) { return 0; }
+    int roots = alloc(32);
+    store64(roots, 40); store64(roots + 8, 36); store64(roots + 16, 43); store64(roots + 24, 38);
+    int bar = 0;
+    for (bar = 0; bar < 8; bar += 1) {
+        int b0 = bar * 16;
+        snd_note(s, b0, 30, 1, 120, 3);
+        snd_note(s, b0 + 8, 30, 1, 110, 3);
+        snd_note(s, b0 + 4, 62, 1, 70, 3);
+        snd_note(s, b0 + 12, 62, 1, 70, 3);
+        int root = load64(roots + (bar % 4) * 8);
+        int e = 0;
+        for (e = 0; e < 8; e += 1) {
+            int p = root;
+            if (e % 2 == 1) { p = root + 12; }
+            snd_note(s, b0 + e * 2, p, 2, 80, 2);
+        }
+    }
+    dealloc(roots);
+    // The melody, as (step, pitch, length) in the first four bars, and again
+    // in the last four with a higher answer at the end.
+    int m = alloc(16 * 24);
+    int k = 0;
+    store64(m + 0, 0);   store64(m + 8, 64);  store64(m + 16, 4);
+    store64(m + 24, 4);  store64(m + 32, 67); store64(m + 40, 2);
+    store64(m + 48, 6);  store64(m + 56, 71); store64(m + 64, 6);
+    store64(m + 72, 16); store64(m + 80, 72); store64(m + 88, 4);
+    store64(m + 96, 20); store64(m + 104, 71); store64(m + 112, 4);
+    store64(m + 120, 24); store64(m + 128, 67); store64(m + 136, 8);
+    store64(m + 144, 32); store64(m + 152, 67); store64(m + 160, 4);
+    store64(m + 168, 36); store64(m + 176, 71); store64(m + 184, 2);
+    store64(m + 192, 38); store64(m + 200, 74); store64(m + 208, 6);
+    store64(m + 216, 48); store64(m + 224, 74); store64(m + 232, 4);
+    store64(m + 240, 52); store64(m + 248, 72); store64(m + 256, 4);
+    store64(m + 264, 56); store64(m + 272, 71); store64(m + 280, 8);
+    for (k = 0; k < 12; k += 1) {
+        int st = load64(m + k * 24);
+        int pi = load64(m + k * 24 + 8);
+        int ln = load64(m + k * 24 + 16);
+        snd_note(s, st, pi, ln, 90, 1);
+        int again = pi;
+        if (k == 11) { again = 76; }
+        snd_note(s, st + 64, again, ln, 90, 1);
+    }
+    dealloc(m);
+    return s;
+}
+
+// Sets the sound up. Returns 1 when there is a card, 0 when the game is
+// silent, which it plays perfectly well without.
+int snd_init() {
+    if (sound(0, 0) < 0) { return 0; }
+    snd_bytes = alloc(SND_BLOCK);
+    snd_mix = alloc(SND_BLOCK * 8);
+    snd_kind = alloc(SND_VOICES * 8);
+    snd_age = alloc(SND_VOICES * 8);
+    if (!snd_bytes || !snd_mix || !snd_kind || !snd_age) { return 0; }
+    snd_song = noter_load("infecteria.not", 512);
+    if (!snd_song) { snd_song = snd_build_song(); }
+    if (!snd_song) { return 0; }
+    snd_loop = synth_length(snd_song);
+    int bars = synth_at(snd_song, SND_LOOP_STEPS);
+    if (snd_loop < bars) { snd_loop = bars; }
+    snd_on = 1;
+    return 1;
+}
+
+// Starts an effect, in the first free voice. With every voice busy the
+// effect is dropped, since a game event that cannot be heard costs less
+// than one that cuts another short.
+void sfx(int kind) {
+    if (snd_on != 1) { return; }
+    int v = 0;
+    for (v = 0; v < SND_VOICES; v += 1) {
+        if (load64(snd_kind + v * 8) == 0) {
+            store64(snd_kind + v * 8, kind);
+            store64(snd_age + v * 8, 0);
+            return;
+        }
+    }
+    return;
+}
+
+// A square wave of frequency f at sample k, as amp or -amp.
+int snd_square(int f, int k, int amp) {
+    if (((k * f * 2) / SYNTH_RATE) % 2 == 0) { return amp; }
+    return 0 - amp;
+}
+
+// A square wave sweeping from f0 to f1 over n samples, at sample k. The
+// phase is the integral of the frequency, so the sweep is smooth.
+int snd_sweep(int f0, int f1, int n, int k, int amp) {
+    int cycles2 = (2 * k * f0 + (f1 - f0) * k * k / n) / SYNTH_RATE;
+    if (cycles2 % 2 == 0) { return amp; }
+    return 0 - amp;
+}
+
+// Fades v out linearly over the last quarter of an effect n samples long.
+int snd_fade(int v, int k, int n) {
+    int tail = n / 4;
+    if (n - k < tail) { return v * (n - k) / tail; }
+    return v;
+}
+
+// One sample of an effect, `k` samples in, or a value past 1000000 when it
+// has finished.
+int sfx_sample(int kind, int k) {
+    int MS = SYNTH_RATE / 1000;
+    if (kind == SFX_READY) {
+        // Two rising blips, 1000 Hz then 1500 Hz.
+        if (k < 70 * MS) { return snd_fade(snd_square(1000, k, 22), k, 70 * MS); }
+        if (k < 140 * MS) { return snd_fade(snd_square(1500, k, 22), k - 70 * MS, 70 * MS); }
+        return 2000000;
+    }
+    if (kind == SFX_EAT) {
+        // A gulp, falling from 600 Hz to 120 Hz.
+        if (k < 220 * MS) { return snd_fade(snd_sweep(600, 120, 220 * MS, k, 28), k, 220 * MS); }
+        return 2000000;
+    }
+    if (kind == SFX_FACTORY) {
+        // A low thump and a ping an octave above.
+        if (k < 110 * MS) { return snd_fade(snd_square(220, k, 26), k, 110 * MS); }
+        if (k < 260 * MS) { return snd_fade(snd_square(440, k, 22), k - 110 * MS, 150 * MS); }
+        return 2000000;
+    }
+    if (kind == SFX_KILL) {
+        // A burst of noise that dies away.
+        int n = 180 * MS;
+        if (k < n) {
+            int v = 30;
+            if (((synth_mix(k / 2) >> 40) & 1) == 1) { v = 0 - 30; }
+            return v * (n - k) / n;
+        }
+        return 2000000;
+    }
+    if (kind == SFX_HURT) {
+        if (k < 90 * MS) { return snd_fade(snd_square(110, k, 22), k, 90 * MS); }
+        return 2000000;
+    }
+    if (kind == SFX_ARRIVE) {
+        // A low warning that bends down a little.
+        if (k < 350 * MS) { return snd_fade(snd_sweep(180, 150, 350 * MS, k, 18), k, 350 * MS); }
+        return 2000000;
+    }
+    if (kind == SFX_WIN || kind == SFX_LOSE) {
+        // Four notes, up an E minor chord for a win, down it for a loss.
+        int step = 120 * MS;
+        int i = k / step;
+        if (i >= 4) { return 2000000; }
+        int f = 0;
+        if (kind == SFX_WIN) {
+            if (i == 0) { f = 659; }
+            if (i == 1) { f = 784; }
+            if (i == 2) { f = 988; }
+            if (i == 3) { f = 1319; }
+        } else {
+            if (i == 0) { f = 330; }
+            if (i == 1) { f = 262; }
+            if (i == 2) { f = 220; }
+            if (i == 3) { f = 165; }
+        }
+        return snd_fade(snd_square(f, k, 24), k - i * step, step);
+    }
+    return 2000000;
+}
+
+// Starts or stops the music. Stopping also drops what is already queued, so
+// it stops at once rather than after the queue has played out.
+void snd_music_on(int on) {
+    if (snd_on != 1) { return; }
+    if (on == 0 && snd_music == 1) { sound(0, 0 - 1); }
+    if (on == 1 && snd_music == 0) { snd_pos = 0; }
+    snd_music = on;
+    return;
+}
+
+// Keeps the card fed. Call it every frame.
+void snd_pump() {
+    if (snd_on != 1) { return; }
+    while (sound(0, 0) < SND_AHEAD) {
+        int i = 0;
+        if (snd_music == 1) {
+            // The block, across the loop's end when it gets there.
+            int n = snd_loop - snd_pos;
+            if (n > SND_BLOCK) { n = SND_BLOCK; }
+            synth_render(snd_song, snd_pos, n, snd_bytes, snd_mix);
+            if (n < SND_BLOCK) {
+                synth_render(snd_song, 0, SND_BLOCK - n, snd_bytes + n, snd_mix);
+            }
+            snd_pos = (snd_pos + SND_BLOCK) % snd_loop;
+        } else {
+            for (i = 0; i < SND_BLOCK; i += 1) { store8(snd_bytes + i, 128); }
+        }
+        int v = 0;
+        for (v = 0; v < SND_VOICES; v += 1) {
+            int kind = load64(snd_kind + v * 8);
+            if (kind != 0) {
+                int age = load64(snd_age + v * 8);
+                for (i = 0; i < SND_BLOCK; i += 1) {
+                    int x = sfx_sample(kind, age + i);
+                    if (x > 1000000) {
+                        store64(snd_kind + v * 8, 0);
+                        i = SND_BLOCK;
+                    } else {
+                        int b = load8(snd_bytes + i) + x;
+                        if (b < 0) { b = 0; }
+                        if (b > 255) { b = 255; }
+                        store8(snd_bytes + i, b);
+                    }
+                }
+                store64(snd_age + v * 8, age + SND_BLOCK);
+            }
+        }
+        if (sound(snd_bytes, SND_BLOCK) < SND_BLOCK) { return; }
+    }
+    return;
+}

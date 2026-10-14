@@ -26,6 +26,10 @@ int SYS_WRITEFILE   = 15;
 int SYS_SLEEP       = 16;
 int SYS_ARGC        = 17;
 int SYS_ARGV        = 18;
+int SYS_LISTDIR     = 19;
+int SYS_SPAWN       = 20;
+int SYS_PROTECT     = 21;
+int SYS_EDIT        = 22;
 
 // Copies a path out of user memory into a fresh kmalloc'd buffer, bounded by
 // what jakel allows, and returns it (the caller kfrees it), or 0.
@@ -37,13 +41,12 @@ int SYS_ARGV        = 18;
 int sys_copy_path(int src) {
     int max = JAKEL_NAME_LEN * 4;
     int buf = kmalloc(max);
-    if (buf == 0) { return 0; }
+    if (!buf) { return 0; }
     int i = 0;
-    while (i < max - 1) {
+    for (i = 0; i < max - 1; i += 1) {
         int c = load8(src + i);
         store8(buf + i, c);
-        if (c == 0) { return buf; }
-        i = i + 1;
+        if (!c) { return buf; }
     }
     store8(buf + i, 0);
     return buf;
@@ -51,7 +54,7 @@ int sys_copy_path(int src) {
 
 
 int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
-    if (num == 0) {
+    if (!num) {
         int tid = sched_current;
         store64(task_state_base + tid * 8, TASK_EXITED);
         serial_print("[syscall] exit code=");
@@ -84,7 +87,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // goes to kakel_focus — the shell's focus, not this process's).
         int wid = load64(task_win_base + sched_current * 8);
         int i = 0;
-        while (i < a2) {
+        for (i = 0; i < a2; i += 1) {
             int ch = load8(a1 + i);
             serial_putc(ch);
             if (wid >= 0 && kakel_active == 1) {
@@ -92,7 +95,6 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
             } else {
                 sk_putc(ch);
             }
-            i = i + 1;
         }
         return a2;
     }
@@ -107,7 +109,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // tall as it is and bounce its sprite off an edge far below anything
         // visible.
         int wid2 = load64(task_win_base + sched_current * 8);
-        if (wid2 < 0 || kakel_active == 0) { return 0; }
+        if (wid2 < 0 || !kakel_active) { return 0; }
         int w = load64(kakel_cols_base + wid2 * 8) * FONT_W;
         int h = load64(kakel_rows_base + wid2 * 8) * FONT_H;
         // Remember what we told it. A program sizes its frame buffer from this
@@ -115,8 +117,8 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // this is the pitch its buffer will be written at for as long as it
         // runs -- SYS_PRESENT needs that, not the window's size today. See
         // task_win_reported_base (chrone.c0).
-        store64(task_win_reported_base + sched_current * 8, w * 65536 + h);
-        return w * 65536 + h;
+        store64(task_win_reported_base + sched_current * 8, (w << 16) | h);
+        return (w << 16) | h;
     }
     if (num == 3) {
         // SYS_FILL(x, y, w, h, color) — fill a rectangle in the task's
@@ -124,22 +126,8 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // to absolute screen coordinates and clips to both the window
         // bounds and the framebuffer edges.
         int wid3 = load64(task_win_base + sched_current * 8);
-        if (wid3 < 0 || kakel_active == 0) { return -1; }
-        int wx = load64(kakel_cx_base + wid3 * 8) * FONT_W;
-        int wy = load64(kakel_cy_base + wid3 * 8) * FONT_H;
-        int ww = load64(kakel_cols_base + wid3 * 8) * FONT_W;
-        int wh = load64(kakel_rows_base + wid3 * 8) * FONT_H;
-        // Clip to window bounds.
-        int rx = a1; if (rx < 0) { rx = 0; }
-        int ry = a2; if (ry < 0) { ry = 0; }
-        if (rx > ww) { rx = ww; }
-        if (ry > wh) { ry = wh; }
-        int rw = a3; if (rw < 0) { rw = 0; }
-        int rh = a4; if (rh < 0) { rh = 0; }
-        if (rx + rw > ww) { rw = ww - rx; }
-        if (ry + rh > wh) { rh = wh - ry; }
-        if (rw <= 0 || rh <= 0) { return 0; }
-        fb_fill_rect(wx + rx, wy + ry, rw, rh, a5);
+        if (wid3 < 0 || !kakel_active) { return -1; }
+        kakel_fill(wid3, a1, a2, a3, a4, a5);
         return 0;
     }
     if (num == 4) {
@@ -156,42 +144,12 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // in framebuffer order, blue at offset 0, green 1, red 2, zero 3).
         // Coordinates are window-relative; clipped to window bounds.
         int wid5 = load64(task_win_base + sched_current * 8);
-        if (wid5 < 0 || kakel_active == 0) { return -1; }
+        if (wid5 < 0 || !kakel_active) { return -1; }
         int wx5 = load64(kakel_cx_base + wid5 * 8) * FONT_W;
         int wy5 = load64(kakel_cy_base + wid5 * 8) * FONT_H;
         int ww5 = load64(kakel_cols_base + wid5 * 8) * FONT_W;
         int wh5 = load64(kakel_rows_base + wid5 * 8) * FONT_H;
-        int buf5 = a1;
-        int bx = a2; int by = a3; int bw = a4; int bh = a5;
-        // One lift around the WHOLE blit, not per pixel, since klick's pointer
-        // caches the pixels it covers, and a ring-3 program painting its
-        // window would otherwise erase the pointer or leave it restoring
-        // stale pixels. fb_put_pixel is deliberately not wrapped -- doing it
-        // per pixel would cost more than the blit itself.
-        klick_lift();
-        int row = 0;
-        while (row < bh) {
-            int col = 0;
-            while (col < bw) {
-                int sx = bx + col;
-                int sy = by + row;
-                if (sx >= 0 && sy >= 0 && sx < ww5 && sy < wh5) {
-                    int off = (row * bw + col) * 4;
-                    int pixel = load8(buf5 + off)
-                        + load8(buf5 + off + 1) * 256
-                        + load8(buf5 + off + 2) * 65536
-                        + load8(buf5 + off + 3) * 16777216;
-                    // Color 0 (fully transparent black) is skipped —
-                    // sprites can have holes without alpha blending.
-                    if (pixel != 0) {
-                        fb_put_pixel(wx5 + sx, wy5 + sy, pixel);
-                    }
-                }
-                col = col + 1;
-            }
-            row = row + 1;
-        }
-        klick_drop();
+        fb_blit(a1, a2, a3, a4, a5, wx5, wy5, ww5, wh5);
         return 0;
     }
     if (num == 6) {
@@ -243,15 +201,15 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // it, so a bad value would have the kernel scribble file contents
         // into its own memory. Not a security model -- ring 3 has none here
         // yet -- just refusing the one operation that can corrupt the kernel.
-        if (a1 == 0) { return -1; }
+        if (!a1) { return -1; }
         int nbuf = sys_copy_path(a1);
-        if (nbuf == 0) { return -1; }
+        if (!nbuf) { return -1; }
         int fid = jakel_open(0, nbuf);
         kfree(nbuf);
         if (fid < 0) { return -1; }
         if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) { return -1; }
         int fsz = load64(jakel_size_base + fid * 8);
-        if (a2 == 0) { return fsz; }
+        if (!a2) { return fsz; }
         if (a2 < USER_VIRT_BASE) {
             serial_print("[syscall] readfile: refusing non-user buffer\n");
             return -1;
@@ -272,9 +230,8 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // How much work it removes is the point. SYS_BLIT reads four bytes
         // and multiplies them together to rebuild each pixel, checks it
         // against colour 0 so sprites can have holes, then writes through
-        // fb_put_pixel -> store32_le -> two store16_le -> four store8, with
-        // divisions along the way. Roughly eight memory accesses and ten
-        // arithmetic ops per pixel.
+        // fb_put_pixel. Several memory accesses and a handful of arithmetic
+        // ops per pixel.
         //
         // This does none of it. It copies whole rows, eight bytes (two pixels) at a
         // time, no per-pixel branch and no arithmetic. It can, because a
@@ -289,8 +246,8 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // window, in framebuffer order. Returns 0, or -1 if the task has no
         // window.
         int wid9 = load64(task_win_base + sched_current * 8);
-        if (wid9 < 0 || kakel_active == 0) { return -1; }
-        if (a1 == 0) { return -1; }
+        if (wid9 < 0 || !kakel_active) { return -1; }
+        if (!a1) { return -1; }
         int wx9 = load64(kakel_cx_base + wid9 * 8) * FONT_W;
         int wy9 = load64(kakel_cy_base + wid9 * 8) * FONT_H;
         int ww9 = load64(kakel_cols_base + wid9 * 8) * FONT_W;
@@ -298,7 +255,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // The buffer's own geometry -- what SYS_WIN_INFO last told this task,
         // NOT the window's size today. They are the same number right up until
         // the layout reflows underneath a running program, which happens on
-        // every split, close and spawn3, and the program has no way to hear
+        // every split, close and start, and the program has no way to hear
         // about it and no way to resize a bump-allocated buffer if it did.
         //
         // Reading the buffer at the WINDOW's pitch would be wrong in both
@@ -316,8 +273,8 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         int bw9 = ww9;
         int bh9 = wh9;
         if (rep9 > 0) {
-            bw9 = rep9 / 65536;
-            bh9 = rep9 - bw9 * 65536;
+            bw9 = rep9 >> 16;
+            bh9 = rep9 & 65535;
         }
         int srcbytes = bw9 * 4;               // the caller's row pitch
         int copybytes = srcbytes;             // how much of a row lands on screen
@@ -334,17 +291,11 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
             int max_rows = (hnext9 - a1) / srcbytes;
             if (rows9 > max_rows) { rows9 = max_rows; }
         }
-        klick_lift();
+        klick_lift_rect(wx9, wy9, copybytes / 4, rows9);
         int r9 = 0;
-        while (r9 < rows9) {
-            int src = a1 + r9 * srcbytes;
-            int dst = fb_addr + (wy9 + r9) * fb_pitch + wx9 * 4;
-            int b9 = 0;
-            while (b9 < copybytes) {
-                store64(dst + b9, load64(src + b9));
-                b9 = b9 + 8;
-            }
-            r9 = r9 + 1;
+        for (r9 = 0; r9 < rows9; r9 += 1) {
+            mem_copy(fb_addr + (wy9 + r9) * fb_pitch + wx9 * 4,
+                     a1 + r9 * srcbytes, copybytes);
         }
         klick_drop();
         return 0;
@@ -417,10 +368,10 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // the full framebuffer minus the status bar. Deliberately NOT reduced
         // by a tavla's title strip -- that inset makes a window smaller, and a
         // program that budgeted for the un-inset size is still correct.
-        if (kakel_active == 0) { return 0; }
+        if (!kakel_active) { return 0; }
         int mw = (fb_width / FONT_W) * FONT_W;
         int mh = (fb_height / FONT_H - KAKEL_LOG_ROWS) * FONT_H;
-        return mw * 65536 + mh;
+        return (mw << 16) | mh;
     }
     if (num == 12) {
         // SYS_GLYPH(ch, buf) -- copies one character's font bitmap into the
@@ -438,7 +389,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // Why a bitmap and not a draw call? Ring-3 programs composite whole
         // frames into their own buffer and present them with ONE syscall,
         // because a multi-call draw sequence gets torn by the scheduler (see
-        // SYS_PRESENT and gnista.c0's header). A kernel-side draw_text would
+        // SYS_PRESENT and gnista's engine.c0). A kernel-side draw_text would
         // write straight to the framebuffer and put text back outside that
         // discipline. Handing over the bitmap keeps every pixel a program
         // shows under its own compositing, and costs one syscall per glyph
@@ -449,7 +400,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // text and the shell's look like one system. Unmapped characters
         // (including space) come back all-zero, which is what font_hi/font_lo
         // already return for them.
-        if (a2 == 0) { return FONT_W * 65536 + FONT_H; }
+        if (!a2) { return (FONT_W << 16) | FONT_H; }
         // Written through, like SYS_READFILE's buffer and unlike the pointers
         // the kernel only reads -- so it gets the same refusal.
         if (a2 < USER_VIRT_BASE) {
@@ -462,13 +413,12 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // byte is row 7, so four peels visit 7,6,5,4, and switching to the
         // untouched font_hi continues the identical pattern for 3,2,1,0.
         int gr12 = 7;
-        while (gr12 >= 0) {
+        for (gr12 = 7; gr12 >= 0; gr12 -= 1) {
             if (gr12 == 3) { gv12 = ghi12; }
             store8(a2 + gr12, gv12 % 256);
-            gv12 = gv12 / 256;
-            gr12 = gr12 - 1;
+            gv12 /= 256;
         }
-        return FONT_W * 65536 + FONT_H;
+        return (FONT_W << 16) | FONT_H;
     }
     if (num == 15) {
         // SYS_WRITEFILE(name, buf, len) -- makes the file `name` hold exactly
@@ -486,7 +436,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
             return -1;
         }
         int wpath = sys_copy_path(a1);
-        if (wpath == 0) { return -1; }
+        if (!wpath) { return -1; }
         int wid = jakel_open(0, wpath);
         if (wid < 0) { wid = jakel_create_at(0, wpath); }
         kfree(wpath);
@@ -511,8 +461,15 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // The wait itself is SYS_EXIT's, with interrupts on, halt until the
         // state changes. Unlike exit this returns to ring 3, so interrupts
         // go off again first -- syscall_entry's exit path is not safe with
-        // them on (see boot.s's disable_interrupts). A task killed while
-        // asleep is never scheduled again, so it never gets here.
+        // them on (see boot.s's disable_interrupts).
+        //
+        // A task can be killed while it sleeps, by alt+w on its window, and
+        // the interrupt that does it can arrive while this very loop is the
+        // one halted on the CPU. Then the loop ends with the task EXITED,
+        // and returning to ring 3 would run a dead program, whose next sleep
+        // would mark it BLOCKED again and bring it back from the dead after
+        // its stack has been reaped. So an exited sleeper parks the way
+        // SYS_EXIT does, until the next tick switches away for good.
         if (a1 <= 0) { return 0; }
         int me = sched_current;
         store64(task_wake_at_base + me * 8, pit_ticks + a1);
@@ -520,6 +477,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         int on = enable_interrupts;
         on();
         while (load64(task_state_base + me * 8) == TASK_BLOCKED) { halt(); }
+        while (load64(task_state_base + me * 8) == TASK_EXITED) { halt(); }
         int off = disable_interrupts;
         off();
         return 0;
@@ -529,7 +487,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // name included, as on Linux. 0 when it was started without any
         // (run3, or a kernel-built task).
         int ab = load64(task_args_base + sched_current * 8);
-        if (ab == 0) { return 0; }
+        if (!ab) { return 0; }
         return load64(ab);
     }
     if (num == 18) {
@@ -541,36 +499,166 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         int ab18 = load64(task_args_base + me18 * 8);
         if (ab18 == 0 || a1 < 0 || a1 >= load64(ab18)) { return 0; }
         int u = load64(task_argv_user_base + me18 * 8);
-        if (u == 0) {
+        if (!u) {
             int count = load64(ab18);
             int bytes = 0;
             int k = 0;
             int sp = ab18 + 8;
             while (k < count) {
                 int l = jakel_str_len(sp) + 1;
-                bytes = bytes + l;
-                sp = sp + l;
-                k = k + 1;
+                bytes += l;
+                sp += l;
+                k += 1;
             }
             u = lager_alloc(me18, count * 8 + bytes);
-            if (u == 0) { return 0; }
+            if (!u) { return 0; }
             int dst = u + count * 8;
             sp = ab18 + 8;
             k = 0;
-            while (k < count) {
+            for (k = 0; k < count; k += 1) {
                 store64(u + k * 8, dst);
                 int c = 1;
                 while (c != 0) {
                     c = load8(sp);
                     store8(dst, c);
-                    sp = sp + 1;
-                    dst = dst + 1;
+                    sp += 1;
+                    dst += 1;
                 }
-                k = k + 1;
             }
             store64(task_argv_user_base + me18 * 8, u);
         }
         return load64(u + a1 * 8);
+    }
+    if (num == 19) {
+        // SYS_LISTDIR(path, buf, max) -- the entries of a directory, one
+        // 48-byte record each, at most max of them: +0 the type (1 file,
+        // 2 directory, jakel's own numbers), +8 the size in bytes, +16 the
+        // name, NUL-terminated, at most 31 bytes. The path is from the root,
+        // and "" is the root itself. Returns how many records were written,
+        // or with buf == 0 how many entries there are, or -1 when the path
+        // is not a directory. buf is checked against the user range like
+        // SYS_READFILE's, since the kernel writes through it.
+        if (!a1) { return 0 - 1; }
+        int lp = sys_copy_path(a1);
+        if (!lp) { return 0 - 1; }
+        int did = 0;
+        if (load8(lp) != 0) { did = jakel_open(0, lp); }
+        kfree(lp);
+        if (did < 0 || load64(jakel_type_base + did * 8) != JAKEL_TYPE_DIR) { return 0 - 1; }
+        int n19 = load64(jakel_size_base + did * 8) / 8;
+        if (!a2) { return n19; }
+        if (a2 < USER_VIRT_BASE) {
+            serial_print("[syscall] listdir: refusing non-user buffer\n");
+            return 0 - 1;
+        }
+        if (a3 < n19) { n19 = a3; }
+        int kids = load64(jakel_data_base + did * 8);
+        int r19 = 0;
+        for (r19 = 0; r19 < n19; r19 += 1) {
+            int cid = load64(kids + r19 * 8);
+            int rec = a2 + r19 * 48;
+            store64(rec, load64(jakel_type_base + cid * 8));
+            store64(rec + 8, load64(jakel_size_base + cid * 8));
+            int cname = load64(jakel_name_base + cid * 8);
+            int k19 = 0;
+            for (k19 = 0; k19 < 31 && load8(cname + k19) != 0; k19 += 1) {
+                store8(rec + 16 + k19, load8(cname + k19));
+            }
+            store8(rec + 16 + k19, 0);
+        }
+        return n19;
+    }
+    if (num == 20) {
+        // SYS_SPAWN(line) -- starts the program the line names, with the
+        // rest of the line as its arguments, in a window of its own, the way
+        // the shell's start does (spawn_program). Names are found from the
+        // root. Returns the new task's id or spawn_program's negative error.
+        if (!a1) { return 0 - 1; }
+        int sl = kmalloc(256);
+        if (!sl) { return 0 - 1; }
+        int k20 = 0;
+        for (k20 = 0; k20 < 255 && load8(a1 + k20) != 0; k20 += 1) {
+            store8(sl + k20, load8(a1 + k20));
+        }
+        store8(sl + k20, 0);
+        int t20 = spawn_program(0, sl);
+        kfree(sl);
+        return t20;
+    }
+    if (num == 21) {
+        // SYS_PROTECT(addr, pages, mode) -- changes what this task may do
+        // with `pages` pages of its own heap starting at the page-aligned
+        // `addr`. Mode 1 makes them writable and not executable, mode 0
+        // executable and read-only, so a program that writes machine code
+        // (utsikt's glimt) never has a page it can both write and run.
+        // Every page must already be mapped, or nothing changes. Returns 0,
+        // or -1 for a bad request.
+        if ((a1 & 4095) != 0 || a2 <= 0 || a2 > 256 || a3 < 0 || a3 > 1) { return 0 - 1; }
+        int hend = load64(task_heap_end_base + sched_current * 8);
+        int hmapped = load64(task_heap_mapped_base + sched_current * 8);
+        if (!hend || a1 < hend - HEAP_PAGES * 4096 || a1 + a2 * 4096 > hmapped) {
+            serial_print("[syscall] protect: refusing pages outside the heap\n");
+            return 0 - 1;
+        }
+        int cr21 = load64(task_cr3_base + sched_current * 8);
+        int p21 = 0;
+        for (p21 = 0; p21 < a2; p21 += 1) {
+            if (!pt_leaf(cr21, a1 + p21 * 4096)) { return 0 - 1; }
+        }
+        for (p21 = 0; p21 < a2; p21 += 1) {
+            int leaf = pt_leaf(cr21, a1 + p21 * 4096);
+            int phys = load64(leaf) & PTE_ADDR;
+            if (a3 == 1) {
+                store64(leaf, phys | PRESENT_WRITE_USER | (1 << 63));
+            } else {
+                store64(leaf, phys | 5);
+            }
+        }
+        int flush21 = flush_tlb;
+        flush21();
+        return 0;
+    }
+    if (num == 22) {
+        // SYS_EDIT(path) -- opens a file in the kernel's editor for it, a
+        // sprite (.spr) in pensel and anything else in skrift, in a new
+        // shell window that takes the focus, so hylla can open what it
+        // cannot draw itself. Names are found from the root. When the editor
+        // quits, the window is an ordinary shell. Returns the window's id,
+        // -1 for a bad path, -2 when that editor is already open somewhere,
+        // -3 when there is no room for another window.
+        if (!a1 || kakel_active != 1) { return 0 - 1; }
+        int path22 = sys_copy_path(a1);
+        if (!path22) { return 0 - 1; }
+        int n22 = 0;
+        while (load8(path22 + n22) != 0) { n22 += 1; }
+        int sprite22 = 0;
+        if (n22 > 4 && load8(path22 + n22 - 4) == '.' && load8(path22 + n22 - 3) == 's'
+            && load8(path22 + n22 - 2) == 'p' && load8(path22 + n22 - 1) == 'r') {
+            sprite22 = 1;
+        }
+        if ((sprite22 == 1 && pensel_active == 1) || (!sprite22 && skrift_active == 1)) {
+            kfree(path22);
+            return 0 - 2;
+        }
+        int w22 = kakel_split();
+        if (w22 < 0) { kfree(path22); return 0 - 3; }
+        store64(raket_authed_base + w22 * 8, 1);
+        store64(sk_uid_base + w22 * 8, jakel_current_uid);
+        store64(sk_cwd_base + w22 * 8, 0);
+        shell_reprompt_others(w22);
+        kakel_focus_to(w22);
+        serial_print("[syscall] edit ");
+        serial_print(path22);
+        serial_print(" in window ");
+        serial_print_int(w22);
+        serial_print("\n");
+        if (sprite22 == 1) {
+            pensel_start(w22, path22, 0);
+        } else {
+            skrift_start(w22, path22);
+        }
+        kfree(path22);
+        return w22;
     }
     if (num == 14) {
         // SYS_SOUND(buf, len) -- queues len bytes of 8-bit mono PCM at
@@ -603,21 +691,21 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
 // Title for the tavla a windowed spawn is about to create. The shell sets it
 // to an owned copy of the filename it is spawning; 0 means "no name given,
 // use the generic label". A global rather than a parameter for the same
-// reason spawn3_code/spawn_elf_code are, since the spawn path crosses a
+// reason spawn_elf_code is, since the spawn path crosses a
 // task_spawn boundary, and the new task's entry point takes no arguments.
 int ring3_win_title = 0;
 
 // Consumes ring3_win_title, falling back to `fallback` when the shell did not
-// set one (bare `spawn3`, which has no filename to name a window after).
+// set one (the built-in test, which has no filename to name a window after).
 int ring3_title_take(int fallback) {
-    if (ring3_win_title == 0) { return fallback; }
+    if (!ring3_win_title) { return fallback; }
     return ring3_win_title;
 }
 
 // When `windowed` is 1 and the windowing layer is active (kakel_active),
 // the process gets its own dedicated kakel window (via kakel_split) before
 // entering ring 3, and all SYS_DEBUG_PRINT output routes to that window
-// instead of wherever the shell happens to be focused. spawn3/spawnelf
+// instead of wherever the shell happens to be focused. start and SYS_SPAWN
 // use this so a ring-3 process's output appears in its own tile alongside
 // the shell. run3/run3 (file) pass windowed=0 (blocks the calling task,
 // no separate window needed -- the shell IS the output surface).
@@ -627,9 +715,9 @@ void run_ring3_binary(int code, int code_len, int windowed) {
         return;
     }
     int code_page = pmm_alloc_page();
-    if (code_page == 0) { serial_print("[ring3] no code page\n"); return; }
+    if (!code_page) { serial_print("[ring3] no code page\n"); return; }
     int stack_page = pmm_alloc_page();
-    if (stack_page == 0) { serial_print("[ring3] no stack page\n"); return; }
+    if (!stack_page) { serial_print("[ring3] no stack page\n"); return; }
 
     serial_print("[ring3] loading ");
     serial_print_int(code_len);
@@ -641,9 +729,8 @@ void run_ring3_binary(int code, int code_len, int windowed) {
     // -- it is only once the process is actually running in ring 3 that its
     // code lives at USER_VIRT_BASE instead.
     int i = 0;
-    while (i < code_len) {
+    for (i = 0; i < code_len; i += 1) {
         store8(code_page + i, load8(code + i));
-        i = i + 1;
     }
 
     // Patch the string address immediate if this is the built-in test binary.
@@ -654,10 +741,7 @@ void run_ring3_binary(int code, int code_len, int windowed) {
     if (code_len == RING3_TEST_LEN && load8(code) == 0xB8 && load8(code + 1) == 1) {
         int str_addr = USER_VIRT_BASE + RING3_TEST_MSG_OFF;
         int off = RING3_TEST_STRADDR_OFF;
-        store8(code_page + off,     str_addr % 256);
-        store8(code_page + off + 1, (str_addr / 256) - (str_addr / 65536) * 256);
-        store8(code_page + off + 2, (str_addr / 65536) - (str_addr / 16777216) * 256);
-        store8(code_page + off + 3, (str_addr / 16777216) - (str_addr / 16777216 / 256) * 256);
+        store32(code_page + off, str_addr);
     }
 
     int proc_pml4 = pt_create();
@@ -699,26 +783,6 @@ void run_ring3_binary(int code, int code_len, int windowed) {
     return;
 }
 
-// --- spawn3 runs a ring-3 binary as an independent task -----------------------
-// Global variables set by the shell's spawn3 command, read by spawn3_entry.
-int spawn3_code = 0;
-int spawn3_len  = 0;
-
-// Entry point for a spawned ring-3 task. Reads the globals above and calls
-// the loader. Never returns (enters ring 3, then sys_exit halts the task).
-void spawn3_entry() {
-    int code = spawn3_code;
-    int len  = spawn3_len;
-    spawn3_code = 0;  // consume the data so it cannot be re-spawned by accident
-    spawn3_len  = 0;
-    if (code == 0 || len == 0) {
-        serial_print("[spawn3] no binary loaded\n");
-        return;
-    }
-    run_ring3_binary(code, len, 1);
-    // Unreachable — run_ring3_binary calls enter_ring3 which does IRETQ.
-}
-
 // Built-in ring-3 test, sys_debug_print("hello from ring 3\n", 18) + sys_exit(0).
 // The string address is patched at runtime (load time) by c0 code, since the
 // binary does not know its final load address until run_ring3_binary allocates
@@ -735,7 +799,7 @@ int RING3_TEST_LEN = 48;
 int ring3_test_code() {
     int p = elf_scratch;
     int i = 0;
-    while (i < RING3_TEST_LEN) { store8(p + i, 0); i = i + 1; }
+    for (i = 0; i < RING3_TEST_LEN; i += 1) { store8(p + i, 0); }
 
     // sys_debug_print(msg, 18)
     store8(p+0,0xB8);store8(p+1,0x01);store8(p+2,0x00);store8(p+3,0x00);store8(p+4,0x00);
@@ -780,15 +844,10 @@ void run_ring3_test() {
 // "do not pre-build a general format, follow real friction" discipline c0's
 // own feature growth has always used.
 
-// Writes a little-endian 32-bit immediate at `addr` -- the same
-// no-bitwise-ops byte-extraction idiom used throughout jenna.c0/syscall.c0
-// (c0 has no shift/mask operators), factored out here since the ELF test
-// binary below needs it for several fields.
+// Writes a little-endian 32-bit immediate at `addr`, factored out here
+// since the ELF test binary below needs it for several fields.
 void store_imm32_le(int addr, int v) {
-    store8(addr,     v % 256);
-    store8(addr + 1, (v / 256) - (v / 65536) * 256);
-    store8(addr + 2, (v / 65536) - (v / 16777216) * 256);
-    store8(addr + 3, (v / 16777216) - (v / 16777216 / 256) * 256);
+    store32(addr, v);
 }
 
 // Checks the ELF64 magic, class (64-bit), endianness (little), type
@@ -833,7 +892,7 @@ int elf_load(int pml4, int buf, int len) {
 
     elf_next_free_virt = 0;
     int i = 0;
-    while (i < e_phnum) {
+    for (i = 0; i < e_phnum; i += 1) {
         int ph = buf + e_phoff + i * e_phentsize;
         int p_type = load32(ph);
         if (p_type == 1) { // PT_LOAD
@@ -846,23 +905,21 @@ int elf_load(int pml4, int buf, int len) {
             int seg_end = ((p_vaddr + p_memsz + 4095) / 4096) * 4096;
             if (seg_end > elf_next_free_virt) { elf_next_free_virt = seg_end; }
 
-            int page = seg_start;
-            while (page < seg_end) {
+            int page = 0;
+            for (page = seg_start; page < seg_end; page += 4096) {
                 int frame = pmm_alloc_page();
                 zero_page(frame);
-                int voff = 0;
-                while (voff < 4096) {
-                    int vaddr = page + voff;
-                    if (vaddr >= p_vaddr && vaddr < p_vaddr + p_filesz) {
-                        store8(frame + voff, load8(buf + p_offset + (vaddr - p_vaddr)));
-                    }
-                    voff = voff + 1;
+                // The part of this page the file supplies, the rest stays zero.
+                int lo = page;
+                if (lo < p_vaddr) { lo = p_vaddr; }
+                int hi = page + 4096;
+                if (hi > p_vaddr + p_filesz) { hi = p_vaddr + p_filesz; }
+                if (hi > lo) {
+                    mem_copy(frame + (lo - page), buf + p_offset + (lo - p_vaddr), hi - lo);
                 }
                 map_page_user(pml4, page, frame);
-                page = page + 4096;
             }
         }
-        i = i + 1;
     }
     return e_entry;
 }
@@ -881,25 +938,23 @@ int elf_load(int pml4, int buf, int len) {
 // When `windowed` is 1 and the windowing layer is active, the process gets
 // its own dedicated kakel window -- same semantics as run_ring3_binary's
 // windowed parameter (see its comment).
-// 8MB per ring-3 process (see SYS_ALLOC and lager.c0). Raised from 64 pages
-// (256KB) for Infecteria, since a scrolling game has a camera, so every pixel of
-// the view moves every frame and the incremental bounding-box redraw the
-// first Gnista demo used buys nothing. It has to composite a whole frame and
+// 8MB per ring-3 process (see SYS_ALLOC and lager.c0). A scrolling game has
+// a camera, so every pixel of the view moves every frame and an incremental
+// bounding-box redraw buys nothing. It has to composite a whole frame and
 // present it in one blit, and a full tavla-sized frame is ~1.5MB on its own.
 //
-// Raised again from 1024 pages (4MB) when SYS_WIN_MAX landed. A program that
-// wants to survive its window being resized has to size its frame buffer for
-// the LARGEST window it could ever be given -- ~2.97MB at 1024x768 -- because
-// there was no free then and there is still no realloc to grow it with. At 4MB that left a
-// game under 1MB for everything else, which is not enough headroom to spend
-// without thinking. This is address space plus one-off mapping work, not a
-// standing cost per process beyond what each actually allocates.
-//
-// Eagerly mapped, so this is 1024 map_page_user calls per spawn rather than
-// 64. That is real but one-off work at spawn time, not per frame.
+// A program that wants to survive its window being resized has to size its
+// frame buffer for the LARGEST window it could ever be given -- ~2.97MB at
+// 1024x768 -- because there is no realloc to grow it with. That leaves a game
+// about 5MB for everything else, which is enough headroom to spend without
+// thinking. This is address space plus one-off mapping work, not a standing
+// cost per process beyond what each actually allocates.
 int HEAP_PAGES = 2048;
 
-// The largest ELF image run3/spawn3 will load, checked in skalman (before it
+// Pages of stack every ring-3 program gets, 64KB.
+int USER_STACK_PAGES = 16;
+
+// The largest ELF image run3/start will load, checked in skalman (before it
 // copies the file) and here. 256KB leaves room for utsikt, which carries
 // image drawing, with headroom. The image is copied into
 // the kernel heap while it loads, which is the one real cost, 256KB of the
@@ -907,32 +962,35 @@ int HEAP_PAGES = 2048;
 // jakel_arena_init).
 int ELF_MAX_BYTES = 262144;
 void run_elf_binary(int code, int code_len, int windowed) {
-    // ELF_MAX_BYTES (above), raised from 65536 for utsikt, which was raised
-    // from the original 4096 -- that cap was sized for hello-world-
-    // scale demos and never revisited; kmalloc already sizes the caller's
-    // buffer to the real file size, and elf_load's PT_LOAD mapping loop
-    // already handles multi-page images, so there was no structural reason
-    // for it. Raised once a real Gnista demo (code + a baked-in sprite)
-    // actually exceeded it -- generous headroom past current need, not
-    // exactly current need, same sizing philosophy used elsewhere in this
-    // codebase (c0-coff's own source-read buffer, jenna's ring-3 heap).
+    // ELF_MAX_BYTES (above). kmalloc sizes the caller's buffer to the real
+    // file size, and elf_load's PT_LOAD mapping loop handles multi-page
+    // images, so the cap is only a sanity limit, sized with generous
+    // headroom past the largest program rather than exactly to it, the same
+    // way coff's source-read buffer and jenna's ring-3 heap are sized.
     if (code_len > ELF_MAX_BYTES) {
         serial_print("[elf] image too large\n");
         return;
     }
     int proc_pml4 = pt_create();
     int entry = elf_load(proc_pml4, code, code_len);
-    if (entry == 0) {
+    if (!entry) {
         serial_print("[elf] invalid ELF64 image\n");
         return;
     }
 
-    int stack_virt = elf_next_free_virt;
-    int stack_page = pmm_alloc_page();
-    if (stack_page == 0) { serial_print("[elf] no stack page\n"); return; }
-    map_page_user(proc_pml4, stack_virt, stack_page);
+    // One page above the image stays unmapped, so a stack that runs off its
+    // bottom touches nothing of the program's own.
+    int stack_virt = elf_next_free_virt + 4096;
+    int sp_i = 0;
+    for (sp_i = 0; sp_i < USER_STACK_PAGES; sp_i += 1) {
+        int stack_page = pmm_alloc_page();
+        if (!stack_page) { serial_print("[elf] no stack page\n"); return; }
+        zero_page(stack_page);
+        map_page_user(proc_pml4, stack_virt + sp_i * 4096, stack_page);
+    }
+    int stack_top = stack_virt + USER_STACK_PAGES * 4096;
 
-    int heap_virt = stack_virt + 4096;
+    int heap_virt = stack_top;
     // The heap region is RESERVED here, not mapped. Pages are attached by
     // SYS_ALLOC as the program actually asks for memory -- see there.
     //
@@ -969,7 +1027,7 @@ void run_elf_binary(int code, int code_len, int windowed) {
         store64(task_win_base + tid * 8, wid);
         if (wid < 0) {
             serial_print("[elf] no window available, running unwindowed\n");
-            sk_print("spawn3: no free window -- close one first\n");
+            sk_print("start: no free window, close one first\n");
         }
         if (wid >= 0) {
             kakel_tavla_claim(wid, tid, ring3_title_take("elf"));
@@ -983,7 +1041,7 @@ void run_elf_binary(int code, int code_len, int windowed) {
 
     int kstack = load64(task_stack_base + tid * 8);
     int fn = enter_ring3;
-    fn(entry, stack_virt + 4096, kstack + TASK_STACK_SIZE, proc_pml4);
+    fn(entry, stack_top, kstack + TASK_STACK_SIZE, proc_pml4);
     serial_print("[elf] ERROR: returned from enter_ring3\n");
     return;
 }
@@ -993,6 +1051,50 @@ int spawn_elf_code = 0;
 int spawn_elf_len  = 0;
 int spawn_elf_args = 0;   // the arguments block for the task (see chrone.c0)
 
+// Starts the program a command line names, in a task and a window of its
+// own, the way the shell's start does, with the rest of the line as its
+// arguments. `cwd` is the directory the name is found from. Returns the new
+// task's id, or -1 for an empty line, -2 when there is no such file, -3
+// when it is not a file, -4 when it is empty or too large to load, -5 when
+// the task table is full, -6 when it is not an ELF program. start and
+// SYS_SPAWN both come here.
+int spawn_program(int cwd, int line) {
+    int args = sk_args_block(line);
+    if (!args) { return 0 - 1; }
+    int name = args + 8;    // the first word, NUL-terminated
+    int fid = jakel_open(cwd, name);
+    if (fid < 0) { kfree(args); return 0 - 2; }
+    if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) { kfree(args); return 0 - 3; }
+    int fsize = load64(jakel_size_base + fid * 8);
+    if (fsize == 0 || fsize > ELF_MAX_BYTES) { kfree(args); return 0 - 4; }
+    int buf = kmalloc(fsize);
+    if (!buf) { kfree(args); return 0 - 4; }
+    jakel_read(fid, 0, buf, fsize);
+    if (fsize < 4 || load8(buf) != 0x7F || load8(buf + 1) != 'E'
+        || load8(buf + 2) != 'L' || load8(buf + 3) != 'F') {
+        kfree(buf);
+        kfree(args);
+        return 0 - 6;
+    }
+    spawn_elf_code = buf;
+    spawn_elf_len = fsize;
+    spawn_elf_args = args;
+    // Name the tavla after the file. An owned copy, not `name` itself, since
+    // the caller's line is gone long before the spawned task reaches
+    // kakel_tavla_claim.
+    ring3_win_title = sk_strdup(name);
+    int tid = task_spawn(spawn_elf_entry);
+    if (tid < 0) {
+        spawn_elf_code = 0;
+        spawn_elf_len = 0;
+        spawn_elf_args = 0;
+        kfree(buf);
+        kfree(args);
+        return 0 - 5;
+    }
+    return tid;
+}
+
 void spawn_elf_entry() {
     int code = spawn_elf_code;
     int len  = spawn_elf_len;
@@ -1000,7 +1102,7 @@ void spawn_elf_entry() {
     spawn_elf_len  = 0;
     store64(task_args_base + sched_current * 8, spawn_elf_args);
     spawn_elf_args = 0;
-    if (code == 0 || len == 0) {
+    if (code == 0 || !len) {
         serial_print("[spawnelf] no image loaded\n");
         return;
     }
@@ -1023,7 +1125,7 @@ int ELF_TEST_LEN = 162;       // ELF_TEST_HDR_LEN + ELF_TEST_CODE_LEN
 int elf_test_code() {
     int p = elf_scratch;
     int i = 0;
-    while (i < ELF_TEST_LEN) { store8(p + i, 0); i = i + 1; }
+    for (i = 0; i < ELF_TEST_LEN; i += 1) { store8(p + i, 0); }
 
     int entry = USER_VIRT_BASE + ELF_TEST_HDR_LEN;
     int msg_addr = entry + 27;

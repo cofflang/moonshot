@@ -17,22 +17,24 @@
 //
 //   offset  field
 //    0      magic           "noter" and three zero bytes
-//    8      version         1
+//    8      version         2
 //   16      steps per beat  the grid; lira uses 4, so a step is a sixteenth
 //   24      tempo           beats per minute
 //   32      note count      N
-//   40      N notes, 32 bytes each:
+//   40      N notes, 40 bytes each:
 //             +0  pitch     MIDI note number, 0-127, 60 = middle C
 //             +8  start     in steps from the beginning
 //             +16 length    in steps, at least 1
 //             +24 velocity  1-127
+//             +32 instrument 0 square, 1 triangle, 2 sawtooth, 3 drum
 //
 // The notes are sorted by start, then by pitch, and no two share both. The
 // order is part of the format so that a player can walk the list once from
 // the front, and so that two saves of the same song are the same bytes.
 //
 // The magic and the version are there so the format can change later. A
-// file without them is refused, never guessed at.
+// file without them is refused, never guessed at. Version 1 had no
+// instrument, 32 bytes a note, and still loads, every note a square wave.
 //
 // In memory a song is the file itself, in a buffer with room for more notes.
 // the editor changes the list in place and a save writes the buffer out as
@@ -51,29 +53,30 @@ layout NoterNote {
     int nn_start;
     int nn_length;
     int nn_velocity;
+    int nn_instrument;
 }
 
-int NOTER_VERSION = 1;
+int NOTER_VERSION = 2;
+int NOTER_INSTRUMENTS = 4;
 
 // Writes the magic, "noter" and three zero bytes, at `buf`.
 void noter_put_magic(int buf) {
     int m = "noter";
     int i = 0;
-    while (i < 5) { store8(buf + i, load8(m + i)); i = i + 1; }
-    while (i < 8) { store8(buf + i, 0); i = i + 1; }
+    for (i = 0; i < 5; i += 1) { store8(buf + i, load8(m + i)); }
+    while (i < 8) { store8(buf + i, 0); i += 1; }
     return;
 }
 
 int noter_magic_ok(int buf) {
     int m = "noter";
     int i = 0;
-    while (i < 5) {
+    for (i = 0; i < 5; i += 1) {
         if (load8(buf + i) != load8(m + i)) { return 0; }
-        i = i + 1;
     }
     while (i < 8) {
         if (load8(buf + i) != 0) { return 0; }
-        i = i + 1;
+        i += 1;
     }
     return 1;
 }
@@ -86,7 +89,7 @@ int noter_bytes(int n) {
 // A new, empty song with room for `cap` notes. Returns 0 if alloc fails.
 int noter_new(int cap, int steps, int tempo) {
     int s = alloc(noter_bytes(cap));
-    if (s == 0) { return 0; }
+    if (!s) { return 0; }
     noter_put_magic(s);
     s.nh_version = NOTER_VERSION;
     s.nh_steps = steps;
@@ -97,8 +100,8 @@ int noter_new(int cap, int steps, int tempo) {
 
 int noter_count(int s) { return s.nh_count; }
 
-// The i-th note's record. Its fields are .nn_pitch, .nn_start, .nn_length
-// and .nn_velocity.
+// The i-th note's record. Its fields are .nn_pitch, .nn_start, .nn_length,
+// .nn_velocity and .nn_instrument.
 int noter_note(int s, int i) {
     return s + sizeof(NoterHead) + i * sizeof(NoterNote);
 }
@@ -120,26 +123,37 @@ int noter_note_ok(int pitch, int start, int length, int velocity) {
     return 1;
 }
 
+// Puts a square-wave note into its sorted place. See noter_add_with.
+int noter_add(int s, int cap, int pitch, int start, int length, int velocity) {
+    return noter_add_with(s, cap, pitch, start, length, velocity, 0);
+}
+
+// Copies note record `from` over note record `to`.
+void noter_copy(int to, int from) {
+    to.nn_pitch = from.nn_pitch;
+    to.nn_start = from.nn_start;
+    to.nn_length = from.nn_length;
+    to.nn_velocity = from.nn_velocity;
+    to.nn_instrument = from.nn_instrument;
+    return;
+}
+
 // Puts a note into its sorted place. A note with the same start and pitch as
 // one already there replaces it. Returns its index, or -1 for invalid fields
 // or a full song (`cap` notes).
-int noter_add(int s, int cap, int pitch, int start, int length, int velocity) {
+int noter_add_with(int s, int cap, int pitch, int start, int length, int velocity,
+                   int instrument) {
     if (noter_note_ok(pitch, start, length, velocity) == 0) { return 0 - 1; }
+    if (instrument < 0 || instrument >= NOTER_INSTRUMENTS) { return 0 - 1; }
     int n = s.nh_count;
     int i = 0;
-    while (i < n && noter_order(noter_note(s, i), start, pitch) < 0) { i = i + 1; }
+    while (i < n && noter_order(noter_note(s, i), start, pitch) < 0) { i += 1; }
     if (i == n || noter_order(noter_note(s, i), start, pitch) != 0) {
         if (n >= cap) { return 0 - 1; }
         // Open a gap at i, moving the tail up by one record, last first.
-        int j = n;
-        while (j > i) {
-            int to = noter_note(s, j);
-            int from = noter_note(s, j - 1);
-            to.nn_pitch = from.nn_pitch;
-            to.nn_start = from.nn_start;
-            to.nn_length = from.nn_length;
-            to.nn_velocity = from.nn_velocity;
-            j = j - 1;
+        int j = 0;
+        for (j = n; j > i; j -= 1) {
+            noter_copy(noter_note(s, j), noter_note(s, j - 1));
         }
         s.nh_count = n + 1;
     }
@@ -148,6 +162,7 @@ int noter_add(int s, int cap, int pitch, int start, int length, int velocity) {
     r.nn_start = start;
     r.nn_length = length;
     r.nn_velocity = velocity;
+    r.nn_instrument = instrument;
     return i;
 }
 
@@ -156,13 +171,8 @@ void noter_remove(int s, int i) {
     int n = s.nh_count;
     if (i < 0 || i >= n) { return; }
     while (i < n - 1) {
-        int to = noter_note(s, i);
-        int from = noter_note(s, i + 1);
-        to.nn_pitch = from.nn_pitch;
-        to.nn_start = from.nn_start;
-        to.nn_length = from.nn_length;
-        to.nn_velocity = from.nn_velocity;
-        i = i + 1;
+        noter_copy(noter_note(s, i), noter_note(s, i + 1));
+        i += 1;
     }
     s.nh_count = n - 1;
     return;
@@ -172,11 +182,10 @@ void noter_remove(int s, int i) {
 // click on the grid hits.
 int noter_find(int s, int pitch, int step) {
     int i = 0;
-    while (i < s.nh_count) {
+    for (i = 0; i < s.nh_count; i += 1) {
         int r = noter_note(s, i);
         if (r.nn_start > step) { return 0 - 1; }
         if (r.nn_pitch == pitch && step < r.nn_start + r.nn_length) { return i; }
-        i = i + 1;
     }
     return 0 - 1;
 }
@@ -186,8 +195,8 @@ int noter_find(int s, int pitch, int step) {
 // `start` itself and at every note start inside the range.
 int noter_voices(int s, int start, int length) {
     int most = 0;
-    int i = 0 - 1;
-    while (i < s.nh_count) {
+    int i = 0;
+    for (i = 0 - 1; i < s.nh_count; i += 1) {
         int at = start;
         if (i >= 0) {
             int ri = noter_note(s, i);
@@ -196,14 +205,12 @@ int noter_voices(int s, int start, int length) {
         if (at >= start && at < start + length) {
             int here = 0;
             int j = 0;
-            while (j < s.nh_count) {
+            for (j = 0; j < s.nh_count; j += 1) {
                 int r = noter_note(s, j);
-                if (r.nn_start <= at && at < r.nn_start + r.nn_length) { here = here + 1; }
-                j = j + 1;
+                if (r.nn_start <= at && at < r.nn_start + r.nn_length) { here += 1; }
             }
             if (here > most) { most = here; }
         }
-        i = i + 1;
     }
     return most;
 }
@@ -226,25 +233,58 @@ int noter_check(int s, int size) {
     int n = s.nh_count;
     if (n < 0 || noter_bytes(n) != size) { return 0; }
     int i = 0;
-    while (i < n) {
+    for (i = 0; i < n; i += 1) {
         int r = noter_note(s, i);
         if (noter_note_ok(r.nn_pitch, r.nn_start, r.nn_length, r.nn_velocity) == 0) { return 0; }
+        if (r.nn_instrument < 0 || r.nn_instrument >= NOTER_INSTRUMENTS) { return 0; }
         if (i > 0 && noter_order(noter_note(s, i - 1), r.nn_start, r.nn_pitch) >= 0) { return 0; }
-        i = i + 1;
     }
     return 1;
 }
 
+// Rewrites a version 1 song of n notes, read into the front of buffer s,
+// as version 2 in place. Each 32-byte note becomes a 40-byte one with
+// instrument 0, last note first, so no note is overwritten before it moves.
+// The buffer must have room for n version 2 notes.
+void noter_upgrade(int s, int n) {
+    int i = 0;
+    for (i = n - 1; i >= 0; i -= 1) {
+        int from = s + sizeof(NoterHead) + i * 32;
+        int to = noter_note(s, i);
+        int pitch = load64(from);
+        int start = load64(from + 8);
+        int length = load64(from + 16);
+        int velocity = load64(from + 24);
+        to.nn_pitch = pitch;
+        to.nn_start = start;
+        to.nn_length = length;
+        to.nn_velocity = velocity;
+        to.nn_instrument = 0;
+    }
+    s.nh_version = NOTER_VERSION;
+    return;
+}
+
 // Reads a song from jakel into a buffer with room for at least `cap` notes.
 // Returns the buffer, or 0 if the file is missing, malformed or holds more
-// than `cap` notes. The cap is the caller's promise to noter_add.
+// than `cap` notes. The cap is the caller's promise to noter_add. A version
+// 1 file is upgraded on the way in and checked as version 2 afterwards.
 int noter_load(int name, int cap) {
     int size = readfile(name, 0, 0);
     if (size < sizeof(NoterHead)) { return 0; }
     if (size > noter_bytes(cap)) { return 0; }
     int s = alloc(noter_bytes(cap));
-    if (s == 0) { return 0; }
-    if (readfile(name, s, size) != size || noter_check(s, size) == 0) {
+    if (!s) { return 0; }
+    if (readfile(name, s, size) != size) {
+        dealloc(s);
+        return 0;
+    }
+    if (noter_magic_ok(s) == 1 && s.nh_version == 1 && s.nh_count >= 0
+            && s.nh_count <= cap && size == sizeof(NoterHead) + s.nh_count * 32) {
+        noter_upgrade(s, s.nh_count);
+        size = noter_bytes(s.nh_count);
+    }
+    if (noter_check(s, size) == 0) {
         dealloc(s);
         return 0;
     }

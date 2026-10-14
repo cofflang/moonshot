@@ -48,19 +48,19 @@ void die(int msg) {
 void put8(int b) {
     if (outpos >= OUTCAP) { die("output larger than the buffer"); }
     store8(out + outpos, b);
-    outpos = outpos + 1;
+    outpos += 1;
     return;
 }
 
 void put64(int v) {
     int i = 0;
-    while (i < 8) { put8(v & 255); v = v >> 8; i = i + 1; }
+    for (i = 0; i < 8; i += 1) { put8(v & 255); v = v >> 8; }
     return;
 }
 
 void puts_(int s) {
     int i = 0;
-    while (load8(s + i) != 0) { put8(load8(s + i)); i = i + 1; }
+    for (i = 0; load8(s + i) != 0; i += 1) { put8(load8(s + i)); }
     return;
 }
 
@@ -76,7 +76,7 @@ int read_file(int name) {
     buf = alloc(cap);
     got = read(fd, buf, cap);
     while (got > 0) {
-        len = len + got;
+        len += got;
         got = read(fd, buf + len, cap - len);
     }
     close(fd);
@@ -95,39 +95,35 @@ void write_out(int path) {
 
 int do_pack() {
     int count = (argc() - 4) / 4;
-    if (count == 0) { die("no test programs given"); }
+    if (!count) { die("no test programs given"); }
     if (argc() != 4 + count * 4) { die("arguments come in fours: name source expect elf"); }
     out = alloc(OUTCAP);
 
     put64(count);
     int i = 0;
-    while (i < count) {
+    for (i = 0; i < count; i += 1) {
         int name = argv(4 + i * 4);
         int nl = 0;
-        while (load8(name + nl) != 0) { nl = nl + 1; }
+        while (load8(name + nl) != 0) { nl += 1; }
         if (nl > 15) { die("a test name is longer than 15 bytes"); }
         int k = 0;
-        while (k < 16) {
+        for (k = 0; k < 16; k += 1) {
             if (k < nl) { put8(load8(name + k)); } else { put8(0); }
-            k = k + 1;
         }
         int data = read_file(argv(7 + i * 4));
         int n = file_len;
         put64(n);
-        k = 0;
-        while (k < n) { put8(load8(data + k)); k = k + 1; }
-        while (k % 8 != 0) { put8(0); k = k + 1; }
-        i = i + 1;
+        for (k = 0; k < n; k += 1) { put8(load8(data + k)); }
+        while (k % 8 != 0) { put8(0); k += 1; }
     }
     write_out(argv(2));
 
     outpos = 0;
     i = 0;
-    while (i < count) {
+    for (i = 0; i < count; i += 1) {
         puts_(argv(4 + i * 4)); puts_(" ");
         puts_(argv(5 + i * 4)); puts_(" ");
         puts_(argv(6 + i * 4)); puts_("\n");
-        i = i + 1;
     }
     write_out(argv(3));
     print("wrote ");
@@ -138,9 +134,8 @@ int do_pack() {
 
 int streq(int a, int b) {
     int i = 0;
-    while (a[i] != 0 && b[i] != 0) {
+    for (i = 0; a[i] != 0 && b[i] != 0; i += 1) {
         if (a[i] != b[i]) { return 0; }
-        i = i + 1;
     }
     if (a[i] != b[i]) { return 0; }
     return 1;

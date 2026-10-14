@@ -15,23 +15,23 @@ int bump(int p) {
 }
 int main() {
     int c = alloc(8);
-    if (c == 0) { return 210; }
+    if (!c) { return 210; }
     store64(c, 0);
 
     int t = 0;
-    if (1 == 1 && 2 == 2) { t = t + 1; }
-    if (1 == 1 && 2 == 3) { t = t + 100; }
-    if (1 == 2 || 3 == 3) { t = t + 2; }
-    if (1 == 2 || 3 == 4) { t = t + 100; }
-    if (bump(c) == 1 && bump(c) == 1) { t = t + 4; }
+    if (1 == 1 && 2 == 2) { t += 1; }
+    if (1 == 1 && 2 == 3) { t += 100; }
+    if (1 == 2 || 3 == 3) { t += 2; }
+    if (1 == 2 || 3 == 4) { t += 100; }
+    if (bump(c) == 1 && bump(c) == 1) { t += 4; }
     if (load64(c) != 2) { return 211; }
 
     // false && X must not evaluate X; true || X must not evaluate X.
     store64(c, 0);
-    if (0 == 1 && bump(c) == 1) { t = t + 100; }
-    if (1 == 1 || bump(c) == 1) { t = t + 8; }
+    if (0 == 1 && bump(c) == 1) { t += 100; }
+    if (1 == 1 || bump(c) == 1) { t += 8; }
     if (load64(c) != 0) { return 212; }
 
-    if ((1 == 1 && 2 == 2) || (3 == 4 && 5 == 5)) { t = t + 16; }
+    if ((1 == 1 && 2 == 2) || (3 == 4 && 5 == 5)) { t += 16; }
     return t;
 }

@@ -11,7 +11,9 @@
 // at 22050 samples a second, 128 being silence. A ring-3 library, included
 // after noter.c0.
 //
-// Every note is a square wave. Its loudness is its velocity, scaled so that
+// A note's instrument picks its wave, a square, a triangle, a sawtooth, or
+// noise that dies away over the note for a drum. Its loudness is its
+// velocity, scaled so that
 // eight notes at full velocity add up to exactly the 8-bit range, so up to eight
 // voices never clip, at the cost of one note alone being fairly quiet. Each
 // note ramps in and out over SYNTH_RAMP samples (3ms), because a square wave
@@ -33,7 +35,7 @@ int SYNTH_ONE = 4294967296;   // one whole cycle of phase
 
 // MIDI 60-71 (C4 to B4) in millihertz, equal temperament, A4 = 440 Hz.
 int synth_mhz(int n) {
-    if (n == 0) { return 261626; }
+    if (!n) { return 261626; }
     if (n == 1) { return 277183; }
     if (n == 2) { return 293665; }
     if (n == 3) { return 311127; }
@@ -52,9 +54,9 @@ int synth_mhz(int n) {
 // every C is exactly twice the C below it.
 int synth_step(int pitch) {
     int inc = synth_mhz(pitch % 12) * SYNTH_ONE / (SYNTH_RATE * 1000);
-    int oct = pitch / 12 - 5;
-    while (oct > 0) { inc = inc * 2; oct = oct - 1; }
-    while (oct < 0) { inc = inc / 2; oct = oct + 1; }
+    int oct = 0;
+    for (oct = pitch / 12 - 5; oct > 0; oct -= 1) { inc *= 2; }
+    while (oct < 0) { inc /= 2; oct += 1; }
     return inc;
 }
 
@@ -70,10 +72,9 @@ int synth_at(int s, int k) {
 int synth_length(int s) {
     int end = 0;
     int i = 0;
-    while (i < s.nh_count) {
+    for (i = 0; i < s.nh_count; i += 1) {
         int r = noter_note(s, i);
         if (r.nn_start + r.nn_length > end) { end = r.nn_start + r.nn_length; }
-        i = i + 1;
     }
     return synth_at(s, end);
 }
@@ -81,12 +82,47 @@ int synth_length(int s) {
 // Renders samples [from, from + n) of the song into `out`, one byte each.
 // `mix` is scratch space for n int64 sums, owned by the caller so a player
 // rendering block after block allocates it once.
+// A well-mixed 64-bit hash of x, splitmix64's finisher. Consecutive inputs
+// give unrelated outputs, which is what noise needs. Simpler hashes of a
+// counter come out nearly periodic, and that is heard as a tone. c0's >> keeps
+// the sign, so each shift is masked to make it a logical one, and the
+// constants are written as the signed numbers with the same 64 bits.
+int synth_mix(int x) {
+    int z = x * (0 - 7046029254386353131);
+    z = (z ^ ((z >> 30) & 17179869183)) * (0 - 4658895280553007687);
+    z = (z ^ ((z >> 27) & 137438953471)) * (0 - 7723592293110705685);
+    return z ^ ((z >> 31) & 8589934591);
+}
+
+// One sample of instrument `inst` at `amp`, `k` samples into a note `len`
+// samples long whose phase is now `phase` of SYNTH_ONE. The drum ignores the
+// phase. Its noise changes value every `hold` samples, longer for a lower
+// pitch, so pitch still says how deep it sounds, and it fades out over the
+// note.
+int synth_wave(int inst, int phase, int k, int len, int pitch, int amp) {
+    int x = phase >> 16;   // 0 to 65535 across one cycle
+    if (inst == 1) {
+        int d = 2 * x - 65536;
+        if (d < 0) { d = 0 - d; }
+        return amp * (65536 - 2 * d) / 65536;
+    }
+    if (inst == 2) { return amp * (2 * x - 65536) / 65536; }
+    if (inst == 3) {
+        int hold = 1 + (127 - pitch) / 16;
+        int v = amp;
+        if (((synth_mix(k / hold + pitch * 7919) >> 40) & 1) == 1) { v = 0 - amp; }
+        return v * (len - k) / len;
+    }
+    if (phase >= SYNTH_ONE / 2) { return 0 - amp; }
+    return amp;
+}
+
 void synth_render(int s, int from, int n, int out, int mix) {
     int i = 0;
-    while (i < n) { store64(mix + i * 8, 0); i = i + 1; }
+    for (i = 0; i < n; i += 1) { store64(mix + i * 8, 0); }
     int to = from + n;
     int k = 0;
-    while (k < s.nh_count) {
+    for (k = 0; k < s.nh_count; k += 1) {
         int r = noter_note(s, k);
         int a = synth_at(s, r.nn_start);
         if (a >= to) { break; }   // sorted by start, so nothing later sounds here
@@ -98,28 +134,37 @@ void synth_render(int s, int from, int n, int out, int mix) {
             if (t < from) { t = from; }
             int stop = b;
             if (stop > to) { stop = to; }
+            // The phase is carried from sample to sample, which gives the
+            // same value as working it out from t each time without a
+            // division per sample. Only its start needs one.
+            int phase = (t - a) * inc % SYNTH_ONE;
+            int inst = r.nn_instrument;
             while (t < stop) {
                 int v = amp;
-                if ((t - a) * inc % SYNTH_ONE >= SYNTH_ONE / 2) { v = 0 - amp; }
+                if (inst == 0) {
+                    if (phase >= SYNTH_ONE / 2) { v = 0 - amp; }
+                } else {
+                    v = synth_wave(inst, phase, t - a, b - a, r.nn_pitch, amp);
+                }
                 // The ramps, in and out, so the edges do not click.
                 if (t - a < SYNTH_RAMP) { v = v * (t - a) / SYNTH_RAMP; }
                 if (b - t < SYNTH_RAMP) { v = v * (b - t) / SYNTH_RAMP; }
                 int p = mix + (t - from) * 8;
                 store64(p, load64(p) + v);
-                t = t + 1;
+                phase += inc;
+                if (phase >= SYNTH_ONE) { phase -= SYNTH_ONE; }
+                t += 1;
             }
         }
-        k = k + 1;
     }
     i = 0;
-    while (i < n) {
+    for (i = 0; i < n; i += 1) {
         int v = load64(mix + i * 8) + 128;
         // Only a song with more than eight notes at once can get here; lira
         // does not let one be made, but a file from elsewhere could.
         if (v < 0) { v = 0; }
         if (v > 255) { v = 255; }
         store8(out + i, v);
-        i = i + 1;
     }
     return;
 }
@@ -131,7 +176,7 @@ void synth_render(int s, int from, int n, int out, int mix) {
 int synth_play(int s, int block) {
     int out = alloc(block);
     int mix = alloc(block * 8);
-    if (out == 0 || mix == 0) { return 0; }
+    if (out == 0 || !mix) { return 0; }
     int len = synth_length(s);
     int at = 0;
     while (at < len) {
@@ -142,9 +187,9 @@ int synth_play(int s, int block) {
         while (sent < n) {
             int got = sound(out + sent, n - sent);
             if (got < 0) { dealloc(out); dealloc(mix); return 0; }
-            sent = sent + got;
+            sent += got;
         }
-        at = at + n;
+        at += n;
     }
     dealloc(out);
     dealloc(mix);

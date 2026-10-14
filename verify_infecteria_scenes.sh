@@ -105,7 +105,7 @@ word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
 word("make infecteria.seed"); typ(["ret"]); time.sleep(0.6)
 word("write infecteria.seed 1"); typ(["ret"]); time.sleep(0.6)
-word("spawn3 infecteria.elf"); typ(["ret"]); time.sleep(3.0)
+word("start infecteria.elf"); typ(["ret"]); time.sleep(3.0)
 typ(["alt-tab"]); time.sleep(1.0)
 
 c = counts()

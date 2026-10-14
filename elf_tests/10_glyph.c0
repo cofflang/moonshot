@@ -24,7 +24,7 @@
 // so a failure says which of the three broke.
 int main() {
     int buf = alloc(64);
-    if (buf == 0) { return 101; }
+    if (!buf) { return 101; }
 
     int d = glyph('M', 0);
     if (d != 8 * 65536 + 8) { return 102; }
@@ -40,13 +40,12 @@ int main() {
     if (glyph('M', buf) != d) { return 104; }
     int lit = 0;
     int i = 0;
-    while (i < rows) {
+    for (i = 0; i < rows; i += 1) {
         int b = load8(buf + i);
         while (b > 0) {
             lit = lit + b % 2;
-            b = b / 2;
+            b /= 2;
         }
-        i = i + 1;
     }
     if (lit != 18) { return 200 + lit; }
 
@@ -56,9 +55,8 @@ int main() {
     // fail here.
     if (glyph(' ', buf) != d) { return 105; }
     i = 0;
-    while (i < rows) {
+    for (i = 0; i < rows; i += 1) {
         if (load8(buf + i) != 0) { return 106; }
-        i = i + 1;
     }
 
     // '/' rises to the right, so row r has exactly one pixel, at column
@@ -69,18 +67,17 @@ int main() {
     if (glyph('/', buf) != d) { return 107; }
     int sum = 0;
     i = 0;
-    while (i < 4) {
+    for (i = 0; i < 4; i += 1) {
         int b = load8(buf + i);
         int col = 0;
         while (col < cols) {
             // bit 7 is the leftmost pixel, so column `col` is bit 7 - col.
             int shifted = b;
             int k = 0;
-            while (k < 7 - col) { shifted = shifted / 2; k = k + 1; }
+            while (k < 7 - col) { shifted /= 2; k += 1; }
             if (shifted % 2 == 1) { sum = sum + col * (i + 1); }
-            col = col + 1;
+            col += 1;
         }
-        i = i + 1;
     }
     // rows 0..3 lit at columns 7,6,5,4 weighted by row+1, 7 + 12 + 15 + 16.
     if (sum != 50) { return 300 + sum; }

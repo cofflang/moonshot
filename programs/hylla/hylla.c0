@@ -1,0 +1,528 @@
+// hylla.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// hylla -- the file manager. It shows the files and folders of jakel as a
+// shelf of icons, and a click opens what it is clicked on. A folder is
+// entered, a program (.elf) is started, a page (.html) opens in utsikt, a
+// song (.not) in lira, a picture (.spr) in pensel and source or text (.c0,
+// .txt) in skrift, each in a window of its own. Nothing is renamed,
+// moved or deleted here, and there are no dialogs. Names are made in the
+// shell, and hylla is for finding things and opening them. Start it with
+// `start hylla.elf`, or `start hylla.elf test` to open a folder.
+//
+// Keys
+//   click        open whatever is under the pointer
+//   Backspace    up one folder
+//   r            read the folder and the background again
+//   Esc          quit
+//
+// The background is whatever hylla.bg in the root says, written there from
+// the shell. A colour, `write hylla.bg #203040`, or the name of a picture,
+// `write hylla.bg moon.spr`, drawn as tiles. Without the file it is a plain
+// dark blue.
+
+include "moon.c0";
+
+int MAX_ENTRIES = 128;
+int REC = 48;           // one listdir record
+int BAR_H = 16;         // the path along the top
+int STATUS_H = 16;      // the message along the bottom
+int CELL_W = 96;
+int CELL_H = 64;
+int ICON = 32;
+
+int COL_BG = 0x1c2838;
+int COL_BAR = 0x101820;
+int COL_TEXT = 0xe0e4e8;
+int COL_DIM = 0x8890a0;
+int COL_HOVER = 0x34465c;
+
+int fb;              // the frame, composited here and presented whole
+int fb_w;            // the window as of this frame
+int fb_h;
+int fb_max_w;
+int fb_max_h;
+int cell_w;          // the kernel font's cell
+int cell_h;
+int font;            // 128 glyphs, cell_h bytes each
+
+int path;            // the folder shown, from the root, "" for the root
+int entries;         // its listdir records
+int count;           // how many
+int message = 0;     // the status line, or 0
+int bg_colour = 0;
+int bg_img = 0;      // a .spr picture for the background, or 0
+int scroll = 0;      // the first row of icons shown
+
+// --- small strings ------------------------------------------------------------
+
+int len(int s) {
+    int n = 0;
+    while (s[n] != 0) { n += 1; }
+    return n;
+}
+
+// A new string, a and b joined, with sep between when both are there.
+int join(int a, int sep, int b) {
+    int la = len(a);
+    int ls = len(sep);
+    int lb = len(b);
+    int s = alloc(la + ls + lb + 1);
+    if (!s) { return 0; }
+    int i = 0;
+    for (i = 0; i < la; i += 1) { s[i] = a[i]; }
+    int o = la;
+    if (la > 0 && lb > 0) {
+        for (i = 0; i < ls; i += 1) { s[o] = sep[i]; o += 1; }
+    }
+    for (i = 0; i < lb; i += 1) { s[o] = b[i]; o += 1; }
+    s[o] = 0;
+    return s;
+}
+
+// 1 when s ends with the ending e.
+int ends(int s, int e) {
+    int ls = len(s);
+    int le = len(e);
+    if (le > ls) { return 0; }
+    int i = 0;
+    for (i = 0; i < le; i += 1) {
+        if (s[ls - le + i] != e[i]) { return 0; }
+    }
+    return 1;
+}
+
+// --- drawing ----------------------------------------------------------------
+
+void box(int x, int y, int w, int h, int color) {
+    int x0 = x;
+    int y0 = y;
+    int x1 = x + w;
+    int y1 = y + h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > fb_w) { x1 = fb_w; }
+    if (y1 > fb_h) { y1 = fb_h; }
+    int row = 0;
+    for (row = y0; row < y1; row += 1) {
+        int p = fb + (row * fb_w + x0) * 4;
+        int col = x0;
+        for (col = x0; col < x1; col += 1) {
+            store32(p, color & 0xFFFFFF);
+            p += 4;
+        }
+    }
+    return;
+}
+
+int font_init() {
+    int d = glyph('M', 0);
+    if (d <= 0) { return 0; }
+    cell_w = d >> 16;
+    cell_h = d & 65535;
+    font = alloc(128 * cell_h);
+    if (!font) { return 0; }
+    int c = 0;
+    for (c = 0; c < 128; c += 1) { glyph(c, font + c * cell_h); }
+    return 1;
+}
+
+// n characters of s at (x, y), clipped to the frame. Returns the x after them.
+int text(int x, int y, int s, int n, int color) {
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int ch = s[i];
+        if (ch > 0 && ch < 128) {
+            int r = 0;
+            for (r = 0; r < cell_h; r += 1) {
+                int bits = load8(font + ch * cell_h + r);
+                int yy = y + r;
+                int c = 0;
+                for (c = 0; c < cell_w && bits != 0; c += 1) {
+                    int xx = x + c;
+                    if (((bits >> (cell_w - 1 - c)) & 1) == 1 && xx >= 0 && xx < fb_w
+                        && yy >= 0 && yy < fb_h) {
+                        store32(fb + (yy * fb_w + xx) * 4, color & 0xFFFFFF);
+                    }
+                }
+            }
+        }
+        x += cell_w;
+    }
+    return x;
+}
+
+// --- the background -----------------------------------------------------------
+
+// Reads hylla.bg. "#rrggbb" is a colour, anything else the name of a .spr
+// picture, which is used when it loads.
+void read_background() {
+    bg_colour = COL_BG;
+    bg_img = 0;
+    int buf = alloc(64);
+    if (!buf) { return; }
+    int n = readfile("hylla.bg", buf, 63);
+    if (n <= 0) { return; }
+    while (n > 0 && (buf[n - 1] == 10 || buf[n - 1] == 13 || buf[n - 1] == ' ')) { n -= 1; }
+    buf[n] = 0;
+    if (buf[0] == '#' && n == 7) {
+        int v = 0;
+        int i = 1;
+        for (i = 1; i < 7; i += 1) {
+            int c = buf[i];
+            int d = 0 - 1;
+            if (c >= '0' && c <= '9') { d = c - '0'; }
+            if (c >= 'a' && c <= 'f') { d = c - 'a' + 10; }
+            if (c >= 'A' && c <= 'F') { d = c - 'A' + 10; }
+            if (d < 0) { return; }
+            v = v * 16 + d;
+        }
+        bg_colour = v;
+        return;
+    }
+    // A picture. pensel's .spr, three 8-byte words (width, height, frames)
+    // then the pixels of each frame, blue, green, red, unused.
+    int size = readfile(buf, 0, 0);
+    if (size < 28 || size > 4194304) { return; }
+    int img = alloc(size);
+    if (!img) { return; }
+    if (readfile(buf, img, size) != size) { return; }
+    int w = load64(img);
+    int h = load64(img + 8);
+    if (w <= 0 || h <= 0 || w > 2048 || h > 2048 || 24 + w * h * 4 > size) { return; }
+    bg_img = img;
+    return;
+}
+
+void draw_background() {
+    box(0, 0, fb_w, fb_h, bg_colour);
+    if (!bg_img) { return; }
+    int w = load64(bg_img);
+    int h = load64(bg_img + 8);
+    int y = 0;
+    for (y = 0; y < fb_h; y += 1) {
+        int sy = y % h;
+        int src = bg_img + 24 + sy * w * 4;
+        int dst = fb + y * fb_w * 4;
+        int x = 0;
+        for (x = 0; x < fb_w; x += 1) {
+            int px = load32(src + (x % w) * 4) & 0xFFFFFF;
+            // Colour 0 is transparent in a .spr, so the colour shows through.
+            if (px != 0) { store32(dst + x * 4, px); }
+        }
+    }
+    return;
+}
+
+// --- the folder ---------------------------------------------------------------
+
+void read_folder() {
+    count = listdir(path, entries, MAX_ENTRIES);
+    if (count < 0) {
+        count = 0;
+        message = "not a folder";
+    }
+    scroll = 0;
+    return;
+}
+
+// The number of icons in the grid, ".." first when there is a folder above.
+int slots() {
+    if (path[0] != 0) { return count + 1; }
+    return count;
+}
+
+// The record an icon stands for, or 0 for "..".
+int slot_record(int k) {
+    if (path[0] != 0) {
+        if (k == 0) { return 0; }
+        return entries + (k - 1) * REC;
+    }
+    return entries + k * REC;
+}
+
+int columns() {
+    int c = fb_w / CELL_W;
+    if (c < 1) { c = 1; }
+    return c;
+}
+
+// Kinds of icon.
+int K_UP = 0;
+int K_DIR = 1;
+int K_PROGRAM = 2;
+int K_PAGE = 3;
+int K_SONG = 4;
+int K_PICTURE = 5;
+int K_FILE = 6;
+int K_TEXT = 7;
+
+int kind_of(int rec) {
+    if (!rec) { return K_UP; }
+    if (load64(rec) == 2) { return K_DIR; }
+    int name = rec + 16;
+    if (ends(name, ".elf") == 1) { return K_PROGRAM; }
+    if (ends(name, ".html") == 1) { return K_PAGE; }
+    if (ends(name, ".not") == 1) { return K_SONG; }
+    if (ends(name, ".spr") == 1) { return K_PICTURE; }
+    if (ends(name, ".c0") == 1 || ends(name, ".txt") == 1) { return K_TEXT; }
+    return K_FILE;
+}
+
+// An icon, ICON pixels square, with its top-left at (x, y). Each kind is a
+// few rectangles, so it reads at a glance without any pictures to load.
+void icon(int x, int y, int kind) {
+    if (kind == K_UP || kind == K_DIR) {
+        int c = 0xd8a850;
+        if (kind == K_UP) { c = 0x9c8a68; }
+        box(x + 2, y + 6, 12, 4, c);
+        box(x + 2, y + 9, 28, 19, c);
+        box(x + 2, y + 12, 28, 1, 0x806020);
+        if (kind == K_UP) {
+            // An arrow pointing up on the folder.
+            box(x + 15, y + 14, 2, 10, COL_BAR);
+            box(x + 12, y + 17, 8, 2, COL_BAR);
+            box(x + 13, y + 16, 6, 1, COL_BAR);
+        }
+        return;
+    }
+    if (kind == K_PROGRAM) {
+        box(x + 3, y + 3, 26, 26, 0x40a060);
+        box(x + 5, y + 5, 22, 22, 0x2c7848);
+        // A play triangle.
+        int r = 0;
+        for (r = 0; r < 12; r += 1) {
+            int w = r;
+            if (r >= 6) { w = 11 - r; }
+            box(x + 12, y + 10 + r, w + 1, 1, 0xe8f0e8);
+        }
+        return;
+    }
+    // A sheet of paper with a folded corner, in the kind's colour.
+    int paper = 0xe8e8e4;
+    int mark = 0x808890;
+    if (kind == K_PAGE) { mark = 0x3070d0; }
+    if (kind == K_SONG) { mark = 0x9050c0; }
+    if (kind == K_PICTURE) { mark = 0xe08030; }
+    if (kind == K_TEXT) { mark = 0x30a8a0; }
+    box(x + 6, y + 2, 16, 28, paper);
+    box(x + 22, y + 8, 6, 22, paper);
+    box(x + 22, y + 2, 1, 6, 0xb0b0b0);
+    box(x + 22, y + 7, 6, 1, 0xb0b0b0);
+    if (kind == K_SONG) {
+        // A note.
+        box(x + 17, y + 10, 2, 12, mark);
+        box(x + 12, y + 19, 6, 4, mark);
+        box(x + 19, y + 10, 4, 2, mark);
+    } else if (kind == K_PICTURE) {
+        box(x + 9, y + 12, 7, 7, mark);
+        box(x + 16, y + 18, 8, 7, 0x40a0d0);
+    } else if (kind == K_TEXT) {
+        // Lines of code, indented the way code is.
+        box(x + 9, y + 9, 12, 2, mark);
+        box(x + 12, y + 13, 12, 2, mark);
+        box(x + 12, y + 17, 9, 2, mark);
+        box(x + 15, y + 21, 9, 2, mark);
+        box(x + 9, y + 25, 4, 2, mark);
+    } else {
+        int line = 0;
+        for (line = 0; line < 5; line += 1) {
+            box(x + 9, y + 9 + line * 4, 15, 2, mark);
+        }
+    }
+    return;
+}
+
+// --- the frame ----------------------------------------------------------------
+
+void render(int hover) {
+    draw_background();
+    // The path along the top.
+    box(0, 0, fb_w, BAR_H, COL_BAR);
+    int x = text(4, (BAR_H - cell_h) / 2, "/", 1, COL_DIM);
+    text(x, (BAR_H - cell_h) / 2, path, len(path), COL_TEXT);
+    // The shelf.
+    int cols = columns();
+    int n = slots();
+    int k = 0;
+    for (k = scroll * cols; k < n; k += 1) {
+        int row = k / cols - scroll;
+        int cx = (k % cols) * CELL_W;
+        int cy = BAR_H + 4 + row * CELL_H;
+        if (cy + CELL_H > fb_h - STATUS_H) { k = n; }
+        else {
+            if (k == hover) { box(cx + 2, cy, CELL_W - 4, CELL_H - 2, COL_HOVER); }
+            int rec = slot_record(k);
+            icon(cx + (CELL_W - ICON) / 2, cy + 4, kind_of(rec));
+            int name = "..";
+            if (rec != 0) { name = rec + 16; }
+            // As much of the name as fits under the icon.
+            int nl = len(name);
+            int fit = (CELL_W - 4) / cell_w;
+            if (nl > fit) { nl = fit; }
+            text(cx + (CELL_W - nl * cell_w) / 2, cy + 4 + ICON + 6, name, nl, COL_TEXT);
+        }
+    }
+    // The message along the bottom.
+    box(0, fb_h - STATUS_H, fb_w, STATUS_H, COL_BAR);
+    if (message != 0) {
+        text(4, fb_h - STATUS_H + (STATUS_H - cell_h) / 2, message, len(message), COL_DIM);
+    }
+    present(fb);
+    return;
+}
+
+// The icon under window point (mx, my), or -1.
+int icon_at(int mx, int my) {
+    if (my < BAR_H + 4 || my >= fb_h - STATUS_H) { return 0 - 1; }
+    int cols = columns();
+    int col = mx / CELL_W;
+    int row = (my - BAR_H - 4) / CELL_H + scroll;
+    if (col >= cols) { return 0 - 1; }
+    int k = row * cols + col;
+    if (k >= slots()) { return 0 - 1; }
+    return k;
+}
+
+// --- opening things ---------------------------------------------------------
+
+void go_up() {
+    int n = len(path);
+    if (!n) { return; }
+    while (n > 0 && path[n - 1] != '/') { n -= 1; }
+    if (n > 0) { n -= 1; }
+    int up = alloc(n + 1);
+    if (!up) { return; }
+    int i = 0;
+    for (i = 0; i < n; i += 1) { up[i] = path[i]; }
+    up[n] = 0;
+    path = up;
+    message = 0;
+    read_folder();
+    return;
+}
+
+// Starts `program` with the file `file` as its argument, or the file itself
+// when program is 0, and says so on the status line.
+void start(int program, int file) {
+    int line = file;
+    if (program != 0) { line = join(program, " ", file); }
+    if (spawn(line) >= 0) {
+        message = join("opened", " ", line);
+    } else {
+        message = join("could not open", " ", line);
+    }
+    return;
+}
+
+void open_slot(int k) {
+    int rec = slot_record(k);
+    int kind = kind_of(rec);
+    if (kind == K_UP) { go_up(); return; }
+    int full = join(path, "/", rec + 16);
+    if (kind == K_DIR) {
+        path = full;
+        message = 0;
+        read_folder();
+        return;
+    }
+    if (kind == K_PROGRAM) { start(0, full); return; }
+    if (kind == K_PAGE) { start("utsikt.elf", full); return; }
+    if (kind == K_SONG) { start("lira.elf", full); return; }
+    if (kind == K_PICTURE || kind == K_TEXT) {
+        int w = edit(full);
+        if (w >= 0) {
+            message = join("opened", " ", full);
+        } else if (w == 0 - 2 && kind == K_PICTURE) {
+            message = "pensel is already open, quit it first";
+        } else if (w == 0 - 2) {
+            message = "skrift is already open, quit it first";
+        } else if (w == 0 - 3) {
+            message = "no room for another window, close one first";
+        } else {
+            message = join("could not open", " ", full);
+        }
+        return;
+    }
+    message = join("nothing opens", " ", rec + 16);
+    return;
+}
+
+int main() {
+    int wi = win_info();
+    if (!wi) {
+        print("hylla: no window, run me with start hylla.elf\n");
+        return 2;
+    }
+    int wm = win_max();
+    fb_max_w = wm >> 16;
+    fb_max_h = wm & 65535;
+    fb = alloc(fb_max_w * fb_max_h * 4);
+    entries = alloc(MAX_ENTRIES * REC);
+    if (!fb || !entries) { return 3; }
+    if (font_init() == 0) { return 4; }
+    path = "";
+    if (argc() >= 2) { path = argv(1); }
+    read_background();
+    read_folder();
+
+    int dirty = 1;
+    int last_left = 0;
+    int hover = 0 - 1;
+    while (1) {
+        int w = win_info();
+        int ww = w >> 16;
+        int wh = w & 65535;
+        if (ww > fb_max_w) { ww = fb_max_w; }
+        if (wh > fb_max_h) { wh = fb_max_h; }
+        if (ww != fb_w || wh != fb_h) { fb_w = ww; fb_h = wh; dirty = 1; }
+
+        int m = mouse_poll();
+        int left = 0;
+        int now = 0 - 1;
+        if (m >= 0) {
+            left = m % 2;
+            now = icon_at((m / 8) / 1024, (m / 8) % 1024);
+        }
+        if (now != hover) { hover = now; dirty = 1; }
+        // Opened on the press edge, the frame the button goes down, so a held
+        // button opens once.
+        if (left == 1 && !last_left && now >= 0) {
+            open_slot(now);
+            hover = 0 - 1;
+            dirty = 1;
+        }
+        last_left = left;
+
+        int key = key_poll();
+        while (key >= 0) {
+            int make = key / 2;
+            if (key % 2 == 0) {
+                if (make == 1) { return 0; }                   // Esc
+                if (make == 14) { go_up(); dirty = 1; }        // Backspace
+                if (make == 19) {                              // r
+                    read_background();
+                    read_folder();
+                    dirty = 1;
+                }
+                if (make == 80) { scroll += 1; dirty = 1; }    // down
+                if (make == 72 && scroll > 0) { scroll -= 1; dirty = 1; }  // up
+            }
+            key = key_poll();
+        }
+
+        if (dirty == 1 && fb_w > 0 && fb_h > 0) {
+            render(hover);
+            dirty = 0;
+        } else {
+            sleep(1);
+        }
+    }
+    return 0;
+}

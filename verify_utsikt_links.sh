@@ -145,7 +145,7 @@ typ(["ret"]); time.sleep(1.2)
 
 # utsikt takes a tavla beside the shell. Focus it first, the way
 # verify_utsikt.sh does, so Backspace later reaches the browser.
-word("spawn3 utsikt.elf"); typ(["ret"]); time.sleep(4.5)
+word("start utsikt.elf"); typ(["ret"]); time.sleep(4.5)
 typ(["alt-tab"]); time.sleep(1.5)
 shot("ulink_first.ppm")
 

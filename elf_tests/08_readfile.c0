@@ -10,7 +10,7 @@ int main() {
     if (size <= 0) { return 220; }
 
     int buf = alloc(size + 1);
-    if (buf == 0) { return 221; }
+    if (!buf) { return 221; }
 
     int n = readfile("demo.c0", buf, size);
     if (n != size) { return 222; }

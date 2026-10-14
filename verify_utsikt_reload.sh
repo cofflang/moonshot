@@ -20,8 +20,11 @@
 #
 #   1. Live bytes are unchanged. The same document parsed again owns exactly
 #      as much as before, so any growth is something kept by mistake.
-#   2. The frontier moved by less than one document's worth over thirty
-#      reloads. With no reuse it would move by thirty.
+#   2. The frontier moved by no more than one document's worth over thirty
+#      reloads. With no reuse it would move by thirty. A document's worth is
+#      the gap between the frontier and the live bytes after the first
+#      reloads, which is the space the old document gave back. The live bytes
+#      themselves are no measure, since most of them are the frame buffer.
 #   3. lager refused no dealloc. It logs every pointer it will not take back,
 #      so a block utsikt freed twice, or a name it did not own, shows up here
 #      instead of as corruption somewhere else later.
@@ -91,7 +94,7 @@ def tasks():
 
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
-word("spawn3 utsikt.elf"); typ(["ret"]); time.sleep(4.5)
+word("start utsikt.elf"); typ(["ret"]); time.sleep(4.5)
 typ(["alt-tab"]); time.sleep(1.5)
 
 reloads(2)
@@ -130,9 +133,9 @@ if t1 != t2:
 if h2 != h1:
     print("FAIL: live heap changed across 30 reloads of the same page (%+d bytes)" % (h2 - h1))
     ok = False
-if top2 - top1 >= h1:
-    print("FAIL: the frontier moved %d bytes in 30 reloads, a document's worth or more"
-          % (top2 - top1))
+if top2 - top1 > top1 - h1:
+    print("FAIL: the frontier moved %d bytes in 30 reloads, more than a document's worth (%d)"
+          % (top2 - top1, top1 - h1))
     ok = False
 
 refused = re.findall(r"\[lager\] dealloc: not a live block.*", log)

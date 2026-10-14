@@ -387,9 +387,9 @@ check "jit print 77" '\[jit] 77'
 # a distinctive value still makes a failure easier to read.
 type_cmd "write runtest.c0 9947 + 53"
 sleep 3
-type_cmd "run runtest.c0"
+type_cmd "interpret runtest.c0"
 sleep 3
-check "run file 9947+53" '\[repl] 10000'
+check "interpret file 9947+53" '\[repl] 10000'
 
 # Run the seeded demo.c0 (created in jakel_init on first boot).
 # Uses distinctive values (777, 888, 999) to avoid false positives.
@@ -397,7 +397,7 @@ type_cmd "list"
 sleep 1
 type_cmd "echo --file demo.c0"
 sleep 2
-type_cmd "run demo.c0"
+type_cmd "interpret demo.c0"
 sleep 2
 check "demo.c0 print(777)" '\[repl] 777'
 # n=888 is not auto-printed, since repl_eval only prints the LAST statement

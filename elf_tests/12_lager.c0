@@ -13,19 +13,19 @@ int main() {
     int a = alloc(64);
     int b = alloc(64);
     store64(a, 99);
-    if (dealloc(a) == 0) { ok = ok + 1; }
+    if (dealloc(a) == 0) { ok += 1; }
     int c = alloc(32);
-    if (c == a) { ok = ok + 1; }
+    if (c == a) { ok += 1; }
 
     // 2. ...and comes back zeroed, though it held 99 a moment ago.
-    if (load64(c) == 0) { ok = ok + 1; }
+    if (load64(c) == 0) { ok += 1; }
 
     // 3. A second dealloc of the same block is refused, not obeyed.
-    if (dealloc(b) == 0) { ok = ok + 1; }
-    if (dealloc(b) == 0 - 1) { ok = ok + 1; }
+    if (dealloc(b) == 0) { ok += 1; }
+    if (dealloc(b) == 0 - 1) { ok += 1; }
 
     // 4. So is a pointer into the middle of a live block.
-    if (dealloc(c + 8) == 0 - 1) { ok = ok + 1; }
+    if (dealloc(c + 8) == 0 - 1) { ok += 1; }
 
     // 5. Freeing three neighbours in the order outer, outer, middle merges
     //    them into one block big enough for all three. The 8-byte guard keeps
@@ -37,16 +37,16 @@ int main() {
     dealloc(x);
     dealloc(z);
     dealloc(y);
-    if (alloc(144) == x) { ok = ok + 1; }
+    if (alloc(144) == x) { ok += 1; }
 
     // 6. A free block at the very end grows in place rather than being
     //    left behind as a hole.
     int m = alloc(16);
     dealloc(m);
-    if (alloc(4096) == m) { ok = ok + 1; }
+    if (alloc(4096) == m) { ok += 1; }
 
     // 7. dealloc(0) is a harmless no-op, like free(NULL).
-    if (dealloc(0) == 0) { ok = ok + 1; }
+    if (dealloc(0) == 0) { ok += 1; }
 
     // 8. What a document reload does, a thousand times over, 100KB each,
     //    about 100MB in total through an 8MB heap. Without reuse this runs
@@ -55,14 +55,14 @@ int main() {
     int all = 1;
     while (i < 1000) {
         int p = alloc(100000);
-        if (p == 0) { all = 0; }
+        if (!p) { all = 0; }
         else {
             store64(p, i);
             dealloc(p);
         }
-        i = i + 1;
+        i += 1;
     }
-    if (all == 1 && guard != 0) { ok = ok + 1; }
+    if (all == 1 && guard != 0) { ok += 1; }
 
     return ok;
 }

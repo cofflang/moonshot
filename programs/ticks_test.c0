@@ -18,7 +18,7 @@ int main() {
     int i = 0;
     t0 = ticks();
     i = 0;
-    while (i < 20000000) { i = i + 1; }
+    while (i < 20000000) { i += 1; }
     t1 = ticks();
     print("ticks test ok\n");
     if (t1 > t0) { return 1; }

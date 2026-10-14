@@ -18,11 +18,11 @@ int main() {
                             exit(42);
                         }
                     }
-                    j = j + 1;
+                    j += 1;
                 }
             }
         }
-        i = i + 1;
+        i += 1;
     }
     // Reaching here at all means the exit above did not take.
     return 99;

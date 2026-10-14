@@ -36,16 +36,12 @@ SMED=../c0-coff/smed
 SMED_SRC=../c0-coff/c0/smed.c0
 
 COFF_DIR=../c0-coff
-MANIFEST=$COFF_DIR/BOOTSTRAP.sha256
-# Moonshot's own record of the coff1 and smed it last verified. The
-# released coff commits no binaries and so records none in its manifest (a
-# manifest that changed whenever you built would fail on every fresh
-# clone); only the private dev tree, which commits both binaries, carries
-# their lines there. So the hashes the kernel build gates on are recorded
-# HERE, by this script, at the one moment they are known to be true, right
-# after the full audit passed. Same line format as the manifest, so one
-# lookup serves both. Gitignored -- it describes binaries on this machine,
-# not source.
+# Moonshot's own record of the coff1 and smed it last verified. coff
+# commits no binaries and so records none in its manifest (a manifest that
+# changed whenever you built would fail on every fresh clone). So the hashes
+# the kernel build gates on are recorded HERE, by this script, at the one
+# moment they are known to be true, right after the full audit passed.
+# Gitignored -- it describes binaries on this machine, not source.
 TOOL_RECORD=toolchain.sha256
 
 audit_or_die() {
@@ -121,12 +117,12 @@ if [ "$rebuilt" -eq 1 ]; then
   # re-derived here -- and re-derived by the full audit, not by a bare
   # sha256sum, so the new binaries are checked against source before they
   # are blessed rather than merely recorded.
-  # --write-manifest only where the manifest tracks binaries (the dev tree,
-  # recognisable by its coff1 line). There a rebuilt coff1 makes the
-  # committed line stale and the refresh is what keeps the audit green.
-  # A released coff's manifest is a fixed committed file; rewriting it
-  # would only dirty the clone.
-  if [ -f "$MANIFEST" ] && grep -qE '^[0-9a-f]{64}  coff1$' "$MANIFEST"; then
+  # --write-manifest only in coff's dev tree, the one that carries
+  # sync_release.sh. There the rebuild happened because a source moved, so
+  # the manifest's line for it is stale and the refresh is what keeps the
+  # audit green. A released coff's manifest is a fixed committed file, and
+  # rewriting it would only dirty the clone.
+  if [ -f "$COFF_DIR/sync_release.sh" ]; then
     echo "re-verifying the bootstrap chain and refreshing the manifest..."
     audit_or_die --write-manifest
   else
@@ -141,20 +137,15 @@ fi
 # point is that nothing but coff and smed themselves are required. Catches
 # a binary that was altered after it was verified.
 #
-# Where the expected hash comes from, in order, is the coff manifest's own
-# line for the binary (dev tree), else this script's record from the last
-# passing audit. A binary with neither -- typically one bootstrapped by
-# hand from a public clone, following coff's README -- is not "tampered",
-# it is unverified, so it gets the full audit now and is recorded on
-# success. A binary that HAS a record and does not match it is the case the
-# gate exists for, and that one fails closed with no automatic
+# The expected hash is this script's record from the last passing audit. A
+# binary without one -- typically one bootstrapped by hand from a public
+# clone, following coff's README -- is not "tampered", it is unverified,
+# so it gets the full audit now and is recorded on success. A binary that
+# HAS a record and does not match it is the case the gate exists for, and that one fails closed with no automatic
 # re-verification, since a human has to look.
 gate() { # name path
   local name="$1" path="$2" expected_src expected actual
-  if [ -f "$MANIFEST" ] && grep -qE "^[0-9a-f]{64}  $name\$" "$MANIFEST"; then
-    expected_src="c0-coff/BOOTSTRAP.sha256"
-    expected=$(grep -E "^[0-9a-f]{64}  $name\$" "$MANIFEST" | cut -c1-64)
-  elif [ -f "$TOOL_RECORD" ] && grep -qE "^[0-9a-f]{64}  $name\$" "$TOOL_RECORD"; then
+  if [ -f "$TOOL_RECORD" ] && grep -qE "^[0-9a-f]{64}  $name\$" "$TOOL_RECORD"; then
     expected_src="$TOOL_RECORD"
     expected=$(grep -E "^[0-9a-f]{64}  $name\$" "$TOOL_RECORD" | cut -c1-64)
   else
@@ -182,6 +173,17 @@ gate smed "$SMED"
 # build/ from source by the gated coff1 and smed, every time. kmain.c0's
 # `embed` lines name these files; nothing generated is committed, so the
 # kernel cannot carry a stale program.
+# MOONSHOT_DEBUG=1 builds a kernel with the shell's debug commands
+# (skalman_debug.c0). Every build writes the choice afresh, so a debug build
+# never leaks into the next ordinary one.
+mkdir -p build
+if [ "${MOONSHOT_DEBUG:-0}" = 1 ]; then
+  echo 'include "../skalman_debug.c0";' > build/debug.c0
+  echo "debug build, with the shell's debug commands"
+else
+  echo 'include "../skalman_nodebug.c0";' > build/debug.c0
+fi
+
 ./gen_programs.sh >/dev/null
 ./gen_elf_tests.sh >/dev/null
 

@@ -41,11 +41,10 @@ void raket_init() {
     raket_stage_base = kmalloc(KAKEL_MAX_WIN * 8);
     raket_pending_uid_base = kmalloc(KAKEL_MAX_WIN * 8);
     int i = 0;
-    while (i < KAKEL_MAX_WIN) {
+    for (i = 0; i < KAKEL_MAX_WIN; i += 1) {
         store64(raket_authed_base + i * 8, 0);
         store64(raket_stage_base + i * 8, RAKET_STAGE_USER);
         store64(raket_pending_uid_base + i * 8, 0 - 1);
-        i = i + 1;
     }
     return;
 }
@@ -87,7 +86,7 @@ void raket_reset_session(int f) {
 // the arrays (a stray keypress right at boot, before shell_init has run --
 // the same early-key race shell_enqueue already guards against).
 int raket_authed(int f) {
-    if (raket_authed_base == 0) { return 0; }
+    if (!raket_authed_base) { return 0; }
     return load64(raket_authed_base + f * 8);
 }
 
@@ -97,7 +96,7 @@ int raket_authed(int f) {
 // echo time; the real character still reaches shell_input/raket_login_line
 // unmasked via the ordinary input queue, only the ON-SCREEN glyph differs.
 int raket_should_mask(int f) {
-    if (raket_authed_base == 0) { return 0; }
+    if (!raket_authed_base) { return 0; }
     if (load64(raket_authed_base + f * 8) == 1) { return 0; }
     if (load64(raket_stage_base + f * 8) != RAKET_STAGE_PASS) { return 0; }
     return 1;
@@ -196,7 +195,7 @@ void raket_login_line(int f, int line) {
             sk_print("\nlogin correct.\n\ntype 'help' for commands.\n");
         }
         shell_prompt_win(f);
-        if (kakel_active == 0) { shell_prompt(); }
+        if (!kakel_active) { shell_prompt(); }
     } else {
         store64(raket_stage_base + f * 8, RAKET_STAGE_USER);
         store64(raket_pending_uid_base + f * 8, 0 - 1);

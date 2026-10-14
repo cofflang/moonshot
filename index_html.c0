@@ -175,3 +175,145 @@ simplification written down in the source rather than an accident.</p>
 </body>
 </html>";
 }
+
+// test/elements.html, the page verify_utsikt_elements.sh opens with
+// `start utsikt.elf test/elements.html`. Every element it checks has a
+// colour nothing else on the page uses, so the test finds each one on the
+// screen by colour. The script's string holds markup that must stay text.
+int utsikt_elements_html() {
+    return "<!DOCTYPE html>
+<html>
+<head>
+<meta charset=\"utf-8\">
+<title>Elements</title>
+<style>
+body { background: #ffffff; color: #000000; padding: 8px; }
+pre { color: #a01010; background: #ffffff; padding: 0px; }
+ol { color: #1040a0; }
+u { color: #108010; }
+s { color: #806000; }
+h4 { color: #a000a0; }
+.js { color: #ff0000; }
+.box { color: #0060c0; }
+</style>
+</head>
+<body>
+<pre>
+AB
+    CD</pre>
+<ol><li>one</li><li>two</li><li>three</li></ol>
+<p><u>under lined</u> and <s>struck out</s></p>
+<h4>Heading four</h4>
+<div class=box><script>var a = \"<h1 class=js>NOT HTML</h1></div>\"; if (a < b) { a = 1; }</script>inside the box</div>
+<p>after the script <mark>marked</mark></p>
+</body>
+</html>
+";
+}
+
+// test/script.html, the page verify_utsikt_script.sh opens. One script for
+// utsikt's test engine (engine_test.c0), one with no type and one typed
+// text/javascript, which nothing may run even though their text is a
+// command the test engine would obey, and a block whose onclick the test
+// clicks. Colours as in
+// test/elements.html, one per thing checked.
+int utsikt_script_html() {
+    return "<!DOCTYPE html>
+<html>
+<head>
+<title>Scripts</title>
+<style>
+body { background: #f8f4ec; color: #000000; padding: 8px; }
+.out { color: #c02060; }
+.keep { color: #20a020; }
+.btn { background: #2080c0; color: #fff0a0; padding: 6px; margin: 8px; }
+</style>
+</head>
+<body>
+<p class=out id=out>before</p>
+<script type=\"text/x-utsikt-test\">set out after the script</script>
+<script>set keep a script without a type ran</script>
+<script type=\"text/javascript\">set keep a javascript script ran</script>
+<p class=keep id=keep>untouched</p>
+<div class=btn id=btn onclick=\"set out clicked; set btn done\">click me</div>
+</body>
+</html>
+";
+}
+
+// test/glimt.html, the page verify_glimt.sh opens. Each script exercises one
+// part of glimt and writes what it computed into a paragraph of its own
+// colour, which the test reads off the screen.
+int utsikt_glimt_html() {
+    return "<!DOCTYPE html>
+<html>
+<head>
+<title>glimt</title>
+<style>
+body { background: #f8f4ec; color: #000000; padding: 8px; }
+.out { color: #c02060; }
+.red { color: #e04000; }
+.keep { color: #20a020; }
+.bad { color: #6020c0; }
+.btn { background: #2080c0; color: #fff0a0; padding: 6px; margin: 8px; }
+</style>
+</head>
+<body>
+<p class=out id=out>before</p>
+<p class=keep id=keep>before</p>
+<p class=bad id=bad>untouched</p>
+<div class=btn id=btn onclick=\"bump();\">click me</div>
+<script type=\"text/x-glimt\">
+int clicks = 0;
+int sum_to(int n) {
+    int s = 0;
+    for (int i = 1; i <= n; i += 1) { s += i; }
+    return s;
+}
+int fact(int n) {
+    if (n < 2) { return 1; }
+    return n * fact(n - 1);
+}
+int odds = 0;
+int k = 0;
+while (1) {
+    k += 1;
+    if (k > 9) { break; }
+    if (k % 2 == 0) { continue; }
+    odds += 1;
+}
+int total = sum_to(10);
+int line = concat(num(total), concat(\" \", num(fact(5))));
+line = concat(line, concat(\" \", num(7 / (total - 55))));
+line = concat(line, concat(\" \", num(0 - 42)));
+line = concat(line, concat(\" \", num(odds)));
+set_text(by_id(\"out\"), line);
+void bump() {
+    clicks += 1;
+    set_text(by_id(\"btn\"), concat(\"clicked \", num(clicks)));
+    set_class(by_id(\"out\"), \"red\");
+}
+</script>
+<script type=\"text/x-glimt\">
+log(\"glimt test: a loop that never ends\");
+while (1) { }
+</script>
+<script type=\"text/x-glimt\">
+int deep(int n) { return deep(n + 1) + 1; }
+deep(0);
+</script>
+<script type=\"text/x-glimt\">
+set_text(by_id(\"bad\"), \"compiled\" ;
+</script>
+<script type=\"text/x-glimt\">
+set_text(12345, \"x\");
+set_text(0 - 1, text(99));
+set_class(77, attr(5, \"id\"));
+if (eq(attr(by_id(\"keep\"), \"id\"), \"keep\") && len(\"abc\") == 3) {
+    set_text(by_id(\"keep\"), \"still runs\");
+}
+</script>
+</body>
+</html>
+";
+}

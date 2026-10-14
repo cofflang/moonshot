@@ -31,13 +31,11 @@ int JIT_NX = 0;
 // toggle the writable and NX bits together to enforce W^X.
 //   writable=1 → present + writable + NX    (compile, can write, cannot execute)
 //   writable=0 → present                    (execute, can execute, cannot write)
-// The page is never both writable and executable at the same time.
-// Does NOT flush the TLB (the architecture is correct even without a flush —
-// the CPU will #PF on a write to a non-writable page or #PF on fetch from a
-// non-executable page, but we never write during execution nor execute during
-// compilation).
+// The page is never both writable and executable at the same time. The TLB
+// is flushed afterwards (boot.s's flush_tlb), since a translation the CPU
+// cached before the change would otherwise go on granting the old rights.
 void jit_set_writable(int writable) {
-    if (jit_page == 0) { return; }
+    if (!jit_page) { return; }
     int pml4 = pml4_phys;
     // PML4[0] → PDPT
     int pdpt_entry = load64(pml4 + 0);
@@ -58,9 +56,9 @@ void jit_set_writable(int writable) {
     // works when the PTE is positive — if the NX bit (bit 63) is set, the
     // value is negative and c0's truncate-toward-zero division rounds the
     // wrong way. Clear the NX bit arithmetically before extracting phys.
-    if (JIT_NX == 0) { JIT_NX = 0x80000000; JIT_NX = JIT_NX * 0x100000000; }
+    if (JIT_NX == 0) { JIT_NX = 0x80000000; JIT_NX *= 0x100000000; }
     int clean_pte = pte_val;
-    if (clean_pte < 0) { clean_pte = clean_pte - JIT_NX; }
+    if (clean_pte < 0) { clean_pte -= JIT_NX; }
     int phys = (clean_pte / 4096) * 4096;
 
     if (writable == 1) {
@@ -70,6 +68,8 @@ void jit_set_writable(int writable) {
         // Execute mode is present (1), no W, no NX — executable.
         store64(pt + pt_idx * 8, phys + 1);
     }
+    int flush = flush_tlb;
+    flush();
     return;
 }
 
@@ -77,15 +77,15 @@ void jit_init() {
     jit_page = pmm_alloc_page();
     jit_pos = 0;
     jit_str_pos = 3072;  // string data starts at 3 KB into the page
-    if (jit_page == 0) {
+    if (!jit_page) {
         serial_print("[jit] could not allocate code page\n");
         return;
     }
     // Allocate loop/break tracking arrays (heap, small).
-    if (jit_loop_labels == 0) {
+    if (!jit_loop_labels) {
         jit_loop_labels = kmalloc(16 * 8);   // 16 loop depths
     }
-    if (jit_break_patches == 0) {
+    if (!jit_break_patches) {
         jit_break_patches = kmalloc(32 * 8); // 32 break placeholders
     }
     serial_print("[jit] code page at ");
@@ -139,7 +139,7 @@ int jit_byte(int v, int n) {
     if (n >= 4) { return 0; }
     int d = 1;
     int i = 0;
-    while (i < n) { d = d * 256; i = i + 1; }
+    for (i = 0; i < n; i += 1) { d *= 256; }
     return (v / d) - (v / (d * 256)) * 256;
 }
 
@@ -451,7 +451,7 @@ int jit_break_patches = 0; // alloc'd in jit_init, 32 slots × 8B (placeholder p
 int jit_break_count   = 0;
 
 int jit_compile_node(int nd, int pos) {
-    if (nd == 0) { return pos; }
+    if (!nd) { return pos; }
     int kind = nd.kind;
     int left;
     int right;
@@ -467,15 +467,14 @@ int jit_compile_node(int nd, int pos) {
         int str_len = nd.extra;
         int str_addr = jit_page + jit_str_pos;
         int si = 0;
-        while (si <= str_len) {
+        for (si = 0; si <= str_len; si += 1) {
             store8(str_addr + si, load8(str_ptr + si));
-            si = si + 1;
         }
-        jit_str_pos = jit_str_pos + str_len + 1;
+        jit_str_pos += str_len + 1;
         // Align to 8 bytes.
         while ((jit_str_pos % 8) != 0) {
             store8(jit_page + jit_str_pos, 0);
-            jit_str_pos = jit_str_pos + 1;
+            jit_str_pos += 1;
         }
         return jit_mov_rax_imm64(pos, str_addr);
     }
@@ -632,9 +631,8 @@ int jit_compile_node(int nd, int pos) {
             serial_print("[jit] unknown variable '");
             // Print the variable name character by character.
             int ci = 0;
-            while (ci < name_len) {
+            for (ci = 0; ci < name_len; ci += 1) {
                 serial_putc(load64(name_ptr + ci));
-                ci = ci + 1;
             }
             serial_print("'\n");
             return -1;
@@ -642,9 +640,8 @@ int jit_compile_node(int nd, int pos) {
         int val = load64(repl_var_values + idx * 8);
         serial_print("[jit] var ");
         int ci = 0;
-        while (ci < name_len) {
+        for (ci = 0; ci < name_len; ci += 1) {
             serial_putc(load64(name_ptr + ci));
-            ci = ci + 1;
         }
         serial_print(" = ");
         serial_print_int(val);
@@ -688,7 +685,7 @@ int jit_compile_node(int nd, int pos) {
             return -1;
         }
         store64(jit_loop_labels + jit_loop_depth * 8, pos);  // loop start
-        jit_loop_depth = jit_loop_depth + 1;
+        jit_loop_depth += 1;
         int saved_breaks = jit_break_count;
         int loop_start = pos;
         pos = jit_compile_node(cond, pos);
@@ -701,14 +698,13 @@ int jit_compile_node(int nd, int pos) {
         pos = jit_jmp_rel32(pos, loop_start);  // jmp back to cond
         jit_patch_je(je_slot, pos);             // je lands at end
         // Patch all break placeholders to current position.
-        int bi = saved_breaks;
-        while (bi < jit_break_count) {
+        int bi = 0;
+        for (bi = saved_breaks; bi < jit_break_count; bi += 1) {
             int bp = load64(jit_break_patches + bi * 8);
             jit_patch_jmp(bp, pos);
-            bi = bi + 1;
         }
         jit_break_count = saved_breaks;
-        jit_loop_depth = jit_loop_depth - 1;
+        jit_loop_depth -= 1;
         // Loop returns 0 (repl_eval semantics, where the initial result is 0).
         pos = jit_mov_eax_imm(pos, 0);
         return pos;
@@ -731,7 +727,7 @@ int jit_compile_node(int nd, int pos) {
         }
         int loop_start = pos;
         store64(jit_loop_labels + jit_loop_depth * 8, pos);  // for continue
-        jit_loop_depth = jit_loop_depth + 1;
+        jit_loop_depth += 1;
         int saved_breaks = jit_break_count;
         // Compile condition (or emit "true" = 1 if absent).
         if (cond != 0) {
@@ -752,14 +748,13 @@ int jit_compile_node(int nd, int pos) {
         pos = jit_jmp_rel32(pos, loop_start);
         jit_patch_je(je_slot, pos);
         // Patch break placeholders.
-        int bi = saved_breaks;
-        while (bi < jit_break_count) {
+        int bi = 0;
+        for (bi = saved_breaks; bi < jit_break_count; bi += 1) {
             int bp = load64(jit_break_patches + bi * 8);
             jit_patch_jmp(bp, pos);
-            bi = bi + 1;
         }
         jit_break_count = saved_breaks;
-        jit_loop_depth = jit_loop_depth - 1;
+        jit_loop_depth -= 1;
         pos = jit_mov_eax_imm(pos, 0);
         return pos;
     }
@@ -793,7 +788,7 @@ int jit_compile_node(int nd, int pos) {
         // store8(addr, val)
         if (repl_word_is(fname, flen, "store8") == 1) {
             int val_arg = arg.next;
-            if (val_arg == 0) { return -1; }
+            if (!val_arg) { return -1; }
             pos = jit_compile_node(val_arg, pos);   // value in rax
             if (pos < 0) { return -1; }
             pos = jit_push_rax(pos);
@@ -807,7 +802,7 @@ int jit_compile_node(int nd, int pos) {
         // store64(addr, val)
         if (repl_word_is(fname, flen, "store64") == 1) {
             int val_arg = arg.next;
-            if (val_arg == 0) { return -1; }
+            if (!val_arg) { return -1; }
             pos = jit_compile_node(val_arg, pos);   // value in rax
             if (pos < 0) { return -1; }
             pos = jit_push_rax(pos);
@@ -841,7 +836,7 @@ int jit_compile_node(int nd, int pos) {
             return pos;
         }
         store64(jit_break_patches + jit_break_count * 8, pos);
-        jit_break_count = jit_break_count + 1;
+        jit_break_count += 1;
         pos = jit_jmp_placeholder(pos);
         return pos;
     }
@@ -876,7 +871,7 @@ int jit_exec() {
 // Compile the REPL AST rooted at `nd` into machine code and execute it.
 // Returns the result (from RAX), or prints an error if compilation fails.
 int jit_compile_and_run(int nd) {
-    if (jit_page == 0) {
+    if (!jit_page) {
         serial_print("[jit] not initialized\n");
         return 0;
     }

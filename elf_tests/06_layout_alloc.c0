@@ -6,7 +6,7 @@ layout Point { int x; int y; }
 int main() {
     int a = alloc(sizeof(Point));
     int b = alloc(sizeof(Point));
-    if (a == 0 || b == 0) { return 203; }
+    if (a == 0 || !b) { return 203; }
     if (a == b) { return 204; }
     a.x = 3; a.y = 5;
     b.x = 7; b.y = 11;

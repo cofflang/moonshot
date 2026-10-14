@@ -1,0 +1,111 @@
+// skalman_debug.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// The shell's debug commands. They test the kernel rather than do anything
+// for a person, and run3 even costs the shell its window, so only a debug
+// build has them. `MOONSHOT_DEBUG=1 ./build.sh` makes build/debug.c0 include
+// this file, an ordinary build includes skalman_nodebug.c0 instead, and then
+// none of this code is in the kernel at all.
+
+void sk_debug_cmds() {
+    sk_cmd("chars", "", "print every printable ascii glyph, to check the font", 1);
+    sk_cmd("mouse", "", "print the pointer position, buttons and packet count", 1);
+    sk_cmd("run3", "[program]", "run a program (or a built-in test) in this shell's own task, the shell does not come back", 1);
+    return;
+}
+
+// Runs `cmd` when it is a debug command and returns 1, otherwise returns 0
+// and the shell carries on looking.
+int sk_debug_run(int f, int cmd) {
+    // chars — print a grid of all 95 printable ASCII glyphs (32-126) so the
+    // user can visually verify every font glyph in one screenful. Six rows of
+    // 16 characters each (the last row has only 15).
+    if (str_eq(cmd, "chars") == 1) {
+        sk_print("chars: printable ascii 32-126\n\n");
+        int ch = 32;
+        while (ch <= 126) {
+            sk_putc(ch);
+            ch += 1;
+            // 16 columns — newline at the end of each row.
+            if ((ch - 32) % 16 == 0) {
+                sk_print("\n");
+            }
+        }
+        if ((ch - 32) % 16 != 0) {
+            sk_print("\n");
+        }
+        return 1;
+    }
+    // run3 — run the built-in ring-3 test binary in the current task.
+    // Drops the shell to ring 3; when the binary exits (sys_exit), this task
+    // is marked EXITED and the shell is lost. start is the everyday way.
+    if (str_eq(cmd, "run3") == 1) {
+        sk_print("running ring-3 test in current task...\n");
+        run_ring3_test();
+        return 1;
+    }
+    // run3 (file) -- load a real ELF64 executable from jakel and run it in
+    // ring 3 in this task, through elf_load (syscall.c0) instead of the
+    // built-in flat-binary test. The shell is lost the same way.
+    int r3fr = str_starts(cmd, "run3 ");
+    if (r3fr >= 0) {
+        int name = cmd + r3fr;
+        if (load8(name) == 0) {
+            sk_print("run3: usage: run3 (filename)\n");
+            return 1;
+        }
+        int cwd = 0;
+        if (kakel_active == 1) { cwd = load64(sk_cwd_base + f * 8); }
+        int fid = jakel_open(cwd, name);
+        if (fid < 0) {
+            sk_print("run3: file not found: "); sk_print(name); sk_print("\n");
+            return 1;
+        }
+        if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) {
+            sk_print("run3: not a file\n");
+            return 1;
+        }
+        int fsize = load64(jakel_size_base + fid * 8);
+        if (fsize == 0 || fsize > ELF_MAX_BYTES) {
+            sk_print("run3: file empty or too large (max ");
+            sk_print_int(ELF_MAX_BYTES);
+            sk_print(" bytes)\n");
+            return 1;
+        }
+        int buf = kmalloc(fsize);
+        jakel_read(fid, 0, buf, fsize);
+        sk_print("running ELF image in current task...\n");
+        run_elf_binary(buf, fsize, 0);
+        return 1;
+    }
+    // mouse -- klick's current pointer position, buttons and packet count.
+    // The packet count is the useful part, since it separates "the pointer has not
+    // moved" from "no IRQ12 is arriving at all", which look identical on
+    // screen.
+    if (str_eq(cmd, "mouse") == 1) {
+        if (klick_active != 1) {
+            sk_print("mouse: klick not active\n");
+            return 1;
+        }
+        sk_print("pointer ");
+        sk_print_int(klick_x);
+        sk_print(",");
+        sk_print_int(klick_y);
+        sk_print("  buttons L");
+        sk_print_int(klick_left);
+        sk_print(" M");
+        sk_print_int(klick_middle);
+        sk_print(" R");
+        sk_print_int(klick_right);
+        sk_print("  packets ");
+        sk_print_int(klick_packets);
+        sk_print("\n");
+        return 1;
+    }
+    return 0;
+}

@@ -79,11 +79,10 @@ void key_rings_init() {
     key_tail_base = kmalloc(MAX_TASKS * 8);
     key_count_base = kmalloc(MAX_TASKS * 8);
     int i = 0;
-    while (i < MAX_TASKS) {
+    for (i = 0; i < MAX_TASKS; i += 1) {
         store64(key_head_base + i * 8, 0);
         store64(key_tail_base + i * 8, 0);
         store64(key_count_base + i * 8, 0);
-        i = i + 1;
     }
     return;
 }
@@ -97,7 +96,7 @@ void key_task_push(int tid, int make_code, int is_break) {
     if (n >= KEY_RING_CAP) {
         // Once per boot, since a task that never reads its keys would flood serial
         // from the keyboard interrupt.
-        if (key_ring_full_said == 0) {
+        if (!key_ring_full_said) {
             serial_print("[keyboard] key ring of task ");
             serial_print_int(tid);
             serial_print(" full (");
@@ -109,7 +108,7 @@ void key_task_push(int tid, int make_code, int is_break) {
     }
     int tail = load64(key_tail_base + tid * 8);
     store64(key_rings + (tid * KEY_RING_CAP + tail) * 8, make_code * 2 + is_break);
-    tail = tail + 1;
+    tail += 1;
     if (tail >= KEY_RING_CAP) { tail = 0; }
     store64(key_tail_base + tid * 8, tail);
     store64(key_count_base + tid * 8, n + 1);
@@ -122,7 +121,7 @@ int key_task_poll(int tid) {
     if (n <= 0) { return 0 - 1; }
     int head = load64(key_head_base + tid * 8);
     int ev = load64(key_rings + (tid * KEY_RING_CAP + head) * 8);
-    head = head + 1;
+    head += 1;
     if (head >= KEY_RING_CAP) { head = 0; }
     store64(key_head_base + tid * 8, head);
     store64(key_count_base + tid * 8, n - 1);
@@ -164,10 +163,9 @@ void scancode_init() {
     SCANCODE_TABLE_ADDR = sctable_start;
     SCANCODE_SHIFT_TABLE_ADDR = sctable_start + 256;
     int i = 0;
-    while (i < 256) {
+    for (i = 0; i < 256; i += 1) {
         store8(SCANCODE_TABLE_ADDR + i, 0);
         store8(SCANCODE_SHIFT_TABLE_ADDR + i, 0);
-        i = i + 1;
     }
 
     scmap(0x02, '1', '!');
@@ -314,10 +312,10 @@ void keyboard_process(int scancode) {
     } else if (make_code == 0x1D) {
         ctrl_down = 1 - is_break;
     } else if (make_code == 0x3A) {
-        if (is_break == 0) {
+        if (!is_break) {
             caps_lock = 1 - caps_lock;
         }
-    } else if (is_break == 0) {
+    } else if (!is_break) {
         int base_ascii = load8(SCANCODE_TABLE_ADDR + make_code);
         int use_shift = shift_down;
         if (base_ascii >= 'a' && base_ascii <= 'z' && caps_lock == 1) {
@@ -443,7 +441,7 @@ void keyboard_process(int scancode) {
             }
         }
         // --- Ctrl chords in shell mode ---
-        if (ctrl_down == 1 && kakel_active == 1 && skrift_active == 0) {
+        if (ctrl_down == 1 && kakel_active == 1 && !skrift_active) {
             int sf = sk_console();
             if (ascii == 'a') {       // Ctrl+A — Home
                 shell_cursor_home(sf);
@@ -476,9 +474,8 @@ void keyboard_process(int scancode) {
                 if (sf_cp > 0) {
                     int line = load64(shell_line_base + sf * 8);
                     int si = 0;
-                    while (si < sf_len - sf_cp) {
+                    for (si = 0; si < sf_len - sf_cp; si += 1) {
                         store8(line + si, load8(line + sf_cp + si));
-                        si = si + 1;
                     }
                     store64(shell_len_base + sf * 8, sf_len - sf_cp);
                     store64(shell_cpos_base + sf * 8, 0);
@@ -502,7 +499,7 @@ void keyboard_process(int scancode) {
                 serial_print_int(kakel_get_col(kakel_focus));
             } else if (fb_available == 1) {
                 fb_putc(' ', FB_FG, FB_BG);
-                while ((fb_col - (fb_col / TAB_WIDTH) * TAB_WIDTH) != 0) {
+                while (fb_col % TAB_WIDTH != 0) {
                     fb_putc(' ', FB_FG, FB_BG);
                 }
                 serial_print("fb tab: row=");
@@ -512,7 +509,7 @@ void keyboard_process(int scancode) {
             } else {
                 vga_putc(' ', VGA_DEFAULT_ATTR);
                 vga_move_cursor();
-                while ((vga_col - (vga_col / TAB_WIDTH) * TAB_WIDTH) != 0) {
+                while (vga_col % TAB_WIDTH != 0) {
                     vga_putc(' ', VGA_DEFAULT_ATTR);
                     vga_move_cursor();
                 }

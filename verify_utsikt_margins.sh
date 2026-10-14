@@ -31,9 +31,8 @@
 #   added:       8 + 10     = 18
 #
 # Those two numbers are far enough apart that the check does not need to be
-# clever, and the measured value was 18 before the change and 10 after it,
-# so this test has been seen to produce both answers rather than only the
-# one it wants.
+# clever, and with margins added instead of collapsed it measures 18, so it
+# can produce both answers rather than only the one it wants.
 #
 # It deliberately measures a gap rather than the document's total height. A
 # height would also shrink, but by an amount that depends on every margin on
@@ -87,7 +86,7 @@ def word(s):
     typ([keymap.get(c, c) for c in s])
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
-word("spawn3 utsikt.elf"); typ(["ret"]); time.sleep(4.5)
+word("start utsikt.elf"); typ(["ret"]); time.sleep(4.5)
 send("screendump umarg_page.ppm", settle=1.0)
 sock.close()
 EOF2

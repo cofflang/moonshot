@@ -1,0 +1,37 @@
+// crash_test.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// Takes the CPU exception its argument names, so verify_crash.sh can check
+// that a faulting program ends alone and the system carries on. div divides
+// by zero, null reads address 0 (kernel memory, a protection fault), wild
+// reads an address nothing maps, and gp reads a non-canonical address, one
+// past the lower half.
+include "moon.c0";
+
+int str_same(int a, int b) {
+    int i = 0;
+    for (i = 0; load8(a + i) == load8(b + i); i += 1) {
+        if (load8(a + i) == 0) { return 1; }
+    }
+    return 0;
+}
+
+int main() {
+    if (argc() < 2) { return 1; }
+    int kind = argv(1);
+    print("crash test ");
+    print(kind);
+    print("\n");
+    int zero = argc() - 2;
+    if (str_same(kind, "div")) { return 7 / zero; }
+    if (str_same(kind, "null")) { return load64(zero); }
+    if (str_same(kind, "wild")) { return load64(0x7000000000 + zero); }
+    if (str_same(kind, "gp")) { return load64(0x800000000000 + zero); }
+    return 1;
+}

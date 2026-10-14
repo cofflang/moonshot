@@ -1,0 +1,65 @@
+// mouse_probe.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// The ring-3 end of the mouse tests. It paints its whole window dark and,
+// for as long as the left button is held inside the window, an orange
+// square centred on the pointer. verify_mouse.sh looks for the square at the
+// pointer, and for its absence while a press was only focusing the window.
+// verify_tavla.sh uses it as a program that paints every pixel it owns.
+// Esc quits.
+include "moon.c0";
+
+int BG = 0x101418;
+int MARK = 0xFF8C00;
+int SIZE = 12;
+
+int main() {
+    int wi = win_info();
+    if (!wi) { return 2; }
+    fill(0, 0, wi >> 16, wi & 65535, BG);
+    int shown = 0;
+    int sx = 0;
+    int sy = 0;
+    while (1) {
+        int key = key_poll();
+        while (key >= 0) {
+            if (key == 2) { return 0; }   // Esc pressed (make code 1)
+            key = key_poll();
+        }
+        int nw = win_info();
+        if (nw != wi) {
+            wi = nw;
+            fill(0, 0, wi >> 16, wi & 65535, BG);
+            shown = 0;
+        }
+        // mouse_poll is ((x * 1024 + y) * 8) + buttons, or -1 when the
+        // pointer is outside the window.
+        int m = mouse_poll();
+        int held = 0;
+        int x = 0;
+        int y = 0;
+        if (m >= 0) {
+            held = m % 2;
+            x = (m / 8) / 1024;
+            y = (m / 8) % 1024;
+        }
+        if (shown == 1 && (held == 0 || x != sx || y != sy)) {
+            fill(sx - SIZE / 2, sy - SIZE / 2, SIZE, SIZE, BG);
+            shown = 0;
+        }
+        if (held == 1 && shown == 0) {
+            sx = x;
+            sy = y;
+            fill(sx - SIZE / 2, sy - SIZE / 2, SIZE, SIZE, MARK);
+            shown = 1;
+        }
+        sleep(1);
+    }
+    return 0;
+}

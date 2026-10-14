@@ -9,9 +9,9 @@
 # License version 3 or (at your option) any later version, WITHOUT ANY
 # WARRANTY; see the LICENSE file for the full text.
 #
-# Infecteria's first test. The game had none at all until its sprites landed,
-# which meant the renderer could be rewritten with nothing but a screenshot
-# and an opinion to say whether it still worked.
+# Infecteria's rendering, checked against the screen, so the renderer can be
+# rewritten with more than a screenshot and an opinion to say whether it
+# still works.
 #
 # What it checks, and why each one is a thing that can actually break.
 #
@@ -86,13 +86,13 @@ def shot(name):
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
 # A fixed world. Infecteria builds its layout from infecteria.seed when the
-# file exists, so every run of this test plays the same world, and no
-# layout can make checks below fail
-# for reasons that have nothing to do with the game being broken.
+# file exists, so every run of this test plays the same world, and no layout
+# can make the checks below fail for reasons that have nothing to do with the
+# game being broken.
 word("make infecteria.seed"); typ(["ret"]); time.sleep(0.6)
 word("write infecteria.seed 1"); typ(["ret"]); time.sleep(0.6)
-word("spawn3 infecteria.elf"); typ(["ret"]); time.sleep(4.0)
-# spawn3 leaves focus on the shell, so the arrow keys would drive the shell.
+word("start infecteria.elf"); typ(["ret"]); time.sleep(4.0)
+# start leaves focus on the shell, so the arrow keys would drive the shell.
 typ(["alt-tab"]); time.sleep(1.5)
 # The game opens on its title scene; space starts the world.
 typ(["spc"]); time.sleep(1.5)

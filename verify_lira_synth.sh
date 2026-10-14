@@ -85,7 +85,7 @@ def word(s):
 
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.5)
-word("spawn3 test/et15.elf"); typ(["ret"])
+word("start test/et15.elf"); typ(["ret"])
 # One second of sound plus up to two halves of latency, then the exit.
 time.sleep(4.0)
 sock.close()

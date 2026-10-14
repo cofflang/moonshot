@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# verify_windowed_ring3.sh — prove that spawn3 creates a dedicated kakel window
+# verify_windowed_ring3.sh — prove that start creates a dedicated kakel window
 # for the ring-3 process and routes output there.
 #
 # Checks
-#   1. Serial log shows "[ring3] windowed spawn wid=N" (kakel_split called)
-#   2. "hello from ring 3" reaches serial (syscall output is correct)
-#   3. Two sequential spawn3 calls each get their own window
+#   1. Serial log shows "[elf] windowed spawn wid=N" (kakel_split called)
+#   2. "hello from elf" reaches serial (syscall output is correct)
+#   3. Two sequential start calls each get their own window
 #   4. No crash, no panic
 
 set -u
@@ -60,17 +60,12 @@ time.sleep(0.5)
 typ(["ret"])  # empty password
 time.sleep(1.0)
 
-# spawn3 — windowed ring-3 test (flat binary)
-typ(["s","p","a","w","n","3","ret"])
+# start test/hello.elf twice, each run should get its own window. Fixtures
+# live in /test, so this needs the path.
+hello = ["s","t","a","r","t","spc","t","e","s","t","slash","h","e","l","l","o","dot","e","l","f","ret"]
+typ(hello)
 time.sleep(1.5)
-
-# spawn3 again — second ring-3 process, should get its own window
-typ(["s","p","a","w","n","3","ret"])
-time.sleep(1.5)
-
-# spawn3 test/hello.elf — windowed ELF ring-3 test. Fixtures live in
-# /test now, so this needs the path.
-typ(["s","p","a","w","n","3","spc","t","e","s","t","slash","h","e","l","l","o","dot","e","l","f","ret"])
+typ(hello)
 time.sleep(1.5)
 
 sock.close()
@@ -80,34 +75,20 @@ sleep 2
 
 ok=1
 
-# Check 1, windowed spawn messages for flat binary
-ring3_win=$(grep -c '\[ring3\] windowed spawn wid=' serial.log || true)
-echo "ring3 windowed spawn messages: $ring3_win"
-if [ "$ring3_win" -lt 2 ]; then
-  echo "FAIL: expected at least 2 [ring3] windowed spawn messages, got $ring3_win"
-  ok=0
-fi
-
-# Check 2, windowed spawn message for ELF
+# Check 1, one windowed spawn per start, in two different windows
 elf_win=$(grep -c '\[elf\] windowed spawn wid=' serial.log || true)
-echo "elf windowed spawn messages: $elf_win"
-if [ "$elf_win" -lt 1 ]; then
-  echo "FAIL: expected at least 1 [elf] windowed spawn message, got $elf_win"
+elf_wids=$(grep -oE '\[elf\] windowed spawn wid=[0-9]+' serial.log | sort -u | wc -l)
+echo "elf windowed spawn messages: $elf_win, distinct windows: $elf_wids"
+if [ "$elf_win" -lt 2 ] || [ "$elf_wids" -lt 2 ]; then
+  echo "FAIL: expected 2 [elf] windowed spawn messages in 2 windows"
   ok=0
 fi
 
-# Check 3, output reached serial
-ring3_hello=$(grep -c 'hello from ring 3' serial.log || true)
-echo "hello from ring 3 count: $ring3_hello"
-if [ "$ring3_hello" -lt 2 ]; then
-  echo "FAIL: expected at least 2 'hello from ring 3', got $ring3_hello"
-  ok=0
-fi
-
+# Check 2, output reached serial
 elf_hello=$(grep -c 'hello from elf' serial.log || true)
 echo "hello from elf count: $elf_hello"
-if [ "$elf_hello" -lt 1 ]; then
-  echo "FAIL: expected at least 1 'hello from elf', got $elf_hello"
+if [ "$elf_hello" -lt 2 ]; then
+  echo "FAIL: expected at least 2 'hello from elf', got $elf_hello"
   ok=0
 fi
 
@@ -123,14 +104,13 @@ fi
 if [ "$ok" -eq 1 ]; then
   echo ""
   echo "PASS: windowed ring-3 spawn verified —"
-  echo "  flat binary: 2 spawn3 calls each got their own window id"
-  echo "  ELF binary: spawn3 test/hello.elf got its own window id"
+  echo "  start test/hello.elf twice, each run got its own window id"
   echo "  all output reached serial, no crashes"
   echo ""
   echo "--- windowed spawn messages ---"
-  grep -E '\[(ring3|elf)\] windowed spawn wid=' serial.log
+  grep -E '\[elf\] windowed spawn wid=' serial.log
   echo "--- ring-3 output ---"
-  grep -E 'hello from (ring 3|elf)' serial.log
+  grep -E 'hello from elf' serial.log
   exit 0
 else
   echo ""

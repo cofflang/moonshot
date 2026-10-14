@@ -22,7 +22,8 @@
 #
 # That single package ships qemu-system-x86_64 with the cocoa display
 # backend. No other dependencies are needed at runtime -- the ISO and
-# disk.img are self-contained.
+# disk.img are self-contained. Sound plays through CoreAudio into an
+# emulated Sound Blaster 16, which is what oljud drives.
 #
 # To build the ISO (done on Linux, checked into the repo or scp'd over)
 #   ./build.sh && ./run_graphical_mac.sh
@@ -43,4 +44,5 @@ echo "Starting Moonshot in a macOS-native QEMU window (display=cocoa)."
 echo "Close the window to stop -- no timeout, unlike run_qemu.sh."
 qemu-system-x86_64 -cdrom moonshot.iso \
   -display cocoa -m 128 \
-  -drive file=disk.img,format=raw,if=ide,index=0,media=disk
+  -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
+  -audiodev coreaudio,id=snd0 -device sb16,audiodev=snd0

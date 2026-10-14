@@ -34,7 +34,7 @@
 #      between frames -- a pen position not reset, a line height carried
 #      over, an alloc that grows on every render.
 #
-# The window is a tavla beside the shell tile, the way spawn3 leaves it.
+# The window is a tavla beside the shell tile, the way start leaves it.
 set -u
 cd "$(dirname "$0")"
 
@@ -86,8 +86,8 @@ def shot(name):
 
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
-word("spawn3 utsikt.elf"); typ(["ret"]); time.sleep(4.0)
-# spawn3 leaves focus on the shell, so the scroll keys would go there.
+word("start utsikt.elf"); typ(["ret"]); time.sleep(4.0)
+# start leaves focus on the shell, so the scroll keys would go there.
 # Focus FIRST and only then take the reference shot, since alt+tab retints both
 # windows' title strips, and check 5 compares whole frames.
 typ(["alt-tab"]); time.sleep(1.5)

@@ -8,17 +8,17 @@
 # moonshot is free software, distributed under the GNU General Public
 # License version 3 or (at your option) any later version, WITHOUT ANY
 # WARRANTY; see the LICENSE file for the full text.
-# Shell process-model lifecycle test. It drives skalman's `spawn` and `kill`
-# builtins via QEMU `sendkey` and proves BOTH reach chrone at runtime, using the
-# scheduler's own serial log as the witness.
+# Shell process-model lifecycle test. It drives skalman's `start` and `kill`
+# builtins via QEMU `sendkey` and proves both reach chrone at runtime, using
+# the shell's and the scheduler's own serial lines as the witness.
 #
-#   spawn -> a new task id (the first FREE slot, which is 3 after slot reuse
-#            recycles the boot exiter's slot) appears in [sched] output. The
-#            spawned id is detected dynamically from the serial log so this
-#            test stays valid regardless of future slot-numbering changes.
-#   kill N -> task N STOPS appearing, so after its last [sched] line, many more
-#            switches happen (to other tasks) with N never again -- proof `kill`
-#            marked it EXITED and sched_pick_next now skips it.
+#   start test/mouse.elf -> a new task, a program that runs until something
+#            stops it. Its id is read from the scheduler's serial line, so
+#            the test does not depend on slot numbering.
+#   tasks -> lists task N.
+#   kill N -> "killed task N", after which the reaper frees its stack and
+#            its address space ([sched] reaped task N, freed address space of
+#            task N), and a second start fits again.
 #
 # Same "inject a real key event, check the real output" approach as
 # test_keyboard.sh, one layer up (the whole process lifecycle).
@@ -44,14 +44,12 @@ qemu-system-x86_64 -cdrom moonshot.iso \
   -serial file:serial.log -display none -no-reboot -m 128 \
   -monitor unix:shell_test.sock,server,nowait &
 qemu_pid=$!
-cleanup() { kill "$qemu_pid" 2>/dev/null; wait "$qemu_pid" 2>/dev/null; }
+cleanup() { kill "$qemu_pid" 2>/dev/null; wait "$qemu_pid" 2>/dev/null; rm -f shell_test.sock; }
 trap cleanup EXIT
 
-# Reach the interrupt-enabled shell prompt, and let the boot-time exiter task
-# (task 3) run its 3 quanta and exit first, so the table state is settled.
 sleep 2
 
-python3 - <<'EOF'
+python3 - <<'EOF2'
 import socket, time, re
 
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -59,92 +57,51 @@ s.connect("shell_test.sock")
 time.sleep(0.2)
 s.recv(4096)  # discard QEMU monitor banner
 
-def typ(word_keys, gap=0.3):
-    for k in word_keys:
+def word(text, gap=0.08):
+    for c in text:
+        k = {" ": "spc", "\n": "ret", ".": "dot", "/": "slash"}.get(c, c)
         s.sendall(("sendkey %s\n" % k).encode())
         time.sleep(gap)
         s.recv(4096)
 
-# Log in as root (raket's boot-time login gate) before any shell command
-# can reach shell_run -- root has no password set at boot, so an empty
-# password line logs in. See raket.c0.
-typ(["r", "o", "o", "t", "ret"])
-time.sleep(0.5)
-typ(["ret"])
-time.sleep(1.0)
+word("root\n"); time.sleep(0.5)
+word("\n"); time.sleep(1.0)
 
-# "spawn" + Enter, then give the new task ~1.5s to actually get scheduled.
-typ(["s", "p", "a", "w", "n", "ret"])
-time.sleep(1.5)
-
-# Detect which task id was spawned by reading the serial log. Boot spawns
-# tasks 0-4 (workers + shell task), so the shell-initiated spawn is the 6th
-# "[sched] spawned task" entry. The last such line in the log is ours.
-with open("serial.log") as f:
-    content = f.read()
-spawns = re.findall(r"\[sched\] spawned task (\d+)", content)
-our_id = int(spawns[-1]) if len(spawns) >= 6 else 4  # fallback to 4
-
-# Write for bash verification to consume.
+word("start test/mouse.elf\n"); time.sleep(2.0)
+with open("serial.log", errors="replace") as f:
+    # The scheduler's own line, since a [sched] line written mid-way through
+    # the shell's mirrored output can cut the shell's "started task N".
+    m = re.findall(r"^\[sched\] spawned task (\d+) ", f.read(), re.M)
+tid = m[-1] if m else "0"
 with open("shell_spawn_id.txt", "w") as f:
-    f.write(str(our_id))
-
-# Kill the spawned task by its actual id.
-kill_keys = ["k", "i", "l", "l", "spc"] + list(str(our_id)) + ["ret"]
-typ(kill_keys)
+    f.write(tid)
+word("tasks\n"); time.sleep(1.0)
+word("kill %s\n" % tid); time.sleep(1.5)
+# The reaper only runs on a scheduler tick with another task to run, and
+# the shell waits for keys, so give it something to do.
+word("start test/mouse.elf\n"); time.sleep(2.0)
 s.close()
-EOF
+EOF2
 
-# Let the scheduler run well past the kill so there are plenty of post-kill
-# switches to confirm task 4 is gone for good.
-sleep 3
+sleep 1
 
 ok=1
-
-# Read the dynamically-detected spawned task id (written by the Python above).
-# Falls back to 4 if the file is not there (should not happen in normal runs).
-shell_id=$(cat shell_spawn_id.txt 2>/dev/null || echo 4)
-
-# spawn. The shell-initiated task must have appeared in the scheduler log.
-if ! grep -qE "^\[sched\] -> task ${shell_id} \(counter=[0-9]+\)$" serial.log; then
-  ok=0
-fi
-
-# reclaim/reuse. The boot exiter (task 3) is reaped BEFORE the shell spawn,
-# freeing its page. Because pmm's free list is LIFO and nothing else frees a
-# page in between, the shell's spawn must get that exact page back. With slot
-# reuse enabled, the shell's spawn lands in slot 3 (the just-freed slot) and
-# gets the same page address. The LAST "spawned task <shell_id>" line (tail -1)
-# is ours -- the first would be the boot-time spawn of that slot (if reused).
-reap3_stack=$(grep -oE "^\[sched\] reaped task 3 stack=[0-9]+$" serial.log | head -1 | grep -oE "[0-9]+$")
-spawn_shell_stack=$(grep -oE "^\[sched\] spawned task ${shell_id} stack=[0-9]+$" serial.log | tail -1 | grep -oE "[0-9]+$")
-if [ -z "$reap3_stack" ] || [ "$reap3_stack" != "$spawn_shell_stack" ]; then ok=0; fi
-
-# kill also feeds the reaper. After `kill N`, task N must itself be reaped.
-if ! grep -qE "^\[sched\] reaped task ${shell_id} stack=[0-9]+$" serial.log; then ok=0; fi
-
-# kill. After the spawned task's LAST scheduler appearance, there must be many
-# more switches (to other tasks) and none of them the spawned task -- proof
-# `kill` marked it EXITED and sched_pick_next now skips it.
-last_tS=$(grep -nE "^\[sched\] -> task ${shell_id} \(counter=[0-9]+\)$" serial.log | tail -1 | cut -d: -f1)
-after=0
-if [ -z "$last_tS" ]; then
-  ok=0
-else
-  after=$(grep -nE "^\[sched\] -> task [0-9]+ \(counter=[0-9]+\)$" serial.log \
-    | awk -F: -v L="$last_tS" '$1 > L' | wc -l)
-  [ "$after" -ge 10 ] || ok=0
-fi
+tid=$(cat shell_spawn_id.txt 2>/dev/null || echo none)
+grep -aqE "^\[sh\] task ${tid} (run|blk|cur) " serial.log || { echo "tasks did not list task $tid"; ok=0; }
+grep -aqE "^\[sh\] killed task ${tid}$" serial.log || { echo "no 'killed task $tid'"; ok=0; }
+kill_line=$(grep -anE "^\[sh\] killed task ${tid}$" serial.log | head -1 | cut -d: -f1)
+reaped=$(grep -anE "^\[sched\] reaped task ${tid} " serial.log | awk -F: -v L="${kill_line:-0}" '$1 > L' | head -1)
+freed=$(grep -anE "^\[sched\] freed address space of task ${tid}," serial.log | awk -F: -v L="${kill_line:-0}" '$1 > L' | head -1)
+[ -n "$reaped" ] || { echo "task $tid was not reaped after the kill"; ok=0; }
+[ -n "$freed" ] || { echo "task $tid's address space was not freed"; ok=0; }
+again=$(grep -anE "^\[sched\] spawned task [0-9]+ " serial.log | awk -F: -v L="${kill_line:-0}" '$1 > L' | head -1)
+[ -n "$again" ] || { echo "the second start failed"; ok=0; }
 
 if [ "$ok" -eq 1 ]; then
-  echo "PASS: shell spawn/kill/reap lifecycle proven -- task ${shell_id} ran, reused task 3's reaped page ($spawn_shell_stack), 'kill ${shell_id}' stopped it ($after later switches, never rescheduled), and it was reaped"
-  echo "--- task ${shell_id}'s life + reclaim ---"
-  grep -nE "^\[sched\] (spawned task ${shell_id}|reaped task [3${shell_id}]) " serial.log
-  grep -nE "^\[sched\] -> task ${shell_id} " serial.log | sed -n '1p;$p'
+  echo "PASS: start ran task $tid, tasks listed it, kill $tid stopped it, the reaper freed it, and a second start fit"
+  grep -aE "^\[sh\] killed task|^\[sched\] (spawned task|reaped task ${tid} |freed address space of task ${tid},)" serial.log | tail -n +6
   exit 0
-else
-  echo "FAIL: spawn/kill/reap lifecycle not proven (shell_id=${shell_id} last='${last_tS:-none}' after='${after:-0}' reap3='${reap3_stack:-none}' spawn='${spawn_shell_stack:-none}')"
-  echo "--- [sched] lines ---"
-  grep -E "^\[sched\]" serial.log | tail -30
-  exit 1
 fi
+echo "FAIL: start/kill/reap lifecycle not proven (task ${tid})"
+grep -aE "^\[sh\]|^\[sched\] (spawned|reaped|freed)" serial.log | tail -30
+exit 1

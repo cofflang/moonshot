@@ -122,19 +122,6 @@ void fb_probe(int mb_info) {
     return;
 }
 
-// 2^n via repeated multiplication -- c0 has no shift operator, so this is
-// how fb_rgb turns a channel's bit *position* into the multiplier that
-// packs it there. n is always small (a bit position within a 32bpp pixel,
-// so well under 32) -- no overflow concern.
-int pow2(int n) {
-    int r = 1;
-    int i = 0;
-    while (i < n) {
-        r = r * 2;
-        i = i + 1;
-    }
-    return r;
-}
 
 // Packs an 8-bit r/g/b triple into a pixel value using the REAL channel
 // bit positions fb_probe read back (not an assumed byte order) -- since
@@ -143,7 +130,7 @@ int pow2(int n) {
 // "addition instead of OR" idiom as every other flag-packing in this
 // codebase.
 int fb_rgb(int r, int g, int b) {
-    return r * pow2(fb_red_pos) + g * pow2(fb_green_pos) + b * pow2(fb_blue_pos);
+    return (r << fb_red_pos) + (g << fb_green_pos) + (b << fb_blue_pos);
 }
 
 // Identity-maps the framebuffer's real physical range into the SAME page
@@ -157,28 +144,24 @@ int fb_rgb(int r, int g, int b) {
 // an identity map (virt == phys) is the simplest correct choice for MMIO
 // that nothing else needs a different virtual address for. Deliberately
 // NOT marked cache-disabled (a real driver would want that for MMIO, to
-// avoid the CPU caching stale framebuffer reads/delaying writes) -- c0 has
-// no bitwise ops to build a richer entry flag cheaply, and QEMU's
+// avoid the CPU caching stale framebuffer reads/delaying writes) -- QEMU's
 // emulation does not make caching visibly wrong here; a documented
 // simplification, not an oversight, revisit if it ever causes real tearing.
 void fb_map() {
     int start = (fb_addr / 4096) * 4096;
     int end_addr = fb_addr + fb_pitch * fb_height;
     int end = ((end_addr + 4095) / 4096) * 4096;
-    int p = start;
-    while (p < end) {
+    int p = 0;
+    for (p = start; p < end; p += 4096) {
         map_page(pml4_phys, p, p);
-        p = p + 4096;
     }
     return;
 }
 
-// Writes one pixel -- store32_le already exists (built for IDT entries)
-// and is exactly the right shape for a 32bpp write, no new primitive
-// needed. No bounds check, since every caller in this file goes through
+// Writes one pixel, one store32. No bounds check, since every caller in this file goes through
 // fb_draw_char/fb_putc, which already clamp via cell wrapping/scrolling.
 void fb_put_pixel(int x, int y, int color) {
-    store32_le(fb_addr + y * fb_pitch + x * 4, color);
+    store32(fb_addr + y * fb_pitch + x * 4, color);
     return;
 }
 
@@ -187,25 +170,23 @@ void fb_put_pixel(int x, int y, int color) {
 // is under the mouse pointer so it can put it back when the pointer moves.
 // Same no-bounds-check contract as fb_put_pixel, since klick clamps first.
 int fb_get_pixel(int x, int y) {
-    return load8(fb_addr + y * fb_pitch + x * 4)
-        + load8(fb_addr + y * fb_pitch + x * 4 + 1) * 256
-        + load8(fb_addr + y * fb_pitch + x * 4 + 2) * 65536
-        + load8(fb_addr + y * fb_pitch + x * 4 + 3) * 16777216;
+    return load32(fb_addr + y * fb_pitch + x * 4);
 }
 
 // Fills the axis-aligned rectangle [x, x+w) x [y, y+h) with `color`. Unlike
 // fb_put_pixel this CLAMPS to the framebuffer bounds, so a caller can pass a
 // rect that runs off any edge (or covers the whole screen) without faulting
 // -- the point of having a real primitive rather than open-coding pixel
-// loops per feature. Row-by-row via fb_put_pixel; no load64/store64 block
-// write like fb_scroll's, since the panic/UI paths that use this are not
-// megabyte-scale and clarity wins here.
+// loops per feature. Each row is written two pixels per store64, with a
+// single pixel at either end when the row does not start or end on an
+// 8-byte boundary. kakel clears whole windows through this, so it is hot.
 void fb_fill_rect(int x, int y, int w, int h, int color) {
-    // Lift klick's pointer out of the way first, since it caches the pixels it
-    // covers, and painting over them without lifting either erases the
-    // pointer or leaves it restoring stale pixels later. No-op until klick
-    // is up, and re-entrant (see klick_lift's depth counter).
-    klick_lift();
+    // Lift klick's pointer out of the way first if the rectangle covers it,
+    // since it caches the pixels it covers, and painting over them without
+    // lifting either erases the pointer or leaves it restoring stale pixels
+    // later. No-op until klick is up, and re-entrant (see klick_lift's depth
+    // counter).
+    klick_lift_rect(x, y, w, h);
     int x0 = x;
     int y0 = y;
     int x1 = x + w;
@@ -214,14 +195,88 @@ void fb_fill_rect(int x, int y, int w, int h, int color) {
     if (y0 < 0) { y0 = 0; }
     if (x1 > fb_width) { x1 = fb_width; }
     if (y1 > fb_height) { y1 = fb_height; }
-    int yy = y0;
-    while (yy < y1) {
+    int pair = ((color & 4294967295) << 32) | (color & 4294967295);
+    int yy = 0;
+    for (yy = y0; yy < y1; yy += 1) {
         int xx = x0;
-        while (xx < x1) {
+        int row = fb_addr + yy * fb_pitch;
+        if (xx < x1 && (row + xx * 4) % 8 != 0) {
             fb_put_pixel(xx, yy, color);
-            xx = xx + 1;
+            xx += 1;
         }
-        yy = yy + 1;
+        int n = x1 - xx;
+        if (n > 0) {
+            int addr = row + xx * 4;
+            int end = addr + (n >> 1) * 8;
+            // Four pairs per pass while there are four left, since the loop's
+            // own counting costs about as much as the stores.
+            while (addr + 32 <= end) {
+                store64(addr, pair);
+                store64(addr + 8, pair);
+                store64(addr + 16, pair);
+                store64(addr + 24, pair);
+                addr += 32;
+            }
+            while (addr < end) {
+                store64(addr, pair);
+                addr += 8;
+            }
+            if (n % 2 != 0) { fb_put_pixel(x1 - 1, yy, color); }
+        }
+    }
+    klick_drop();
+    return;
+}
+
+// Copies a bw x bh block of pixels from buf onto the screen at (bx, by)
+// inside the rectangle that starts at (ox, oy) and is cw x ch, clipped to
+// it. SYS_BLIT passes the calling task's window as that rectangle. Pixels
+// are 4 bytes in framebuffer order, and colour 0 is transparent and skipped,
+// so sprites can have holes without alpha blending.
+//
+// One lift around the WHOLE blit, not per pixel, since klick's pointer
+// caches the pixels it covers, and a ring-3 program painting its window
+// would otherwise erase the pointer or leave it restoring stale pixels.
+//
+// Each row is clipped once, then read two pixels per load64. A pair that is
+// all transparent costs one test, and an opaque pair landing on an 8-byte
+// boundary is one store. A row's odd last pixel is read with a 32-bit load
+// so the read never runs past the end of the caller's buffer.
+void fb_blit(int buf, int bx, int by, int bw, int bh, int ox, int oy, int cw, int ch) {
+    int c0 = 0;
+    if (bx < 0) { c0 = 0 - bx; }
+    int c1 = bw;
+    if (bx + c1 > cw) { c1 = cw - bx; }
+    klick_lift_rect(ox + bx, oy + by, bw, bh);
+    int row = 0;
+    for (row = 0; row < bh; row += 1) {
+        int sy = by + row;
+        if (sy >= 0 && sy < ch && c1 > c0) {
+            int src = buf + (row * bw + c0) * 4;
+            int dst = fb_addr + (oy + sy) * fb_pitch + (ox + bx + c0) * 4;
+            int col = 0;
+            for (col = c0; col + 1 < c1; col += 2) {
+                int two = load64(src);
+                if (two != 0) {
+                    int left = two & 4294967295;
+                    int right = (two >> 32) & 4294967295;
+                    if (left != 0 && right != 0 && dst % 8 == 0) {
+                        store64(dst, two);
+                    } else {
+                        if (left != 0) { fb_put_pixel(ox + bx + col, oy + sy, left); }
+                        if (right != 0) { fb_put_pixel(ox + bx + col + 1, oy + sy, right); }
+                    }
+                }
+                src += 8;
+                dst += 8;
+            }
+            if (col < c1) {
+                int pixel = load32(src);
+                if (pixel != 0) {
+                    fb_put_pixel(ox + bx + col, oy + sy, pixel);
+                }
+            }
+        }
     }
     klick_drop();
     return;
@@ -479,64 +534,160 @@ int font_lo(int ch) {
     return 0;
 }
 
-// Draws one character's 8x8 glyph with its top-left pixel at (x, y).
-// Unpacks font_lo (rows 4-7) then font_hi (rows 0-3) one byte at a time
-// from the LOW end of each 32-bit half (`v - (v/256)*256` peels the
-// lowest byte then `v = v/256` shifts to the next one, matching
-// store16_le's own digit-extraction idiom elsewhere in this codebase --
-// safe here since both halves are always non-negative, see font_hi's
-// comment). `lo`'s lowest byte is row 7 (packing put row 4 in the highest
-// byte, row 7 in the lowest -- see font_hi), so peeling it 4 times in a
-// row visits 7,6,5,4 in that order; switching to `hi` (untouched, its own
-// lowest byte is row 3) continues the SAME peel-and-shift pattern for
-// 3,2,1,0 -- together an unbroken 7-down-to-0 sweep across both halves
-// with no separate offset/shift-count bookkeeping needed. Each row's bits
-// are unpacked the same way (lowest bit first = rightmost column, since a
-// row's bit 7 is the LEFTMOST pixel). Draws every cell, background
-// included (an opaque glyph, not a transparent one), so text always fully
-// overwrites whatever was there before -- needed for both scrolling and
-// simply typing over old content.
+// Draws one character's 8x8 glyph with its top-left pixel at (x, y),
+// background included (an opaque glyph, not a transparent one), so text
+// always fully overwrites whatever was there before -- needed for both
+// scrolling and simply typing over old content. font_hi holds rows 0-3 and
+// font_lo rows 4-7, each row a byte with bit 7 the LEFTMOST pixel and the
+// lowest row in the lowest byte (see font_hi).
+//
+// A row is written as four store64s of two pixels each, picking each pair
+// from the four combinations of two lit or unlit pixels. Text cells start
+// on multiples of 8 pixels, so the pairs are 8-byte aligned. A glyph drawn
+// anywhere else falls back to one pixel at a time.
+//
+// font_hi and font_lo are long chains of comparisons, so their answers for
+// every character are kept in font_tab, built the first time a glyph is
+// drawn, two words per character.
+int font_tab = 0;
+
 void fb_draw_char(int x, int y, int ch, int fg, int bg) {
     // Same reason as fb_fill_rect, lift klick's pointer before painting a
     // glyph over the region it is caching.
-    klick_lift();
-    int hi = font_hi(ch);
-    int v = font_lo(ch);
-    int row = 7;
-    while (row >= 0) {
-        if (row == 3) { v = hi; }
-        int rowbyte = v % 256;
-        v = v / 256;
-        int b = rowbyte;
-        int col = 7;
-        while (col >= 0) {
-            int bit = b % 2;
-            b = b / 2;
-            int color = bg;
-            if (bit == 1) { color = fg; }
-            fb_put_pixel(x + col, y + row, color);
-            col = col - 1;
+    klick_lift_rect(x, y, 8, 8);
+    if (!font_tab) {
+        font_tab = kmalloc(128 * 16);
+        int c = 0;
+        for (c = 0; c < 128 && font_tab != 0; c += 1) {
+            store64(font_tab + c * 16, font_hi(c));
+            store64(font_tab + c * 16 + 8, font_lo(c));
         }
-        row = row - 1;
+    }
+    int hi = 0;
+    int lo = 0;
+    if (ch >= 0 && ch < 128 && font_tab != 0) {
+        hi = load64(font_tab + ch * 16);
+        lo = load64(font_tab + ch * 16 + 8);
+    } else {
+        hi = font_hi(ch);
+        lo = font_lo(ch);
+    }
+    int f = fg & 4294967295;
+    int b = bg & 4294967295;
+    int addr = fb_addr + y * fb_pitch + x * 4;
+    int row = 0;
+    for (row = 0; row < 8; row += 1) {
+        int bits = 0;
+        if (row < 4) {
+            bits = (hi >> ((3 - row) * 8)) & 255;
+        } else {
+            bits = (lo >> ((7 - row) * 8)) & 255;
+        }
+        if (addr % 8 == 0) {
+            int k = 0;
+            for (k = 0; k < 4; k += 1) {
+                int two = (bits >> (6 - k * 2)) & 3;
+                int left = b;
+                int right = b;
+                if (two >= 2) { left = f; }
+                if (two % 2 == 1) { right = f; }
+                store64(addr + k * 8, left | (right << 32));
+            }
+        } else {
+            int col = 0;
+            for (col = 0; col < 8; col += 1) {
+                int color = bg;
+                if (((bits >> (7 - col)) & 1) == 1) { color = fg; }
+                fb_put_pixel(x + col, y + row, color);
+            }
+        }
+        addr += fb_pitch;
     }
     klick_drop();
     return;
 }
 
-// Fills the whole framebuffer with `bg` and resets the text cursor --
-// pixel-graphics equivalent of vga_clear. Row-by-row rather than one huge
-// loop so the "one row" shape matches fb_scroll's own row-copy loop below.
-void fb_clear(int bg) {
-    int y = 0;
-    int x = 0;
-    while (y < fb_height) {
-        x = 0;
-        while (x < fb_width) {
-            fb_put_pixel(x, y, bg);
-            x = x + 1;
+// Boot readback for fb_draw_char. Draws `ch` at (x, y) and counts the
+// pixels that disagree with the font, decoded here straight from font_hi
+// and font_lo rather than through font_tab, so a glyph drawn mirrored,
+// shifted or from the wrong row shows up as a nonzero count.
+int fb_glyph_mismatches(int x, int y, int ch) {
+    fb_draw_char(x, y, ch, FB_FG, FB_BG);
+    int bad = 0;
+    int row = 0;
+    for (row = 0; row < 8; row += 1) {
+        int bits = (font_lo(ch) >> ((7 - row) * 8)) & 255;
+        if (row < 4) { bits = (font_hi(ch) >> ((3 - row) * 8)) & 255; }
+        int col = 0;
+        for (col = 0; col < 8; col += 1) {
+            int want = FB_BG;
+            if (((bits >> (7 - col)) & 1) == 1) { want = FB_FG; }
+            if (fb_get_pixel(x + col, y + row) != want) { bad += 1; }
         }
-        y = y + 1;
     }
+    return bad;
+}
+
+// Boot readback for fb_blit. A 5x2 sprite with holes is blitted four times
+// into a 5x6 clip rectangle at (ox, oy). Once on an 8-byte boundary, once a
+// pixel off it, once cut by the left edge and once by the bottom edge, and
+// the right edge cuts the second. A 9x7 patch from one pixel left of the
+// rectangle is then compared pixel by pixel with the same blits worked out
+// one pixel at a time, so the column left of the clip, the three right of
+// it and the row below it must all still be background. Returns the number
+// of pixels that differ.
+int fb_blit_mismatches(int ox, int oy) {
+    int spr = kmalloc(5 * 2 * 4);
+    int want = kmalloc(9 * 7 * 8);
+    if (!spr || !want) { return 0 - 1; }
+    int i = 0;
+    for (i = 0; i < 10; i += 1) {
+        // Holes at 1, 5 and 8, the rest a different colour each.
+        int c = 0x102030 + i * 0x0B0907;
+        if (i == 1 || i == 5 || i == 8) { c = 0; }
+        store32(spr + i * 4, c);
+    }
+    fb_fill_rect(ox - 1, oy, 9, 7, FB_BG);
+    for (i = 0; i < 63; i += 1) { store64(want + i * 8, FB_BG); }
+    int blits = 0;
+    for (blits = 0; blits < 4; blits += 1) {
+        int bx = 0;
+        int by = 0;
+        if (blits == 1) { bx = 1; by = 2; }
+        if (blits == 2) { bx = 0 - 1; by = 4; }
+        if (blits == 3) { bx = 2; by = 5; }
+        fb_blit(spr, bx, by, 5, 2, ox, oy, 5, 6);
+        int r = 0;
+        for (r = 0; r < 2; r += 1) {
+            int c = 0;
+            for (c = 0; c < 5; c += 1) {
+                int px = load32(spr + (r * 5 + c) * 4);
+                int sx = bx + c;
+                int sy = by + r;
+                if (px != 0 && sx >= 0 && sx < 5 && sy >= 0 && sy < 6) {
+                    store64(want + (sy * 9 + sx + 1) * 8, px);
+                }
+            }
+        }
+    }
+    int bad = 0;
+    int y = 0;
+    for (y = 0; y < 7; y += 1) {
+        int x = 0;
+        for (x = 0; x < 9; x += 1) {
+            if (fb_get_pixel(ox - 1 + x, oy + y) != load64(want + (y * 9 + x) * 8)) { bad += 1; }
+        }
+    }
+    kfree(spr);
+    kfree(want);
+    return bad;
+}
+
+// Fills the whole framebuffer with `bg` and resets the text cursor --
+// pixel-graphics equivalent of vga_clear. A whole-screen fb_fill_rect, so it
+// gets the paired stores too.
+void fb_clear(int bg) {
+    fb_fill_rect(0, 0, fb_width, fb_height, bg);
     fb_row = 0;
     fb_col = 0;
     fb_cursor_row = -1;
@@ -554,10 +705,9 @@ void fb_draw_cursor(int row, int col, int color) {
     int x = col * FONT_W;
     int y = row * FONT_H + FONT_H - 2;
     int i = 0;
-    while (i < FONT_W) {
+    for (i = 0; i < FONT_W; i += 1) {
         fb_put_pixel(x + i, y, color);
         fb_put_pixel(x + i, y + 1, color);
-        i = i + 1;
     }
     return;
 }
@@ -574,22 +724,17 @@ void fb_scroll(int bg) {
     int x = 0;
     int src = 0;
     while (y < fb_height - FONT_H) {
-        x = 0;
-        while (x < fb_pitch) {
+        for (x = 0; x < fb_pitch; x += 8) {
             src = fb_addr + (y + FONT_H) * fb_pitch + x;
             store64(fb_addr + y * fb_pitch + x, load64(src));
-            x = x + 8;
         }
-        y = y + 1;
+        y += 1;
     }
-    y = fb_height - FONT_H;
-    while (y < fb_height) {
+    for (y = fb_height - FONT_H; y < fb_height; y += 1) {
         x = 0;
-        while (x < fb_width) {
+        for (x = 0; x < fb_width; x += 1) {
             fb_put_pixel(x, y, bg);
-            x = x + 1;
         }
-        y = y + 1;
     }
     return;
 }
@@ -608,19 +753,19 @@ void fb_putc(int ch, int fg, int bg) {
         fb_draw_cursor(fb_cursor_row, fb_cursor_col, bg);
     }
     if (ch == '\n') {
-        fb_row = fb_row + 1;
+        fb_row += 1;
         fb_col = 0;
     } else {
         fb_draw_char(fb_col * FONT_W, fb_row * FONT_H, ch, fg, bg);
-        fb_col = fb_col + 1;
+        fb_col += 1;
         if (fb_col * FONT_W >= fb_width) {
             fb_col = 0;
-            fb_row = fb_row + 1;
+            fb_row += 1;
         }
     }
     if (fb_row * FONT_H >= fb_height) {
         fb_scroll(bg);
-        fb_row = fb_row - 1;
+        fb_row -= 1;
     }
     fb_cursor_row = fb_row;
     fb_cursor_col = fb_col;
@@ -636,7 +781,7 @@ void fb_backspace(int fg, int bg) {
         if (fb_cursor_row >= 0) {
             fb_draw_cursor(fb_cursor_row, fb_cursor_col, bg);
         }
-        fb_col = fb_col - 1;
+        fb_col -= 1;
         fb_draw_char(fb_col * FONT_W, fb_row * FONT_H, ' ', fg, bg);
         fb_cursor_row = fb_row;
         fb_cursor_col = fb_col;
@@ -649,9 +794,8 @@ void fb_backspace(int fg, int bg) {
 // shape as serial_print/vga_print.
 void fb_print(int msg, int fg, int bg) {
     int i = 0;
-    while (load8(msg + i) != 0) {
+    for (i = 0; load8(msg + i) != 0; i += 1) {
         fb_putc(load8(msg + i), fg, bg);
-        i = i + 1;
     }
     return;
 }
@@ -665,17 +809,17 @@ void fb_print_int(int v, int fg, int bg) {
     int tmp = punkt_scratch;
     int neg = 0;
     int i = 31;
-    if (v == 0) { fb_putc('0', fg, bg); return; }
+    if (!v) { fb_putc('0', fg, bg); return; }
     if (v < 0) { neg = 1; v = 0 - v; }
     while (v > 0) {
-        i = i - 1;
+        i -= 1;
         store8(tmp + i, '0' + (v % 10));
-        v = v / 10;
+        v /= 10;
     }
-    if (neg == 1) { i = i - 1; store8(tmp + i, '-'); }
+    if (neg == 1) { i -= 1; store8(tmp + i, '-'); }
     while (i < 31) {
         fb_putc(load8(tmp + i), fg, bg);
-        i = i + 1;
+        i += 1;
     }
     return;
 }
@@ -686,20 +830,20 @@ void fb_print_hex(int v, int fg, int bg) {
     int tmp = punkt_scratch;
     int i = 31;
     int d = 0;
-    if (v == 0) { fb_putc('0', fg, bg); return; }
+    if (!v) { fb_putc('0', fg, bg); return; }
     while (v > 0) {
-        i = i - 1;
+        i -= 1;
         d = v % 16;
         if (d < 10) {
             store8(tmp + i, '0' + d);
         } else {
             store8(tmp + i, 'a' + d - 10);
         }
-        v = v / 16;
+        v /= 16;
     }
     while (i < 31) {
         fb_putc(load8(tmp + i), fg, bg);
-        i = i + 1;
+        i += 1;
     }
     return;
 }
@@ -710,9 +854,8 @@ void fb_test_scroll() {
     fb_putc('M', FB_FG, FB_BG);
     fb_putc('\n', FB_FG, FB_BG);
     int i = 0;
-    while (i < 94) {
+    for (i = 0; i < 94; i += 1) {
         fb_putc('\n', FB_FG, FB_BG);
-        i = i + 1;
     }
     int moved_count = 0;
     int cleared_count = 0;
@@ -720,16 +863,15 @@ void fb_test_scroll() {
     int px = 0;
     while (py < 8) {
         px = 0;
-        while (px < 8) {
+        for (px = 0; px < 8; px += 1) {
             if (load32(fb_addr + (0 + py) * fb_pitch + px * 4) == FB_FG) {
-                moved_count = moved_count + 1;
+                moved_count += 1;
             }
             if (load32(fb_addr + (8 + py) * fb_pitch + px * 4) == FB_FG) {
-                cleared_count = cleared_count + 1;
+                cleared_count += 1;
             }
-            px = px + 1;
         }
-        py = py + 1;
+        py += 1;
     }
     serial_print("fb scroll: moved_count=");
     serial_print_int(moved_count);

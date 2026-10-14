@@ -19,8 +19,7 @@
 // puts it) inside the 16MB identity map, so no paging changes were needed.
 // 80x25 characters, 2 bytes/cell ([char][attribute]). Attribute nibbles
 // low = foreground color, high = background color -- since they are disjoint
-// nibbles, `bg * 16 + fg` packs them with plain arithmetic (no bitwise
-// ops), same idiom as every other flag-packing in this codebase. CRT
+// nibbles, `bg * 16 + fg` packs them. CRT
 // controller ports 0x3D4 (index)/0x3D5 (data) move the blinking hardware
 // cursor to match.
 int VGA_BUFFER = 0xB8000;
@@ -60,11 +59,10 @@ void vga_clear(int attr) {
     int col = 0;
     while (row < VGA_HEIGHT) {
         col = 0;
-        while (col < VGA_WIDTH) {
+        for (col = 0; col < VGA_WIDTH; col += 1) {
             vga_write_cell(row, col, ' ', attr);
-            col = col + 1;
         }
-        row = row + 1;
+        row += 1;
     }
     vga_row = 0;
     vga_col = 0;
@@ -84,17 +82,15 @@ void vga_scroll(int attr) {
     int src = 0;
     while (row < VGA_HEIGHT - 1) {
         col = 0;
-        while (col < VGA_WIDTH * 2) {
+        for (col = 0; col < VGA_WIDTH * 2; col += 1) {
             src = VGA_BUFFER + (row + 1) * VGA_WIDTH * 2 + col;
             store8(VGA_BUFFER + row * VGA_WIDTH * 2 + col, load8(src));
-            col = col + 1;
         }
-        row = row + 1;
+        row += 1;
     }
     col = 0;
-    while (col < VGA_WIDTH) {
+    for (col = 0; col < VGA_WIDTH; col += 1) {
         vga_write_cell(VGA_HEIGHT - 1, col, ' ', attr);
-        col = col + 1;
     }
     return;
 }
@@ -105,14 +101,13 @@ void vga_scroll(int attr) {
 // just the text itself. Cursor location is a 16-bit value (linear offset =
 // row*80+col) written 8 bits at a time through the CRT controller's
 // index/data port pair. Index 0x0E selects the high byte register, 0x0F
-// the low byte -- same "no bitwise ops" split as store16_le elsewhere in
-// this codebase (v/256 for the high byte, v - (v/256)*256 for the low one).
+// the low byte, the same split as store16_le.
 void vga_move_cursor() {
     int pos = vga_row * VGA_WIDTH + vga_col;
     outb(VGA_CRT_INDEX, 0x0E);
-    outb(VGA_CRT_DATA, pos / 256);
+    outb(VGA_CRT_DATA, pos >> 8);
     outb(VGA_CRT_INDEX, 0x0F);
-    outb(VGA_CRT_DATA, pos % 256);
+    outb(VGA_CRT_DATA, pos & 255);
     return;
 }
 
@@ -124,14 +119,14 @@ void vga_move_cursor() {
 // vga_move_cursor's 4 outb calls are real port I/O, not free.
 void vga_putc(int ch, int attr) {
     if (ch == '\n') {
-        vga_row = vga_row + 1;
+        vga_row += 1;
         vga_col = 0;
     } else {
         vga_write_cell(vga_row, vga_col, ch, attr);
-        vga_col = vga_col + 1;
+        vga_col += 1;
         if (vga_col >= VGA_WIDTH) {
             vga_col = 0;
-            vga_row = vga_row + 1;
+            vga_row += 1;
         }
     }
     if (vga_row >= VGA_HEIGHT) {
@@ -147,9 +142,8 @@ void vga_putc(int ch, int attr) {
 // real hardware cursor once at the end.
 void vga_print(int msg, int attr) {
     int i = 0;
-    while (load8(msg + i) != 0) {
+    for (i = 0; load8(msg + i) != 0; i += 1) {
         vga_putc(load8(msg + i), attr);
-        i = i + 1;
     }
     vga_move_cursor();
     return;
@@ -164,7 +158,7 @@ void vga_print(int msg, int attr) {
 // step if multi-line editing is ever needed.
 void vga_backspace(int attr) {
     if (vga_col > 0) {
-        vga_col = vga_col - 1;
+        vga_col -= 1;
         vga_write_cell(vga_row, vga_col, ' ', attr);
     }
     return;

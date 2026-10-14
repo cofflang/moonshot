@@ -31,7 +31,7 @@ SMED=../c0-coff/smed
 [ -x "$SMED" ]  || { echo "smed not built at $SMED -- run build.sh first"; exit 1; }
 
 if [ -z "${GNISTA_DIR:-}" ]; then
-  if [ -f programs/gnista.c0 ]; then GNISTA_DIR=programs; else GNISTA_DIR=../gnista; fi
+  if [ -f programs/infecteria.c0 ]; then GNISTA_DIR=programs; else GNISTA_DIR=../gnista; fi
 fi
 if [ -z "${UTSIKT_DIR:-}" ]; then
   if [ -f programs/utsikt/utsikt.c0 ]; then UTSIKT_DIR=programs/utsikt; else UTSIKT_DIR=../utsikt; fi
@@ -59,9 +59,12 @@ prog programs alloc_test.c0 alloc_test
 # ticks_test, ticks() (SYS_TICKS) before and after a busy loop, exits 1 if
 # the second read is greater (the counter is live and monotonic in ring 3).
 prog programs ticks_test.c0 ticks_test
-# Gnista's engine demo, an entity pool, AABB collision with shallowest-axis
-# resolution, arrow keys, its sprite from hero.spr when one exists.
-prog "$GNISTA_DIR" gnista.c0 gnista
+# crash_test, takes the CPU exception its argument names, for verify_crash.
+prog programs crash_test.c0 crash_test
+# The mouse tests' program, a square at the pointer while the button is held.
+prog programs mouse_probe.c0 mouse_probe
+# A square wave at the pitch given as its argument, for the mixing test.
+prog programs tone.c0 tone
 # Infecteria, the scrolling game built on Gnista's engine layer.
 prog "$GNISTA_DIR" infecteria.c0 infecteria
 # The full-frame render cost probe, 30 whole frames through SYS_PRESENT,
@@ -72,7 +75,9 @@ prog "$GNISTA_DIR" fps_probe.c0 fps_probe
 prog "$UTSIKT_DIR" utsikt.c0 utsikt
 # lira, the piano roll, with noter songs, the synth, oljud.
 prog programs/lira lira.c0 lira
+# hylla, the file manager.
+prog programs/hylla hylla.c0 hylla
 
-for p in alloc_test ticks_test gnista infecteria fps_probe utsikt lira; do
+for p in alloc_test ticks_test crash_test mouse_probe tone infecteria fps_probe utsikt lira hylla; do
   printf '  build/%s.elf  %s bytes\n' "$p" "$(stat -c %s "$OUT/$p.elf")"
 done

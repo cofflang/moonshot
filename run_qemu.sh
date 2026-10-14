@@ -228,8 +228,17 @@ fi
 #   stats_bg = 1          -- the very last screen row (inside the status bar)
 #       shows the log window's distinct dark background, proving the strip was
 #       created and cleared
+#   glyph: aligned_bad = unaligned_bad = 0 -- every pixel of an asymmetric
+#       glyph matches the font, drawn on a cell boundary and a pixel off it
+#   blit: bad = 0 -- SYS_BLIT's drawing with holes, both alignments and
+#       clipping on three edges, pixel for pixel
+#   fill: bad = 0 -- SYS_FILL clipped to all four edges of a window, pixel
+#       for pixel
 kakel_ok=0
-if grep -qE "^kakel: win0_fg=18 corner_bg=1 stats_bg=1$" serial.log; then
+if grep -qE "^kakel: win0_fg=18 corner_bg=1 stats_bg=1$" serial.log \
+   && grep -qE "^glyph: aligned_bad=0 unaligned_bad=0$" serial.log \
+   && grep -qE "^blit: bad=0$" serial.log \
+   && grep -qE "^fill: bad=0$" serial.log; then
   kakel_ok=1
 fi
 
@@ -241,9 +250,13 @@ jakel_ok=0
 if grep -qE "^\[ata\] drive detected$" serial.log; then ata_ok=1; fi
 if grep -qE "^\[jakel\] (filesystem ready|loaded)" serial.log \
    && grep -qE "^\[jakel\] synced " serial.log \
-   && grep -qE "^\[jakel\] 2MB self-test: ok$" serial.log; then jakel_ok=1; fi
+   && grep -qE "^\[jakel\] 2MB self-test: ok$" serial.log \
+   && grep -qE "^\[jakel\] append self-test: ok$" serial.log; then jakel_ok=1; fi
 
+# serial_init (serial.c0) programs COM1 and proves it in loopback mode
+# before anything else is printed.
 if grep -q "Hello from Moonshot" serial.log \
+   && grep -qE "^serial: 16550 ready, loopback ok$" serial.log \
    && grep -qE "Lower memory \(KB\): [0-9]+" serial.log \
    && grep -qE "Upper memory \(KB\): [0-9]+" serial.log \
    && grep -q "^Memory map:" serial.log \

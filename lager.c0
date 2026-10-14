@@ -58,17 +58,23 @@ int LAGER_MAX_CAP = 16384;
 int task_lager_tab_base = 0;  // per task, a kmalloc'd LagerBlock array, or 0
 int task_lager_n_base = 0;    // per task, blocks in use
 int task_lager_cap_base = 0;  // per task, blocks the array has room for
+// Per task, an index with no free block before it. First fit starts looking
+// here rather than at 0. A document is thousands of small blocks
+// allocated in a row with nothing free among them, and walking all of them
+// again for each new one would make building a page quadratic.
+int task_lager_hint_base = 0;
 
 void lager_init() {
     task_lager_tab_base = kmalloc(MAX_TASKS * 8);
     task_lager_n_base = kmalloc(MAX_TASKS * 8);
     task_lager_cap_base = kmalloc(MAX_TASKS * 8);
+    task_lager_hint_base = kmalloc(MAX_TASKS * 8);
     int i = 0;
-    while (i < MAX_TASKS) {
+    for (i = 0; i < MAX_TASKS; i += 1) {
         store64(task_lager_tab_base + i * 8, 0);
         store64(task_lager_n_base + i * 8, 0);
         store64(task_lager_cap_base + i * 8, 0);
-        i = i + 1;
+        store64(task_lager_hint_base + i * 8, 0);
     }
     return;
 }
@@ -77,12 +83,13 @@ void lager_init() {
 // reaped, so a reused task id never inherits another process's blocks. The
 // heap pages themselves go with the process's address space, as before.
 void lager_reset(int tid) {
-    if (task_lager_tab_base == 0) { return; }
+    if (!task_lager_tab_base) { return; }
     int tab = load64(task_lager_tab_base + tid * 8);
     if (tab != 0) { kfree(tab); }
     store64(task_lager_tab_base + tid * 8, 0);
     store64(task_lager_n_base + tid * 8, 0);
     store64(task_lager_cap_base + tid * 8, 0);
+    store64(task_lager_hint_base + tid * 8, 0);
     return;
 }
 
@@ -106,48 +113,37 @@ int lager_room(int tid) {
         return 0;
     }
     int ntab = kmalloc(ncap * sizeof(LagerBlock));
-    if (ntab == 0) {
+    if (!ntab) {
         serial_print("[lager] kernel heap cannot grow the block table for task ");
         serial_print_int(tid);
         serial_print("\n");
         return 0;
     }
-    int w = 0;
-    while (w < n * 3) {
-        store64(ntab + w * 8, load64(tab + w * 8));
-        w = w + 1;
+    if (tab != 0) {
+        mem_copy(ntab, tab, n * sizeof(LagerBlock));
+        kfree(tab);
     }
-    if (tab != 0) { kfree(tab); }
     store64(task_lager_tab_base + tid * 8, ntab);
     store64(task_lager_cap_base + tid * 8, ncap);
     return ntab;
 }
 
 // Opens a gap at index i by moving every later block up one. The caller has
-// already made room.
+// already made room. Word by word from the top down, since the two ranges
+// overlap and mem_copy only copies downwards safely.
 void lager_insert_gap(int tab, int n, int i) {
-    int j = n;
-    while (j > i) {
-        int to = lager_at(tab, j);
-        int from = lager_at(tab, j - 1);
-        to.lb_addr = from.lb_addr;
-        to.lb_size = from.lb_size;
-        to.lb_free = from.lb_free;
-        j = j - 1;
+    int stop = lager_at(tab, i);
+    int w = 0;
+    for (w = lager_at(tab, n) - 8; w >= stop; w -= 8) {
+        store64(w + sizeof(LagerBlock), load64(w));
     }
     return;
 }
 
 // Closes the slot at index i by moving every later block down one.
 void lager_remove(int tab, int n, int i) {
-    int j = i;
-    while (j < n - 1) {
-        int to = lager_at(tab, j);
-        int from = lager_at(tab, j + 1);
-        to.lb_addr = from.lb_addr;
-        to.lb_size = from.lb_size;
-        to.lb_free = from.lb_free;
-        j = j + 1;
+    if (i < n - 1) {
+        mem_copy(lager_at(tab, i), lager_at(tab, i + 1), (n - 1 - i) * sizeof(LagerBlock));
     }
     return;
 }
@@ -160,7 +156,7 @@ int lager_attach(int tid, int upto) {
     int cr3 = load64(task_cr3_base + tid * 8);
     while (mapped < upto) {
         int frame = pmm_alloc_page();
-        if (frame == 0) {
+        if (!frame) {
             // Fail the allocation rather than mapping frame 0, which would
             // silently corrupt low memory.
             serial_print("[lager] out of physical pages\n");
@@ -169,7 +165,7 @@ int lager_attach(int tid, int upto) {
         }
         zero_page(frame);
         map_page_user(cr3, mapped, frame);
-        mapped = mapped + 4096;
+        mapped += 4096;
     }
     store64(task_heap_mapped_base + tid * 8, mapped);
     return 1;
@@ -179,9 +175,8 @@ int lager_attach(int tid, int upto) {
 // multiple of 8.
 void lager_zero(int addr, int n) {
     int i = 0;
-    while (i < n) {
+    for (i = 0; i < n; i += 8) {
         store64(addr + i, 0);
-        i = i + 8;
     }
     return;
 }
@@ -193,19 +188,22 @@ int lager_alloc(int tid, int n) {
     n = ((n + 7) / 8) * 8;
     int top = load64(task_heap_next_base + tid * 8);
     int end = load64(task_heap_end_base + tid * 8);
-    if (top == 0) { return 0; }
+    if (!top) { return 0; }
     int tab = load64(task_lager_tab_base + tid * 8);
     int cnt = load64(task_lager_n_base + tid * 8);
 
-    // First fit among the free blocks.
+    // First fit among the free blocks, from the first one there can be.
+    // The hint may sit lower than it has to, never higher.
+    int first_free = -1;
     int i = 0;
-    while (i < cnt) {
+    for (i = load64(task_lager_hint_base + tid * 8); i < cnt; i += 1) {
         int e = lager_at(tab, i);
+        if (e.lb_free == 1 && first_free < 0) { first_free = i; }
         if (e.lb_free == 1 && e.lb_size >= n) {
             if (e.lb_size > n) {
                 // Split, so the rest stays free, right after this block.
                 tab = lager_room(tid);
-                if (tab == 0) { return 0; }
+                if (!tab) { return 0; }
                 e = lager_at(tab, i);
                 lager_insert_gap(tab, cnt, i + 1);
                 int rest = lager_at(tab, i + 1);
@@ -216,11 +214,14 @@ int lager_alloc(int tid, int n) {
                 store64(task_lager_n_base + tid * 8, cnt + 1);
             }
             e.lb_free = 0;
+            if (first_free == i) { first_free = i + 1; }
+            store64(task_lager_hint_base + tid * 8, first_free);
             lager_zero(e.lb_addr, n);
             return e.lb_addr;
         }
-        i = i + 1;
     }
+    if (first_free < 0) { first_free = cnt; }
+    store64(task_lager_hint_base + tid * 8, first_free);
 
     // A free block at the very end can grow into the unused space past it,
     // instead of being skipped and left behind as a hole.
@@ -242,7 +243,7 @@ int lager_alloc(int tid, int n) {
     // so the pages attached here are already zero.
     if (top + n > end) { return 0; }
     tab = lager_room(tid);
-    if (tab == 0) { return 0; }
+    if (!tab) { return 0; }
     if (lager_attach(tid, top + n) == 0) { return 0; }
     int b = lager_at(tab, cnt);
     b.lb_addr = top;
@@ -259,11 +260,16 @@ int lager_alloc(int tid, int n) {
 // logged, because a silent bad free is how corruption at a distance starts
 // (see kfree in jenna.c0 for the day that cost).
 int lager_free(int tid, int ptr) {
-    if (ptr == 0) { return 0; }
+    if (!ptr) { return 0; }
     int tab = load64(task_lager_tab_base + tid * 8);
     int cnt = load64(task_lager_n_base + tid * 8);
+    // The table is in address order, so the block is found by halving.
     int i = 0;
-    while (i < cnt && lager_at(tab, i).lb_addr < ptr) { i = i + 1; }
+    int hi = cnt;
+    while (i < hi) {
+        int mid = (i + hi) / 2;
+        if (lager_at(tab, mid).lb_addr < ptr) { i = mid + 1; } else { hi = mid; }
+    }
     if (i >= cnt || lager_at(tab, i).lb_addr != ptr || lager_at(tab, i).lb_free == 1) {
         serial_print("[lager] dealloc: not a live block, refusing: ");
         serial_print_int(ptr);
@@ -274,17 +280,21 @@ int lager_free(int tid, int ptr) {
     e.lb_free = 1;
     // Merge with the next block, then with the previous one.
     if (i + 1 < cnt && lager_at(tab, i + 1).lb_free == 1) {
-        e.lb_size = e.lb_size + lager_at(tab, i + 1).lb_size;
+        e.lb_size += lager_at(tab, i + 1).lb_size;
         lager_remove(tab, cnt, i + 1);
-        cnt = cnt - 1;
+        cnt -= 1;
     }
     if (i > 0 && lager_at(tab, i - 1).lb_free == 1) {
         int prev = lager_at(tab, i - 1);
-        prev.lb_size = prev.lb_size + e.lb_size;
+        prev.lb_size += e.lb_size;
         lager_remove(tab, cnt, i);
-        cnt = cnt - 1;
+        cnt -= 1;
+        i -= 1;
     }
     store64(task_lager_n_base + tid * 8, cnt);
+    if (i < load64(task_lager_hint_base + tid * 8)) {
+        store64(task_lager_hint_base + tid * 8, i);
+    }
     return 0;
 }
 
@@ -294,10 +304,9 @@ int lager_in_use(int tid) {
     int cnt = load64(task_lager_n_base + tid * 8);
     int sum = 0;
     int i = 0;
-    while (i < cnt) {
+    for (i = 0; i < cnt; i += 1) {
         int e = lager_at(tab, i);
-        if (e.lb_free == 0) { sum = sum + e.lb_size; }
-        i = i + 1;
+        if (e.lb_free == 0) { sum += e.lb_size; }
     }
     return sum;
 }
@@ -306,6 +315,6 @@ int lager_in_use(int tid) {
 // lager has ever had to map, freed or not.
 int lager_extent(int tid) {
     int top = load64(task_heap_next_base + tid * 8);
-    if (top == 0) { return 0; }
+    if (!top) { return 0; }
     return top - (load64(task_heap_end_base + tid * 8) - HEAP_PAGES * 4096);
 }

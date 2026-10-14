@@ -23,7 +23,7 @@
 #      compiled entry point (c0 requires a function literally named
 #      `main`)
 #
-# Entry symbol is `_boot_start`, deliberately not `_start`: every object
+# Entry symbol is `_boot_start`, deliberately not `_start`, since every object
 # file coff0 emits already defines its own `_start` (a Linux-syscall
 # epilogue that is dead code here, never called) -- a different name avoids
 # a duplicate-symbol link error with zero changes to coff itself.
@@ -559,6 +559,7 @@ isr_common:
     mov rsi, [rsp + 128]   # error code (real for #PF, dummy 0 for IRQs)
     mov rdx, cr2           # faulting address (CR2)
     mov rcx, [rsp + 136]   # faulting RIP (from CPU-pushed frame)
+    mov r8, [rsp + 144]    # CS, whose low two bits are the ring that was running
     call int_dispatch
 
     # Preemptive switch check. The timer handler
@@ -678,6 +679,16 @@ enable_interrupts:
 .global disable_interrupts
 disable_interrupts:
     cli
+    ret
+
+# Reloads CR3 with its own value, which drops every cached non-global
+# translation. jit.c0 calls it after changing the JIT page's permissions, or
+# the CPU could go on using the old ones from its TLB. smed has no invlpg,
+# and the page changes rarely enough that a whole flush costs nothing.
+.global flush_tlb
+flush_tlb:
+    mov rax, cr3
+    mov cr3, rax
     ret
 
 # Test-only, deliberately provoking a #8 double fault, to prove the IST stack

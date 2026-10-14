@@ -119,7 +119,7 @@ def move_to(x, y):
 # raket login gate, root, then an empty password.
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
-word("spawn3 utsikt.elf"); typ(["ret"]); time.sleep(4.5)
+word("start utsikt.elf"); typ(["ret"]); time.sleep(4.5)
 typ(["alt-tab"]); time.sleep(1.5)
 shot("uimg_first.ppm")
 

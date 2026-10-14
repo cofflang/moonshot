@@ -1,15 +1,14 @@
-// expect: 14
-// noter -- lira's song format (programs/lira/noter.c0) and writefile()
+// expect: 17
+// noter -- lira's song format (programs/lib/noter.c0) and writefile()
 // (SYS_WRITEFILE 15) on real moonshot. Each check that holds adds one, so the
 // exit code counts them.
-include "../programs/lira/noter.c0";
+include "noter.c0";
 
 // 1 when the n bytes at a and b are the same.
 int same(int a, int b, int n) {
     int i = 0;
-    while (i < n) {
+    for (i = 0; i < n; i += 1) {
         if (load8(a + i) != load8(b + i)) { return 0; }
-        i = i + 1;
     }
     return 1;
 }
@@ -29,68 +28,101 @@ int main() {
     int b = noter_note(s, 1);
     int c = noter_note(s, 2);
     if (noter_count(s) == 3 && a.nn_pitch == 60 && a.nn_length == 2
-        && a.nn_velocity == 80 && b.nn_pitch == 67 && c.nn_start == 4) { ok = ok + 1; }
+        && a.nn_velocity == 80 && b.nn_pitch == 67 && c.nn_start == 4) { ok += 1; }
 
     // 2. Fields the format cannot hold are refused.
     if (noter_add(s, 16, 128, 0, 1, 100) == 0 - 1
         && noter_add(s, 16, 60, 8, 0, 100) == 0 - 1
-        && noter_add(s, 16, 60, 8, 1, 0) == 0 - 1) { ok = ok + 1; }
+        && noter_add(s, 16, 60, 8, 1, 0) == 0 - 1) { ok += 1; }
 
     // 3. A click lands on the note sounding there, and only while it sounds.
     if (noter_find(s, 60, 1) == 0 && noter_find(s, 60, 2) == 0 - 1
-        && noter_find(s, 64, 5) == 2) { ok = ok + 1; }
+        && noter_find(s, 64, 5) == 2) { ok += 1; }
 
     // 4. Two notes overlap at step 0, one at step 4.
-    if (noter_voices(s, 0, 8) == 2 && noter_voices(s, 4, 4) == 1) { ok = ok + 1; }
+    if (noter_voices(s, 0, 8) == 2 && noter_voices(s, 4, 4) == 1) { ok += 1; }
 
     // 5. Saved into a directory, a path with a '/' in it, which readfile
     // has to resolve to the file and not the directory.
-    if (noter_save(s, "test/song.not") == 1) { ok = ok + 1; }
-    if (readfile("test/song.not", 0, 0) == 40 + 3 * 32) { ok = ok + 1; }
+    if (noter_save(s, "test/song.not") == 1) { ok += 1; }
+    if (readfile("test/song.not", 0, 0) == 40 + 3 * 40) { ok += 1; }
 
     // 6. Loaded back byte for byte, with room for the cap asked for.
     int l = noter_load("test/song.not", 16);
-    if (l != 0 && same(l, s, 40 + 3 * 32) == 1) { ok = ok + 1; }
-    if (l != 0 && noter_add(l, 16, 72, 8, 1, 100) == 3) { ok = ok + 1; }
+    if (l != 0 && same(l, s, 40 + 3 * 40) == 1) { ok += 1; }
+    if (l != 0 && noter_add(l, 16, 72, 8, 1, 100) == 3) { ok += 1; }
     // Everything below builds on the loaded copy. Without one, stop here
     // with the count so far rather than fault on a null buffer.
-    if (l == 0) { return ok; }
+    if (!l) { return ok; }
 
     // 7. A shorter save makes the file shorter, since writefile replaces, it does
     // not leave the previous tail behind.
     noter_remove(s, 1);
     noter_save(s, "test/song.not");
-    if (readfile("test/song.not", 0, 0) == 40 + 2 * 32) { ok = ok + 1; }
+    if (readfile("test/song.not", 0, 0) == 40 + 2 * 40) { ok += 1; }
 
     // 8. Malformed files are refused, a wrong magic, notes out of order, a
     // count that does not match the size, more notes than the cap.
-    int bad = alloc(40 + 3 * 32);
+    int bad = alloc(40 + 3 * 40);
     int i = 0;
-    while (i < 40 + 3 * 32) { store8(bad + i, load8(l + i)); i = i + 1; }
+    while (i < 40 + 3 * 40) { store8(bad + i, load8(l + i)); i += 1; }
     bad.nh_count = 3;   // l has a fourth note by now; this copy holds three
     store8(bad, 'N');
-    writefile("test/bad.not", bad, 40 + 3 * 32);
+    writefile("test/bad.not", bad, 40 + 3 * 40);
     int r1 = noter_load("test/bad.not", 16);
     store8(bad, 'n');
     int n0 = noter_note(bad, 0);
     n0.nn_start = 9;
-    writefile("test/bad.not", bad, 40 + 3 * 32);
+    writefile("test/bad.not", bad, 40 + 3 * 40);
     int r2 = noter_load("test/bad.not", 16);
     n0.nn_start = 0;
-    writefile("test/bad.not", bad, 40 + 2 * 32);
+    writefile("test/bad.not", bad, 40 + 2 * 40);
     int r3 = noter_load("test/bad.not", 16);
-    writefile("test/bad.not", bad, 40 + 3 * 32);
+    writefile("test/bad.not", bad, 40 + 3 * 40);
     int r4 = noter_load("test/bad.not", 2);
     int r5 = noter_load("test/bad.not", 3);
-    if (r1 == 0 && r2 == 0 && r3 == 0 && r4 == 0) { ok = ok + 1; }
-    if (r5 != 0) { ok = ok + 1; }
+    if (r1 == 0 && r2 == 0 && r3 == 0 && !r4) { ok += 1; }
+    if (r5 != 0) { ok += 1; }
 
     // 9. writefile's refusals, a kernel buffer, a missing directory, a name
     // longer than jakel keeps, and a directory.
-    if (writefile("test/k.not", 4096, 8) == 0 - 1) { ok = ok + 1; }
-    if (writefile("nodir/x.not", s, 8) == 0 - 1) { ok = ok + 1; }
+    if (writefile("test/k.not", 4096, 8) == 0 - 1) { ok += 1; }
+    if (writefile("nodir/x.not", s, 8) == 0 - 1) { ok += 1; }
     if (writefile("test/a_name_that_is_far_too_long_for_jakel.not", s, 8) == 0 - 1
-        && writefile("test", s, 8) == 0 - 1) { ok = ok + 1; }
+        && writefile("test", s, 8) == 0 - 1) { ok += 1; }
+
+    // 10. Instruments. A note keeps the one it was given through a save and
+    // a load, and one past the last is refused.
+    int t = noter_new(4, 4, 120);
+    if (noter_add_with(t, 4, 60, 0, 1, 100, 2) == 0
+        && noter_add_with(t, 4, 62, 0, 1, 100, NOTER_INSTRUMENTS) == 0 - 1) { ok += 1; }
+    noter_save(t, "test/inst.not");
+    int tl = noter_load("test/inst.not", 4);
+    if (tl != 0) {
+        int t0 = noter_note(tl, 0);
+        if (t0.nn_instrument == 2) { ok += 1; }
+    }
+
+    // 11. A version 1 file, 32 bytes a note and no instrument, loads as
+    // version 2 with every note a square wave and nothing else changed.
+    int v1 = alloc(40 + 2 * 32);
+    noter_put_magic(v1);
+    store64(v1 + 8, 1);
+    store64(v1 + 16, 4);
+    store64(v1 + 24, 120);
+    store64(v1 + 32, 2);
+    store64(v1 + 40, 60); store64(v1 + 48, 0); store64(v1 + 56, 2); store64(v1 + 64, 100);
+    store64(v1 + 72, 64); store64(v1 + 80, 2); store64(v1 + 88, 1); store64(v1 + 96, 90);
+    writefile("test/old.not", v1, 40 + 2 * 32);
+    int ol = noter_load("test/old.not", 4);
+    if (ol != 0 && ol.nh_version == 2 && ol.nh_count == 2) {
+        int o0 = noter_note(ol, 0);
+        int o1 = noter_note(ol, 1);
+        if (o0.nn_pitch == 60 && o0.nn_length == 2 && o0.nn_velocity == 100
+            && o1.nn_pitch == 64 && o1.nn_start == 2 && o1.nn_length == 1
+            && o1.nn_velocity == 90 && o0.nn_instrument == 0
+            && o1.nn_instrument == 0) { ok += 1; }
+    }
 
     return ok;
 }

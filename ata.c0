@@ -49,9 +49,8 @@ int ata_bit(int v, int bit) {
 // Poll until BSY clears (or timeout). Returns 1 on success, 0 on timeout.
 int ata_wait_not_busy() {
     int i = 0;
-    while (i < 100000) {
+    for (i = 0; i < 100000; i += 1) {
         if (ata_bit(inb(ATA_STATUS), STAT_BSY) == 0) { return 1; }
-        i = i + 1;
     }
     return 0;
 }
@@ -60,13 +59,12 @@ int ata_wait_not_busy() {
 // and DRQ must be set. Returns 0 on timeout or error, 1 on success.
 int ata_wait_drq() {
     int i = 0;
-    while (i < 100000) {
+    for (i = 0; i < 100000; i += 1) {
         int st = inb(ATA_STATUS);
         if (ata_bit(st, STAT_ERR) == 1) { return 0; }
         if (ata_bit(st, STAT_BSY) == 0) {
             if (ata_bit(st, STAT_DRQ) == 1) { return 1; }
         }
-        i = i + 1;
     }
     return 0;
 }
@@ -80,13 +78,13 @@ int ata_init() {
     outb(ATA_DRIVE, 0xE0);
     // Brief delay for the drive to respond.
     int d = 0;
-    while (d < 1000) { d = d + 1; }
+    while (d < 1000) { d += 1; }
     int st = inb(ATA_STATUS);
     if (st == 0xFF) {
         serial_print("[ata] no drive (floating bus)\n");
         return 0;
     }
-    if (st == 0) {
+    if (!st) {
         serial_print("[ata] no drive (no response)\n");
         return 0;
     }
@@ -99,7 +97,7 @@ int ata_init() {
 // which must point to at least 512 bytes of writable memory. Safe to
 // call when ata_present == 0 (silently returns).
 void ata_read(int lba, int buf) {
-    if (ata_present == 0) { return; }
+    if (!ata_present) { return; }
     if (lba < 0) { return; }
     if (ata_wait_not_busy() == 0) { return; }
 
@@ -129,11 +127,10 @@ void ata_read(int lba, int buf) {
     // Read 256 16-bit words from the data port.
     // Each 16-bit word is split into two little-endian bytes.
     int i = 0;
-    while (i < 256) {
+    for (i = 0; i < 256; i += 1) {
         int w = inw(ATA_DATA);
         store8(buf + i * 2,       w % 256);  // low byte
         store8(buf + i * 2 + 1,   w / 256);               // high byte
-        i = i + 1;
     }
     return;
 }
@@ -141,7 +138,7 @@ void ata_read(int lba, int buf) {
 // Write one 512-byte sector from buffer `buf` to 28-bit LBA address.
 // Safe to call when ata_present == 0 (silently returns).
 void ata_write(int lba, int buf) {
-    if (ata_present == 0) { return; }
+    if (!ata_present) { return; }
     if (lba < 0) { return; }
     if (ata_wait_not_busy() == 0) { return; }
 
@@ -165,11 +162,10 @@ void ata_write(int lba, int buf) {
     // Write 256 16-bit words to the data port.
     // Each 16-bit word is reconstructed from two little-endian bytes.
     int i = 0;
-    while (i < 256) {
+    for (i = 0; i < 256; i += 1) {
         int lo = load8(buf + i * 2);
         int hi = load8(buf + i * 2 + 1);
         outw(ATA_DATA, lo + hi * 256);
-        i = i + 1;
     }
 
     // Wait for the write to complete, then flush the drive's cache so

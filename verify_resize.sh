@@ -13,7 +13,7 @@
 # it -- the thing SYS_WIN_MAX and view_poll_resize exist for.
 #
 # A kakel tile is not a fixed size. Any reflow (`split`, `close`, another
-# `spawn3`) hands every visible window new geometry, and nothing tells the
+# `start`) hands every visible window new geometry, and nothing tells the
 # program. A running Infecteria whose tile widens could keep
 # presenting a buffer written at the OLD row pitch while SYS_PRESENT reads it at
 # the NEW one. At double the width each screen row would swallow two
@@ -31,7 +31,7 @@
 # halves of the window differ would never fire.
 #
 # Checks, in one boot
-#   1. GROW. spawn3 Infecteria into half the screen, then close the shell
+#   1. GROW. start Infecteria into half the screen, then close the shell
 #      window so the tavla becomes the only one and doubles in width. The
 #      bottom of the window must then be painted with the game's own
 #      background, not left as kakel's reflow clear. It fails on a
@@ -104,7 +104,7 @@ typ(["ret"]); time.sleep(1.0)
 
 # 1, spawn the game into half the screen, let it render a few frames, then
 # close the shell window beside it so its tile doubles in width.
-word("spawn3 infecteria.elf"); typ(["ret"])
+word("start infecteria.elf"); typ(["ret"])
 time.sleep(4.0)
 shot("resize_half.ppm")
 word("close"); typ(["ret"])

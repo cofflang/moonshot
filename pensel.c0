@@ -13,10 +13,9 @@
 // back to jakel on quit, and hands the window back to the shell afterwards.
 //
 // It exists so sprites can be drawn ON Moonshot rather than baked in by a
-// host script. Until SYS_READFILE landed, a ring-3 program could not read a
-// file at all, so every sprite was compiled into the ELF and changing one
-// pixel meant a rebuild. pensel writes a sprite file; a game reads it with
-// readfile(). That is the whole loop, and it closes on the machine itself.
+// host script, where changing one pixel would mean a rebuild. pensel writes
+// a sprite file, and a game reads it with readfile(). That is the whole
+// loop, and it closes on the machine itself.
 //
 // This is also klick's first real consumer, the first thing that reacts to
 // the mouse beyond moving the pointer.
@@ -81,9 +80,9 @@ int pensel_win = 0;
 // on save -- kept unpacked in memory because every comparison and every fill
 // wants the packed form, and the conversion only happens twice per session.
 //
-// Transparent is -1, NOT 0, because 0 is a perfectly good colour, black. The
-// first version used 0 for both and black was simply unpaintable -- selecting
-// it painted holes, and its palette swatch rendered as the transparent one.
+// Transparent is -1, NOT 0, because 0 is a perfectly good colour, black. With
+// 0 for both, black would be unpaintable -- selecting it would paint holes,
+// and its palette swatch would render as the transparent one.
 int pensel_pixels = 0;
 int pensel_filename = 0;
 
@@ -138,7 +137,7 @@ void pensel_set_pixel(int px, int py, int color) {
 // visibly different from "black paint" -- they are the same colour otherwise,
 // and black is a colour a sprite legitimately wants.
 int pensel_empty_shade(int px, int py) {
-    int odd = (px + py) - ((px + py) / 2) * 2;
+    int odd = (px + py) % 2;
     if (odd == 1) { return fb_rgb(60, 60, 60); }
     return fb_rgb(40, 40, 40);
 }
@@ -176,12 +175,12 @@ void pensel_draw_cell(int px, int py) {
 
 // Draws ONE palette swatch. Split out of the full repaint because changing
 // colour happens inside the mouse interrupt handler, and repainting all
-// sixteen there is genuinely too slow, since each swatch is five filled rects, and
-// every one of those lifts and restores klick's pointer. The controller kept
-// delivering bytes while the ISR was busy, the packet stream lost framing,
-// and a click landed on the wrong swatch -- which is exactly how this was
-// found. Two swatches per selection instead of sixteen keeps the handler
-// short enough for the next packet to arrive intact.
+// sixteen there is genuinely too slow, since each swatch is five filled
+// rects, and every one of those lifts and restores klick's pointer. The
+// controller keeps delivering bytes while the ISR is busy, so the packet
+// stream would lose framing and a click would land on the wrong swatch. Two
+// swatches per selection instead of sixteen keeps the handler short enough
+// for the next packet to arrive intact.
 void pensel_draw_swatch(int i) {
     int px = pensel_ox + pensel_dim * pensel_zoom + PENSEL_MARGIN;
     int col = i % 2;
@@ -193,9 +192,8 @@ void pensel_draw_swatch(int i) {
         fb_fill_rect(x, y, PENSEL_SWATCH - 2, PENSEL_SWATCH - 2, fb_rgb(50, 50, 50));
         // A diagonal slash marks the transparent slot.
         int d = 0;
-        while (d < PENSEL_SWATCH - 2) {
+        for (d = 0; d < PENSEL_SWATCH - 2; d += 1) {
             fb_put_pixel(x + d, y + d, fb_rgb(200, 80, 80));
-            d = d + 1;
         }
     } else {
         fb_fill_rect(x, y, PENSEL_SWATCH - 2, PENSEL_SWATCH - 2, c);
@@ -212,9 +210,8 @@ void pensel_draw_swatch(int i) {
 
 void pensel_draw_palette() {
     int i = 0;
-    while (i < PENSEL_COLORS) {
+    for (i = 0; i < PENSEL_COLORS; i += 1) {
         pensel_draw_swatch(i);
-        i = i + 1;
     }
     return;
 }
@@ -242,13 +239,11 @@ void pensel_render() {
     kakel_print(wid, "  [s]ave [c]lear [n]ew [d]el [,.] frame [q]uit\n");
 
     int py = 0;
-    while (py < pensel_dim) {
+    for (py = 0; py < pensel_dim; py += 1) {
         int px = 0;
-        while (px < pensel_dim) {
+        for (px = 0; px < pensel_dim; px += 1) {
             pensel_draw_cell(px, py);
-            px = px + 1;
         }
-        py = py + 1;
     }
     pensel_draw_palette();
     return;
@@ -265,7 +260,7 @@ void pensel_render() {
 // the editor having to track that.
 void pensel_mouse(int sx, int sy, int left, int right) {
     if (pensel_active != 1) { return; }
-    if (left == 0 && right == 0) { return; }
+    if (left == 0 && !right) { return; }
     // Same rule ring-3 programs get from SYS_MOUSE_POLL. A button acts only
     // in the focused window, and the press that performed a focus change is
     // spent. Otherwise clicking an unfocused pensel would focus it AND lay
@@ -315,33 +310,28 @@ void pensel_mouse(int sx, int sy, int left, int right) {
 
 // Serialises the sprite and writes it to jakel. Returns 1 on success.
 int pensel_save() {
-    if (pensel_filename == 0) { return 0; }
+    if (!pensel_filename) { return 0; }
     int n = pensel_dim * pensel_dim * pensel_frames;
     int total = PENSEL_HEADER + n * 4;
     int buf = kmalloc(total);
-    if (buf == 0) { return 0; }
+    if (!buf) { return 0; }
     store64(buf, pensel_dim);
     store64(buf + 8, pensel_dim);
     store64(buf + 16, pensel_frames);
     // The frames sit one after another in pensel_pixels exactly as they do
     // in the file, so one pass over all of them writes the file in order.
     int i = 0;
-    while (i < n) {
+    for (i = 0; i < n; i += 1) {
         int c = load64(pensel_pixels + i * 8);
         int off = PENSEL_HEADER + i * 4;
         // Packed 0xRRGGBB out to BGR0, the order SYS_BLIT reads. Transparent
         // becomes all-zero, which is exactly how SYS_BLIT recognises a hole.
         if (c == PENSEL_EMPTY) { c = 0; }
-        store8(buf + off, c % 256);
-        store8(buf + off + 1, (c / 256) - (c / 65536) * 256);
-        store8(buf + off + 2, (c / 65536) - (c / 16777216) * 256);
-        store8(buf + off + 3, 0);
-        i = i + 1;
+        store32(buf + off, c & 0xFFFFFF);
     }
     int cwd = 0;
     if (kakel_active == 1) { cwd = load64(sk_cwd_base + pensel_win * 8); }
-    int fid = jakel_lookup(cwd, pensel_filename);
-    if (fid < 0) { fid = jakel_make_file(cwd, pensel_filename); }
+    int fid = jakel_open_or_make(cwd, pensel_filename);
     if (fid < 0) { kfree(buf); return 0; }
     jakel_write(fid, 0, buf, total);
     store64(jakel_size_base + fid * 8, total);
@@ -406,9 +396,8 @@ void pensel_handle_key(int make_code, int ascii) {
     if (ascii == 'c') {
         int base = pensel_frame_base(pensel_frame);
         int i = 0;
-        while (i < area) {
+        for (i = 0; i < area; i += 1) {
             store64(base + i * 8, PENSEL_EMPTY);
-            i = i + 1;
         }
         pensel_modified = 1;
         pensel_render();
@@ -418,20 +407,19 @@ void pensel_handle_key(int make_code, int ascii) {
         // A new frame right after this one, starting as a copy of it. The
         // frames after it move up one to make room, last first.
         if (pensel_frames >= pensel_max_frames()) { return; }
-        int f = pensel_frames;
-        while (f > pensel_frame + 1) {
+        int f = 0;
+        for (f = pensel_frames; f > pensel_frame + 1; f -= 1) {
             int src = pensel_frame_base(f - 1);
             int dst = pensel_frame_base(f);
             int k = 0;
-            while (k < area) { store64(dst + k * 8, load64(src + k * 8)); k = k + 1; }
-            f = f - 1;
+            for (k = 0; k < area; k += 1) { store64(dst + k * 8, load64(src + k * 8)); }
         }
         int from = pensel_frame_base(pensel_frame);
         int to = pensel_frame_base(pensel_frame + 1);
         int j = 0;
-        while (j < area) { store64(to + j * 8, load64(from + j * 8)); j = j + 1; }
-        pensel_frames = pensel_frames + 1;
-        pensel_frame = pensel_frame + 1;
+        for (j = 0; j < area; j += 1) { store64(to + j * 8, load64(from + j * 8)); }
+        pensel_frames += 1;
+        pensel_frame += 1;
         pensel_modified = 1;
         pensel_render();
         return;
@@ -439,27 +427,26 @@ void pensel_handle_key(int make_code, int ascii) {
     if (ascii == 'd') {
         // Deletes the frame on screen, closing the gap. The last frame stays.
         if (pensel_frames <= 1) { return; }
-        int g = pensel_frame;
-        while (g < pensel_frames - 1) {
+        int g = 0;
+        for (g = pensel_frame; g < pensel_frames - 1; g += 1) {
             int s2 = pensel_frame_base(g + 1);
             int d2 = pensel_frame_base(g);
             int m = 0;
-            while (m < area) { store64(d2 + m * 8, load64(s2 + m * 8)); m = m + 1; }
-            g = g + 1;
+            for (m = 0; m < area; m += 1) { store64(d2 + m * 8, load64(s2 + m * 8)); }
         }
-        pensel_frames = pensel_frames - 1;
+        pensel_frames -= 1;
         if (pensel_frame >= pensel_frames) { pensel_frame = pensel_frames - 1; }
         pensel_modified = 1;
         pensel_render();
         return;
     }
     if (ascii == ',' && pensel_frame > 0) {
-        pensel_frame = pensel_frame - 1;
+        pensel_frame -= 1;
         pensel_render();
         return;
     }
     if (ascii == '.' && pensel_frame < pensel_frames - 1) {
-        pensel_frame = pensel_frame + 1;
+        pensel_frame += 1;
         pensel_render();
         return;
     }
@@ -495,14 +482,18 @@ void pensel_palette_init() {
 // than fit at its size) is left alone rather than half-loaded, since silently
 // dropping someone's frames would be worse than refusing the file.
 int pensel_load(int cwd) {
+    // buf is 0 until kmalloc succeeds, and kfree(0) is a no-op, so the defer
+    // is safe on the early returns that come before the allocation.
+    int buf = 0;
+    defer kfree(buf);
     int fid = jakel_open(cwd, pensel_filename);
     if (fid < 0) { return 0; }
     if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) { return 0; }
     int fsz = load64(jakel_size_base + fid * 8);
     int want = PENSEL_HEADER + pensel_dim * pensel_dim * 4;
     if (fsz < want) { return 0; }
-    int buf = kmalloc(fsz);
-    if (buf == 0) { return 0; }
+    buf = kmalloc(fsz);
+    if (!buf) { return 0; }
     jakel_read(fid, 0, buf, fsz);
     // Adopt the file's OWN size rather than refusing anything that is not
     // the current one -- the format carries width and height precisely so an
@@ -512,17 +503,14 @@ int pensel_load(int cwd) {
     int fh = load64(buf + 8);
     int fn = load64(buf + 16);
     if (fw != fh || fw < PENSEL_MIN_DIM || fw > PENSEL_MAX_DIM) {
-        kfree(buf);
         return 0;
     }
     if (fn < 1 || PENSEL_HEADER + fw * fh * 4 * fn > fsz) {
-        kfree(buf);
         return 0;
     }
     int fit = PENSEL_MAX_DIM * PENSEL_MAX_DIM / (fw * fw);
     if (fit > PENSEL_MAX_FRAMES) { fit = PENSEL_MAX_FRAMES; }
     if (fn > fit) {
-        kfree(buf);
         return 0;
     }
     pensel_dim = fw;
@@ -530,7 +518,7 @@ int pensel_load(int cwd) {
     pensel_frame = 0;
     pensel_set_zoom();
     int i = 0;
-    while (i < pensel_dim * pensel_dim * pensel_frames) {
+    for (i = 0; i < pensel_dim * pensel_dim * pensel_frames; i += 1) {
         int off = PENSEL_HEADER + i * 4;
         int b = load8(buf + off);
         int g = load8(buf + off + 1);
@@ -543,9 +531,7 @@ int pensel_load(int cwd) {
         int c = PENSEL_EMPTY;
         if (b != 0 || g != 0 || r != 0) { c = fb_rgb(r, g, b); }
         store64(pensel_pixels + i * 8, c);
-        i = i + 1;
     }
-    kfree(buf);
     return 1;
 }
 
@@ -570,14 +556,13 @@ void pensel_start(int win, int filename_str, int dim) {
     // failure path for no benefit.
     pensel_pixels = kmalloc(PENSEL_MAX_DIM * PENSEL_MAX_DIM * 8);
     pensel_palette = kmalloc(PENSEL_COLORS * 8);
-    if (pensel_pixels == 0 || pensel_palette == 0) {
+    if (pensel_pixels == 0 || !pensel_palette) {
         sk_print("draw: out of memory\n");
         return;
     }
     int i = 0;
-    while (i < pensel_dim * pensel_dim) {
+    for (i = 0; i < pensel_dim * pensel_dim; i += 1) {
         store64(pensel_pixels + i * 8, PENSEL_EMPTY);
-        i = i + 1;
     }
     pensel_palette_init();
     pensel_color = 1;

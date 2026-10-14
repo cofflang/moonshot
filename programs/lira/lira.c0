@@ -12,17 +12,21 @@
 // note there and click a note to take it away. Space plays the song through
 // oljud and stops it, s saves it.
 //
-// It edits song.not, in the noter format (noter.c0), and plays it with the
-// synth (synth.c0). When there is no song.not yet it starts from demo.not,
-// which the kernel seeds at boot, but it always saves to song.not, so the
-// demo stays what it is and a person's own song is theirs. A save changes
-// jakel in memory; the shell's `sync` puts it on disk.
+// It edits the file named on its command line (`start lira.elf NAME`, or a
+// click on a song in hylla), a new song when there is none yet, in the noter
+// format (noter.c0), and plays it with the synth (synth.c0). Without a name
+// it edits song.not, starting from demo.not, which the kernel seeds at boot,
+// when there is no song.not yet. It saves to song.not even then, so the demo
+// stays what it is and a person's own song is theirs. A save changes jakel
+// in memory, and the shell's `sync` puts it on disk.
 //
 // Keys
 //   click        put a note of the current length there, or remove the note
 //                that is there
 //   [ and ]      halve or double the length new notes get (1 to 16 steps)
 //   , and .      quieter or louder new notes (velocity, in steps of 16)
+//   1 to 4       the instrument new notes get, square, triangle, sawtooth
+//                or drum, each drawn in its own colour
 //   - and =      tempo down or up by 5 beats per minute
 //   arrows       scroll up and down a semitone, left and right a beat
 //   PgUp, PgDn   scroll an octave
@@ -30,7 +34,8 @@
 //   space        play from the start, or stop
 //   l            loop, playback starts over at the end instead of stopping
 //   s            save
-//   Esc          quit
+//   h            the help, the same list drawn over the grid
+//   Esc          close the help, or quit
 //
 // At most eight notes may sound at once, the synth's limit, so a click that
 // would make a ninth is refused with a message.
@@ -73,8 +78,31 @@ int COL_BG_BLACK = 0x222227;    // rows of black keys
 int COL_STEP = 0x34343c;        // the line between two steps
 int COL_BEAT = 0x484852;        // the line at each beat
 int COL_BAR = 0x6c6c7a;         // the line at each bar (four beats)
-int COL_NOTE = 0xe8a23c;
+int COL_NOTE = 0xe8a23c;        // a square-wave note
 int COL_NOTE_EDGE = 0x8a5a18;
+
+// A note's fill and edge colours, by instrument. The square, the default,
+// has lira's plain note colour.
+int note_colour(int inst) {
+    if (inst == 1) { return 0x5ad07a; }
+    if (inst == 2) { return 0x5aa0f0; }
+    if (inst == 3) { return 0xc08ae0; }
+    return COL_NOTE;
+}
+
+int note_edge(int inst) {
+    if (inst == 1) { return 0x2a6a3a; }
+    if (inst == 2) { return 0x2a4a80; }
+    if (inst == 3) { return 0x604070; }
+    return COL_NOTE_EDGE;
+}
+
+int instrument_name(int inst) {
+    if (inst == 1) { return "triangle"; }
+    if (inst == 2) { return "saw"; }
+    if (inst == 3) { return "drum"; }
+    return "square";
+}
 int COL_VEL = 0xffe2b0;         // the velocity bar inside a note
 int COL_HEAD = 0xf05a5a;        // where playback is
 int COL_TEXT = 0xd0d0c8;
@@ -82,10 +110,7 @@ int COL_DIM = 0x8a8a92;
 int COL_PANEL = 0x18181c;
 
 void put_px(int addr, int color) {
-    store8(addr, color % 256);
-    store8(addr + 1, (color / 256) % 256);
-    store8(addr + 2, (color / 65536) % 256);
-    store8(addr + 3, 0);
+    store32(addr, color & 0xFFFFFF);
     return;
 }
 
@@ -99,28 +124,27 @@ void fill_rect(int x, int y, int w, int h, int color) {
     if (x1 > view_w) { x1 = view_w; }
     if (y1 > view_h) { y1 = view_h; }
     if (x1 <= x0 || y1 <= y0) { return; }
-    int pair = color * 4294967296 + color;
-    int row = y0;
-    while (row < y1) {
+    int pair = (color << 32) | color;
+    int row = 0;
+    for (row = y0; row < y1; row += 1) {
         int col = x0;
         int base = fb + (row * view_w + col) * 4;
         // Paired 8-byte stores need an even pixel index to stay aligned.
         if ((row * view_w + col) % 2 == 1) {
             put_px(base, color);
-            col = col + 1;
-            base = base + 4;
+            col += 1;
+            base += 4;
         }
         while (col + 1 < x1) {
             store64(base, pair);
-            col = col + 2;
-            base = base + 8;
+            col += 2;
+            base += 8;
         }
         while (col < x1) {
             put_px(base, color);
-            col = col + 1;
-            base = base + 4;
+            col += 1;
+            base += 4;
         }
-        row = row + 1;
     }
     return;
 }
@@ -129,15 +153,14 @@ void fill_rect(int x, int y, int w, int h, int color) {
 int font_init() {
     int d = glyph('M', 0);
     if (d <= 0) { return 0; }
-    cell_w = d / 65536;
-    cell_h = d % 65536;
+    cell_w = d >> 16;
+    cell_h = d & 65535;
     if (cell_w <= 0 || cell_w > 8 || cell_h <= 0 || cell_h > 32) { return 0; }
     font_cache = alloc(128 * cell_h);
-    if (font_cache == 0) { return 0; }
+    if (!font_cache) { return 0; }
     int c = 0;
-    while (c < 128) {
+    for (c = 0; c < 128; c += 1) {
         if (glyph(c, font_cache + c * cell_h) != d) { return 0; }
-        c = c + 1;
     }
     return 1;
 }
@@ -146,7 +169,7 @@ int font_init() {
 void draw_char(int x, int y, int ch, int color) {
     if (ch < 0 || ch > 127) { return; }
     int row = 0;
-    while (row < cell_h) {
+    for (row = 0; row < cell_h; row += 1) {
         int b = load8(font_cache + ch * cell_h + row);
         int col = 0;
         int bit = 128;
@@ -158,10 +181,9 @@ void draw_char(int x, int y, int ch, int color) {
                     put_px(fb + (py * view_w + px) * 4, color);
                 }
             }
-            bit = bit / 2;
-            col = col + 1;
+            bit /= 2;
+            col += 1;
         }
-        row = row + 1;
     }
     return;
 }
@@ -169,10 +191,9 @@ void draw_char(int x, int y, int ch, int color) {
 // Draws a NUL-terminated string and returns the x just past it.
 int draw_text(int x, int y, int s, int color) {
     int i = 0;
-    while (load8(s + i) != 0) {
+    for (i = 0; load8(s + i) != 0; i += 1) {
         draw_char(x, y, load8(s + i), color);
-        x = x + cell_w;
-        i = i + 1;
+        x += cell_w;
     }
     return x;
 }
@@ -185,10 +206,9 @@ void line_reset() { line_n = 0; store8(line, 0); return; }
 
 void line_add(int s) {
     int i = 0;
-    while (load8(s + i) != 0 && line_n < 255) {
+    for (i = 0; load8(s + i) != 0 && line_n < 255; i += 1) {
         store8(line + line_n, load8(s + i));
-        line_n = line_n + 1;
-        i = i + 1;
+        line_n += 1;
     }
     store8(line + line_n, 0);
     return;
@@ -198,11 +218,11 @@ void line_num(int n) {
     if (n < 0) { line_add("-"); n = 0 - n; }
     int digits = alloc(24);
     int k = 0;
-    if (n == 0) { store8(digits, '0'); k = 1; }
-    while (n > 0) { store8(digits + k, '0' + n % 10); n = n / 10; k = k + 1; }
+    if (!n) { store8(digits, '0'); k = 1; }
+    while (n > 0) { store8(digits + k, '0' + n % 10); n /= 10; k += 1; }
     while (k > 0) {
-        k = k - 1;
-        if (line_n < 255) { store8(line + line_n, load8(digits + k)); line_n = line_n + 1; }
+        k -= 1;
+        if (line_n < 255) { store8(line + line_n, load8(digits + k)); line_n += 1; }
     }
     store8(line + line_n, 0);
     dealloc(digits);
@@ -217,9 +237,11 @@ int top_pitch;        // the pitch of the top row
 int first_step;       // the step in the leftmost column
 int note_len = 4;     // steps a new note gets
 int note_vel = 100;   // velocity a new note gets
+int note_inst = 0;    // instrument a new note gets
 int looping = 0;      // 1 means playback starts over at the end
 int fitted = 0;       // 1 once the view has been centred on the song
 int message;          // the status line's message, or 0
+int help_open;        // 1 while the help is drawn over the grid
 int dirty = 1;
 
 int playing = 0;
@@ -258,7 +280,7 @@ int is_black(int pitch) {
 // Adds a pitch's name ("C4", "F#5") to the line buffer. MIDI 60 is C4.
 void line_pitch(int pitch) {
     int n = pitch % 12;
-    if (n == 0) { line_add("C"); }
+    if (!n) { line_add("C"); }
     if (n == 1) { line_add("C#"); }
     if (n == 2) { line_add("D"); }
     if (n == 3) { line_add("D#"); }
@@ -285,11 +307,10 @@ void view_fit() {
     int hi = 0 - 1;
     int lo = 128;
     int i = 0;
-    while (i < noter_count(song)) {
+    for (i = 0; i < noter_count(song); i += 1) {
         int r = noter_note(song, i);
         if (r.nn_pitch > hi) { hi = r.nn_pitch; }
         if (r.nn_pitch < lo) { lo = r.nn_pitch; }
-        i = i + 1;
     }
     if (hi < 0) { hi = 60; lo = 60; }
     top_pitch = (hi + lo) / 2 + grid_rows() / 2;
@@ -308,13 +329,13 @@ int play_sample() {
     if (waiting < 0) { waiting = 0; }
     int at = play_done - waiting;
     if (at < 0) { at = 0; }
-    if (play_len > 0) { at = at % play_len; }
+    if (play_len > 0) { at %= play_len; }
     return at;
 }
 
 // The playhead's x, -1 when it is not playing or not on screen.
 int play_x() {
-    if (playing == 0) { return 0 - 1; }
+    if (!playing) { return 0 - 1; }
     // Samples to steps without rounding twice, x in pixels straight from
     // the sample, so the line moves smoothly within a step.
     int px = play_sample() * song.nh_tempo * song.nh_steps * COL_W
@@ -334,7 +355,7 @@ void render() {
     // Rows, with their names on the left. C gets its name in full colour,
     // so the octaves are easy to find.
     int r = 0;
-    while (r < rows) {
+    for (r = 0; r < rows; r += 1) {
         int pitch = top_pitch - r;
         if (pitch < 0) { break; }
         int y = HEAD_H + r * ROW_H;
@@ -346,13 +367,12 @@ void render() {
         int c = COL_DIM;
         if (pitch % 12 == 0) { c = COL_TEXT; }
         draw_text(3, y + (ROW_H - cell_h) / 2, line, c);
-        r = r + 1;
     }
 
     // Columns, a faint line between steps, stronger at beats and bars, and
     // the bar number above each bar.
     int k = 0;
-    while (k <= cols) {
+    for (k = 0; k <= cols; k += 1) {
         int step = first_step + k;
         int x = LABEL_W + k * COL_W;
         int lc = COL_STEP;
@@ -364,12 +384,11 @@ void render() {
             draw_text(x + 2, (HEAD_H - cell_h) / 2, line, COL_DIM);
         }
         fill_rect(x, HEAD_H, 1, gh, lc);
-        k = k + 1;
     }
 
     // Notes.
     int i = 0;
-    while (i < noter_count(song)) {
+    for (i = 0; i < noter_count(song); i += 1) {
         int n = noter_note(song, i);
         int row = top_pitch - n.nn_pitch;
         if (row >= 0 && row < rows) {
@@ -379,8 +398,8 @@ void render() {
             if (x1 > LABEL_W + gw) { x1 = LABEL_W + gw; }
             if (x1 > x0) {
                 int y = HEAD_H + row * ROW_H;
-                fill_rect(x0 + 1, y + 1, x1 - x0 - 1, ROW_H - 3, COL_NOTE_EDGE);
-                fill_rect(x0 + 2, y + 2, x1 - x0 - 3, ROW_H - 5, COL_NOTE);
+                fill_rect(x0 + 1, y + 1, x1 - x0 - 1, ROW_H - 3, note_edge(n.nn_instrument));
+                fill_rect(x0 + 2, y + 2, x1 - x0 - 3, ROW_H - 5, note_colour(n.nn_instrument));
                 // The velocity bar, along the bottom two rows of the note,
                 // measured against the note's whole length even when part
                 // of it is scrolled off the left edge.
@@ -393,7 +412,6 @@ void render() {
                 if (vx1 > vx) { fill_rect(vx, y + ROW_H - 5, vx1 - vx, 2, COL_VEL); }
             }
         }
-        i = i + 1;
     }
 
     head_x = play_x();
@@ -410,12 +428,63 @@ void render() {
     line_add(" steps  vel ");
     line_num(note_vel);
     line_add("  ");
+    line_add(instrument_name(note_inst));
+    line_add("  ");
     line_num(noter_count(song));
     line_add(" notes");
     if (looping == 1) { line_add("  loop"); }
     if (playing == 1) { line_add("  playing"); }
-    int x = draw_text(4, py, line, COL_TEXT);
+    // The help hint first, so a narrow window never cuts it off.
+    int x = draw_text(4, py, "h help", COL_DIM);
+    x = draw_text(x + cell_w * 2, py, line, COL_TEXT);
     if (message != 0) { draw_text(x + cell_w * 2, py, message, COL_HEAD); }
+    if (help_open == 1) { draw_help(); }
+    return;
+}
+
+// The help, drawn over the grid in a box. Everything a person needs to make
+// a first song, since the keys are not written anywhere else they can see.
+void draw_help() {
+    int lines = alloc(26 * 8);
+    int n = 0;
+    store64(lines + n * 8, "lira, the piano roll"); n += 1;
+    store64(lines + n * 8, ""); n += 1;
+    store64(lines + n * 8, "Rows are pitches, the C of each octave named"); n += 1;
+    store64(lines + n * 8, "in full colour. Columns are steps, four steps"); n += 1;
+    store64(lines + n * 8, "to a beat and four beats to a numbered bar."); n += 1;
+    store64(lines + n * 8, ""); n += 1;
+    store64(lines + n * 8, "click      put a note in, or take one out"); n += 1;
+    store64(lines + n * 8, "1 2 3 4    square, triangle, saw or drum"); n += 1;
+    store64(lines + n * 8, "[ ]        shorter or longer new notes"); n += 1;
+    store64(lines + n * 8, ", .        quieter or louder new notes"); n += 1;
+    store64(lines + n * 8, "- =        slower or faster"); n += 1;
+    store64(lines + n * 8, "arrows     a semitone or a beat"); n += 1;
+    store64(lines + n * 8, "PgUp PgDn  an octave"); n += 1;
+    store64(lines + n * 8, "Home       back to the start"); n += 1;
+    store64(lines + n * 8, "space      play, or stop"); n += 1;
+    store64(lines + n * 8, "l          loop on or off"); n += 1;
+    store64(lines + n * 8, "s          save"); n += 1;
+    store64(lines + n * 8, "h          this help"); n += 1;
+    store64(lines + n * 8, "Esc        close this, or quit lira"); n += 1;
+    store64(lines + n * 8, ""); n += 1;
+    store64(lines + n * 8, "The bottom line shows what new notes get."); n += 1;
+    store64(lines + n * 8, "s saves to the name at its start. Type sync"); n += 1;
+    store64(lines + n * 8, "in the shell to keep it after a restart."); n += 1;
+    int w = 46 * cell_w + 16;
+    int h = n * (cell_h + 2) + 14;
+    int x = (view_w - w) / 2;
+    int y = (view_h - h) / 2;
+    if (x < 0) { x = 0; }
+    if (y < 0) { y = 0; }
+    fill_rect(x, y, w, h, COL_BAR);
+    fill_rect(x + 1, y + 1, w - 2, h - 2, COL_PANEL);
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int c = COL_TEXT;
+        if (i == 0) { c = COL_NOTE; }
+        draw_text(x + 8, y + 7 + i * (cell_h + 2), load64(lines + i * 8), c);
+    }
+    dealloc(lines);
     return;
 }
 
@@ -439,7 +508,7 @@ void click(int mx, int my) {
         message = "eight notes already sound there";
         return;
     }
-    if (noter_add(song, SONG_CAP, pitch, step, note_len, note_vel) < 0) {
+    if (noter_add_with(song, SONG_CAP, pitch, step, note_len, note_vel, note_inst) < 0) {
         message = "the song is full";
         return;
     }
@@ -452,7 +521,7 @@ void play_start() {
     play_at = 0;
     play_done = 0;
     playing = 1;
-    if (play_len == 0) { playing = 0; return; }
+    if (!play_len) { playing = 0; return; }
     if (sound(0, 0) < 0) {
         playing = 0;
         message = "no sound card";
@@ -470,12 +539,12 @@ void play_stop() {
 // Keeps oljud's queue topped up to PLAY_AHEAD while playing, and notices
 // when the song is over.
 void play_feed() {
-    if (playing == 0) { return; }
+    if (!playing) { return; }
     while (sound(0, 0) + PLAY_BLOCK <= PLAY_AHEAD) {
         // At the end of the song a loop starts over. The synth keeps no
         // state between blocks, so the start follows the end seamlessly.
         if (play_at >= play_len) {
-            if (looping == 0) { break; }
+            if (!looping) { break; }
             play_at = 0;
         }
         int n = PLAY_BLOCK;
@@ -485,10 +554,10 @@ void play_feed() {
         while (sent < n) {
             int got = sound(play_out + sent, n - sent);
             if (got < 0) { playing = 0; return; }
-            sent = sent + got;
+            sent += got;
         }
-        play_at = play_at + n;
-        play_done = play_done + n;
+        play_at += n;
+        play_done += n;
     }
     if (looping == 0 && play_at >= play_len && sound(0, 0) == 0) {
         playing = 0;
@@ -497,9 +566,12 @@ void play_feed() {
     return;
 }
 
+// The file a save writes, song.not, or the one named on the command line.
+int save_name = 0;
+
 void save() {
-    if (noter_save(song, "song.not") == 1) {
-        song_name = "song.not";
+    if (noter_save(song, save_name) == 1) {
+        song_name = save_name;
         message = "saved, sync to keep";
     } else {
         message = "could not save";
@@ -509,32 +581,36 @@ void save() {
 
 int main() {
     int mx_max = win_max();
-    fb_max_w = mx_max / 65536;
-    fb_max_h = mx_max % 65536;
+    fb_max_w = mx_max >> 16;
+    fb_max_h = mx_max & 65535;
     fb = alloc(fb_max_w * fb_max_h * 4);
-    if (fb == 0) { print("lira: cannot allocate a frame buffer\n"); return 2; }
+    if (!fb) { print("lira: cannot allocate a frame buffer\n"); return 2; }
     if (font_init() == 0) { print("lira: the kernel would not hand over its font\n"); return 3; }
     line = alloc(256);
     play_out = alloc(PLAY_BLOCK);
     play_mix = alloc(PLAY_BLOCK * 8);
-    if (line == 0 || play_out == 0 || play_mix == 0) { print("lira: out of memory\n"); return 4; }
+    if (line == 0 || play_out == 0 || !play_mix) { print("lira: out of memory\n"); return 4; }
     head_x = 0 - 1;
     ROW_H = cell_h + 4;
     LABEL_W = cell_w * 4 + 6;
     HEAD_H = cell_h + 6;
     PANEL_H = cell_h + 8;
 
-    song_name = "song.not";
-    song = noter_load("song.not", SONG_CAP);
-    if (song == 0) {
+    // `start lira.elf NAME` edits NAME, a new song when there is none yet,
+    // and saves to it. Without a name, song.not, starting from the demo.
+    save_name = "song.not";
+    if (argc() >= 2) { save_name = argv(1); }
+    song_name = save_name;
+    song = noter_load(save_name, SONG_CAP);
+    if (!song && argc() < 2) {
         song_name = "demo.not";
         song = noter_load("demo.not", SONG_CAP);
     }
-    if (song == 0) {
-        song_name = "song.not";
+    if (!song) {
+        song_name = save_name;
         song = noter_new(SONG_CAP, 4, 120);
     }
-    if (song == 0) { print("lira: out of memory\n"); return 5; }
+    if (!song) { print("lira: out of memory\n"); return 5; }
     // Nothing may be printed past this point, since a task with a window has its
     // prints drawn into that window, over the grid.
 
@@ -543,8 +619,8 @@ int main() {
     int last_left = 0;
     while (1) {
         int wi = win_info();
-        int ww = wi / 65536;
-        int wh = wi % 65536;
+        int ww = wi >> 16;
+        int wh = wi & 65535;
         if (ww > fb_max_w) { ww = fb_max_w; }
         if (wh > fb_max_h) { wh = fb_max_h; }
         if (ww != last_w || wh != last_h) { last_w = ww; last_h = wh; dirty = 1; }
@@ -559,8 +635,8 @@ int main() {
         if (mp >= 0) {
             buttons = mp % 8;
             int packed = mp / 8;
-            if (buttons % 2 == 1 && last_left == 0) {
-                click(packed / 1024, packed % 1024);
+            if (buttons % 2 == 1 && !last_left) {
+                if (help_open == 1) { help_open = 0; } else { click(packed / 1024, packed % 1024); }
                 dirty = 1;
             }
         }
@@ -571,25 +647,31 @@ int main() {
             int make = key / 2;
             if (key % 2 == 0) {
                 dirty = 1;
-                if (make == 1) { play_stop(); return 0; }                     // Esc
+                if (make == 1 && help_open == 1) {                            // Esc
+                    help_open = 0;
+                    make = 0;
+                }
+                if (make == 1) { play_stop(); return 0; }
+                if (make == 35) { help_open = 1 - help_open; }               // h
                 if (make == 57) {                                             // space
                     if (playing == 1) { play_stop(); } else { play_start(); }
                 }
                 if (make == 38) { looping = 1 - looping; }                    // l
-                if (make == 51 && note_vel > 15) { note_vel = note_vel - 16; } // ,
-                if (make == 52 && note_vel < 127) { note_vel = note_vel + 16; } // .
+                if (make == 51 && note_vel > 15) { note_vel -= 16; } // ,
+                if (make == 52 && note_vel < 127) { note_vel += 16; } // .
                 if (note_vel > 127) { note_vel = 127; }
+                if (make >= 2 && make <= 5) { note_inst = make - 2; }        // 1 to 4
                 if (make == 31) { save(); }                                   // s
-                if (make == 26 && note_len > 1) { note_len = note_len / 2; }  // [
-                if (make == 27 && note_len < 16) { note_len = note_len * 2; } // ]
-                if (make == 12 && song.nh_tempo > 40) { song.nh_tempo = song.nh_tempo - 5; }  // -
-                if (make == 13 && song.nh_tempo < 300) { song.nh_tempo = song.nh_tempo + 5; } // =
-                if (make == 72 && top_pitch < 127) { top_pitch = top_pitch + 1; }  // up
-                if (make == 80 && top_pitch > 0) { top_pitch = top_pitch - 1; }    // down
-                if (make == 73) { top_pitch = top_pitch + 12; }                    // PgUp
-                if (make == 81) { top_pitch = top_pitch - 12; }                    // PgDn
-                if (make == 75) { first_step = first_step - song.nh_steps; }       // left
-                if (make == 77) { first_step = first_step + song.nh_steps; }       // right
+                if (make == 26 && note_len > 1) { note_len /= 2; }  // [
+                if (make == 27 && note_len < 16) { note_len *= 2; } // ]
+                if (make == 12 && song.nh_tempo > 40) { song.nh_tempo -= 5; }  // -
+                if (make == 13 && song.nh_tempo < 300) { song.nh_tempo += 5; } // =
+                if (make == 72 && top_pitch < 127) { top_pitch += 1; }  // up
+                if (make == 80 && top_pitch > 0) { top_pitch -= 1; }    // down
+                if (make == 73) { top_pitch += 12; }                    // PgUp
+                if (make == 81) { top_pitch -= 12; }                    // PgDn
+                if (make == 75) { first_step -= song.nh_steps; }       // left
+                if (make == 77) { first_step += song.nh_steps; }       // right
                 if (make == 71) { first_step = 0; }                                // Home
                 if (top_pitch > 127) { top_pitch = 127; }
                 if (top_pitch < 0) { top_pitch = 0; }

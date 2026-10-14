@@ -24,9 +24,12 @@
 // an antibacterium it goes for that instead -- they are the only thing that
 // can hurt one.
 //
-// Antibacteria hunt YOU. They are slower than you are, so you can always
-// outrun them, but touching one kills you. You cannot fight back directly;
-// the only counterplay is to build factories and let the mini-bacteria do it.
+// Antibacteria hunt YOU when you come near. They are slower than you are, so
+// you can always outrun them, but touching one drains your health. Away from
+// you they go to the nearest infected cell, one that has not been absorbed or
+// made a factory yet, and heal it, so its infection bar runs back down. More
+// of them arrive as the game goes on. You cannot fight back directly, the
+// only counterplay is to build factories and let the mini-bacteria do it.
 //
 // Everything is drawn from sprites. Five of them ship compiled into this
 // binary, drawn by gen_art.c0, and every one can be replaced by drawing over
@@ -45,6 +48,9 @@
 include "engine.c0";
 include "infecteria_art.c0";
 include "moon.c0";
+include "noter.c0";
+include "synth.c0";
+include "infecteria_sound.c0";
 
 // NOTHING here is a global. Every constant lives as a local in main and
 // is passed down.
@@ -66,11 +72,20 @@ void step_toward(int e, int target, int speed) {
     int ey = e.y + e.h / 2;
     int tx = target.x + target.w / 2;
     int ty = target.y + target.h / 2;
-    if (tx > ex) { e.x = e.x + speed; }
-    if (tx < ex) { e.x = e.x - speed; }
-    if (ty > ey) { e.y = e.y + speed; }
-    if (ty < ey) { e.y = e.y - speed; }
+    if (tx > ex) { e.x += speed; }
+    if (tx < ex) { e.x -= speed; }
+    if (ty > ey) { e.y += speed; }
+    if (ty < ey) { e.y -= speed; }
     return;
+}
+
+// Splits a sub-pixel move into the whole pixels to move this frame and the
+// remainder carried into the next. Speeds are in hundredths of a pixel per
+// frame, and every entity of one speed shares a carry, since they all move
+// in lockstep anyway.
+(int, int) sub_px(int carry, int speed) {
+    int total = carry + speed;
+    return total / 100, total % 100;
 }
 
 // Nearest living entity of `kind`, or 0. O(n) per searcher, which at this
@@ -80,13 +95,28 @@ int nearest_of_kind(int pool, int cap, int from, int kind) {
     int best = 0;
     int bestd = 0;
     int i = 0;
-    while (i < cap) {
+    for (i = 0; i < cap; i += 1) {
         int e = pool_at(pool, i);
         if (e.alive == 1 && e.kind == kind && e != from) {
             int d = dist2(from, e);
             if (best == 0 || d < bestd) { best = e; bestd = d; }
         }
-        i = i + 1;
+    }
+    return best;
+}
+
+// Nearest living cell of `kind` with some infection in it, or 0. What an
+// antibacterium looks for when the player is not close enough to chase.
+int nearest_infected(int pool, int cap, int from, int kind) {
+    int best = 0;
+    int bestd = 0;
+    int i = 0;
+    for (i = 0; i < cap; i += 1) {
+        int e = pool_at(pool, i);
+        if (e.alive == 1 && e.kind == kind && e.a1 > 0) {
+            int d = dist2(from, e);
+            if (best == 0 || d < bestd) { best = e; bestd = d; }
+        }
     }
     return best;
 }
@@ -94,12 +124,11 @@ int nearest_of_kind(int pool, int cap, int from, int kind) {
 // The cell the player's centre is inside, or 0.
 int cell_under(int pool, int cap, int p, int kind) {
     int i = 0;
-    while (i < cap) {
+    for (i = 0; i < cap; i += 1) {
         int c = pool_at(pool, i);
         if (c.alive == 1 && c.kind == kind) {
             if (centre_inside(c, p) == 1) { return c; }
         }
-        i = i + 1;
     }
     return 0;
 }
@@ -128,31 +157,88 @@ void clamp_world(int e, int world_w, int world_h) {
 // world. A layout worth replaying can be kept, and a test can know where
 // everything starts. Without the file the layout comes from the clock, as it
 // always did.
-int world_seed() {
+//
+// A second number, when there is one, is how many antibacteria the world
+// starts with, and a third how many cells it has, the one below the start
+// included. Zero antibacteria gives a world where the only ones are those
+// that arrive later, which is how a test can watch one heal a cell without
+// being hunted first, and a single cell is a world a test can win. The
+// counts land in g_num_anti and g_num_cells, starting from the defaults
+// passed in, and the seed is returned.
+int world_setup(int g, int start_anti, int cells) {
     int buf = alloc(32);
     int n = readfile("infecteria.seed", buf, 31);
+    int nums = alloc(24);
+    int found = 0;
     int v = 0;
     int digits = 0;
     int i = 0;
-    while (i < n) {
-        int c = load8(buf + i);
+    for (i = 0; i <= n && found < 3; i += 1) {
+        int c = ' ';
+        if (i < n) { c = load8(buf + i); }
         if (c >= '0' && c <= '9') {
             v = v * 10 + (c - '0');
-            digits = digits + 1;
-        } else {
-            if (digits > 0) { i = n; }
+            digits += 1;
+        } else if (digits > 0) {
+            store64(nums + found * 8, v);
+            found += 1;
+            v = 0;
+            digits = 0;
         }
-        i = i + 1;
     }
+    int seed = ticks() + 12345;
+    if (found >= 1) { seed = load64(nums); }
+    if (found >= 2) { start_anti = load64(nums + 8); }
+    if (found >= 3) { cells = load64(nums + 16); }
+    if (cells < 1) { cells = 1; }
+    g.g_num_anti = start_anti;
+    g.g_num_cells = cells;
     dealloc(buf);
-    if (digits == 0) { return ticks() + 12345; }
-    return v;
+    dealloc(nums);
+    return seed;
 }
 
 int art_load(int name, int w, int h, int draw_fn) {
     int s = sprite_from_file(name);
     if (s != 0 && s.sp_w == w && s.sp_h == h) { return s; }
     return draw_fn();
+}
+
+// A new antibacterium somewhere at least `min_dist` from the player, or 0
+// when the pool is full.
+int spawn_anti(int pool, int cap, int player, int seed, int world_w, int world_h,
+               int kind, int d, int min_dist, int health, int color) {
+    int e = pool_spawn(pool, cap);
+    if (!e) { return 0; }
+    e.kind = kind;
+    e.w = d;
+    e.h = d;
+    e.x = rng_range(seed, 0, world_w - d);
+    e.y = rng_range(seed, 0, world_h - d);
+    e.color = color;
+    e.a1 = health;
+    // Keep it at least a full screen away from the player. A bounded re-roll
+    // rather than one corrective push, since a push moves a half-world and
+    // wraps, which lands inside the exclusion zone again whenever the first
+    // roll was roughly a half-world away to begin with. Sixteen tries is not
+    // a loop that can hang, and the push is kept as the last resort so the
+    // outcome is bounded even in the case where every try was bad.
+    //
+    // Mirroring the point about the world centre would not do, since it does
+    // nothing at all when the player is AT the centre. Reflecting a nearby
+    // point across it leaves the distance identical.
+    int tries = 0;
+    for (tries = 0; dist2(e, player) < min_dist * min_dist && tries < 16; tries += 1) {
+        e.x = rng_range(seed, 0, world_w - d);
+        e.y = rng_range(seed, 0, world_h - d);
+    }
+    if (dist2(e, player) < min_dist * min_dist) {
+        e.x += world_w / 2;
+        if (e.x > world_w - d) { e.x -= world_w - d; }
+        e.y += world_h / 2;
+        if (e.y > world_h - d) { e.y -= world_h - d; }
+    }
+    return e;
 }
 
 // What the scenes share, everything made once at startup, and the last game's
@@ -170,6 +256,9 @@ layout Game {
     int g_absorbed;     // cells absorbed with e
     int g_factories;    // cells turned into factories with q
     int g_killed;       // antibacteria destroyed by mini-bacteria
+    int g_num_anti;     // antibacteria this world starts with
+    int g_num_cells;    // cells this world has, the one below the start included
+    int g_won;          // 1 when the last game ended with every cell taken
 }
 
 // The playing field. It
@@ -199,10 +288,12 @@ int play_scene(int g) {
     int PLAYER_D; int CELL_D; int MINI_D; int ANTI_D;
     int POOL_CAP; int NUM_CELLS; int NUM_ANTI;
     int SPD_PLAYER; int SPD_PLAYER_SLOW; int SPD_MINI; int SPD_ANTI;
+    int px_player = 0; int px_slow = 0; int px_mini = 0; int px_anti = 0;
+    int c_player = 0; int c_slow = 0; int c_mini = 0; int c_anti = 0;
     int INFECT_PER_TICK; int INFECT_PER_MINI; int MINI_LIFETIME;
     int FACTORY_PERIOD; int ANTI_HEALTH; int ANTI_MIN_SPAWN;
     int PLAYER_MAX_HP; int ANTI_DPS; int ABSORB_HEAL; int MINI_DAMAGE;
-    int COL_HP;
+    int COL_HP; int COL_HUD;
     int COL_BG; int COL_PLAYER; int COL_CELL; int COL_INFECT;
     int COL_FACTORY; int COL_MINI; int COL_ANTI; int COL_BAR;
     int col;
@@ -212,6 +303,11 @@ int play_scene(int g) {
     int phase;
     int moving;
     int started;
+    int sick;
+    int anti_timer;
+    int anti_alive;
+    int ANTI_SPAWN_PERIOD; int ANTI_MAX; int ANTI_HUNT_RANGE; int HEAL_PER_TICK;
+    int hurt_next = 0;   // the tick before which no new hurt sound starts
 
     K_PLAYER = 1; K_CELL = 2; K_FACTORY = 3; K_MINI = 4; K_ANTI = 5;
     WORLD_W = 2400; WORLD_H = 1800;
@@ -219,7 +315,15 @@ int play_scene(int g) {
     POOL_CAP = 160; NUM_CELLS = 46; NUM_ANTI = 5;
     // Antibacteria are strictly slower than the player, so you can always
     // outrun them -- that is the whole counterplay, since you cannot fight.
-    SPD_PLAYER = 3; SPD_PLAYER_SLOW = 2; SPD_MINI = 2; SPD_ANTI = 2;
+    // In hundredths of a pixel per frame, and a frame is one tick at most.
+    SPD_PLAYER = 100; SPD_PLAYER_SLOW = 68; SPD_MINI = 68; SPD_ANTI = 68;
+    // A new antibacterium every fifteen seconds, up to ten at once. One
+    // further than ANTI_HUNT_RANGE from the player goes to heal the nearest
+    // infected cell instead, as fast as standing in a cell infects it. The
+    // range is short, a few body lengths, so the healing happens on screen
+    // where it can be seen, and it is getting close that turns one on you.
+    ANTI_SPAWN_PERIOD = 1500; ANTI_MAX = 10; ANTI_HUNT_RANGE = 150;
+    HEAL_PER_TICK = 1;
     INFECT_PER_TICK = 1; INFECT_PER_MINI = 12; MINI_LIFETIME = 900;
     // A screen is about 1000 px wide, so an antibacterium that starts closer
     // than this is one you can see hunting you before you have moved.
@@ -238,8 +342,11 @@ int play_scene(int g) {
     COL_INFECT = 0xC06040; COL_FACTORY = 0xE0A030; COL_MINI = 0x80FFC0;
     COL_ANTI = 0xE04040; COL_BAR = 0x40E060; COL_READY = 0xFFFFA0;
     COL_HP = 0x40C0FF;
+    COL_HUD = 0xC8D8E0;
 
     v = g.g_v;
+    int hud = alloc(96);
+    defer dealloc(hud);
     seed = g.g_seed;
     pool = g.g_pool;
     sp_player = g.g_sp_player;
@@ -253,7 +360,10 @@ int play_scene(int g) {
 
     // A new world every game, from the seed file when there is one, so a
     // playtest can replay the same world as often as it likes.
-    store64(seed, world_seed());
+    store64(seed, world_setup(g, NUM_ANTI, NUM_CELLS + 1));
+    NUM_ANTI = g.g_num_anti;
+    NUM_CELLS = g.g_num_cells - 1;
+    g.g_won = 0;
     pool_clear(pool, POOL_CAP);
 
     // The player starts in the middle of the world.
@@ -283,7 +393,7 @@ int play_scene(int g) {
     // harmful here, and rejection sampling would be a loop that can fail to
     // terminate on a crowded world.
     i = 0;
-    while (i < NUM_CELLS) {
+    for (i = 0; i < NUM_CELLS; i += 1) {
         e = pool_spawn(pool, POOL_CAP);
         if (e != 0) {
             e.kind = K_CELL;
@@ -294,60 +404,25 @@ int play_scene(int g) {
             e.color = COL_CELL;
             e.a1 = 0;
         }
-        i = i + 1;
     }
 
     // Antibacteria, kept away from the player's starting position so the
     // first seconds are not an ambush.
     i = 0;
-    while (i < NUM_ANTI) {
-        e = pool_spawn(pool, POOL_CAP);
-        if (e != 0) {
-            e.kind = K_ANTI;
-            e.w = ANTI_D;
-            e.h = ANTI_D;
-            e.x = rng_range(seed, 0, WORLD_W - ANTI_D);
-            e.y = rng_range(seed, 0, WORLD_H - ANTI_D);
-            e.color = COL_ANTI;
-            e.a1 = ANTI_HEALTH;
-            // Keep it at least a full screen away from where the player
-            // starts. A bounded re-roll rather than one corrective push, since the
-            // push moved a half-world and wrapped, which lands inside the
-            // exclusion zone again whenever the first roll was roughly a
-            // half-world away to begin with, and the only thing stopping that
-            // from being common was luck. Sixteen tries is not a loop that
-            // can hang, and the push is kept as the last resort so the
-            // outcome is bounded even in the case where every try was bad.
-            //
-            // The earlier version of this guard mirrored the point about the
-            // world centre, which does nothing at all here, because the
-            // player starts AT the centre and reflecting a nearby point
-            // across it leaves the distance identical. It looked like a guard
-            // and was a no-op, and the player was being killed within seconds
-            // of starting.
-            int tries = 0;
-            while (dist2(e, player) < ANTI_MIN_SPAWN * ANTI_MIN_SPAWN
-                   && tries < 16) {
-                e.x = rng_range(seed, 0, WORLD_W - ANTI_D);
-                e.y = rng_range(seed, 0, WORLD_H - ANTI_D);
-                tries = tries + 1;
-            }
-            if (dist2(e, player) < ANTI_MIN_SPAWN * ANTI_MIN_SPAWN) {
-                e.x = e.x + WORLD_W / 2;
-                if (e.x > WORLD_W - ANTI_D) { e.x = e.x - (WORLD_W - ANTI_D); }
-                e.y = e.y + WORLD_H / 2;
-                if (e.y > WORLD_H - ANTI_D) { e.y = e.y - (WORLD_H - ANTI_D); }
-            }
-        }
-        i = i + 1;
+    for (i = 0; i < NUM_ANTI; i += 1) {
+        spawn_anti(pool, POOL_CAP, player, seed, WORLD_W, WORLD_H, K_ANTI, ANTI_D,
+                   ANTI_MIN_SPAWN, ANTI_HEALTH, COL_ANTI);
     }
+    anti_timer = ANTI_SPAWN_PERIOD;
 
     print("infecteria: running\n");
     prev = ticks();
     started = prev;
+    snd_music_on(1);
     up = 0; down = 0; left = 0; right = 0;
 
     while (1) {
+        snd_pump();
         // --- input ---------------------------------------------------------
         // Arrow keys are tracked as HELD state via make/break, not as
         // one-shot events, since the player should keep moving while a key is down.
@@ -359,8 +434,8 @@ int play_scene(int g) {
             if (make_code == 80) { down = 1 - is_break; }
             if (make_code == 75) { left = 1 - is_break; }
             if (make_code == 77) { right = 1 - is_break; }
-            if (is_break == 0) {
-                if (make_code == 1) { return 0; }        // Esc quits
+            if (!is_break) {
+                if (make_code == 1) { snd_music_on(0); return 0; }   // Esc quits
                 // e / q act on the cell you are standing in, and only once it
                 // is fully infected.
                 if (make_code == 18 || make_code == 16) {
@@ -370,20 +445,31 @@ int play_scene(int g) {
                             // Absorbing is the only way to heal, which is
                             // what makes infecting cells worth the risk of
                             // standing still near an antibacterium.
-                            player.a1 = player.a1 + ABSORB_HEAL;
+                            player.a1 += ABSORB_HEAL;
                             if (player.a1 > PLAYER_MAX_HP) { player.a1 = PLAYER_MAX_HP; }
                             pool_kill(here);              // e absorbs
-                            g.g_absorbed = g.g_absorbed + 1;
+                            sfx(SFX_EAT);
+                            g.g_absorbed += 1;
                         } else {
                             here.kind = K_FACTORY;        // q converts
+                            sfx(SFX_FACTORY);
                             here.color = COL_FACTORY;
                             here.a2 = FACTORY_PERIOD;
-                            g.g_factories = g.g_factories + 1;
+                            g.g_factories += 1;
                         }
                     }
                 }
             }
             key = key_poll();
+        }
+
+        // Every cell eaten or made a factory ends the game, won.
+        if (g.g_absorbed + g.g_factories >= g.g_num_cells) {
+            g.g_won = 1;
+            g.g_ticks = ticks() - started;
+            snd_music_on(0);
+            sfx(SFX_WIN);
+            return over_scene;
         }
 
         t = ticks();
@@ -402,28 +488,33 @@ int play_scene(int g) {
             sleep(1);
         } else {
             prev = t;
+            px_player, c_player = sub_px(c_player, SPD_PLAYER);
+            px_slow, c_slow = sub_px(c_slow, SPD_PLAYER_SLOW);
+            px_mini, c_mini = sub_px(c_mini, SPD_MINI);
+            px_anti, c_anti = sub_px(c_anti, SPD_ANTI);
 
             // --- player ----------------------------------------------------
             here = cell_under(pool, POOL_CAP, player, K_CELL);
-            speed = SPD_PLAYER;
-            if (here != 0) { speed = SPD_PLAYER_SLOW; }
-            if (up == 1) { player.y = player.y - speed; }
-            if (down == 1) { player.y = player.y + speed; }
-            if (left == 1) { player.x = player.x - speed; }
-            if (right == 1) { player.x = player.x + speed; }
+            speed = px_player;
+            if (here != 0) { speed = px_slow; }
+            if (up == 1) { player.y -= speed; }
+            if (down == 1) { player.y += speed; }
+            if (left == 1) { player.x -= speed; }
+            if (right == 1) { player.x += speed; }
             clamp_world(player, WORLD_W, WORLD_H);
 
             // Standing in a cell infects it.
             if (here != 0 && here.kind == K_CELL && here.a1 < 100) {
-                here.a1 = here.a1 + INFECT_PER_TICK * dt;
+                here.a1 += INFECT_PER_TICK * dt;
                 if (here.a1 >= 100) {
                     here.a1 = 100;
+                    sfx(SFX_READY);
                 }
             }
 
             // --- everything else -------------------------------------------
             i = 0;
-            while (i < POOL_CAP) {
+            for (i = 0; i < POOL_CAP; i += 1) {
                 e = pool_at(pool, i);
                 if (e.alive == 1) {
                     if (e.kind == K_FACTORY) {
@@ -433,7 +524,7 @@ int play_scene(int g) {
                         // "frames" while being named in ticks, and the first
                         // factory came within a frame or two of never
                         // emitting at all inside a seven-second test.
-                        e.a2 = e.a2 - dt;
+                        e.a2 -= dt;
                         if (e.a2 <= 0) {
                             e.a2 = FACTORY_PERIOD;
                             spawned = pool_spawn(pool, POOL_CAP);
@@ -453,48 +544,86 @@ int play_scene(int g) {
                         // it instead of looking for a cell.
                         target = nearest_of_kind(pool, POOL_CAP, e, K_ANTI);
                         if (target != 0 && dist2(e, target) < 260 * 260) {
-                            step_toward(e, target, SPD_MINI);
+                            step_toward(e, target, px_mini);
                             if (aabb_hit(e, target) == 1) {
-                                target.a1 = target.a1 - MINI_DAMAGE;
+                                target.a1 -= MINI_DAMAGE;
                                 if (target.a1 <= 0) {
                                     pool_kill(target);
-                                    g.g_killed = g.g_killed + 1;
+                                    g.g_killed += 1;
+                                    sfx(SFX_KILL);
                                 }
                                 pool_kill(e);
                             }
                         } else {
                             target = nearest_of_kind(pool, POOL_CAP, e, K_CELL);
                             if (target != 0) {
-                                step_toward(e, target, SPD_MINI);
+                                step_toward(e, target, px_mini);
                                 if (centre_inside(target, e) == 1) {
-                                    target.a1 = target.a1 + INFECT_PER_MINI;
+                                    if (target.a1 < 100 && target.a1 + INFECT_PER_MINI >= 100) {
+                                        sfx(SFX_READY);
+                                    }
+                                    target.a1 += INFECT_PER_MINI;
                                     if (target.a1 > 100) { target.a1 = 100; }
                                     // Spent on arrival.
                                     pool_kill(e);
                                 }
                             }
                         }
-                        e.a1 = e.a1 - dt;
+                        e.a1 -= dt;
                         if (e.a1 <= 0) { pool_kill(e); }
                         clamp_world(e, WORLD_W, WORLD_H);
                     }
                     if (e.kind == K_ANTI) {
-                        step_toward(e, player, SPD_ANTI);
+                        // The player when it is close, otherwise the nearest
+                        // infected cell, and the player again when no cell is
+                        // infected at all.
+                        target = player;
+                        if (dist2(e, player) > ANTI_HUNT_RANGE * ANTI_HUNT_RANGE) {
+                            sick = nearest_infected(pool, POOL_CAP, e, K_CELL);
+                            if (sick != 0) { target = sick; }
+                        }
+                        step_toward(e, target, px_anti);
                         clamp_world(e, WORLD_W, WORLD_H);
+                        if (target != player && centre_inside(target, e) == 1) {
+                            target.a1 -= HEAL_PER_TICK * dt;
+                            if (target.a1 < 0) { target.a1 = 0; }
+                        }
                         // Contact drains health rather than killing outright.
                         // Instant death made a single mistake fatal, and with
                         // an antibacterium that follows you forever there was
                         // no way to recover from being caught once.
                         if (aabb_hit(e, player) == 1) {
-                            player.a1 = player.a1 - ANTI_DPS * dt;
+                            player.a1 -= ANTI_DPS * dt;
+                            if (t >= hurt_next) {
+                                sfx(SFX_HURT);
+                                hurt_next = t + 30;
+                            }
                             if (player.a1 <= 0) {
                                 g.g_ticks = t - started;
+                                snd_music_on(0);
+                                sfx(SFX_LOSE);
                                 return over_scene;
                             }
                         }
                     }
                 }
-                i = i + 1;
+            }
+
+            // More antibacteria as the game goes on.
+            anti_timer -= dt;
+            if (anti_timer <= 0) {
+                anti_timer = ANTI_SPAWN_PERIOD;
+                anti_alive = 0;
+                for (i = 0; i < POOL_CAP; i += 1) {
+                    e = pool_at(pool, i);
+                    if (e.alive == 1 && e.kind == K_ANTI) { anti_alive += 1; }
+                }
+                if (anti_alive < ANTI_MAX) {
+                    if (spawn_anti(pool, POOL_CAP, player, seed, WORLD_W, WORLD_H, K_ANTI,
+                                   ANTI_D, ANTI_MIN_SPAWN, ANTI_HEALTH, COL_ANTI) != 0) {
+                        sfx(SFX_ARRIVE);
+                    }
+                }
             }
 
             // --- render ----------------------------------------------------
@@ -522,7 +651,7 @@ int play_scene(int g) {
             view_bar(v, player.x, player.y, PLAYER_D,
                      player.a1 * 100 / PLAYER_MAX_HP, COL_HP);
             i = 0;
-            while (i < POOL_CAP) {
+            for (i = 0; i < POOL_CAP; i += 1) {
                 e = pool_at(pool, i);
                 if (e.alive == 1) {
                     if (e.kind == K_MINI) {
@@ -535,7 +664,6 @@ int play_scene(int g) {
                         view_bar(v, e.x, e.y, ANTI_D, e.a1 * 100 / ANTI_HEALTH, COL_ANTI);
                     }
                 }
-                i = i + 1;
             }
 
             // Then the cells and factories, with their infection bars on top.
@@ -545,7 +673,7 @@ int play_scene(int g) {
             // become a thing that stands there, and looking solid is how it
             // says so without a label.
             i = 0;
-            while (i < POOL_CAP) {
+            for (i = 0; i < POOL_CAP; i += 1) {
                 e = pool_at(pool, i);
                 if (e.alive == 1 && (e.kind == K_CELL || e.kind == K_FACTORY)) {
                     col = COL_CELL;
@@ -567,8 +695,18 @@ int play_scene(int g) {
                         view_bar(v, e.x, e.y, CELL_D, e.a1, bc);
                     }
                 }
-                i = i + 1;
             }
+
+            // How far the game is, in screen coordinates over everything else.
+            int n = put_str(hud, 0, "cells ");
+            n = put_num(hud, n, g.g_absorbed + g.g_factories);
+            n = put_str(hud, n, " of ");
+            n = put_num(hud, n, g.g_num_cells);
+            n = put_str(hud, n, "   eaten ");
+            n = put_num(hud, n, g.g_absorbed);
+            n = put_str(hud, n, "   factories ");
+            n = put_num(hud, n, g.g_factories);
+            view_text(v, 8, 8, hud, COL_HUD, 1);
 
             present(v.buf);
         }
@@ -601,6 +739,7 @@ int title_scene(int g) {
     int v = g.g_v;
     int last = 0 - 1;
     while (1) {
+        snd_pump();
         int k = key_pressed(57, 1);                   // space, Esc
         if (k == 1) { return play_scene; }
         if (k == 2) { return 0; }
@@ -611,7 +750,7 @@ int title_scene(int g) {
             card_begin(g, t);
             view_text_centred(v, v.vh / 2 - 80, "INFECTERIA", COL_TITLE, 4);
             view_text_centred(v, v.vh / 2 + 30, "arrows move   e absorb a cell   q make it a factory", COL_TEXT, 1);
-            view_text_centred(v, v.vh / 2 + 50, "outrun the red ones: only your factories can hurt them", COL_DIM_TEXT, 1);
+            view_text_centred(v, v.vh / 2 + 50, "red ones hunt you and heal cells, factories hurt them", COL_DIM_TEXT, 1);
             view_text_centred(v, v.vh / 2 + 80, "space to start   esc to quit", COL_TEXT, 1);
             present(v.buf);
         }
@@ -624,9 +763,9 @@ int title_scene(int g) {
 int put_num(int buf, int at, int n) {
     int d = alloc(24);
     int k = 0;
-    if (n == 0) { store8(d, '0'); k = 1; }
-    while (n > 0) { store8(d + k, '0' + n % 10); n = n / 10; k = k + 1; }
-    while (k > 0) { k = k - 1; store8(buf + at, load8(d + k)); at = at + 1; }
+    if (!n) { store8(d, '0'); k = 1; }
+    while (n > 0) { store8(d + k, '0' + n % 10); n /= 10; k += 1; }
+    while (k > 0) { k -= 1; store8(buf + at, load8(d + k)); at += 1; }
     store8(buf + at, 0);
     dealloc(d);
     return at;
@@ -634,17 +773,23 @@ int put_num(int buf, int at, int n) {
 
 int put_str(int buf, int at, int s) {
     int i = 0;
-    while (load8(s + i) != 0) { store8(buf + at, load8(s + i)); at = at + 1; i = i + 1; }
+    for (i = 0; load8(s + i) != 0; i += 1) { store8(buf + at, load8(s + i)); at += 1; }
     store8(buf + at, 0);
     return at;
 }
 
+// The end of a game, lost or won. Death says CLEARED in red. Taking every
+// cell says INFECTED in green and how long it took.
 int over_scene(int g) {
     int v = g.g_v;
     int line = alloc(96);
     int n = put_str(line, 0, "you lasted ");
+    if (g.g_won == 1) { n = put_str(line, 0, "every cell taken in "); }
     n = put_num(line, n, g.g_ticks / 100);
     n = put_str(line, n, " seconds");
+    int title = "CLEARED";
+    int title_col = 0xE04040;
+    if (g.g_won == 1) { title = "INFECTED"; title_col = COL_TITLE; }
     int line2 = alloc(96);
     int m = put_num(line2, 0, g.g_absorbed);
     m = put_str(line2, m, " absorbed   ");
@@ -655,6 +800,7 @@ int over_scene(int g) {
     int last = 0 - 1;
     int next = 0 - 1;
     while (next < 0) {
+        snd_pump();
         int k = key_pressed(57, 1);                   // space, Esc
         if (k == 1) { next = play_scene; }
         if (k == 2) { next = 0; }
@@ -663,7 +809,7 @@ int over_scene(int g) {
         if (next < 0 && t != last) {
             last = t;
             card_begin(g, t);
-            view_text_centred(v, v.vh / 2 - 80, "CLEARED", 0xE04040, 4);
+            view_text_centred(v, v.vh / 2 - 80, title, title_col, 4);
             view_text_centred(v, v.vh / 2 + 30, line, COL_TEXT, 1);
             view_text_centred(v, v.vh / 2 + 50, line2, COL_TEXT, 1);
             view_text_centred(v, v.vh / 2 + 80, "space to play again   esc to quit", COL_DIM_TEXT, 1);
@@ -681,12 +827,12 @@ int over_scene(int g) {
 // any other size is refused, because size decides what collides.
 int main() {
     int winfo = win_info();
-    if (winfo == 0) { return 200; }
+    if (!winfo) { return 200; }
     int g = alloc(sizeof(Game));
     int v = alloc(sizeof(View));
-    if (g == 0 || v == 0) { return 202; }
-    v.vw = winfo / 65536;
-    v.vh = winfo % 65536;
+    if (g == 0 || !v) { return 202; }
+    v.vw = winfo >> 16;
+    v.vh = winfo & 65535;
     v.cam_x = 0;
     v.cam_y = 0;
     // Sized for the LARGEST window this machine can hand out, not for the one
@@ -719,6 +865,9 @@ int main() {
         print("infecteria: the kernel would not hand over its font\n");
         return 204;
     }
+    snd_init();
+    snd_music_on(1);
     scene_run(title_scene, g);
+    snd_music_on(0);
     return 0;
 }

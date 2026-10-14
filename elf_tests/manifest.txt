@@ -11,6 +11,7 @@ et10 10_glyph.c0 26
 et11 11_globals.c0 137
 et12 12_lager.c0 10
 et13 13_oljud.c0 10
-et14 14_noter.c0 14
+et14 14_noter.c0 17
 et15 15_synth.c0 11
 et16 16_args_sleep.c0 8
+et17 17_instruments.c0 5

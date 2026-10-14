@@ -33,7 +33,8 @@
 set -u
 cd "$(dirname "$0")"
 
-./build.sh || exit 1
+# `mouse` is a debug command, so this needs a debug build.
+MOONSHOT_DEBUG=1 ./build.sh || exit 1
 
 isodir=isoroot
 rm -rf "$isodir" moonshot.iso

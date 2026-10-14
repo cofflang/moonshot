@@ -25,3 +25,35 @@
 int sleep(int t) {
     return syscall(16, t, 0, 0, 0, 0);
 }
+
+// The entries of a directory, from the root ("" is the root itself), as
+// 48-byte records in buf, at most max of them: +0 the type (1 file, 2
+// directory), +8 the size, +16 the name, NUL-terminated. Returns how many
+// were written, with buf == 0 how many there are, or -1 when the path is not
+// a directory.
+int listdir(int path, int buf, int max) {
+    return syscall(19, path, buf, max, 0, 0);
+}
+
+// Starts the program a command line names, as the shell's start does,
+// `spawn("utsikt.elf about.html")`. Names are found from the root. Returns
+// the new task's id, or a negative number when it could not be started.
+int spawn(int line) {
+    return syscall(20, line, 0, 0, 0, 0);
+}
+
+// Opens a file in the kernel's own editor for it, a sprite (.spr) in pensel
+// and anything else in skrift, in a new window that takes the focus. Names
+// are found from the root. Returns the window's id, -2 when that editor is
+// already open, -3 when there is no room for another window, -1 otherwise.
+int edit(int path) {
+    return syscall(22, path, 0, 0, 0, 0);
+}
+
+// Makes `pages` pages of this program's own heap, from the page-aligned
+// `addr`, writable and not executable (mode 1) or executable and read-only
+// (mode 0). For a program that writes machine code and then runs it. Returns
+// 0, or -1 when a page is not the program's own.
+int protect(int addr, int pages, int mode) {
+    return syscall(21, addr, pages, mode, 0, 0);
+}

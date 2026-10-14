@@ -83,15 +83,14 @@ int KLICK_EDGE = 0;
 // --- 8042 controller plumbing ---------------------------------------------
 
 // Waits until the controller is ready to be WRITTEN to (status bit 1, the
-// input-buffer-full flag, clear). Bounded rather than a bare `while`: a
+// input-buffer-full flag, clear). Bounded rather than a bare `while`, since a
 // controller that never clears the flag -- no PS/2 hardware at all, which is
 // possible on real machines even though QEMU always has one -- would
 // otherwise hang the boot forever.
 int klick_wait_write() {
     int spin = 0;
-    while (spin < 100000) {
+    for (spin = 0; spin < 100000; spin += 1) {
         if ((inb(0x64) / 2) - ((inb(0x64) / 2) / 2) * 2 == 0) { return 1; }
-        spin = spin + 1;
     }
     return 0;
 }
@@ -100,9 +99,8 @@ int klick_wait_write() {
 // Same bounded-spin reasoning.
 int klick_wait_read() {
     int spin = 0;
-    while (spin < 100000) {
+    for (spin = 0; spin < 100000; spin += 1) {
         if (inb(0x64) - (inb(0x64) / 2) * 2 == 1) { return 1; }
-        spin = spin + 1;
     }
     return 0;
 }
@@ -129,17 +127,15 @@ int klick_write(int b) {
 void klick_hide() {
     if (klick_active != 1 || klick_saved_at < 0) { return; }
     int row = 0;
-    while (row < KLICK_SIZE) {
+    for (row = 0; row < KLICK_SIZE; row += 1) {
         int col = 0;
-        while (col < KLICK_SIZE) {
+        for (col = 0; col < KLICK_SIZE; col += 1) {
             int x = klick_saved_x + col;
             int y = klick_saved_y + row;
             if (x < fb_width && y < fb_height) {
                 fb_put_pixel(x, y, load64(klick_save_buf + (row * KLICK_SIZE + col) * 8));
             }
-            col = col + 1;
         }
-        row = row + 1;
     }
     klick_saved_at = 0 - 1;
     return;
@@ -155,9 +151,9 @@ void klick_show() {
     klick_saved_x = klick_x;
     klick_saved_y = klick_y;
     int row = 0;
-    while (row < KLICK_SIZE) {
+    for (row = 0; row < KLICK_SIZE; row += 1) {
         int col = 0;
-        while (col < KLICK_SIZE) {
+        for (col = 0; col < KLICK_SIZE; col += 1) {
             int x = klick_saved_x + col;
             int y = klick_saved_y + row;
             if (x < fb_width && y < fb_height) {
@@ -167,9 +163,7 @@ void klick_show() {
                 if (col == KLICK_SIZE - 1 || row == KLICK_SIZE - 1) { c = KLICK_EDGE; }
                 fb_put_pixel(x, y, c);
             }
-            col = col + 1;
         }
-        row = row + 1;
     }
     klick_saved_at = 1;
     return;
@@ -191,19 +185,36 @@ void klick_show() {
 // The depth counter makes nesting safe. klick_hide/klick_show are each
 // individually idempotent, so a nested pair would otherwise redraw the
 // pointer in the middle of the outer operation -- visible as the pointer
-// being painted over anyway. Only the outermost lift/drop does the work.
+// being painted over anyway. Only the outermost drop redraws it.
+//
+// klick_lift_rect lifts only when the area about to be painted overlaps the
+// pointer. Text is drawn a glyph at a time, and saving and restoring the
+// pointer around each one would cost three times the glyph itself. The depth goes
+// up before the overlap test, so a mouse interrupt arriving in between
+// moves the pointer without redrawing it (see klick_move_to).
 int klick_lift_depth = 0;
 
 void klick_lift() {
     if (klick_active != 1) { return; }
-    if (klick_lift_depth == 0) { klick_hide(); }
-    klick_lift_depth = klick_lift_depth + 1;
+    klick_lift_depth += 1;
+    klick_hide();
+    return;
+}
+
+void klick_lift_rect(int x, int y, int w, int h) {
+    if (klick_active != 1) { return; }
+    klick_lift_depth += 1;
+    if (klick_saved_at >= 0
+            && x < klick_saved_x + KLICK_SIZE && klick_saved_x < x + w
+            && y < klick_saved_y + KLICK_SIZE && klick_saved_y < y + h) {
+        klick_hide();
+    }
     return;
 }
 
 void klick_drop() {
     if (klick_active != 1) { return; }
-    klick_lift_depth = klick_lift_depth - 1;
+    klick_lift_depth -= 1;
     if (klick_lift_depth <= 0) {
         klick_lift_depth = 0;
         klick_show();
@@ -211,7 +222,9 @@ void klick_drop() {
     return;
 }
 
-// Moves the pointer to (x, y), clamped to the screen. It lifts, moves and redraws.
+// Moves the pointer to (x, y), clamped to the screen. It lifts, moves and
+// redraws, unless something is being painted right now, in which case the
+// redraw waits for that painting's klick_drop.
 void klick_move_to(int x, int y) {
     if (klick_active != 1) { return; }
     if (x < 0) { x = 0; }
@@ -222,7 +235,7 @@ void klick_move_to(int x, int y) {
     klick_hide();
     klick_x = x;
     klick_y = y;
-    klick_show();
+    if (!klick_lift_depth) { klick_show(); }
     return;
 }
 
@@ -254,7 +267,7 @@ int klick_ev_tail = 0;
 int klick_ev_count = 0;
 
 void klick_ev_push(int x, int y, int buttons) {
-    if (klick_ev_buf == 0) { return; }
+    if (!klick_ev_buf) { return; }
     // Dropping the OLDEST event when full is wrong for a mouse, since the newest
     // position is the one that matters, and a full ring means the consumer is
     // behind. Drop the new one instead -- a stroke loses a sample, which is
@@ -262,7 +275,7 @@ void klick_ev_push(int x, int y, int buttons) {
     if (klick_ev_count >= KLICK_EV_CAP) {
         // Said once per boot, since this runs in the mouse interrupt, and a
         // consumer that has stopped would otherwise flood serial.
-        if (klick_ev_full_said == 0) {
+        if (!klick_ev_full_said) {
             serial_print("[klick] event queue full (");
             serial_print_int(KLICK_EV_CAP);
             serial_print("), dropping new events\n");
@@ -271,9 +284,9 @@ void klick_ev_push(int x, int y, int buttons) {
         return;
     }
     store64(klick_ev_buf + klick_ev_tail * 8, (x * 1024 + y) * 8 + buttons);
-    klick_ev_tail = klick_ev_tail + 1;
+    klick_ev_tail += 1;
     if (klick_ev_tail >= KLICK_EV_CAP) { klick_ev_tail = 0; }
-    klick_ev_count = klick_ev_count + 1;
+    klick_ev_count += 1;
     return;
 }
 
@@ -281,9 +294,9 @@ void klick_ev_push(int x, int y, int buttons) {
 int klick_ev_poll() {
     if (klick_ev_count <= 0) { return 0 - 1; }
     int ev = load64(klick_ev_buf + klick_ev_head * 8);
-    klick_ev_head = klick_ev_head + 1;
+    klick_ev_head += 1;
     if (klick_ev_head >= KLICK_EV_CAP) { klick_ev_head = 0; }
-    klick_ev_count = klick_ev_count - 1;
+    klick_ev_count -= 1;
     return ev;
 }
 
@@ -301,7 +314,7 @@ void klick_handler() {
     // Bit 5 of the status register distinguishes an aux-device byte from a
     // keyboard byte -- both arrive on port 0x60, and consuming a keyboard
     // byte here would silently eat keystrokes.
-    int from_aux = (status / 32) - ((status / 32) / 2) * 2;
+    int from_aux = (status >> 5) & 1;
     if (from_aux != 1) {
         outb(0xA0, 0x20);
         outb(0x20, 0x20);
@@ -309,12 +322,12 @@ void klick_handler() {
     }
     int b = inb(0x60);
 
-    if (klick_phase == 0) {
+    if (!klick_phase) {
         // Bit 3 of the first byte is always 1. If it is not, the stream is
         // out of sync (a dropped byte, or a byte that arrived before the
         // enable completed) -- drop it and wait for a byte that looks like a
         // real packet start rather than decoding garbage into pointer jumps.
-        int always = (b / 8) - ((b / 8) / 2) * 2;
+        int always = (b >> 3) & 1;
         if (always != 1) {
             outb(0xA0, 0x20);
             outb(0x20, 0x20);
@@ -330,14 +343,14 @@ void klick_handler() {
         int dx = klick_b1;
         int dy = b;
         klick_phase = 0;
-        klick_packets = klick_packets + 1;
+        klick_packets += 1;
 
         int was_l = klick_left;
         int was_m = klick_middle;
         int was_r = klick_right;
         klick_left = flags % 2;
-        klick_right = (flags / 2) - ((flags / 2) / 2) * 2;
-        klick_middle = (flags / 4) - ((flags / 4) / 2) * 2;
+        klick_right = (flags >> 1) & 1;
+        klick_middle = (flags >> 2) & 1;
         // Only on a CHANGE, since buttons are re-reported in every packet, so
         // logging unconditionally would put a line on serial for every
         // pixel of movement. On change it stays bounded, and it is the
@@ -355,28 +368,22 @@ void klick_handler() {
 
         // Sign-extend, since the movement bytes are the low 8 bits of a signed
         // 9-bit value whose sign bit sits in the flag byte.
-        int xsign = (flags / 16) - ((flags / 16) / 2) * 2;
-        int ysign = (flags / 32) - ((flags / 32) / 2) * 2;
-        if (xsign == 1) { dx = dx - 256; }
-        if (ysign == 1) { dy = dy - 256; }
+        int xsign = (flags >> 4) & 1;
+        int ysign = (flags >> 5) & 1;
+        if (xsign == 1) { dx -= 256; }
+        if (ysign == 1) { dy -= 256; }
 
         // Overflow bits mean the counters saturated and the deltas are
-        // meaningless; treat the packet as no movement rather than lurching.
+        // meaningless, so the packet counts as no movement rather than a lurch.
         //
-        // Clamping to a large step in the sign's direction was tried instead,
-        // on the theory that a fast flick should still travel. It was reverted
-        // as part of a batch of changes that regressed the mouse.
-        //
-        // This branch is unreachable under QEMU, though, so that revert
-        // convicted it on proximity to the other changes in the batch rather
-        // than on evidence. QEMU's ps2_mouse_send_packet() clamps deltas to
-        // +/-127 and never sets bits 6/7 at all; a session of deliberate fast
-        // flicking logged 4396 packets and 0 overflows. Only real hardware
-        // can exercise this code. The clamp is very likely correct (it is
-        // what QEMU itself does), but it stays out until there is hardware
-        // that can tell the difference.
-        int xover = (flags / 64) - ((flags / 64) / 2) * 2;
-        int yover = (flags / 128) - ((flags / 128) / 2) * 2;
+        // Clamping to a large step in the sign's direction would let a fast
+        // flick still travel, and is very likely correct, since it is what
+        // QEMU itself does. But this branch is unreachable under QEMU, whose
+        // ps2_mouse_send_packet() clamps deltas to +/-127 and never sets bits
+        // 6/7 at all, so only real hardware can exercise it. Treating the
+        // packet as no movement is the choice that cannot go wrong untested.
+        int xover = (flags >> 6) & 1;
+        int yover = (flags >> 7) & 1;
         if (xover == 1 || yover == 1) {
             dx = 0;
             dy = 0;
@@ -446,11 +453,10 @@ int klick_init() {
     // bytes and acknowledgements (0xFA) are dropped, a keyboard scancode
     // goes to the keyboard as if its interrupt had delivered it.
     int stale = 0;
-    while (stale < 16 && inb(0x64) % 2 == 1) {
+    for (stale = 0; stale < 16 && inb(0x64) % 2 == 1; stale += 1) {
         int status = inb(0x64);
         int b = inb(0x60);
         if ((status / 32) % 2 == 0 && b != 0xFA) { keyboard_process(b); }
-        stale = stale + 1;
     }
 
     // Read the controller configuration byte, set bit 1 (aux interrupt
@@ -461,10 +467,10 @@ int klick_init() {
     outb(0x64, 0x20);
     if (klick_wait_read() == 0) { return 0; }
     int cfg = inb(0x60);
-    int bit1 = (cfg / 2) - ((cfg / 2) / 2) * 2;
-    if (bit1 == 0) { cfg = cfg + 2; }
-    int bit5 = (cfg / 32) - ((cfg / 32) / 2) * 2;
-    if (bit5 == 1) { cfg = cfg - 32; }
+    int bit1 = (cfg >> 1) & 1;
+    if (!bit1) { cfg += 2; }
+    int bit5 = (cfg >> 5) & 1;
+    if (bit5 == 1) { cfg -= 32; }
     if (klick_wait_write() == 0) { return 0; }
     outb(0x64, 0x60);
     if (klick_wait_write() == 0) { return 0; }
@@ -488,7 +494,7 @@ int klick_init() {
     klick_ev_tail = 0;
     klick_ev_count = 0;
     klick_save_buf = kmalloc(KLICK_SIZE * KLICK_SIZE * 8);
-    if (klick_save_buf == 0) {
+    if (!klick_save_buf) {
         serial_print("[klick] no memory for pointer backing store\n");
         return 0;
     }
@@ -554,14 +560,14 @@ void klick_drain() {
         int y = rest % 1024;
         int x = rest / 1024;
         int left = buttons % 2;
-        int right = (buttons / 2) - ((buttons / 2) / 2) * 2;
-        if (left == 1 && klick_drain_left == 0) {
+        int right = (buttons >> 1) & 1;
+        if (left == 1 && !klick_drain_left) {
             // kakel_click returns the window it focused, or -1 when the
             // click changed nothing (already focused, or no window there).
             // Only a real focus change spends the press.
             if (kakel_click(x, y) >= 0) { klick_focus_click = 1; }
         }
-        if (left == 0) { klick_focus_click = 0; }
+        if (!left) { klick_focus_click = 0; }
         klick_drain_left = left;
         pensel_mouse(x, y, left, right);
         ev = klick_ev_poll();

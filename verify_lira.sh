@@ -165,7 +165,7 @@ def is_note(img, org, pitch, step):
 
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
-word("spawn3 lira.elf"); typ(["ret"]); time.sleep(2.0)
+word("start lira.elf"); typ(["ret"]); time.sleep(2.0)
 park()
 
 print("1. the demo song")
@@ -218,7 +218,7 @@ typ(["esc"]); time.sleep(1.0)
 # the next command is typed into nothing and the previous frame is what gets
 # checked. The second lira's tile is found from the screen like the first.
 send("sendkey alt-w", settle=0.8)
-word("spawn3 lira.elf"); typ(["ret"]); time.sleep(2.0)
+word("start lira.elf"); typ(["ret"]); time.sleep(2.0)
 park()
 c = shot("lira_c.ppm")
 org2 = origin(c)

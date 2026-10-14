@@ -119,10 +119,10 @@ word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
 
 # utsikt takes a tavla beside the shell tile, the right half of the screen.
-word("spawn3 utsikt.elf"); typ(["ret"]); time.sleep(4.5)
+word("start utsikt.elf"); typ(["ret"]); time.sleep(4.5)
 shot("uresize_half.ppm")
 
-# spawn3 leaves focus on the shell, so `close` goes to the shell window and
+# start leaves focus on the shell, so `close` goes to the shell window and
 # closes IT -- leaving the tavla as the only tile, at full width.
 word("close"); typ(["ret"]); time.sleep(3.5)
 shot("uresize_full.ppm")

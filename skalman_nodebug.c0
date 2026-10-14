@@ -1,0 +1,18 @@
+// skalman_nodebug.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// The shell's debug commands in an ordinary build, which is none. See
+// skalman_debug.c0 for the ones a MOONSHOT_DEBUG=1 build has.
+
+void sk_debug_cmds() {
+    return;
+}
+
+int sk_debug_run(int f, int cmd) {
+    return 0;
+}

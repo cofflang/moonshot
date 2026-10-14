@@ -56,6 +56,26 @@ copy_tree() { # src-dir dest-dir
 }
 
 base=$snap/base
+# An interrupted run removes its copies too, about 100MB per shard, which
+# would otherwise pile up in a tmpfs /tmp until it is full. Everything
+# running inside the snapshot goes first, the scripts and their QEMUs, then
+# the copies. The logs stay.
+interrupted() {
+  trap - INT TERM HUP
+  local p
+  for p in /proc/[0-9]*; do
+    p=${p#/proc/}
+    [ "$p" = "$$" ] && continue
+    case "$(readlink /proc/$p/cwd 2>/dev/null)" in
+      "$snap"/*) kill "$p" 2>/dev/null ;;
+    esac
+  done
+  wait 2>/dev/null
+  rm -rf "$base" "$snap"/shard*
+  echo "interrupted, copies removed, logs: $snap/logs"
+  exit 130
+}
+trap interrupted INT TERM HUP
 for d in moonshot c0-coff gnista utsikt; do
   [ -d "$code/$d" ] && copy_tree "$code/$d" "$base/$d"
 done

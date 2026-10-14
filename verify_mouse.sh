@@ -12,34 +12,31 @@
 # Proves the two things that make klick useful rather than merely correct.
 # click-to-focus in kakel, and the ring-3 mouse syscall.
 #
-# The scene is a shell tile on the left and Gnista's demo in a tavla on the
-# right. Movement and buttons are injected through QEMU's monitor
+# The scene is a shell tile on the left and mouse_probe (programs/) in a
+# tavla on the right. It draws an orange square at the pointer for as long as
+# the left button is held. Movement and buttons are injected through QEMU's monitor
 # (`mouse_move`, `mouse_button`), the same path verify_klick.sh drives.
 #
-#   1. spawn3 leaves focus on the shell, so a left press over the tavla must
+#   1. start leaves focus on the shell, so a left press over the tavla must
 #      move focus there, and a press back over the shell must move it back.
 #      kakel logs every focus change with its cause, so the serial line is
 #      the witness ("(click)"), and the pointer's position in the
 #      screendumps confirms which tile was under it each time.
 #   2. That focusing press must NOT also reach the program inside the
-#      tavla. It is held down for four seconds, which is ample time for the
-#      demo to steer entity 0 to the pointer, and no sprite may arrive.
+#      tavla. It is held down for four seconds, and no square may appear.
 #      This is the half that fails if a click ever goes back to doing two
 #      things at once.
-#   3. Once the tavla is focused, the NEXT press does steer the demo's
-#      entity 0 toward the pointer (gnista.c0's mouse_poll() loop). After a
-#      few seconds a sprite must sit at the pointer, and still be there a
-#      second later -- the other three movers bounce around the same window
-#      wearing the same sprite, and one of them passing by would not stay.
-#      That only happens if SYS_MOUSE_POLL hands the program
+#   3. Once the tavla is focused, the NEXT press does reach the program, and
+#      the square must sit at the pointer, and still be there a second
+#      later. That only happens if SYS_MOUSE_POLL hands the program
 #      window-relative coordinates and the button state.
 #
 # Checks 2 and 3 are the same measurement with the same tolerance, run on
 # either side of one button release, and they must disagree. That is what
-# makes this a test of the rule rather than of the demo.
+# makes this a test of the rule rather than of the program.
 #
 # Screendumps are analysed by pixel, the way the other graphical checks are.
-# the pointer by its exact fill colour, the sprite by its two frame colours.
+# the pointer by its exact fill colour, the square by its orange.
 set -u
 cd "$(dirname "$0")"
 
@@ -84,7 +81,7 @@ def typ(keys, gap=0.06):
         send("sendkey " + k)
         time.sleep(gap)
 def word(s):
-    keymap = {".": "dot", " ": "spc", "-": "minus"}
+    keymap = {".": "dot", " ": "spc", "-": "minus", "/": "slash"}
     typ([keymap.get(c, c) for c in s])
 def shot(name):
     send("screendump %s" % name, settle=0.6)
@@ -94,11 +91,11 @@ def move(dx, dy, steps):
 
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
-word("spawn3 gnista.elf"); typ(["ret"]); time.sleep(3.0)
+word("start test/mouse.elf"); typ(["ret"]); time.sleep(3.0)
 
 # 1. Press over the unfocused tavla. This focuses it, and that is ALL it
-#    may do, since the press is held for four seconds, and the demo must not
-#    steer anything with it.
+#    may do, since the press is held for four seconds, and the program must
+#    not draw anything for it.
 move(14, 0, 10)                          # ~140 px right, into the tavla
 move(0, 6, 10)                           # and a little down
 time.sleep(0.5)
@@ -110,7 +107,7 @@ send("mouse_button 0", settle=0.3)
 time.sleep(0.5)
 
 # 2. Press again, without moving. The tavla is focused now, so this one is
-#    the program's and the demo steers entity 0 to the pointer.
+#    the program's and the square goes to the pointer.
 send("mouse_button 1", settle=0.3)
 time.sleep(4.0)
 shot("mouse_held.ppm")
@@ -141,7 +138,7 @@ fi
 python3 - <<'PY'
 import sys
 POINTER = (255, 255, 255)
-SPRITE = ((255, 140, 0), (255, 220, 0))
+SQUARE = ((255, 140, 0),)
 def read_ppm(path):
     with open(path, "rb") as f:
         data = f.read()
@@ -173,9 +170,9 @@ def pixels_of(path, colours):
 def pointer(path):
     px, w, h = pixels_of(path, (POINTER,))
     return (min(px) if px else None), len(px), w
-def nearest_sprite(path, p):
-    """Distance from pointer p to the nearest sprite pixel, or None."""
-    spr, _, _ = pixels_of(path, SPRITE)
+def nearest_square(path, p):
+    """Distance from pointer p to the nearest square pixel, or None."""
+    spr, _, _ = pixels_of(path, SQUARE)
     if not spr or p is None:
         return None
     return min(max(abs(x - p[0]), abs(y - p[1])) for x, y in spr)
@@ -189,25 +186,25 @@ if p_tavla is None or p_tavla[0] < w // 2:
     print("FAIL: the first click was not over the right (tavla) tile"); ok = False
 if p_shell is None or p_shell[0] >= w // 2:
     print("FAIL: the second click was not over the left (shell) tile"); ok = False
-# The demo stops steering within 2 px of the pointer on each axis and the
-# sprite is 12 px across, so a steered sprite has pixels within a few px of
-# the hot spot; 16 leaves room for the pointer glyph covering some of it.
+# The square is 12 px across and centred on the pointer, so its pixels are
+# within 6 px of the hot spot. 16 leaves room for the pointer glyph covering
+# some of it.
 # The same 16 is the threshold both checks below use.
 NEAR = 16
 
-d0 = nearest_sprite("mouse_focusheld.ppm", p_focus)
-print("nearest sprite pixel after 4s of the FOCUSING press: %s px" % (d0,))
+d0 = nearest_square("mouse_focusheld.ppm", p_focus)
+print("nearest square pixel after 4s of the FOCUSING press: %s px" % (d0,))
 if d0 is not None and d0 <= NEAR:
     print("FAIL: the focusing click was also delivered to the program -- a")
-    print("      sprite followed a press whose only job was to focus the")
+    print("      square followed a press whose only job was to focus the")
     print("      window. See klick_focus_click in klick.c0.")
     ok = False
 
-d1 = nearest_sprite("mouse_held.ppm", p_held)
-d2 = nearest_sprite("mouse_held2.ppm", p_held)
-print("nearest sprite pixel to the pointer: %s px after 4s held, %s px a second later" % (d1, d2))
+d1 = nearest_square("mouse_held.ppm", p_held)
+d2 = nearest_square("mouse_held2.ppm", p_held)
+print("nearest square pixel to the pointer: %s px after 4s held, %s px a second later" % (d1, d2))
 if d1 is None or d1 > NEAR or d2 is None or d2 > NEAR:
-    print("FAIL: no sprite stayed at the pointer -- mouse_poll() is not steering entity 0"); ok = False
+    print("FAIL: no square stayed at the pointer -- mouse_poll() is not reaching the program"); ok = False
 sys.exit(0 if ok else 1)
 PY
 [ $? -eq 0 ] || ok=0

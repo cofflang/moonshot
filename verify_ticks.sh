@@ -62,8 +62,8 @@ time.sleep(0.5)
 typ(["ret"])  # empty password
 time.sleep(1.0)
 
-# spawn3 test/tickstest.elf -- fixtures live in /test now.
-typ(["s","p","a","w","n","3","spc","t","e","s","t","slash","t","i","c","k","s","t","e","s","t","dot","e","l","f","ret"])
+# start test/tickstest.elf -- fixtures live in /test.
+typ(["s","t","a","r","t","spc","t","e","s","t","slash","t","i","c","k","s","t","e","s","t","dot","e","l","f","ret"])
 time.sleep(2.5)
 
 sock.close()

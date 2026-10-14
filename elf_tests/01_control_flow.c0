@@ -7,14 +7,14 @@
 int main() {
     int t = 0;
     int i = 0;
-    if (1 < 2) { t = t + 1; } else { t = t + 100; }
-    if (2 < 1) { t = t + 100; } else { t = t + 2; }
-    while (i < 4) { t = t + 4; i = i + 1; }
-    if (t == 19) { t = t + 8; } else { t = t + 100; }
+    if (1 < 2) { t += 1; } else { t += 100; }
+    if (2 < 1) { t += 100; } else { t += 2; }
+    while (i < 4) { t += 4; i += 1; }
+    if (t == 19) { t += 8; } else { t += 100; }
     i = 0;
     while (i < 3) {
-        if (i == 1) { t = t + 16; } else { t = t + 32; }
-        i = i + 1;
+        if (i == 1) { t += 16; } else { t += 32; }
+        i += 1;
     }
     return t;
 }

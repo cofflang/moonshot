@@ -8,31 +8,40 @@
 // WARRANTY; see the LICENSE file for the full text.
 // knekt.c0 -- the kernel core, main() (the actual entry point boot.s
 // calls), the post-paging-switch init step, the halt primitive, and the
-// generic byte-manipulation helpers (load32/store16_le/store32_le) every
+// generic byte-manipulation helpers (store16_le/mem_copy) every
 // other subsystem builds on.
 
-// Reassembles a little-endian 32-bit field from four bytes -- Multiboot's
-// info structure is all u32 fields, and c0 only has load8/load64 (no
-// load32); this is a plain c0 helper, not a new compiler builtin, same
-// spirit as everything else being "just bytes" until proven otherwise.
-int load32(int addr) {
-    return load8(addr) + load8(addr + 1) * 256 + load8(addr + 2) * 65536 + load8(addr + 3) * 16777216;
-}
-
-// Inverse of load32 for 16/32-bit little-endian writes -- needed for IDT
-// entries and the IDTR, since c0 only has store8/store64 natively. Pure
-// arithmetic (v/256, no bitwise shift/mask) since c0 has neither -- v is
-// always guaranteed < 65536 by the caller (see interrupts.c0's idt_set),
-// so v/256 alone (no re-masking) is already < 256.
+// A little-endian 16-bit write, for IDT entries and the IDTR. c0 has 8, 32
+// and 64-bit loads and stores built in, but no 16-bit one.
 void store16_le(int addr, int v) {
-    store8(addr, v % 256);
-    store8(addr + 1, v / 256);
+    store8(addr, v & 255);
+    store8(addr + 1, (v >> 8) & 255);
     return;
 }
 
-void store32_le(int addr, int v) {
-    store16_le(addr, v % 65536);
-    store16_le(addr + 2, v / 65536);
+// Copies n bytes from src to dst, thirty-two at a time while that many are
+// left, since the loop's own counting costs about as much as a copy, then
+// eight at a time, then the odd tail one byte at a time. x86 does not mind
+// the 8-byte accesses being unaligned. Copying forwards is safe when dst
+// sits below an overlapping src, never above it. File reads and writes and
+// the ELF loader all go through this, and a byte loop would make them eight
+// times slower than they need to be.
+void mem_copy(int dst, int src, int n) {
+    int i = 0;
+    for (i = 0; i + 32 <= n; i += 32) {
+        store64(dst + i, load64(src + i));
+        store64(dst + i + 8, load64(src + i + 8));
+        store64(dst + i + 16, load64(src + i + 16));
+        store64(dst + i + 24, load64(src + i + 24));
+    }
+    while (i + 8 <= n) {
+        store64(dst + i, load64(src + i));
+        i += 8;
+    }
+    while (i < n) {
+        store8(dst + i, load8(src + i));
+        i += 1;
+    }
     return;
 }
 
@@ -102,13 +111,12 @@ void kernel_post_init() {
         int px = 0;
         while (py < 8) {
             px = 0;
-            while (px < 8) {
+            for (px = 0; px < 8; px += 1) {
                 if (load32(fb_addr + py * fb_pitch + px * 4) == FB_FG) {
-                    w0_fg = w0_fg + 1;
+                    w0_fg += 1;
                 }
-                px = px + 1;
             }
-            py = py + 1;
+            py += 1;
         }
         // Bottom-right corner of the shell area (above the status bar).
         int shell_bot = fb_height - KAKEL_LOG_ROWS * FONT_H - 1;
@@ -127,6 +135,26 @@ void kernel_post_init() {
         serial_print_int(corner_bg);
         serial_print(" stats_bg=");
         serial_print_int(stats_bg);
+        serial_print("\n");
+
+        // Every pixel of an asymmetric glyph, once where text cells always
+        // sit (whole pairs of pixels) and once a pixel off, which takes
+        // fb_draw_char's one-pixel-at-a-time path. The 'M' above is
+        // symmetric, so it would not notice a mirrored glyph.
+        serial_print("glyph: aligned_bad=");
+        serial_print_int(fb_glyph_mismatches(16, 0, 'F'));
+        serial_print(" unaligned_bad=");
+        serial_print_int(fb_glyph_mismatches(25, 0, 'R'));
+        serial_print("\n");
+
+        // SYS_BLIT's drawing, transparency, both alignments and clipping.
+        serial_print("blit: bad=");
+        serial_print_int(fb_blit_mismatches(64, 8));
+        serial_print("\n");
+
+        // SYS_FILL's clipping, on all four edges of window 0.
+        serial_print("fill: bad=");
+        serial_print_int(kakel_fill_mismatches(0));
         serial_print("\n");
 
         // Clear the verification marker so the shell starts clean.
@@ -158,6 +186,7 @@ void kernel_post_init() {
     // errors print through the shell's output path (already live).
     jakel_init();
     jakel_big_file_test();
+    jakel_append_test();
 
     // klick last, since it draws the pointer as soon as it comes up, so everything
     // that paints the initial screen -- the window layout, each session's
@@ -173,7 +202,13 @@ void kernel_post_init() {
 }
 
 int main() {
+    int uart = serial_init();
     serial_print("Hello from Moonshot\n");
+    if (uart == 1) {
+        serial_print("serial: 16550 ready, loopback ok\n");
+    } else {
+        serial_print("serial: no 16550 answered in loopback\n");
+    }
 
     int mb_info = load32(MBINFO_ADDR);
     fb_probe(mb_info);

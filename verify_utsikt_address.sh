@@ -29,6 +29,11 @@
 # The comparison in check 3 is over the strip's pixels, not over a count of
 # them, because "index.html" and "about.html" are the same length and a
 # count could coincide.
+#
+#   4. The text is the RIGHT text, pixel for pixel. "/index.html" and
+#      "/about.html" are drawn from punkt.c0's own font tables here and must
+#      match the strip's text exactly, from the strip's top-left corner plus
+#      its padding. Checks 2 and 3 pass with every glyph drawn mirrored.
 set -u
 cd "$(dirname "$0")"
 
@@ -114,7 +119,7 @@ def move_to(x, y):
 
 word("root"); typ(["ret"]); time.sleep(0.5)
 typ(["ret"]); time.sleep(1.2)
-word("spawn3 utsikt.elf"); typ(["ret"]); time.sleep(4.5)
+word("start utsikt.elf"); typ(["ret"]); time.sleep(4.5)
 # Focus the browser, the way the links check does. The first click on an
 # unfocused window only focuses it now, so a click meant to follow a link
 # has to land on a window that already has focus.
@@ -213,6 +218,52 @@ if ok and fg1 == fg2:
 elif ok:
     d = len(fg1 ^ fg2)
     print("text pixels that differ between the two pages: %d" % d)
+
+# Check 4. The font is read out of punkt.c0's font_hi and font_lo, the same
+# tables SYS_GLYPH hands to utsikt. Rows 0-3 are font_hi's bytes from the
+# top, rows 4-7 font_lo's, bit 7 the leftmost pixel.
+import re
+src = open("punkt.c0").read()
+def table(fn):
+    body = src[src.index("int %s(int ch) {" % fn):]
+    body = body[:body.index("\n}\n")]
+    out = {}
+    for key, val in re.findall(r"if \(ch == ('(?:\\.|.)'|\d+)\)\s*\{ return (0x[0-9A-Fa-f]+); \}", body):
+        ch = int(key) if key[0] != "'" else ord(key[1:-1].replace("\\", ""))
+        out[ch] = int(val, 16)
+    return out
+hi, lo = table("font_hi"), table("font_lo")
+BAR_PAD = 2
+
+def expected(bg, text):
+    # The strip's top row of background is one below the hairline, and its
+    # leftmost pixel is the window's left edge.
+    rows = {}
+    for (x, y) in bg:
+        rows[y] = rows.get(y, 0) + 1
+    widest = max(rows.values())
+    top = min(y for y, n in rows.items() if n > widest // 2)
+    left = min(x for (x, y) in bg if y == top)
+    x0, y0 = left + BAR_PAD, top + BAR_PAD
+    lit = set()
+    for k, ch in enumerate(text):
+        for r in range(8):
+            word = hi.get(ord(ch), 0) if r < 4 else lo.get(ord(ch), 0)
+            bits = (word >> ((3 - r if r < 4 else 7 - r) * 8)) & 255
+            for c in range(8):
+                if (bits >> (7 - c)) & 1:
+                    lit.add((x0 + k * 8 + c, y0 + r))
+    return lit
+
+if ok:
+    for name, bg, fg in (("/index.html", bg1, fg1), ("/about.html", bg2, fg2)):
+        want = expected(bg, name)
+        if want != fg:
+            print("FAIL: the strip does not read %s. %d pixels missing, %d extra"
+                  % (name, len(want - fg), len(fg - want)))
+            ok = False
+        else:
+            print("the strip reads %s, all %d text pixels in place" % (name, len(want)))
 sys.exit(0 if ok else 1)
 PY
 rc=$?

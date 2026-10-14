@@ -20,21 +20,20 @@ int pit_ticks = 0;
 
 // Writes one 64-bit interrupt-gate IDT entry (16 bytes) for `vector`,
 // pointing at `handler_addr`. Splitting the address into offset_low(16)/
-// offset_mid(16)/offset_high(32) is done by successive division by 65536.
+// offset_mid(16)/offset_high(32) is done with shifts and masks.
 // type_attr 0x8E is present | ring 0 | 64-bit interrupt gate.
 void idt_set(int vector, int handler_addr) {
     int entry = idt_start + vector * 16;
-    int lo16 = handler_addr % 65536;
-    int rest = handler_addr / 65536;
-    int mid16 = rest % 65536;
-    int hi32 = rest / 65536;
+    int lo16 = handler_addr & 65535;
+    int mid16 = (handler_addr >> 16) & 65535;
+    int hi32 = handler_addr >> 32;
     store16_le(entry, lo16);
     store16_le(entry + 2, 0x08); // selector, code segment 0x08 (see boot.s's GDT)
     store8(entry + 4, 0);        // IST none
     store8(entry + 5, 0x8e);
     store16_le(entry + 6, mid16);
-    store32_le(entry + 8, hi32);
-    store32_le(entry + 12, 0); // reserved
+    store32(entry + 8, hi32);
+    store32(entry + 12, 0); // reserved
     return;
 }
 
@@ -58,12 +57,16 @@ void dispatch_set(int vector, int handler) {
 // and calls through it -- `h(...)`
 // is an indirect call through a variable. Every handler is passed
 // (vector, errcode, cr2, rip) uniformly; handlers that do not need all of
-// them (timer/keyboard declare no params; page_fault_handler ignores
-// vector/rip) simply ignore the extra registers, which c0's no-arity-
-// checking indirect calls allow. Passing the vector lets one generic
-// panic_handler serve many exception vectors and still report which one
-// fired; passing the RIP lets it report WHERE the fault occurred.
-void int_dispatch(int vector, int errcode, int cr2, int rip) {
+// them (timer/keyboard declare no params) simply ignore the extra
+// registers, which c0's no-arity-checking indirect calls allow. Passing the
+// vector lets one generic panic_handler serve many exception vectors and
+// still report which one fired; passing the RIP lets it report WHERE the fault occurred. The
+// interrupted code segment is kept in int_cs rather than passed on, for the
+// two handlers that need to know whether ring 3 was running.
+int int_cs = 0;
+
+void int_dispatch(int vector, int errcode, int cr2, int rip, int cs) {
+    int_cs = cs;
     int h = load64(dispatch_start + vector * 8);
     h(vector, errcode, cr2, rip);
     return;
@@ -103,7 +106,7 @@ void pit_configure(int divisor) {
 // without this the PIC withholds all further IRQ0s, believing one is still
 // being serviced.
 void timer_tick() {
-    pit_ticks = pit_ticks + 1;
+    pit_ticks += 1;
     if (pit_ticks % 20 == 0) {
         serial_print("tick ");
         serial_print_int(pit_ticks);
@@ -141,7 +144,14 @@ void timer_tick() {
 // of these vectors are not practically triggerable from c0 source at all
 // (e.g. #10 needs a bad far call/TSS selector, #4 needs `into`); #0
 // (divide-by-zero) is the one exercised by test_panic.sh.
+//
+// A fault in a ring-3 program is that program's own, so it ends the program
+// and nothing else (sched_kill_faulted). NMI, double fault and machine check
+// say something about the machine, not the program, and still panic.
 void panic_handler(int vector, int errcode, int cr2, int rip) {
+    if (vector != 2 && vector != 8 && vector != 18) {
+        if (sched_kill_faulted(vector, errcode, cr2, rip) == 1) { return; }
+    }
     serial_print("KERNEL PANIC: exception vector=");
     serial_print_int(vector);
     serial_print(" errcode=");

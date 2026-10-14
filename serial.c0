@@ -6,26 +6,67 @@
 // moonshot is free software, distributed under the GNU General Public
 // License version 3 or (at your option) any later version, WITHOUT ANY
 // WARRANTY; see the LICENSE file for the full text.
-// serial.c0 -- COM1 output, one byte at a time via outb. No UART
-// initialization, since QEMU's emulated 16550 accepts writes to the transmit
-// register without it for `-serial file:`/`-serial stdio` redirection.
-// Real hardware would need the real init sequence, which Moonshot does
-// not do. Automated testing reads the
-// serial log, so this stays the verification channel even now that
-// there is real graphical output too (see vga.c0/punkt.c0).
+// serial.c0 -- COM1 output, one byte at a time via outb. serial_init sets
+// the 16550 up the way real hardware needs it, 115200 baud, 8 data bits, no
+// parity, one stop bit, FIFOs on, and checks the chip in loopback mode
+// first. Automated testing reads the serial log, so this stays the
+// verification channel alongside the real graphical output
+// (see vga.c0/punkt.c0).
 
 int SERIAL_PORT = 0x3f8;
 
+// 1 once serial_init found a working UART. Until then, and on a machine
+// without one, serial_putc writes without waiting, which is what QEMU has
+// always accepted and costs nothing where there is no chip to wait for.
+int serial_ready = 0;
+
+// Programs COM1 and proves it answers. In loopback mode the chip feeds what
+// it sends straight back to its own receiver, so a byte written and read
+// back unchanged means there is a working 16550 at the port. Returns 1, or
+// 0 when there is not, in which case the port is left alone.
+int serial_init() {
+    int b = SERIAL_PORT;
+    outb(b + 1, 0x00);   // no UART interrupts, this driver polls
+    outb(b + 3, 0x80);   // DLAB on, the next two writes are the divisor
+    outb(b + 0, 0x01);   // divisor 1, 115200 baud
+    outb(b + 1, 0x00);
+    outb(b + 3, 0x03);   // DLAB off, 8 bits, no parity, one stop bit
+    outb(b + 2, 0xC7);   // FIFOs on and cleared, 14-byte trigger level
+    outb(b + 4, 0x1E);   // loopback, RTS, OUT1, OUT2
+    outb(b + 0, 0xAE);
+    int i = 0;
+    while (i < 100000 && (inb(b + 5) & 1) == 0) { i += 1; }
+    if (inb(b + 0) != 0xAE) { return 0; }
+    outb(b + 4, 0x0F);   // normal operation, DTR, RTS, OUT1, OUT2
+    serial_ready = 1;
+    return 1;
+}
+
+// Real hardware needs the transmitter to have room before each byte. An
+// empty transmit register (line status bit 5) means the whole 16-byte FIFO
+// is free, so the status is read once per sixteen bytes rather than before
+// every one. Each read is a trip out of the guest under QEMU, and the kernel
+// logs a lot. The wait is bounded, so a UART that stops answering costs a
+// moment rather than a hung kernel.
+int serial_room = 0;
+
 void serial_putc(int c) {
+    if (serial_ready == 1) {
+        if (serial_room == 0) {
+            int i = 0;
+            while (i < 100000 && (inb(SERIAL_PORT + 5) & 32) == 0) { i += 1; }
+            serial_room = 16;
+        }
+        serial_room -= 1;
+    }
     outb(SERIAL_PORT, c);
     return;
 }
 
 void serial_print(int msg) {
     int i = 0;
-    while (load8(msg + i) != 0) {
+    for (i = 0; load8(msg + i) != 0; i += 1) {
         serial_putc(load8(msg + i));
-        i = i + 1;
     }
     return;
 }
@@ -40,18 +81,18 @@ void serial_print_hex(int v) {
     int tmp = serial_scratch;
     int i = 31;
     int d = 0;
-    if (v == 0) { serial_putc('0'); return; }
+    if (!v) { serial_putc('0'); return; }
     // Process all 16 hex digits. For negative v (bit 63 set), c0's / and *
     // truncate toward zero, so v - (v/16)*16 produces a remainder in [-15,0]
     // and v/16 is the ceiling rather than the floor. Both are corrected,
     // remainder in [-15,-1] → adjust with +16, quotient -= 1.
     int n = 0;
-    while (n < 16) {
-        i = i - 1;
+    for (n = 0; n < 16; n += 1) {
+        i -= 1;
         int t = v / 16;
         d = v - t * 16;
         if (d < 0) {
-            d = d + 16;  // remainder in [1, 15]
+            d += 16;  // remainder in [1, 15]
             v = t - 1;   // floor quotient
         } else {
             v = t;       // floor quotient (already correct for d >= 0)
@@ -61,15 +102,14 @@ void serial_print_hex(int v) {
         } else {
             store8(tmp + i, 'a' + d - 10);
         }
-        n = n + 1;
     }
     // Skip leading zeros.
     while (i < 31 && load8(tmp + i) == '0') {
-        i = i + 1;
+        i += 1;
     }
     while (i < 31) {
         serial_putc(load8(tmp + i));
-        i = i + 1;
+        i += 1;
     }
     return;
 }
@@ -78,17 +118,17 @@ void serial_print_int(int v) {
     int tmp = serial_scratch;
     int neg = 0;
     int i = 31;
-    if (v == 0) { serial_putc('0'); return; }
+    if (!v) { serial_putc('0'); return; }
     if (v < 0) { neg = 1; v = 0 - v; }
     while (v > 0) {
-        i = i - 1;
+        i -= 1;
         store8(tmp + i, '0' + (v % 10));
-        v = v / 10;
+        v /= 10;
     }
-    if (neg == 1) { i = i - 1; store8(tmp + i, '-'); }
+    if (neg == 1) { i -= 1; store8(tmp + i, '-'); }
     while (i < 31) {
         serial_putc(load8(tmp + i));
-        i = i + 1;
+        i += 1;
     }
     return;
 }
