@@ -37,6 +37,9 @@ include "moon.c0";
 include "dom.c0";
 include "style.c0";
 include "flow.c0";
+include "script.c0";
+include "engine_test.c0";
+include "glimt.c0";
 
 // The document utsikt opens first. A function rather than a global because
 // a global initialiser is a constant, and a string literal is an address the
@@ -70,20 +73,19 @@ void history_push(int name) {
         // memory of the way back is finite.
         dealloc(load64(history));
         int k = 1;
-        while (k < HIST_MAX) {
+        for (k = 1; k < HIST_MAX; k += 1) {
             store64(history + (k - 1) * 8, load64(history + k * 8));
-            k = k + 1;
         }
         history_n = HIST_MAX - 1;
     }
     store64(history + history_n * 8, name);
-    history_n = history_n + 1;
+    history_n += 1;
     return;
 }
 
 int history_pop() {
     if (history_n <= 0) { return 0; }
-    history_n = history_n - 1;
+    history_n -= 1;
     return load64(history + history_n * 8);
 }
 
@@ -93,13 +95,12 @@ int history_pop() {
 // Refusing it leaves the current page alone, which is the one behaviour that
 // cannot lose what the reader was looking at.
 int followable(int href) {
-    if (href == 0) { return 0; }
+    if (!href) { return 0; }
     if (href[0] == 0) { return 0; }
     if (href[0] == '#') { return 0; }
     int i = 0;
-    while (href[i] != 0) {
+    for (i = 0; href[i] != 0; i += 1) {
         if (href[i] == ':') { return 0; }
-        i = i + 1;
     }
     return 1;
 }
@@ -154,7 +155,7 @@ int load_document(int name) {
     int size = readfile(name, 0, 0);
     if (size <= 0) { return 0; }
     int buf = doc_alloc(size + 1);
-    if (buf == 0) { return 0; }
+    if (!buf) { return 0; }
     int n = readfile(name, buf, size);
     if (n <= 0) { return 0; }
     buf[n] = 0;
@@ -169,7 +170,7 @@ int build_page(int html) {
     rules_tail = 0;
     css_parse(default_css());
     int root = html_parse(html);
-    if (root == 0) { return 0; }
+    if (!root) { return 0; }
     int b = style_blocks;
     while (b != 0) {
         css_parse(b.sb_text);
@@ -179,6 +180,9 @@ int build_page(int html) {
     int bg = find_page_bg(root);
     if (bg < 0) { bg = 0xFFFFFF; }
     page_bg = bg;
+    // Scripts run once the page is styled, before it is first laid out, so
+    // the first frame already shows what they did.
+    scripts_run(root);
     return root;
 }
 
@@ -193,39 +197,96 @@ int build_page(int html) {
 // screen stays as it was. Recording each allocation is simpler and much
 // harder to get wrong than teaching the DOM to free itself node by node,
 // with strings shared between nodes and rules.
+//
+// Small pieces are cut from chunks of DOC_CHUNK bytes and only the chunks
+// are recorded, since a page is hundreds of nodes and strings and asking
+// the kernel for each one would make a page load cost tens of milliseconds. A
+// chunk comes zeroed and nothing in it is handed out twice, so what
+// doc_alloc returns is zeroed the same as alloc's. Anything bigger than a
+// quarter chunk, such as the source text or an image, gets its own block.
+int DOC_CHUNK = 16384;
 int doc_cur = 0;      // record of the document on screen, an array of pointers
 int doc_cur_n = 0;
+int doc_cur_cap = 0;
+int doc_building = 0; // 1 between doc_begin and doc_commit or doc_abort
 int doc_new = 0;      // record of the document being built
 int doc_new_n = 0;
 int doc_new_cap = 0;
+int doc_chunk_at = 0;    // next free byte in the current chunk
+int doc_chunk_left = 0;  // bytes left in it
 
 int doc_alloc(int n) {
+    if (n <= 0) { return 0; }
+    n = (n + 7) & (0 - 8);
+    if (n <= DOC_CHUNK / 4) {
+        if (n > doc_chunk_left) {
+            int c = doc_record(DOC_CHUNK);
+            if (!c) { return 0; }
+            doc_chunk_at = c;
+            doc_chunk_left = DOC_CHUNK;
+        }
+        int q = doc_chunk_at;
+        doc_chunk_at += n;
+        doc_chunk_left -= n;
+        return q;
+    }
+    return doc_record(n);
+}
+
+// A block of its own from the kernel, written down in the record. While a
+// document is being built that is the new document's record. Once it has
+// been committed or abandoned, it is the record of the page on screen, so
+// what a script or a click allocates later goes away with that page rather
+// than with whichever document is built next.
+int doc_record(int n) {
     int p = alloc(n);
-    if (p == 0) { return 0; }
+    if (!p) { return 0; }
+    if (!doc_building) { doc_swap(); }
+    int ok = doc_push(p);
+    if (!doc_building) { doc_swap(); }
+    if (!ok) { dealloc(p); return 0; }
+    return p;
+}
+
+// Appends p to the new document's record, growing it. Returns 0 when the
+// record cannot grow.
+int doc_push(int p) {
     if (doc_new_n == doc_new_cap) {
         int cap = 256;
         if (doc_new_cap > 0) { cap = doc_new_cap * 2; }
         int grown = alloc(cap * 8);
-        if (grown == 0) { dealloc(p); return 0; }
+        if (!grown) { return 0; }
         int i = 0;
-        while (i < doc_new_n) {
+        for (i = 0; i < doc_new_n; i += 1) {
             store64(grown + i * 8, load64(doc_new + i * 8));
-            i = i + 1;
         }
         if (doc_new != 0) { dealloc(doc_new); }
         doc_new = grown;
         doc_new_cap = cap;
     }
     store64(doc_new + doc_new_n * 8, p);
-    doc_new_n = doc_new_n + 1;
-    return p;
+    doc_new_n += 1;
+    return 1;
+}
+
+// Exchanges the two records, so doc_push can add to either.
+void doc_swap() {
+    int t = doc_new;
+    doc_new = doc_cur;
+    doc_cur = t;
+    t = doc_new_n;
+    doc_new_n = doc_cur_n;
+    doc_cur_n = t;
+    t = doc_new_cap;
+    doc_new_cap = doc_cur_cap;
+    doc_cur_cap = t;
+    return;
 }
 
 void doc_release(int record, int n) {
     int i = 0;
-    while (i < n) {
+    for (i = 0; i < n; i += 1) {
         dealloc(load64(record + i * 8));
-        i = i + 1;
     }
     if (record != 0) { dealloc(record); }
     return;
@@ -235,6 +296,9 @@ void doc_begin() {
     doc_new = 0;
     doc_new_n = 0;
     doc_new_cap = 0;
+    doc_chunk_at = 0;
+    doc_chunk_left = 0;
+    doc_building = 1;
     return;
 }
 
@@ -242,26 +306,28 @@ void doc_commit() {
     doc_release(doc_cur, doc_cur_n);
     doc_cur = doc_new;
     doc_cur_n = doc_new_n;
+    doc_cur_cap = doc_new_cap;
     doc_begin();
+    doc_building = 0;
     return;
 }
 
 void doc_abort() {
     doc_release(doc_new, doc_new_n);
     doc_begin();
+    doc_building = 0;
     return;
 }
 
 // A page name of utsikt's own, independent of any document. See history.
 int name_keep(int name) {
     int n = 0;
-    while (name[n] != 0) { n = n + 1; }
+    while (name[n] != 0) { n += 1; }
     int s = alloc(n + 1);
-    if (s == 0) { return 0; }
+    if (!s) { return 0; }
     int i = 0;
-    while (i <= n) {
+    for (i = 0; i <= n; i += 1) {
         s[i] = name[i];
-        i = i + 1;
     }
     return s;
 }
@@ -272,12 +338,12 @@ int name_keep(int name) {
 int goto_page(int name) {
     doc_begin();
     int html = load_document(name);
-    if (html == 0) { doc_abort(); return 0; }
+    if (!html) { doc_abort(); return 0; }
     int r = build_page(html);
-    if (r == 0) { doc_abort(); return 0; }
+    if (!r) { doc_abort(); return 0; }
     // Copied before doc_commit, which gives back the page the link was in.
     int keep = name_keep(name);
-    if (keep == 0) { doc_abort(); return 0; }
+    if (!keep) { doc_abort(); return 0; }
     doc_commit();
     current_page = keep;
     scroll_y = 0;
@@ -295,13 +361,13 @@ int main() {
         print("utsikt: win_max unavailable\n");
         return 3;
     }
-    fb_max_w = winmax / 65536;
-    fb_max_h = winmax - fb_max_w * 65536;
+    fb_max_w = winmax >> 16;
+    fb_max_h = winmax & 65535;
     // Sized for the largest window this machine can hand out, once. There
     // is no realloc, so a buffer cut to today's window could not grow with
     // it, and present() copies what the window measures NOW.
     fb = alloc(fb_max_w * fb_max_h * 4);
-    if (fb == 0) {
+    if (!fb) {
         print("utsikt: cannot allocate a frame buffer\n");
         return 4;
     }
@@ -313,22 +379,29 @@ int main() {
         print("utsikt: cannot allocate a line buffer\n");
         return 6;
     }
+    // The scripting engines. See script.c0 for how one is plugged in.
+    test_engine_register();
+    glimt_register();
     history = alloc(HIST_MAX * 8);
-    if (history == 0) {
+    if (!history) {
         print("utsikt: cannot allocate the history stack\n");
         return 8;
     }
     history_n = 0;
 
-    current_page = name_keep(page_file());
+    // The page named on the command line, `start utsikt.elf about.html`,
+    // or index.html.
+    int first = page_file();
+    if (argc() >= 2) { first = argv(1); }
+    current_page = name_keep(first);
     doc_begin();
-    int html = load_document(page_file());
-    if (html == 0) {
+    int html = load_document(first);
+    if (!html) {
         print("utsikt: no index.html -- showing the built-in page\n");
         html = builtin_page();
     }
     int root = build_page(html);
-    if (root == 0 || current_page == 0) {
+    if (root == 0 || !current_page) {
         print("utsikt: out of memory parsing the document\n");
         return 7;
     }
@@ -346,8 +419,8 @@ int main() {
     int last_left = 0;
     while (1) {
         int wi = win_info();
-        int ww = wi / 65536;
-        int wh = wi - ww * 65536;
+        int ww = wi >> 16;
+        int wh = wi & 65535;
         if (ww > fb_max_w) { ww = fb_max_w; }
         if (wh > fb_max_h) { wh = fb_max_h; }
         if (ww != last_w || wh != last_h) {
@@ -380,8 +453,9 @@ int main() {
             int mx = packed / 1024;
             int my = packed - mx * 1024;
             int left = buttons % 2;
-            if (left == 1 && last_left == 0) {
+            if (left == 1 && !last_left) {
                 int href = link_hit(mx, my);
+                if (!href && script_click(mx, my) == 1) { dirty = 1; }
                 if (followable(href) == 1) {
                     int prev = current_page;
                     int r3 = goto_page(href);
@@ -403,12 +477,12 @@ int main() {
         while (key >= 0) {
             int make = key / 2;
             int is_break = key - make * 2;
-            if (is_break == 0) {
+            if (!is_break) {
                 if (make == 1) { return 0; }                      // Esc
-                if (make == 72) { scroll_y = scroll_y - cell_h * 3; dirty = 1; }
-                if (make == 80) { scroll_y = scroll_y + cell_h * 3; dirty = 1; }
+                if (make == 72) { scroll_y -= cell_h * 3; dirty = 1; }
+                if (make == 80) { scroll_y += cell_h * 3; dirty = 1; }
                 if (make == 73) { scroll_y = scroll_y - view_h + cell_h * 2; dirty = 1; }
-                if (make == 81) { scroll_y = scroll_y + view_h - cell_h * 2; dirty = 1; }
+                if (make == 81) { scroll_y += view_h - cell_h * 2; dirty = 1; }
                 if (make == 71) { scroll_y = 0; dirty = 1; }      // Home
                 if (make == 79) { scroll_y = doc_h; dirty = 1; }  // End
                 if (make == 14) {
@@ -431,7 +505,7 @@ int main() {
                     // costs nothing that stays.
                     doc_begin();
                     int fresh = load_document(current_page);
-                    if (fresh == 0) { fresh = builtin_page(); }
+                    if (!fresh) { fresh = builtin_page(); }
                     int r2 = build_page(fresh);
                     if (r2 != 0) {
                         doc_commit();
@@ -446,6 +520,7 @@ int main() {
             key = key_poll();
         }
 
+        if (script_dirty == 1) { dirty = 1; script_dirty = 0; }
         if (scroll_y < 0) { scroll_y = 0; }
         if (dirty == 1 && view_w > 0 && view_h > 0) {
             render_page(root);

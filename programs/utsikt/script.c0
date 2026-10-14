@@ -1,0 +1,163 @@
+// script.c0 — part of utsikt, a browser engine for the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of utsikt, a browser engine written in c0 for moonshot.
+// utsikt is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// The scripting interface. The rest of utsikt knows no language. A scripting
+// engine, glimt or any other, is plugged in here, and a page's scripts go to whichever engine
+// says it handles their language, by the <script> element's type attribute.
+// A script no engine claims is left alone, which is what happens to
+// JavaScript, since utsikt has no JavaScript engine and is not meant to.
+//
+// An engine is a ScriptEngine record holding its language and two function
+// references, one that runs a script's text and one that handles an event.
+// It registers itself once at startup with engine_register. The engine gets
+// the page through the functions under "what an engine may call" below,
+// and nothing else, so a different engine, a language of one's own or c0,
+// is a new file and one engine_register call, with no change to utsikt.
+//
+// When a page has been parsed and styled, scripts_run hands every claimed
+// <script>, in document order, to its engine. The first engine that claims
+// a script becomes the page's engine, and a click on a block element with
+// an onclick attribute hands that attribute's text to it.
+
+layout ScriptEngine {
+    int se_type;    // the <script type> it runs, lowercased, e.g. "text/x-utsikt-test"
+    int se_run;     // function (engine, text) runs a whole script
+    int se_event;   // function (engine, node, text) runs an event handler
+    int se_next;
+}
+
+int engines = 0;        // every registered engine, a list
+int page_engine = 0;    // the engine of the page on screen, or 0
+int script_root = 0;    // the page on screen, for the DOM calls
+int script_dirty = 0;   // 1 when a script changed the page and it needs a new layout
+int script_page = 0;    // counts pages, so an engine can tell a new page from the same one
+
+// Adds an engine. Called once per engine, at startup.
+void engine_register(int e) {
+    e.se_next = engines;
+    engines = e;
+    return;
+}
+
+// The engine that runs scripts of this type, or 0.
+int engine_for(int type) {
+    int e = engines;
+    while (e != 0) {
+        if (str_eq(e.se_type, type) == 1) { return e; }
+        e = e.se_next;
+    }
+    return 0;
+}
+
+// --- what an engine may call ----------------------------------------------
+
+// The element with this id, or 0. Ids are compared as written.
+int dom_by_id_from(int node, int id) {
+    if (node.n_kind == KIND_ELEM && node.n_id != 0 && str_eq(node.n_id, id) == 1) {
+        return node;
+    }
+    int c = node.n_first;
+    while (c != 0) {
+        int found = dom_by_id_from(c, id);
+        if (found != 0) { return found; }
+        c = c.n_next;
+    }
+    return 0;
+}
+
+int dom_by_id(int id) {
+    if (!script_root) { return 0; }
+    return dom_by_id_from(script_root, id);
+}
+
+// The text of an element's first text child, or 0.
+int dom_text(int node) {
+    int c = node.n_first;
+    while (c != 0) {
+        if (c.n_kind == KIND_TEXT) { return c.n_text; }
+        c = c.n_next;
+    }
+    return 0;
+}
+
+// Replaces everything inside an element with `n` bytes of text from `s`.
+// The old children stay in the document's memory until the page is let go,
+// like everything else it allocated. The new text takes the element's own
+// computed style, which is what a text child of it would have been given.
+void dom_set_text(int node, int s, int n) {
+    if (!node) { return; }
+    int t = node_new(KIND_TEXT, TAG_UNKNOWN);
+    if (!t) { return; }
+    t.n_text = str_dup(s, 0, n);
+    t.n_style = node.n_style;
+    node.n_first = 0;
+    node.n_last = 0;
+    node_append(node, t);
+    script_dirty = 1;
+    return;
+}
+
+// --- utsikt's side ---------------------------------------------------------
+
+// Runs every claimed <script> under `node`, in document order.
+void scripts_run_from(int node) {
+    if (node.n_kind == KIND_ELEM && node.n_tag == TAG_SCRIPT && node.n_type != 0) {
+        int e = engine_for(node.n_type);
+        int text = dom_text(node);
+        if (e != 0 && text != 0) {
+            if (!page_engine) { page_engine = e; }
+            int run = e.se_run;
+            run(e, text);
+        }
+    }
+    int c = node.n_first;
+    while (c != 0) {
+        scripts_run_from(c);
+        c = c.n_next;
+    }
+    return;
+}
+
+// Called with a page once it is parsed and styled.
+void scripts_run(int root) {
+    script_root = root;
+    script_page += 1;
+    page_engine = 0;
+    scripts_run_from(root);
+    return;
+}
+
+// The innermost block element at document point (x, y) with an onclick
+// attribute, or 0. Only blocks have a box to hit; inline elements do not
+// keep one.
+int onclick_at(int node, int x, int y) {
+    int found = 0;
+    if (node.n_kind == KIND_ELEM && node.n_onclick != 0
+        && x >= node.n_x && x < node.n_x + node.n_w
+        && y >= node.n_y && y < node.n_y + node.n_h) {
+        found = node;
+    }
+    int c = node.n_first;
+    while (c != 0) {
+        int inner = onclick_at(c, x, y);
+        if (inner != 0) { found = inner; }
+        c = c.n_next;
+    }
+    return found;
+}
+
+// A click at window point (mx, my). Returns 1 when an onclick handler ran.
+int script_click(int mx, int my) {
+    if (!page_engine || !script_root) { return 0; }
+    int node = onclick_at(script_root, mx, my + scroll_y);
+    if (!node) { return 0; }
+    int ev = page_engine.se_event;
+    ev(page_engine, node, node.n_onclick);
+    return 1;
+}

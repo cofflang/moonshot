@@ -83,7 +83,7 @@ These are known gaps, smallest first:
   a rule to hold a list of ancestors rather than one.
 - **Parent and child margin collapsing.** Adjacent siblings collapse;
   a parent's margin does not collapse with its first or last child's yet.
-- **Content-sized table columns.** Columns are equal width now. Sizing them
+- **Content-sized table columns.** Columns are equal width. Sizing them
   by content needs a measuring pass per cell before any cell is placed.
 
 Anything bigger than these, a new element with layout of its own or a new

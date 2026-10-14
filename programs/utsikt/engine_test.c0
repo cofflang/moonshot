@@ -1,0 +1,67 @@
+// engine_test.c0 — part of utsikt, a browser engine for the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of utsikt, a browser engine written in c0 for moonshot.
+// utsikt is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// The test engine, the smallest thing that can stand in for a scripting
+// language behind script.c0's interface, and the example of what plugging
+// one in takes. It runs <script type="text/x-utsikt-test"> and onclick
+// attributes on a page whose scripts are of that type.
+//
+// Its one command is `set ID TEXT`, which replaces the text of the element
+// with that id. Commands are separated by line breaks or semicolons. It
+// exercises the interface end to end with something far smaller than glimt,
+// and a page can only ever change itself through dom_by_id and
+// dom_set_text, which is the point.
+
+// Runs the commands in s, up to its terminating zero.
+void test_engine_exec(int s) {
+    int i = 0;
+    while (s[i] != 0) {
+        while (s[i] == ' ' || s[i] == 10 || s[i] == 13 || s[i] == 9 || s[i] == ';') { i += 1; }
+        if (s[i] == 0) { return; }
+        int start = i;
+        while (s[i] != 0 && s[i] != 10 && s[i] != ';') { i += 1; }
+        int end = i;
+        // One command, s[start..end).
+        if (end - start > 4 && s[start] == 's' && s[start + 1] == 'e'
+            && s[start + 2] == 't' && s[start + 3] == ' ') {
+            int a = start + 4;
+            while (a < end && s[a] == ' ') { a += 1; }
+            int b = a;
+            while (b < end && s[b] != ' ') { b += 1; }
+            int id = str_dup(s, a, b - a);
+            int t = b;
+            while (t < end && s[t] == ' ') { t += 1; }
+            int stop = end;
+            while (stop > t && (s[stop - 1] == ' ' || s[stop - 1] == 13)) { stop -= 1; }
+            dom_set_text(dom_by_id(id), s + t, stop - t);
+        }
+    }
+    return;
+}
+
+void test_engine_run(int e, int text) {
+    test_engine_exec(text);
+    return;
+}
+
+void test_engine_event(int e, int node, int text) {
+    test_engine_exec(text);
+    return;
+}
+
+// Registers the test engine. Called once from main.
+void test_engine_register() {
+    int e = alloc(sizeof(ScriptEngine));
+    if (!e) { return; }
+    e.se_type = "text/x-utsikt-test";
+    e.se_run = test_engine_run;
+    e.se_event = test_engine_event;
+    engine_register(e);
+    return;
+}

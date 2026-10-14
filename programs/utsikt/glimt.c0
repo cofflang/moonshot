@@ -1,0 +1,1302 @@
+// glimt.c0 — part of utsikt, a browser engine for the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of utsikt, a browser engine written in c0 for moonshot.
+// utsikt is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// glimt, the scripting language of utsikt's pages. It runs
+// <script type="text/x-glimt"> and the onclick attributes of a page whose
+// scripts are glimt, through script.c0's interface like any other engine.
+//
+// The language is a small part of c0. Every value is an int. A script is a
+// list of statements, global declarations and function definitions, run top
+// to bottom once when the page loads.
+//
+//   int clicks = 0;
+//   void bump() {
+//       clicks += 1;
+//       set_text(by_id("count"), concat("clicked ", num(clicks)));
+//   }
+//
+// and an element with onclick="bump();" calls it. There are if, else, while,
+// for, break, continue and return, the operators + - * / % << >> & | ^ ~ ! ==
+// != < <= > >= && ||, and = += -= *= /= %= as statements. Outside a function
+// every `int` is a global, inside one it is a local of that function.
+//
+// What a page can reach is the builtins below, and nothing else. A node or a
+// string is never a pointer. It is a handle, a small number that indexes a
+// table of this page's own, and every builtin checks it before use. So a
+// script that passes a wrong number gets nothing back rather than writing
+// through it, and no script can read or write utsikt's memory. A handle of 0
+// is "nothing", and as a string it reads as the empty string.
+//
+//   by_id(s)            the element with that id, or 0
+//   text(n)             the text of an element's first text child
+//   set_text(n, s)      replaces what is inside an element with text
+//   set_class(n, s)     sets an element's class, and the page is styled again
+//   attr(n, s)          the id, class, href, src or type attribute, or 0
+//   num(i)              the decimal digits of i
+//   concat(a, b)        a followed by b
+//   len(s)              how many bytes s has
+//   eq(a, b)            1 when a and b hold the same bytes, 0 when not
+//   log(s)              writes s and a line break to the serial log
+//
+// A script is compiled to x86-64 machine code once, when it is first run,
+// and the code is kept for as long as the page is on screen, so an onclick
+// handler is compiled on its first click and only run after that. The code
+// buffer is never writable and executable at the same time. It is writable
+// while glimt writes into it and executable while it runs, which the kernel
+// switches with SYS_PROTECT.
+//
+// A fault in a ring-3 program ends that program, and a fault in a script
+// would end utsikt with every page in it, so the code glimt writes must
+// never fault. Division and remainder by zero give 0. Every
+// backward jump of a loop counts down a budget, and every function entry
+// checks how much stack is left. A script that runs out of either is
+// stopped where it is, and the page keeps what it had done up to there.
+
+// --- the code buffer ------------------------------------------------------
+
+int GLIMT_PAGES = 16;     // pages of machine code, shared by everything on a page
+int GLIMT_STACK = 40960;  // bytes of stack a script may use below its entry
+int GLIMT_BUDGET = 4000000; // loop iterations one run may take
+
+int g_code = 0;     // the code buffer, page aligned
+int g_size = 0;     // its size in bytes
+int g_pos = 0;      // where the next byte goes
+int g_base = 0;     // where a page's code starts, after the stubs
+int g_enter = 0;    // stub that runs the code at rdi and returns its rax
+int g_abort = 0;    // stub that unwinds a stopped script back to g_enter's caller
+
+// Words the generated code reads and writes, in g_data.
+int GD_SAVED = 0;     // rsp at entry
+int GD_BUDGET = 8;    // loop iterations left
+int GD_LIMIT = 16;    // the lowest rsp a function may start with
+int GD_STOPPED = 24;  // 1 once g_abort has run
+int GD_GLOBALS = 64;  // the globals, GLIMT_MAX_GLOBALS words
+int GD_SLOTS = 2112;  // the function slots, GLIMT_MAX_FNS words
+int GD_SIZE = 3136;
+int g_data = 0;
+
+int GLIMT_MAX_GLOBALS = 256;
+int GLIMT_MAX_FNS = 128;
+int GLIMT_MAX_LOCALS = 64;
+int GLIMT_MAX_STRS = 4096;
+int GLIMT_MAX_NODES = 1024;
+int GLIMT_MAX_CACHE = 64;
+int GLIMT_MAX_BREAKS = 64;
+
+// --- what a page has, emptied when a new page arrives -----------------------
+
+int g_page = 0 - 1;   // script_page of the page these tables belong to
+
+int g_gname = 0;   // global names, as pointer and length into the source
+int g_glen = 0;
+int g_ng = 0;
+
+int g_fname = 0;   // function names
+int g_flen = 0;
+int g_farity = 0;  // its parameter count, or -1 while only calls have been seen
+int g_fdef = 0;    // 1 once defined
+int g_nf = 0;
+
+int g_strs = 0;    // string handles, handle h is g_strs[h - 1]
+int g_nstr = 0;
+int g_nodes = 0;   // node handles, the same way
+int g_nnode = 0;
+
+int g_cnode = 0;   // onclick code, by node
+int g_ccode = 0;
+int g_ncache = 0;
+
+// --- one compile ------------------------------------------------------------
+
+int g_lname = 0;   // locals of the function being compiled
+int g_llen = 0;
+int g_nl = 0;
+int g_maxl = 0;
+int g_infn = 0;    // 1 inside a function definition
+
+int g_cont = 0;    // continue target of each open loop
+int g_nloop = 0;
+int g_brk = 0;     // break jumps waiting for their loop's end
+int g_brkloop = 0; // which loop each belongs to
+int g_nbrk = 0;
+
+int g_src = 0;     // the source
+int g_p = 0;       // where the lexer is
+int g_line = 1;
+int g_err = 0;     // 1 once a compile error was reported
+
+int tk = 0;        // the current token
+int tk_num = 0;    // its value, for a number or a string handle
+int tk_s = 0;      // where a name starts
+int tk_n = 0;      // how long it is
+
+int T_EOF = 0;
+int T_NUM = 1;
+int T_STR = 2;
+int T_ID = 3;
+int T_INT = 4;
+int T_VOID = 5;
+int T_IF = 6;
+int T_ELSE = 7;
+int T_WHILE = 8;
+int T_FOR = 9;
+int T_BREAK = 10;
+int T_CONTINUE = 11;
+int T_RETURN = 12;
+int T_EQ = 20;
+int T_NE = 21;
+int T_LE = 22;
+int T_GE = 23;
+int T_AND = 24;
+int T_OR = 25;
+int T_SHL = 26;
+int T_SHR = 27;
+int T_ADDEQ = 28;
+int T_SUBEQ = 29;
+int T_MULEQ = 30;
+int T_DIVEQ = 31;
+int T_MODEQ = 32;
+// Every other token is its own character, '(' or ';' and so on.
+
+// --- errors -----------------------------------------------------------------
+
+// Reports a compile error once, with the line it is on, and ends the
+// compile. The lexer reads nothing more after it, so every parsing loop
+// sees the end of the source and returns.
+void gl_fail(int msg) {
+    if (g_err) { return; }
+    g_err = 1;
+    print("glimt: line ");
+    print(gl_num_digits(g_line));
+    print(": ");
+    print(msg);
+    print("\n");
+    tk = T_EOF;
+    return;
+}
+
+// --- strings and nodes as handles ---------------------------------------------
+
+// A handle for the NUL-terminated bytes at p, or 0 when the table is full.
+int gl_str_handle(int p) {
+    if (!p) { return 0; }
+    if (g_nstr == GLIMT_MAX_STRS) {
+        print("glimt: too many strings on one page\n");
+        return 0;
+    }
+    store64(g_strs + g_nstr * 8, p);
+    g_nstr += 1;
+    return g_nstr;
+}
+
+// The bytes of string handle h, "" for 0 or anything that is not a handle.
+int gl_str_of(int h) {
+    if (h < 1 || h > g_nstr) { return ""; }
+    return load64(g_strs + (h - 1) * 8);
+}
+
+int gl_node_handle(int node) {
+    if (!node) { return 0; }
+    int i = 0;
+    for (i = 0; i < g_nnode; i += 1) {
+        if (load64(g_nodes + i * 8) == node) { return i + 1; }
+    }
+    if (g_nnode == GLIMT_MAX_NODES) { return 0; }
+    store64(g_nodes + g_nnode * 8, node);
+    g_nnode += 1;
+    return g_nnode;
+}
+
+int gl_node_of(int h) {
+    if (h < 1 || h > g_nnode) { return 0; }
+    return load64(g_nodes + (h - 1) * 8);
+}
+
+// The decimal digits of v in document memory.
+int gl_num_digits(int v) {
+    int s = doc_alloc(24);
+    if (!s) { return ""; }
+    int t = alloc(24);
+    if (!t) { return ""; }
+    int n = 0;
+    int neg = 0;
+    if (v < 0) { neg = 1; }
+    // Digits come out lowest first. Working on the negative side covers the
+    // most negative int, which has no positive counterpart.
+    if (!neg) { v = 0 - v; }
+    while (v != 0 || n == 0) {
+        t[n] = '0' - v % 10;
+        v /= 10;
+        n += 1;
+    }
+    int k = 0;
+    if (neg) { s[0] = '-'; k = 1; }
+    while (n > 0) {
+        n -= 1;
+        s[k] = t[n];
+        k += 1;
+    }
+    s[k] = 0;
+    dealloc(t);
+    return s;
+}
+
+// --- the builtins -------------------------------------------------------------
+
+int glimt_by_id(int s) {
+    if (!s) { return 0; }
+    return gl_node_handle(dom_by_id(gl_str_of(s)));
+}
+
+int glimt_text(int n) {
+    int node = gl_node_of(n);
+    if (!node) { return 0; }
+    return gl_str_handle(dom_text(node));
+}
+
+int glimt_set_text(int n, int s) {
+    int node = gl_node_of(n);
+    if (!node) { return 0; }
+    int p = gl_str_of(s);
+    dom_set_text(node, p, str_len(p));
+    return 0;
+}
+
+int glimt_set_class(int n, int s) {
+    int node = gl_node_of(n);
+    if (!node) { return 0; }
+    int p = gl_str_of(s);
+    node.n_class = str_dup_lower(p, 0, str_len(p));
+    // A class decides style, and style is inherited, so the whole page is
+    // styled again, as build_page did it.
+    style_tree(script_root, 0);
+    int bg = find_page_bg(script_root);
+    if (bg < 0) { bg = 0xFFFFFF; }
+    page_bg = bg;
+    script_dirty = 1;
+    return 0;
+}
+
+int glimt_attr(int n, int s) {
+    int node = gl_node_of(n);
+    if (!node) { return 0; }
+    int name = gl_str_of(s);
+    if (str_eq(name, "id") == 1) { return gl_str_handle(node.n_id); }
+    if (str_eq(name, "class") == 1) { return gl_str_handle(node.n_class); }
+    if (str_eq(name, "href") == 1) { return gl_str_handle(node.n_href); }
+    if (str_eq(name, "src") == 1) { return gl_str_handle(node.n_src); }
+    if (str_eq(name, "type") == 1) { return gl_str_handle(node.n_type); }
+    return 0;
+}
+
+int glimt_num(int v) {
+    return gl_str_handle(gl_num_digits(v));
+}
+
+int glimt_concat(int a, int b) {
+    int pa = gl_str_of(a);
+    int pb = gl_str_of(b);
+    int la = str_len(pa);
+    int lb = str_len(pb);
+    int s = doc_alloc(la + lb + 1);
+    if (!s) { return 0; }
+    int i = 0;
+    for (i = 0; i < la; i += 1) { s[i] = pa[i]; }
+    for (i = 0; i < lb; i += 1) { s[la + i] = pb[i]; }
+    s[la + lb] = 0;
+    return gl_str_handle(s);
+}
+
+int glimt_len(int s) {
+    return str_len(gl_str_of(s));
+}
+
+int glimt_eq(int a, int b) {
+    return str_eq(gl_str_of(a), gl_str_of(b));
+}
+
+int glimt_log(int s) {
+    print(gl_str_of(s));
+    print("\n");
+    return 0;
+}
+
+// Where a call to a function that is not defined yet goes.
+int glimt_missing() {
+    print("glimt: a function was called before it was defined\n");
+    return 0;
+}
+
+// The builtin a name means, as its function, with its parameter count in
+// g_barity, or 0.
+int g_barity = 0;
+
+int gl_builtin(int s, int n) {
+    if (gl_name_is(s, n, "by_id") == 1) { g_barity = 1; return glimt_by_id; }
+    if (gl_name_is(s, n, "text") == 1) { g_barity = 1; return glimt_text; }
+    if (gl_name_is(s, n, "set_text") == 1) { g_barity = 2; return glimt_set_text; }
+    if (gl_name_is(s, n, "set_class") == 1) { g_barity = 2; return glimt_set_class; }
+    if (gl_name_is(s, n, "attr") == 1) { g_barity = 2; return glimt_attr; }
+    if (gl_name_is(s, n, "num") == 1) { g_barity = 1; return glimt_num; }
+    if (gl_name_is(s, n, "concat") == 1) { g_barity = 2; return glimt_concat; }
+    if (gl_name_is(s, n, "len") == 1) { g_barity = 1; return glimt_len; }
+    if (gl_name_is(s, n, "eq") == 1) { g_barity = 2; return glimt_eq; }
+    if (gl_name_is(s, n, "log") == 1) { g_barity = 1; return glimt_log; }
+    return 0;
+}
+
+// 1 when the n bytes at s are the word w.
+int gl_name_is(int s, int n, int w) {
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        if (w[i] != s[i]) { return 0; }
+    }
+    if (w[n] != 0) { return 0; }
+    return 1;
+}
+
+int gl_same_name(int a, int an, int b, int bn) {
+    if (an != bn) { return 0; }
+    int i = 0;
+    for (i = 0; i < an; i += 1) {
+        if (a[i] != b[i]) { return 0; }
+    }
+    return 1;
+}
+
+// --- the lexer ------------------------------------------------------------------
+
+int gl_is_alpha(int c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+// The byte an escape stands for, the one after the backslash.
+int gl_unescape(int c) {
+    if (c == 'n') { return 10; }
+    if (c == 't') { return 9; }
+    if (c == 'r') { return 13; }
+    if (c == '0') { return 0; }
+    return c;
+}
+
+// Reads the next token into tk.
+void gl_next() {
+    if (g_err) { tk = T_EOF; return; }
+    int s = g_src;
+    // Spaces, line breaks and // comments.
+    while (1) {
+        int c = s[g_p];
+        if (c == 10) { g_line += 1; g_p += 1; }
+        else if (c == ' ' || c == 9 || c == 13) { g_p += 1; }
+        else if (c == '/' && s[g_p + 1] == '/') {
+            while (s[g_p] != 0 && s[g_p] != 10) { g_p += 1; }
+        }
+        else { break; }
+    }
+    int c = s[g_p];
+    if (c == 0) { tk = T_EOF; return; }
+    if (is_digit(c)) {
+        int v = 0;
+        if (c == '0' && (s[g_p + 1] == 'x' || s[g_p + 1] == 'X')) {
+            g_p += 2;
+            while (1) {
+                int d = s[g_p];
+                if (is_digit(d)) { v = v * 16 + d - '0'; }
+                else if (d >= 'a' && d <= 'f') { v = v * 16 + d - 'a' + 10; }
+                else if (d >= 'A' && d <= 'F') { v = v * 16 + d - 'A' + 10; }
+                else { break; }
+                g_p += 1;
+            }
+        } else {
+            while (is_digit(s[g_p])) { v = v * 10 + s[g_p] - '0'; g_p += 1; }
+        }
+        if (gl_is_alpha(s[g_p])) { gl_fail("a number runs into a name"); return; }
+        tk = T_NUM;
+        tk_num = v;
+        return;
+    }
+    if (gl_is_alpha(c)) {
+        tk_s = s + g_p;
+        tk_n = 0;
+        while (gl_is_alpha(s[g_p]) || is_digit(s[g_p])) { g_p += 1; tk_n += 1; }
+        tk = T_ID;
+        if (gl_name_is(tk_s, tk_n, "int") == 1) { tk = T_INT; }
+        if (gl_name_is(tk_s, tk_n, "void") == 1) { tk = T_VOID; }
+        if (gl_name_is(tk_s, tk_n, "if") == 1) { tk = T_IF; }
+        if (gl_name_is(tk_s, tk_n, "else") == 1) { tk = T_ELSE; }
+        if (gl_name_is(tk_s, tk_n, "while") == 1) { tk = T_WHILE; }
+        if (gl_name_is(tk_s, tk_n, "for") == 1) { tk = T_FOR; }
+        if (gl_name_is(tk_s, tk_n, "break") == 1) { tk = T_BREAK; }
+        if (gl_name_is(tk_s, tk_n, "continue") == 1) { tk = T_CONTINUE; }
+        if (gl_name_is(tk_s, tk_n, "return") == 1) { tk = T_RETURN; }
+        return;
+    }
+    if (c == 34) {
+        // A string. Its bytes are copied out with the escapes resolved.
+        g_p += 1;
+        int start = g_p;
+        int n = 0;
+        while (s[g_p] != 34) {
+            if (s[g_p] == 0 || s[g_p] == 10) { gl_fail("a string is not closed"); return; }
+            if (s[g_p] == 92) { g_p += 1; }
+            g_p += 1;
+            n += 1;
+        }
+        int buf = doc_alloc(n + 1);
+        if (!buf) { gl_fail("no memory for a string"); return; }
+        int q = start;
+        int k = 0;
+        for (k = 0; k < n; k += 1) {
+            if (s[q] == 92) { q += 1; buf[k] = gl_unescape(s[q]); }
+            else { buf[k] = s[q]; }
+            q += 1;
+        }
+        buf[n] = 0;
+        g_p += 1;
+        tk = T_STR;
+        tk_num = gl_str_handle(buf);
+        return;
+    }
+    if (c == 39) {
+        g_p += 1;
+        int ch = s[g_p];
+        if (ch == 92) { g_p += 1; ch = gl_unescape(s[g_p]); }
+        if (s[g_p] == 0 || s[g_p + 1] != 39) { gl_fail("a character is not closed"); return; }
+        g_p += 2;
+        tk = T_NUM;
+        tk_num = ch;
+        return;
+    }
+    int d = s[g_p + 1];
+    g_p += 1;
+    tk = c;
+    if (c == '=' && d == '=') { tk = T_EQ; }
+    if (c == '!' && d == '=') { tk = T_NE; }
+    if (c == '<' && d == '=') { tk = T_LE; }
+    if (c == '>' && d == '=') { tk = T_GE; }
+    if (c == '&' && d == '&') { tk = T_AND; }
+    if (c == '|' && d == '|') { tk = T_OR; }
+    if (c == '<' && d == '<') { tk = T_SHL; }
+    if (c == '>' && d == '>') { tk = T_SHR; }
+    if (c == '+' && d == '=') { tk = T_ADDEQ; }
+    if (c == '-' && d == '=') { tk = T_SUBEQ; }
+    if (c == '*' && d == '=') { tk = T_MULEQ; }
+    if (c == '/' && d == '=') { tk = T_DIVEQ; }
+    if (c == '%' && d == '=') { tk = T_MODEQ; }
+    if (tk != c) { g_p += 1; return; }
+    if (c == '(' || c == ')' || c == '{' || c == '}' || c == ';' || c == ','
+        || c == '=' || c == '+' || c == '-' || c == '*' || c == '/' || c == '%'
+        || c == '<' || c == '>' || c == '!' || c == '&' || c == '|' || c == '^'
+        || c == '~') {
+        return;
+    }
+    gl_fail("a character glimt does not know");
+    return;
+}
+
+void gl_expect(int t, int msg) {
+    if (tk != t) { gl_fail(msg); return; }
+    gl_next();
+    return;
+}
+
+// --- writing machine code -----------------------------------------------------
+
+void gl_e1(int b) {
+    if (g_pos >= g_size) { gl_fail("the page's scripts do not fit in glimt's code buffer"); return; }
+    store8(g_code + g_pos, b & 255);
+    g_pos += 1;
+    return;
+}
+
+void gl_e2(int a, int b) { gl_e1(a); gl_e1(b); return; }
+void gl_e3(int a, int b, int c) { gl_e1(a); gl_e1(b); gl_e1(c); return; }
+
+void gl_e4(int v) {
+    gl_e1(v);
+    gl_e1(v >> 8);
+    gl_e1(v >> 16);
+    gl_e1(v >> 24);
+    return;
+}
+
+void gl_e8(int v) {
+    gl_e4(v);
+    gl_e4(v >> 32);
+    return;
+}
+
+void gl_mov_rax(int v) { gl_e2(0x48, 0xB8); gl_e8(v); return; }
+void gl_mov_rcx(int v) { gl_e2(0x48, 0xB9); gl_e8(v); return; }
+void gl_push_rax() { gl_e1(0x50); return; }
+void gl_pop_rax() { gl_e1(0x58); return; }
+void gl_pop_rcx() { gl_e1(0x59); return; }
+void gl_test_rax() { gl_e3(0x48, 0x85, 0xC0); return; }
+void gl_zero_rax() { gl_e2(0x31, 0xC0); return; }
+void gl_one_rax() { gl_e1(0xB8); gl_e4(1); return; }
+
+// A jump forward whose target is not known yet. Returns where its 32-bit
+// offset is, for patch.
+int gl_jump_fwd(int op) {
+    if (op == 0xE9) { gl_e1(0xE9); } else { gl_e2(0x0F, op); }
+    int at = g_pos;
+    gl_e4(0);
+    return at;
+}
+
+// Points the jump whose offset is at `at` here.
+void gl_patch(int at) {
+    if (g_err) { return; }
+    int rel = g_pos - (at + 4);
+    store8(g_code + at, rel & 255);
+    store8(g_code + at + 1, (rel >> 8) & 255);
+    store8(g_code + at + 2, (rel >> 16) & 255);
+    store8(g_code + at + 3, (rel >> 24) & 255);
+    return;
+}
+
+// A jump to a known place in the buffer.
+void gl_jump_to(int op, int target) {
+    if (op == 0xE9) { gl_e1(0xE9); } else { gl_e2(0x0F, op); }
+    gl_e4(target - (g_pos + 4));
+    return;
+}
+
+int JE = 0x84;
+int JNE = 0x85;
+int JMP = 0xE9;
+
+// rax = rax OP rcx, for the arithmetic, bitwise and comparison operators.
+void gl_binop(int op) {
+    if (op == '+') { gl_e3(0x48, 0x01, 0xC8); return; }
+    if (op == '-') { gl_e3(0x48, 0x29, 0xC8); return; }
+    if (op == '*') { gl_e2(0x48, 0x0F); gl_e2(0xAF, 0xC1); return; }
+    if (op == '&') { gl_e3(0x48, 0x21, 0xC8); return; }
+    if (op == '|') { gl_e3(0x48, 0x09, 0xC8); return; }
+    if (op == '^') { gl_e3(0x48, 0x31, 0xC8); return; }
+    if (op == T_SHL) { gl_e3(0x48, 0xD3, 0xE0); return; }
+    if (op == T_SHR) { gl_e3(0x48, 0xD3, 0xF8); return; }
+    if (op == '/' || op == '%') {
+        // A zero divisor gives 0, and dividing the most negative int by -1,
+        // the other case where idiv faults, gives what wrapping would.
+        gl_e3(0x48, 0x85, 0xC9);                  // test rcx, rcx
+        int nonzero = gl_jump_fwd(JNE);
+        gl_zero_rax();
+        int done1 = gl_jump_fwd(JMP);
+        gl_patch(nonzero);
+        gl_e2(0x48, 0x83); gl_e2(0xF9, 0xFF);        // cmp rcx, -1
+        int other = gl_jump_fwd(JNE);
+        if (op == '/') { gl_e3(0x48, 0xF7, 0xD8); } else { gl_zero_rax(); }
+        int done2 = gl_jump_fwd(JMP);
+        gl_patch(other);
+        gl_e2(0x48, 0x99);                        // cqo
+        gl_e3(0x48, 0xF7, 0xF9);                  // idiv rcx
+        if (op == '%') { gl_e3(0x48, 0x89, 0xD0); }
+        gl_patch(done1);
+        gl_patch(done2);
+        return;
+    }
+    // A comparison, as 0 or 1.
+    gl_e3(0x48, 0x39, 0xC8);                      // cmp rax, rcx
+    int cc = 0x94;
+    if (op == T_NE) { cc = 0x95; }
+    if (op == '<') { cc = 0x9C; }
+    if (op == T_LE) { cc = 0x9E; }
+    if (op == '>') { cc = 0x9F; }
+    if (op == T_GE) { cc = 0x9D; }
+    gl_e3(0x0F, cc, 0xC0);                        // setcc al
+    gl_e3(0x0F, 0xB6, 0xC0);                      // movzx eax, al
+    return;
+}
+
+// A loop's backward jump costs one iteration of the budget, and a run that
+// has none left is stopped.
+void gl_count_iteration() {
+    gl_mov_rax(g_data + GD_BUDGET);
+    gl_e3(0x48, 0xFF, 0x08);                      // dec qword [rax]
+    gl_jump_to(0x8E, g_abort);                    // jle
+    return;
+}
+
+// --- names ----------------------------------------------------------------------
+
+int gl_find_local(int s, int n) {
+    int i = 0;
+    for (i = g_nl - 1; i >= 0; i -= 1) {
+        if (gl_same_name(load64(g_lname + i * 8), load64(g_llen + i * 8), s, n) == 1) { return i; }
+    }
+    return 0 - 1;
+}
+
+int gl_find_global(int s, int n) {
+    int i = 0;
+    for (i = 0; i < g_ng; i += 1) {
+        if (gl_same_name(load64(g_gname + i * 8), load64(g_glen + i * 8), s, n) == 1) { return i; }
+    }
+    return 0 - 1;
+}
+
+int gl_find_fn(int s, int n) {
+    int i = 0;
+    for (i = 0; i < g_nf; i += 1) {
+        if (gl_same_name(load64(g_fname + i * 8), load64(g_flen + i * 8), s, n) == 1) { return i; }
+    }
+    return 0 - 1;
+}
+
+int gl_fn_slot(int i) {
+    return g_data + GD_SLOTS + i * 8;
+}
+
+// The function a name means, added when it is new. A call before the
+// definition goes to glimt_missing until the definition fills the slot.
+int gl_fn_ref(int s, int n, int arity) {
+    int i = gl_find_fn(s, n);
+    if (i < 0) {
+        if (g_nf == GLIMT_MAX_FNS) { gl_fail("too many functions"); return 0; }
+        i = g_nf;
+        store64(g_fname + i * 8, s);
+        store64(g_flen + i * 8, n);
+        store64(g_farity + i * 8, arity);
+        store64(g_fdef + i * 8, 0);
+        store64(gl_fn_slot(i), glimt_missing);
+        g_nf += 1;
+        return i;
+    }
+    int had = load64(g_farity + i * 8);
+    if (had < 0) {
+        store64(g_farity + i * 8, arity);
+    } else if (had != arity) {
+        gl_fail("a function is called with the wrong number of arguments");
+    }
+    return i;
+}
+
+int gl_add_local(int s, int n) {
+    if (g_nl == GLIMT_MAX_LOCALS) { gl_fail("too many locals in one function"); return 0; }
+    store64(g_lname + g_nl * 8, s);
+    store64(g_llen + g_nl * 8, n);
+    g_nl += 1;
+    if (g_nl > g_maxl) { g_maxl = g_nl; }
+    return g_nl - 1;
+}
+
+int gl_add_global(int s, int n) {
+    if (gl_find_global(s, n) >= 0) { gl_fail("a global is declared twice"); return 0; }
+    if (g_ng == GLIMT_MAX_GLOBALS) { gl_fail("too many globals"); return 0; }
+    store64(g_gname + g_ng * 8, s);
+    store64(g_glen + g_ng * 8, n);
+    store64(g_data + GD_GLOBALS + g_ng * 8, 0);
+    g_ng += 1;
+    return g_ng - 1;
+}
+
+// mov rax, [rbp - 8(i + 1)] and the other way.
+void gl_load_local(int i) { gl_e3(0x48, 0x8B, 0x85); gl_e4(0 - 8 * (i + 1)); return; }
+void gl_store_local(int i) { gl_e3(0x48, 0x89, 0x85); gl_e4(0 - 8 * (i + 1)); return; }
+
+void gl_load_var(int s, int n) {
+    int i = gl_find_local(s, n);
+    if (i >= 0) { gl_load_local(i); return; }
+    i = gl_find_global(s, n);
+    if (i >= 0) {
+        gl_mov_rax(g_data + GD_GLOBALS + i * 8);
+        gl_e3(0x48, 0x8B, 0x00);                  // mov rax, [rax]
+        return;
+    }
+    gl_fail("a name that is not declared");
+    return;
+}
+
+void gl_store_var(int s, int n) {
+    int i = gl_find_local(s, n);
+    if (i >= 0) { gl_store_local(i); return; }
+    i = gl_find_global(s, n);
+    if (i >= 0) {
+        gl_mov_rcx(g_data + GD_GLOBALS + i * 8);
+        gl_e3(0x48, 0x89, 0x01);                  // mov [rcx], rax
+        return;
+    }
+    gl_fail("a name that is not declared");
+    return;
+}
+
+// --- expressions, each leaving its value in rax ---------------------------------
+
+// The call whose name was just read, with tk on its '('.
+void gl_call(int s, int n) {
+    gl_next();
+    int count = 0;
+    while (tk != ')' && tk != T_EOF) {
+        gl_expr();
+        gl_push_rax();
+        count += 1;
+        if (tk == ',') { gl_next(); } else if (tk != ')') { gl_fail("expected , or ) in a call"); }
+    }
+    gl_expect(')', "expected ) after a call's arguments");
+    if (count > 6) { gl_fail("a call has more than six arguments"); return; }
+    // The arguments go to rdi, rsi, rdx, rcx, r8 and r9, the last one pushed
+    // first.
+    int i = 0;
+    for (i = count - 1; i >= 0; i -= 1) {
+        if (i == 0) { gl_e1(0x5F); }
+        if (i == 1) { gl_e1(0x5E); }
+        if (i == 2) { gl_e1(0x5A); }
+        if (i == 3) { gl_e1(0x59); }
+        if (i == 4) { gl_e2(0x41, 0x58); }
+        if (i == 5) { gl_e2(0x41, 0x59); }
+    }
+    int b = gl_builtin(s, n);
+    if (b != 0) {
+        if (g_barity != count) { gl_fail("a builtin is called with the wrong number of arguments"); return; }
+        gl_mov_rax(b);
+        gl_e2(0xFF, 0xD0);                        // call rax
+        return;
+    }
+    int f = gl_fn_ref(s, n, count);
+    gl_mov_rax(gl_fn_slot(f));
+    gl_e2(0xFF, 0x10);                            // call [rax]
+    return;
+}
+
+void gl_primary() {
+    if (tk == T_NUM || tk == T_STR) {
+        gl_mov_rax(tk_num);
+        gl_next();
+        return;
+    }
+    if (tk == '(') {
+        gl_next();
+        gl_expr();
+        gl_expect(')', "expected )");
+        return;
+    }
+    if (tk == T_ID) {
+        int s = tk_s;
+        int n = tk_n;
+        gl_next();
+        if (tk == '(') { gl_call(s, n); return; }
+        gl_load_var(s, n);
+        return;
+    }
+    gl_fail("expected a value");
+    return;
+}
+
+void gl_unary() {
+    if (tk == '-') { gl_next(); gl_unary(); gl_e3(0x48, 0xF7, 0xD8); return; }
+    if (tk == '~') { gl_next(); gl_unary(); gl_e3(0x48, 0xF7, 0xD0); return; }
+    if (tk == '!') {
+        gl_next();
+        gl_unary();
+        gl_test_rax();
+        gl_e3(0x0F, 0x94, 0xC0);                  // sete al
+        gl_e3(0x0F, 0xB6, 0xC0);
+        return;
+    }
+    gl_primary();
+    return;
+}
+
+// How tightly a binary operator binds, 0 for a token that is not one.
+int gl_prec(int t) {
+    if (t == T_OR) { return 1; }
+    if (t == T_AND) { return 2; }
+    if (t == '|') { return 3; }
+    if (t == '^') { return 4; }
+    if (t == '&') { return 5; }
+    if (t == T_EQ || t == T_NE) { return 6; }
+    if (t == '<' || t == T_LE || t == '>' || t == T_GE) { return 7; }
+    if (t == T_SHL || t == T_SHR) { return 8; }
+    if (t == '+' || t == '-') { return 9; }
+    if (t == '*' || t == '/' || t == '%') { return 10; }
+    return 0;
+}
+
+// Operators at least as tight as `min`, the left operand already in rax.
+void gl_binary(int min) {
+    while (gl_prec(tk) >= min && gl_prec(tk) > 0) {
+        int op = tk;
+        int p = gl_prec(op);
+        gl_next();
+        if (op == T_AND || op == T_OR) {
+            // Only as much as decides the answer is evaluated.
+            gl_test_rax();
+            int jop = JE;
+            if (op == T_OR) { jop = JNE; }
+            int early = gl_jump_fwd(jop);
+            gl_unary();
+            gl_binary(p + 1);
+            gl_test_rax();
+            int early2 = gl_jump_fwd(jop);
+            if (op == T_AND) { gl_one_rax(); } else { gl_zero_rax(); }
+            int done = gl_jump_fwd(JMP);
+            gl_patch(early);
+            gl_patch(early2);
+            if (op == T_AND) { gl_zero_rax(); } else { gl_one_rax(); }
+            gl_patch(done);
+        } else {
+            gl_push_rax();
+            gl_unary();
+            gl_binary(p + 1);
+            gl_e3(0x48, 0x89, 0xC1);              // mov rcx, rax
+            gl_pop_rax();
+            gl_binop(op);
+        }
+    }
+    return;
+}
+
+void gl_expr() {
+    gl_unary();
+    gl_binary(1);
+    return;
+}
+
+// --- statements -------------------------------------------------------------------
+
+// A declaration, an assignment or a call, without its ';'. Used by
+// statements and by a for's first and last parts.
+void gl_simple() {
+    if (tk == T_INT) {
+        gl_next();
+        if (tk != T_ID) { gl_fail("expected a name after int"); return; }
+        int ds = tk_s;
+        int dn = tk_n;
+        gl_next();
+        if (tk == '=') { gl_next(); gl_expr(); } else { gl_zero_rax(); }
+        if (g_infn) {
+            gl_store_local(gl_add_local(ds, dn));
+        } else {
+            gl_add_global(ds, dn);
+            gl_store_var(ds, dn);
+        }
+        return;
+    }
+    if (tk != T_ID) { gl_fail("expected a statement"); return; }
+    int s = tk_s;
+    int n = tk_n;
+    gl_next();
+    if (tk == '(') { gl_call(s, n); return; }
+    if (tk == '=') { gl_next(); gl_expr(); gl_store_var(s, n); return; }
+    int op = 0;
+    if (tk == T_ADDEQ) { op = '+'; }
+    if (tk == T_SUBEQ) { op = '-'; }
+    if (tk == T_MULEQ) { op = '*'; }
+    if (tk == T_DIVEQ) { op = '/'; }
+    if (tk == T_MODEQ) { op = '%'; }
+    if (!op) { gl_fail("expected = or ( after a name"); return; }
+    gl_next();
+    gl_load_var(s, n);
+    gl_push_rax();
+    gl_expr();
+    gl_e3(0x48, 0x89, 0xC1);
+    gl_pop_rax();
+    gl_binop(op);
+    gl_store_var(s, n);
+    return;
+}
+
+void gl_open_loop(int cont) {
+    if (g_nloop == 16) { gl_fail("loops are nested too deep"); return; }
+    store64(g_cont + g_nloop * 8, cont);
+    g_nloop += 1;
+    return;
+}
+
+// Closes the innermost loop, pointing its breaks here.
+void gl_close_loop() {
+    g_nloop -= 1;
+    int i = 0;
+    int kept = 0;
+    for (i = 0; i < g_nbrk; i += 1) {
+        if (load64(g_brkloop + i * 8) == g_nloop) {
+            gl_patch(load64(g_brk + i * 8));
+        } else {
+            store64(g_brk + kept * 8, load64(g_brk + i * 8));
+            store64(g_brkloop + kept * 8, load64(g_brkloop + i * 8));
+            kept += 1;
+        }
+    }
+    g_nbrk = kept;
+    return;
+}
+
+void gl_leave() {
+    gl_e3(0x48, 0x89, 0xEC);                      // mov rsp, rbp
+    gl_e1(0x5D);                                  // pop rbp
+    gl_e1(0xC3);                                  // ret
+    return;
+}
+
+void gl_stmt() {
+    if (tk == '{') {
+        gl_next();
+        int nl = g_nl;
+        while (tk != '}' && tk != T_EOF) { gl_stmt(); }
+        gl_expect('}', "expected }");
+        g_nl = nl;
+        return;
+    }
+    if (tk == ';') { gl_next(); return; }
+    if (tk == T_IF) {
+        gl_next();
+        gl_expect('(', "expected ( after if");
+        gl_expr();
+        gl_expect(')', "expected ) after the condition");
+        gl_test_rax();
+        int skip = gl_jump_fwd(JE);
+        gl_stmt();
+        if (tk == T_ELSE) {
+            int over = gl_jump_fwd(JMP);
+            gl_patch(skip);
+            gl_next();
+            gl_stmt();
+            gl_patch(over);
+        } else {
+            gl_patch(skip);
+        }
+        return;
+    }
+    if (tk == T_WHILE) {
+        gl_next();
+        int top = g_pos;
+        gl_expect('(', "expected ( after while");
+        gl_expr();
+        gl_expect(')', "expected ) after the condition");
+        gl_test_rax();
+        int out = gl_jump_fwd(JE);
+        gl_open_loop(top);
+        gl_stmt();
+        gl_count_iteration();
+        gl_jump_to(JMP, top);
+        gl_patch(out);
+        gl_close_loop();
+        return;
+    }
+    if (tk == T_FOR) {
+        // The step comes before the body in the source and runs after it, so
+        // it is written between the condition and the body and jumped around.
+        gl_next();
+        int nl = g_nl;
+        gl_expect('(', "expected ( after for");
+        if (tk != ';') { gl_simple(); }
+        gl_expect(';', "expected ; after a for's first part");
+        int top = g_pos;
+        if (tk != ';') { gl_expr(); } else { gl_one_rax(); }
+        gl_expect(';', "expected ; after a for's condition");
+        gl_test_rax();
+        int out = gl_jump_fwd(JE);
+        int body = gl_jump_fwd(JMP);
+        int step = g_pos;
+        if (tk != ')') { gl_simple(); }
+        gl_expect(')', "expected ) after a for's step");
+        gl_jump_to(JMP, top);
+        gl_patch(body);
+        gl_open_loop(step);
+        gl_stmt();
+        gl_count_iteration();
+        gl_jump_to(JMP, step);
+        gl_patch(out);
+        gl_close_loop();
+        g_nl = nl;
+        return;
+    }
+    if (tk == T_BREAK) {
+        gl_next();
+        if (!g_nloop) { gl_fail("break outside a loop"); return; }
+        if (g_nbrk == GLIMT_MAX_BREAKS) { gl_fail("too many breaks"); return; }
+        store64(g_brk + g_nbrk * 8, gl_jump_fwd(JMP));
+        store64(g_brkloop + g_nbrk * 8, g_nloop - 1);
+        g_nbrk += 1;
+        gl_expect(';', "expected ; after break");
+        return;
+    }
+    if (tk == T_CONTINUE) {
+        gl_next();
+        if (!g_nloop) { gl_fail("continue outside a loop"); return; }
+        gl_jump_to(JMP, load64(g_cont + (g_nloop - 1) * 8));
+        gl_expect(';', "expected ; after continue");
+        return;
+    }
+    if (tk == T_RETURN) {
+        gl_next();
+        if (tk != ';') { gl_expr(); } else { gl_zero_rax(); }
+        gl_leave();
+        gl_expect(';', "expected ; after return");
+        return;
+    }
+    if (tk == T_VOID || (tk == T_INT && gl_is_function_ahead() == 1)) {
+        if (g_infn) { gl_fail("a function inside a function"); return; }
+        gl_function();
+        return;
+    }
+    gl_simple();
+    gl_expect(';', "expected ;");
+    return;
+}
+
+// 1 when the tokens after this `int` are a name and a '(', a definition.
+int gl_is_function_ahead() {
+    int p = g_p;
+    int s = g_src;
+    while (s[p] == ' ' || s[p] == 9 || s[p] == 10 || s[p] == 13) { p += 1; }
+    if (!gl_is_alpha(s[p])) { return 0; }
+    while (gl_is_alpha(s[p]) || is_digit(s[p])) { p += 1; }
+    while (s[p] == ' ' || s[p] == 9 || s[p] == 10 || s[p] == 13) { p += 1; }
+    if (s[p] == '(') { return 1; }
+    return 0;
+}
+
+// A function definition, with tk on its `int` or `void`. It is written into
+// the middle of the code around it, which jumps over it.
+void gl_function() {
+    gl_next();
+    if (tk != T_ID) { gl_fail("expected a function name"); return; }
+    int s = tk_s;
+    int n = tk_n;
+    gl_next();
+    gl_expect('(', "expected ( after a function name");
+    g_nl = 0;
+    g_maxl = 0;
+    while (tk != ')' && tk != T_EOF) {
+        gl_expect(T_INT, "expected int before a parameter");
+        if (tk != T_ID) { gl_fail("expected a parameter name"); return; }
+        gl_add_local(tk_s, tk_n);
+        gl_next();
+        if (tk == ',') { gl_next(); } else if (tk != ')') { gl_fail("expected , or ) after a parameter"); }
+    }
+    gl_expect(')', "expected ) after the parameters");
+    int nparams = g_nl;
+    if (nparams > 6) { gl_fail("a function has more than six parameters"); return; }
+    int f = gl_fn_ref(s, n, nparams);
+    if (load64(g_fdef + f * 8) == 1) { gl_fail("a function is defined twice"); return; }
+    if (tk != '{') { gl_fail("expected { to start a function"); return; }
+
+    int over = gl_jump_fwd(JMP);
+    int start = g_pos;
+    gl_e1(0x55);                                  // push rbp
+    gl_e3(0x48, 0x89, 0xE5);                      // mov rbp, rsp
+    gl_e3(0x48, 0x81, 0xEC);                      // sub rsp, frame
+    int frame_at = g_pos;
+    gl_e4(0);
+    // Not enough stack left stops the script, before anything is written.
+    gl_mov_rax(g_data + GD_LIMIT);
+    gl_e3(0x48, 0x3B, 0x20);                      // cmp rsp, [rax]
+    gl_jump_to(0x82, g_abort);                    // jb
+    int i = 0;
+    for (i = 0; i < nparams; i += 1) {
+        if (i == 0) { gl_e3(0x48, 0x89, 0xBD); }
+        if (i == 1) { gl_e3(0x48, 0x89, 0xB5); }
+        if (i == 2) { gl_e3(0x48, 0x89, 0x95); }
+        if (i == 3) { gl_e3(0x48, 0x89, 0x8D); }
+        if (i == 4) { gl_e3(0x4C, 0x89, 0x85); }
+        if (i == 5) { gl_e3(0x4C, 0x89, 0x8D); }
+        gl_e4(0 - 8 * (i + 1));
+    }
+    g_infn = 1;
+    gl_stmt();
+    g_infn = 0;
+    gl_zero_rax();
+    gl_leave();
+    if (!g_err) {
+        int frame = (g_maxl * 8 + 15) & (0 - 16);
+        store8(g_code + frame_at, frame & 255);
+        store8(g_code + frame_at + 1, (frame >> 8) & 255);
+        store8(g_code + frame_at + 2, 0);
+        store8(g_code + frame_at + 3, 0);
+        store64(g_fdef + f * 8, 1);
+        store64(gl_fn_slot(f), g_code + start);
+    }
+    gl_patch(over);
+    g_nl = 0;
+    g_maxl = 0;
+    return;
+}
+
+// --- compiling and running ----------------------------------------------------------
+
+// Compiles a whole script, or an onclick attribute, into a function that
+// takes nothing. Returns its address, or 0 after a compile error, in which
+// case everything the compile added is taken back.
+int gl_compile(int src) {
+    if (!g_code) { return 0; }
+    protect(g_code, GLIMT_PAGES, 1);
+    int start = g_pos;
+    int nf = g_nf;
+    int ng = g_ng;
+    g_src = src;
+    g_p = 0;
+    g_line = 1;
+    g_err = 0;
+    g_nl = 0;
+    g_maxl = 0;
+    g_infn = 0;
+    g_nloop = 0;
+    g_nbrk = 0;
+    gl_e1(0x55);
+    gl_e3(0x48, 0x89, 0xE5);
+    gl_next();
+    while (tk != T_EOF) { gl_stmt(); }
+    gl_zero_rax();
+    gl_leave();
+    if (g_err) {
+        // A function this compile defined points into code that is going away.
+        int i = 0;
+        for (i = 0; i < nf; i += 1) {
+            int slot = load64(gl_fn_slot(i));
+            if (slot >= g_code + start) {
+                store64(gl_fn_slot(i), glimt_missing);
+                store64(g_fdef + i * 8, 0);
+            }
+        }
+        g_nf = nf;
+        g_ng = ng;
+        g_pos = start;
+    }
+    protect(g_code, GLIMT_PAGES, 0);
+    if (g_err) { return 0; }
+    return g_code + start;
+}
+
+// Runs compiled code with a fresh budget.
+void gl_run(int code) {
+    if (!code) { return; }
+    store64(g_data + GD_BUDGET, GLIMT_BUDGET);
+    store64(g_data + GD_STOPPED, 0);
+    int enter = g_enter;
+    enter(code);
+    if (load64(g_data + GD_STOPPED) == 1) {
+        print("glimt: a script was stopped, it ran too long or too deep\n");
+    }
+    return;
+}
+
+// Empties the page tables when the page on screen is a new one.
+void gl_page_check() {
+    if (g_page == script_page) { return; }
+    g_page = script_page;
+    g_pos = g_base;
+    g_ng = 0;
+    g_nf = 0;
+    g_nstr = 0;
+    g_nnode = 0;
+    g_ncache = 0;
+    return;
+}
+
+void glimt_run(int e, int text) {
+    gl_page_check();
+    gl_run(gl_compile(text));
+    return;
+}
+
+void glimt_event(int e, int node, int text) {
+    gl_page_check();
+    int i = 0;
+    for (i = 0; i < g_ncache; i += 1) {
+        if (load64(g_cnode + i * 8) == node) {
+            gl_run(load64(g_ccode + i * 8));
+            return;
+        }
+    }
+    int code = gl_compile(text);
+    if (code != 0 && g_ncache < GLIMT_MAX_CACHE) {
+        store64(g_cnode + g_ncache * 8, node);
+        store64(g_ccode + g_ncache * 8, code);
+        g_ncache += 1;
+    }
+    gl_run(code);
+    return;
+}
+
+// Writes the two stubs every run goes through, at the start of the buffer.
+//
+//   enter    push rbp
+//            mov [saved], rsp          where abort comes back to
+//            mov [limit], rsp - GLIMT_STACK
+//            call rdi
+//            pop rbp
+//            ret
+//
+//   abort    mov rsp, [saved]
+//            mov qword [stopped], 1
+//            xor eax, eax
+//            pop rbp
+//            ret
+void gl_write_stubs() {
+    g_pos = 0;
+    g_enter = g_code;
+    gl_e1(0x55);
+    gl_mov_rax(g_data + GD_SAVED);
+    gl_e3(0x48, 0x89, 0x20);                      // mov [rax], rsp
+    gl_e3(0x48, 0x89, 0xE1);                      // mov rcx, rsp
+    gl_e3(0x48, 0x81, 0xE9);                      // sub rcx, GLIMT_STACK
+    gl_e4(GLIMT_STACK);
+    gl_mov_rax(g_data + GD_LIMIT);
+    gl_e3(0x48, 0x89, 0x08);                      // mov [rax], rcx
+    gl_e2(0xFF, 0xD7);                            // call rdi
+    gl_e1(0x5D);
+    gl_e1(0xC3);
+    g_abort = g_pos;
+    gl_mov_rax(g_data + GD_SAVED);
+    gl_e3(0x48, 0x8B, 0x20);                      // mov rsp, [rax]
+    gl_mov_rax(g_data + GD_STOPPED);
+    gl_e3(0x48, 0xC7, 0x00);                      // mov qword [rax], 1
+    gl_e4(1);
+    gl_zero_rax();
+    gl_e1(0x5D);
+    gl_e1(0xC3);
+    g_base = g_pos;
+    return;
+}
+
+// Sets glimt up and registers it. Called once from main. The buffers are
+// utsikt's own for as long as it runs and are never given back, so lager
+// never has to zero a page that is not writable.
+void glimt_register() {
+    g_size = GLIMT_PAGES * 4096;
+    int raw = alloc(g_size + 4096);
+    g_data = alloc(GD_SIZE);
+    g_gname = alloc(GLIMT_MAX_GLOBALS * 8);
+    g_glen = alloc(GLIMT_MAX_GLOBALS * 8);
+    g_fname = alloc(GLIMT_MAX_FNS * 8);
+    g_flen = alloc(GLIMT_MAX_FNS * 8);
+    g_farity = alloc(GLIMT_MAX_FNS * 8);
+    g_fdef = alloc(GLIMT_MAX_FNS * 8);
+    g_lname = alloc(GLIMT_MAX_LOCALS * 8);
+    g_llen = alloc(GLIMT_MAX_LOCALS * 8);
+    g_strs = alloc(GLIMT_MAX_STRS * 8);
+    g_nodes = alloc(GLIMT_MAX_NODES * 8);
+    g_cnode = alloc(GLIMT_MAX_CACHE * 8);
+    g_ccode = alloc(GLIMT_MAX_CACHE * 8);
+    g_cont = alloc(16 * 8);
+    g_brk = alloc(GLIMT_MAX_BREAKS * 8);
+    g_brkloop = alloc(GLIMT_MAX_BREAKS * 8);
+    int e = alloc(sizeof(ScriptEngine));
+    if (!raw || !g_data || !g_gname || !g_glen || !g_fname || !g_flen || !g_farity
+        || !g_fdef || !g_lname || !g_llen || !g_strs || !g_nodes || !g_cnode
+        || !g_ccode || !g_cont || !g_brk || !g_brkloop || !e) {
+        print("glimt: not enough memory, pages run without scripts\n");
+        return;
+    }
+    g_code = (raw + 4095) & (0 - 4096);
+    if (protect(g_code, GLIMT_PAGES, 1) != 0) {
+        print("glimt: the kernel would not protect the code buffer\n");
+        g_code = 0;
+        return;
+    }
+    gl_write_stubs();
+    protect(g_code, GLIMT_PAGES, 0);
+    e.se_type = "text/x-glimt";
+    e.se_run = glimt_run;
+    e.se_event = glimt_event;
+    engine_register(e);
+    return;
+}
