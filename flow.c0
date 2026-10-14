@@ -41,6 +41,7 @@ layout Item {
     int i_bg;      // inline background, or -1
     int i_href;    // the link this run belongs to, or 0
     int i_img;     // an <img> placed as one item, or 0 for a run of text
+    int i_decor;   // DECOR_ value, a line under or through the run
 }
 
 // Where a link ended up on screen. Filled in by the paint pass, in WINDOW
@@ -107,6 +108,9 @@ int line_advance(int h) {
 // the same reason flow_paint and flow_align are. It is context that every
 // run inherits from where it sits in the tree, not an argument each caller
 // would have to thread through.
+// The text-decoration of the text node being flowed, carried into every
+// item it pushes, like flow_href.
+int flow_decor = 0;
 int flow_href;
 
 // The bottom margin of the block that just finished, still collapsible.
@@ -136,11 +140,13 @@ int flow_carry;
 
 int flow_init() {
     line_items = alloc(LINE_MAX * sizeof(Item));
-    if (line_items == 0) { return 0; }
+    if (!line_items) { return 0; }
     word_scratch = alloc(LINE_MAX * sizeof(Item));
-    if (word_scratch == 0) { return 0; }
+    if (!word_scratch) { return 0; }
     link_boxes = alloc(LINK_MAX * sizeof(LinkBox));
-    if (link_boxes == 0) { return 0; }
+    if (!link_boxes) { return 0; }
+    marker_buf = alloc(32);
+    if (!marker_buf) { return 0; }
     link_count = 0;
     return 1;
 }
@@ -157,7 +163,7 @@ void link_box_add(int x, int y, int w, int h, int href) {
     lb.lb_w = w;
     lb.lb_h = h;
     lb.lb_href = href;
-    link_count = link_count + 1;
+    link_count += 1;
     return;
 }
 
@@ -165,14 +171,13 @@ void link_box_add(int x, int y, int w, int h, int href) {
 // painted at a point wins, which is the same rule the pixels themselves
 // follow.
 int link_hit(int mx, int my) {
-    int k = link_count - 1;
-    while (k >= 0) {
+    int k = 0;
+    for (k = link_count - 1; k >= 0; k -= 1) {
         int lb = link_boxes + k * sizeof(LinkBox);
         if (mx >= lb.lb_x && mx < lb.lb_x + lb.lb_w
             && my >= lb.lb_y && my < lb.lb_y + lb.lb_h) {
             return lb.lb_href;
         }
-        k = k - 1;
     }
     return 0;
 }
@@ -185,7 +190,7 @@ int link_hit(int mx, int my) {
 // the items are buffered rather than drawn as they are placed. A centred
 // line's first word depends on where its last word ended.
 void flush_line() {
-    if (line_count == 0) {
+    if (!line_count) {
         if (line_h > 0) {
             flow_y = line_top + line_advance(line_h);
             flow_carry = 0;
@@ -205,7 +210,7 @@ void flush_line() {
         if (flow_align == ALIGN_RIGHT) { dx = flow_right - flow_left - line_x; }
         if (dx < 0) { dx = 0; }
         int k = 0;
-        while (k < line_count) {
+        for (k = 0; k < line_count; k += 1) {
             int it = line_items + k * sizeof(Item);
             // Bottom-aligned, not top-aligned, because a line mixing a heading-sized
             // word with body text should sit them on one baseline, and with
@@ -217,7 +222,7 @@ void flush_line() {
                 // not underlined, since a line under a picture reads as part of it.
                 draw_image(x, y, it.i_img);
                 if (it.i_href != 0) { link_box_add(x, y, it.i_w, it.i_h, it.i_href); }
-                k = k + 1;
+                
                 continue;
             }
             if (it.i_bg >= 0) { fill_rect(x, y, it.i_w, it.i_h, it.i_bg); }
@@ -241,8 +246,19 @@ void flush_line() {
                 }
                 fill_rect(x, y + it.i_h - 1, uw, 1, it.i_color);
                 link_box_add(x, y, it.i_w, it.i_h, it.i_href);
+            } else if (it.i_decor == DECOR_UNDER || it.i_decor == DECOR_STRIKE) {
+                // text-decoration, run on across the spaces to the next
+                // item with the same decoration, for the same reason a
+                // link's underline is.
+                int dw = it.i_w;
+                if (k + 1 < line_count) {
+                    int nd = line_items + (k + 1) * sizeof(Item);
+                    if (nd.i_decor == it.i_decor && nd.i_img == 0) { dw = nd.i_x - it.i_x; }
+                }
+                int dy = y + it.i_h - 1;
+                if (it.i_decor == DECOR_STRIKE) { dy = y + it.i_h / 2; }
+                fill_rect(x, dy, dw, it.i_scale, it.i_color);
             }
-            k = k + 1;
         }
     }
     flow_y = line_top + line_advance(line_h);
@@ -256,7 +272,7 @@ void flush_line() {
 
 void push_item(int s, int n, int w, int scale, int color, int bold, int bg) {
     if (line_count >= LINE_MAX) { flush_line(); }
-    if (line_count == 0) { line_top = flow_y; }
+    if (!line_count) { line_top = flow_y; }
     int it = line_items + line_count * sizeof(Item);
     it.i_text = s;
     it.i_len = n;
@@ -269,9 +285,10 @@ void push_item(int s, int n, int w, int scale, int color, int bold, int bg) {
     it.i_bg = bg;
     it.i_href = flow_href;
     it.i_img = 0;
-    line_x = line_x + w;
+    it.i_decor = flow_decor;
+    line_x += w;
     if (it.i_h > line_h) { line_h = it.i_h; }
-    line_count = line_count + 1;
+    line_count += 1;
     return;
 }
 
@@ -287,6 +304,7 @@ void item_copy(int dst, int src) {
     dst.i_bg = src.i_bg;
     dst.i_href = src.i_href;
     dst.i_img = src.i_img;
+    dst.i_decor = src.i_decor;
     return;
 }
 
@@ -301,10 +319,9 @@ void item_copy(int dst, int src) {
 void move_word_down() {
     int n = line_count - word_start;
     int k = 0;
-    while (k < n) {
+    for (k = 0; k < n; k += 1) {
         item_copy(word_scratch + k * sizeof(Item),
                   line_items + (word_start + k) * sizeof(Item));
-        k = k + 1;
     }
     // The line's remaining width ends where its last kept item ends, NOT
     // where the moved word began. The difference is the space between them,
@@ -318,14 +335,13 @@ void move_word_down() {
     // otherwise a line losing its only large word keeps its height.
     line_h = 0;
     k = 0;
-    while (k < line_count) {
+    for (k = 0; k < line_count; k += 1) {
         int it = line_items + k * sizeof(Item);
         if (it.i_h > line_h) { line_h = it.i_h; }
-        k = k + 1;
     }
     flush_line();
     k = 0;
-    while (k < n) {
+    for (k = 0; k < n; k += 1) {
         int it2 = word_scratch + k * sizeof(Item);
         push_item(it2.i_text, it2.i_len, it2.i_w, it2.i_scale,
                   it2.i_color, it2.i_bold, it2.i_bg);
@@ -334,13 +350,13 @@ void move_word_down() {
         // moved copy carries the href each run actually had.
         int moved = line_items + (line_count - 1) * sizeof(Item);
         moved.i_href = it2.i_href;
+        moved.i_decor = it2.i_decor;
         // An image keeps its own size, not a text cell's.
         moved.i_img = it2.i_img;
         if (it2.i_img != 0) {
             moved.i_h = it2.i_h;
             if (moved.i_h > line_h) { line_h = moved.i_h; }
         }
-        k = k + 1;
     }
     return;
 }
@@ -357,7 +373,7 @@ void add_run(int s, int n, int scale, int color, int bold, int bg) {
     int cw = cell_w * scale;
     if (cw <= 0) { return; }
     while (n > 0) {
-        if (line_count == 0) { line_top = flow_y; line_x = 0; word_start = 0; }
+        if (!line_count) { line_top = flow_y; line_x = 0; word_start = 0; }
         if (flow_left + line_x + n * cw <= flow_right) {
             push_item(s, n, n * cw, scale, color, bold, bg);
             return;
@@ -380,8 +396,8 @@ void add_run(int s, int n, int scale, int color, int bold, int bg) {
             }
             push_item(s, fit, fit * cw, scale, color, bold, bg);
             flush_line();
-            s = s + fit;
-            n = n - fit;
+            s += fit;
+            n -= fit;
         }
     }
     return;
@@ -395,7 +411,7 @@ void add_run(int s, int n, int scale, int color, int bold, int bg) {
 // unreadable image takes up no room at all.
 void flow_img(int node) {
     int img = node.n_img;
-    if (img == 0) { return; }
+    if (!img) { return; }
     int w = img_w(img);
     int h = img_h(img);
     if (line_count > 0 && flow_left + line_x + w > flow_right) { flush_line(); }
@@ -416,7 +432,7 @@ void flow_img(int node) {
 // A <br>, or the end of a block whose last line is empty. The line still
 // occupies a line's height.
 void break_line(int scale) {
-    if (line_count == 0 && line_h == 0) {
+    if (line_count == 0 && !line_h) {
         line_top = flow_y;
         line_h = cell_h * scale;
     }
@@ -425,7 +441,7 @@ void break_line(int scale) {
 }
 
 int style_scale(int p) {
-    if (p == 0) { return 1; }
+    if (!p) { return 1; }
     if (p.p_scale >= 1) { return p.p_scale; }
     return 1;
 }
@@ -465,27 +481,51 @@ void flow_text(int node) {
         if (pp.p_display == DISPLAY_INLINE && pp.p_bg >= 0) { bg = pp.p_bg; }
     }
     flow_href = enclosing_href(node);
+    flow_decor = DECOR_NONE;
+    if (p != 0 && p.p_decor >= 0) { flow_decor = p.p_decor; }
     int s = node.n_text;
     int i = 0;
+    if (p != 0 && p.p_pre == 1) {
+        // white-space: pre. Every space is kept, a line ends only at a
+        // line break, and a line wider than the box is clipped rather than
+        // wrapped, as in any browser.
+        int cw = cell_w * scale;
+        while (s[i] != 0) {
+            if (s[i] == 10) {
+                break_line(scale);
+                i += 1;
+            } else {
+                int start = i;
+                while (s[i] != 0 && s[i] != 10) { i += 1; }
+                if (!line_count) { line_top = flow_y; line_x = 0; word_start = 0; }
+                push_item(s + start, i - start, (i - start) * cw, scale, color, bold, bg);
+            }
+        }
+        flow_href = 0;
+        flow_decor = DECOR_NONE;
+        return;
+    }
     while (s[i] != 0) {
         if (s[i] == ' ') {
             // A space at the start of a line is dropped, which is what makes
             // a wrapped paragraph line up on the left edge.
-            if (line_count > 0) { line_x = line_x + cell_w * scale; }
+            if (line_count > 0) { line_x += cell_w * scale; }
             // A space is the only place a line may break, so it is also
             // where the next word starts.
             word_start = line_count;
-            i = i + 1;
+            i += 1;
         } else {
             int start = i;
-            while (s[i] != 0 && s[i] != ' ') { i = i + 1; }
+            while (s[i] != 0 && s[i] != ' ') { i += 1; }
             add_run(s + start, i - start, scale, color, bold, bg);
         }
     }
     // flow_href means something only while a text node is being flowed.
     // Nothing else pushes items, and leaving a stale target in a
-    // global is how that stops being true quietly.
+    // global is how that stops being true quietly. The same goes for
+    // flow_decor.
     flow_href = 0;
+    flow_decor = DECOR_NONE;
     return;
 }
 
@@ -508,7 +548,7 @@ int table_rows(int node, int out, int n, int max) {
     while (c != 0) {
         if (c.n_kind == KIND_ELEM) {
             if (c.n_tag == TAG_TR) {
-                if (n < max) { store64(out + n * 8, c); n = n + 1; }
+                if (n < max) { store64(out + n * 8, c); n += 1; }
             } else if (c.n_tag != TAG_TABLE) {
                 // Not into a nested table, whose rows are its own.
                 n = table_rows(c, out, n, max);
@@ -524,7 +564,7 @@ int row_cells(int row) {
     int c = row.n_first;
     while (c != 0) {
         if (c.n_kind == KIND_ELEM && (c.n_tag == TAG_TD || c.n_tag == TAG_TH)) {
-            n = n + 1;
+            n += 1;
         }
         c = c.n_next;
     }
@@ -552,18 +592,17 @@ void flow_table(int node) {
     // laid out again on every reflow, so a rows array that stayed would leak
     // once per frame that has a table in it.
     int rows = alloc(TABLE_MAX_ROWS * 8);
-    if (rows == 0) { return; }
+    if (!rows) { return; }
     int nrows = table_rows(node, rows, 0, TABLE_MAX_ROWS);
-    if (nrows == 0) { dealloc(rows); return; }
+    if (!nrows) { dealloc(rows); return; }
 
     int ncols = 0;
     int i = 0;
-    while (i < nrows) {
+    for (i = 0; i < nrows; i += 1) {
         int rc = row_cells(load64(rows + i * 8));
         if (rc > ncols) { ncols = rc; }
-        i = i + 1;
     }
-    if (ncols == 0) { dealloc(rows); return; }
+    if (!ncols) { dealloc(rows); return; }
 
     int saved_left = flow_left;
     int saved_right = flow_right;
@@ -574,7 +613,7 @@ void flow_table(int node) {
     if (colw < cell_w * 2) { colw = cell_w * 2; }
 
     i = 0;
-    while (i < nrows) {
+    for (i = 0; i < nrows; i += 1) {
         int row = load64(rows + i * 8);
         int row_top = flow_y;
         int maxh = 0;
@@ -603,7 +642,7 @@ void flow_table(int node) {
                 flush_line();
                 int h = flow_y + CELL_PAD - row_top;
                 if (h > maxh) { maxh = h; }
-                ci = ci + 1;
+                ci += 1;
             }
             c = c.n_next;
         }
@@ -618,13 +657,11 @@ void flow_table(int node) {
             // one rule drawn after the last row.
             fill_rect(base, row_top - scroll_y, ncols * colw, 1, GRID_RGB);
             int g = 0;
-            while (g <= ncols) {
+            for (g = 0; g <= ncols; g += 1) {
                 fill_rect(base + g * colw, row_top - scroll_y, 1, maxh, GRID_RGB);
-                g = g + 1;
             }
         }
         flow_y = row_top + maxh;
-        i = i + 1;
     }
     if (flow_paint == 1) {
         fill_rect(base, flow_y - scroll_y, ncols * colw + 1, 1, GRID_RGB);
@@ -642,6 +679,22 @@ void flow_table(int node) {
     return;
 }
 
+// Scratch for a list item's number, which is never more than a few digits.
+int marker_buf = 0;
+
+// A list item's number, its place among the <li> elements of its list.
+int li_number(int node) {
+    int n = 1;
+    int parent = node.n_parent;
+    if (!parent) { return 1; }
+    int c = parent.n_first;
+    while (c != 0 && c != node) {
+        if (c.n_tag == TAG_LI) { n += 1; }
+        c = c.n_next;
+    }
+    return n;
+}
+
 void flow_block(int node, int p) {
     flush_line();
     // Collapse this block's top margin with the previous block's bottom.
@@ -650,7 +703,7 @@ void flow_block(int node, int p) {
     // margin was the larger of the two.
     int top_m = p.p_margin;
     if (flow_carry > top_m) { top_m = flow_carry; }
-    flow_y = flow_y + top_m - flow_carry;
+    flow_y += top_m - flow_carry;
     flow_carry = 0;
     int saved_left = flow_left;
     int saved_right = flow_right;
@@ -670,7 +723,7 @@ void flow_block(int node, int p) {
     flow_right = saved_right - p.p_pad;
     if (flow_right <= flow_left) { flow_right = flow_left + cell_w; }
     if (p.p_align >= 0) { flow_align = p.p_align; }
-    flow_y = flow_y + p.p_pad;
+    flow_y += p.p_pad;
     line_top = flow_y;
 
     // A list item's marker, drawn into the padding its own <ul> reserved on
@@ -678,15 +731,31 @@ void flow_block(int node, int p) {
     // rather than a default a stylesheet could replace -- and it is drawn
     // here, inside the box, because a marker sitting outside the content box
     // is what makes a list look like a list rather than like indented text.
-    if (node.n_tag == TAG_LI && flow_paint == 1) {
+    // In a list whose list-style-type is decimal the marker is the item's
+    // number and a full stop, right-aligned against the item's text, and
+    // with none there is no marker at all.
+    if (node.n_tag == TAG_LI && flow_paint == 1 && p.p_list != LIST_NONE) {
         int mcolor = 0x000000;
         if (p.p_color >= 0) { mcolor = p.p_color; }
         int mscale = style_scale(p);
-        int msize = cell_h * mscale / 3;
-        if (msize < 2) { msize = 2; }
-        fill_rect(flow_left - cell_w * mscale,
-                  flow_y + (cell_h * mscale - msize) / 2 - scroll_y,
-                  msize, msize, mcolor);
+        if (p.p_list == LIST_DECIMAL) {
+            int num = li_number(node);
+            int buf = marker_buf;
+            int len = 0;
+            int d = 1;
+            while (d * 10 <= num) { d *= 10; }
+            while (d > 0) { buf[len] = '0' + num / d % 10; len += 1; d /= 10; }
+            buf[len] = '.';
+            len += 1;
+            draw_text(flow_left - (len + 1) * cell_w * mscale, flow_y - scroll_y,
+                      buf, len, mcolor, mscale, 0);
+        } else {
+            int msize = cell_h * mscale / 3;
+            if (msize < 2) { msize = 2; }
+            fill_rect(flow_left - cell_w * mscale,
+                      flow_y + (cell_h * mscale - msize) / 2 - scroll_y,
+                      msize, msize, mcolor);
+        }
     }
 
     if (node.n_tag == TAG_HR) {
@@ -698,7 +767,7 @@ void flow_block(int node, int p) {
             if (p.p_color >= 0) { c = p.p_color; }
             fill_rect(flow_left, flow_y - scroll_y, flow_right - flow_left, 2, c);
         }
-        flow_y = flow_y + 2;
+        flow_y += 2;
     } else if (node.n_tag == TAG_TABLE) {
         flow_table(node);
     } else {
@@ -710,9 +779,9 @@ void flow_block(int node, int p) {
     }
 
     flush_line();
-    flow_y = flow_y + p.p_pad;
+    flow_y += p.p_pad;
     node.n_h = flow_y - top;
-    flow_y = flow_y + p.p_margin;
+    flow_y += p.p_margin;
     // Remembered, not consumed, since the next block collapses against it. Its
     // padding, if it has any, has already separated this margin from the
     // content, which is why the carry is set here and not before the pad.

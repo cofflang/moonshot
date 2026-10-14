@@ -20,18 +20,33 @@ repository to use it. This is where it is developed.
 
 - **HTML**: a tokenizer and tree builder in one pass. Character references,
   comments, doctype, void elements, `<style>` blocks, whitespace collapsing,
-  the common implied end tags (`<p>`, `<li>`, `<td>`, `<tr>`), stray end tags
-  dropped, unknown tags treated as inline. Kept attributes are `class` and
-  `href`.
+  the common implied end tags (`<p>`, `<li>`, `<td>`, `<tr>`, `<dt>`,
+  `<dd>`), stray end tags dropped, end tags matched by name, unknown tags
+  treated as inline. `<pre>` keeps its whitespace and a `<script>`'s
+  contents are raw text. Default styles for the headings `h1` to `h6`, the
+  sectioning elements, `blockquote`, `pre`, `ol`, `dl`, `figure`, and inline
+  ones such as `u`, `s`, `del`, `mark`, `small`, `kbd` and `abbr`. Kept
+  attributes are `class`, `href`, `src`, `id`, `type` and `onclick`.
 - **CSS**: type, class, `tag.class` and descendant (`div p`) selectors in
   comma-separated lists, with real specificity. `color`, `background`,
   `background-color`, `font-size`, `font-weight`, `display`, `margin`,
-  `padding`, `text-align`. Colours as `#rgb`, `#rrggbb` and fifteen names.
+  `padding`, `text-align`, `text-decoration` (underline, line-through),
+  `white-space` (pre) and `list-style-type` (disc, decimal, none). Colours as `#rgb`, `#rrggbb` and fifteen names.
   The default stylesheet is written in CSS and goes through the same parser
   as a page's own.
 - **Layout**: block boxes, inline content broken into lines at spaces,
-  collapsing vertical margins between siblings, lists with drawn markers,
+  collapsing vertical margins between siblings, lists with drawn markers or
+  numbers,
   `<hr>`, and tables as a grid of equal-width columns.
+- **Scripting**: glimt (`glimt.c0`), a small part of c0 compiled to
+  x86-64 machine code, runs `<script type="text/x-glimt">` and the
+  `onclick` attributes of a page whose scripts are glimt. A script reaches
+  the page through ten builtins, and elements and strings are checked
+  handles, never pointers. glimt sits behind an interface (`script.c0`)
+  that any engine can plug into, by registering the `<script type>` it
+  runs. Scripts no engine claims, JavaScript among them, do not run. A test
+  engine (`engine_test.c0`) with a single command, `set ID TEXT`, exercises
+  the interface on its own.
 - **Interaction**: scrolling by arrow keys, PageUp, PageDown, Home and End;
   links by mouse click; Backspace for back; `r` to reload; an address line
   saying which file is open; re-wrapping when the window is resized.
@@ -55,7 +70,8 @@ cd utsikt
 
 The first build bootstraps coff and takes a few minutes; moonshot's README
 lists the packages it needs. When the QEMU window comes up, log in as
-`root` with an empty password and type `spawn3 utsikt.elf`.
+`root` with an empty password and type `start utsikt.elf`, or
+`start utsikt.elf about.html` to open another page.
 
 `./dev.sh` builds the utsikt in this checkout into the kernel, so an edit
 here is what you see after the next `./dev.sh run`. `./dev.sh test` runs
@@ -65,14 +81,17 @@ the browser's tests. See [CONTRIBUTING.md](CONTRIBUTING.md) for the rest.
 
 | File | What it is |
 |------|------------|
-| `utsikt.c0` | The program: window setup, loading a document, the load, parse, style and lay out pipeline, the key and mouse loop, navigation. It `include`s the four below, in this order. |
+| `utsikt.c0` | The program: window setup, loading a document, the load, parse, style and lay out pipeline, the key and mouse loop, navigation. It `include`s the files below, in this order, with moonshot's `moon.c0` after `paint.c0`. |
 | `paint.c0` | The frame buffer, rectangles, the font cache and text drawing, and the string helpers. |
 | `dom.c0` | HTML bytes in, a tree of nodes out. |
 | `style.c0` | The stylesheet parser and the cascade that gives every node a computed style. |
 | `flow.c0` | Normal flow. The tree becomes boxes and lines, measured in one pass and painted in a second, so a background is painted before the text on it. |
+| `script.c0` | The scripting interface. Engines register here, and get a page's scripts and clicks through it. |
+| `engine_test.c0` | A one-command test engine for the interface. |
+| `glimt.c0` | glimt, the scripting language, compiled to machine code. |
 | `dev.sh` | Builds this checkout into a moonshot checkout next to it, and boots it or tests it. |
 
-c0's `include` is textual, so the five files are one translation unit and
+c0's `include` is textual, so the files are one translation unit and
 the include order is the order the compiler reads them in.
 
 ## How it gets into moonshot

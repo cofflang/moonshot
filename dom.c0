@@ -52,6 +52,11 @@ int TAG_TR      = 24;
 int TAG_TD      = 25;
 int TAG_TH      = 26;
 int TAG_IMG     = 27;
+int TAG_OL      = 28;
+int TAG_PRE     = 29;
+int TAG_SCRIPT  = 30;
+int TAG_DT      = 31;
+int TAG_DD      = 32;
 
 int KIND_ELEM = 0;
 int KIND_TEXT = 1;
@@ -81,6 +86,9 @@ layout Node {
     int n_src;     // <img> src attribute, raw like n_href, or 0
     int n_img;     // <img> loaded .spr (header and pixels), or 0 when
                    // the file is missing or not a sprite (see img_load)
+    int n_id;      // the id attribute, raw, or 0
+    int n_type;    // the type attribute, lowercased, or 0 (a <script>'s language)
+    int n_onclick; // the onclick attribute, raw, or 0, for a script engine
 }
 
 // <style> blocks, collected in document order and handed to the stylesheet
@@ -101,7 +109,7 @@ int pos;
 
 int node_new(int kind, int tag) {
     int n = doc_alloc(sizeof(Node));
-    if (n == 0) { return 0; }
+    if (!n) { return 0; }
     n.n_kind = kind;
     n.n_tag = tag;
     n.n_name = 0;
@@ -117,6 +125,9 @@ int node_new(int kind, int tag) {
     n.n_y = 0;
     n.n_w = 0;
     n.n_h = 0;
+    n.n_id = 0;
+    n.n_type = 0;
+    n.n_onclick = 0;
     return n;
 }
 
@@ -164,6 +175,11 @@ int tag_id(int name) {
     if (str_eq(name, "td") == 1) { return TAG_TD; }
     if (str_eq(name, "th") == 1) { return TAG_TH; }
     if (str_eq(name, "img") == 1) { return TAG_IMG; }
+    if (str_eq(name, "ol") == 1) { return TAG_OL; }
+    if (str_eq(name, "pre") == 1) { return TAG_PRE; }
+    if (str_eq(name, "script") == 1) { return TAG_SCRIPT; }
+    if (str_eq(name, "dt") == 1) { return TAG_DT; }
+    if (str_eq(name, "dd") == 1) { return TAG_DD; }
     // tbody, thead and tfoot are not here on purpose. They are grouping
     // elements a browser inserts whether or not the author wrote them, and
     // this engine finds rows by walking the table's descendants rather than
@@ -175,8 +191,16 @@ int tag_id(int name) {
 // Elements that never have children and never get an end tag, which are
 // <br>, <hr> and <img>. Anything else written as <x/> is handled by the self-closing
 // slash in the tag itself.
-int is_void_tag(int tag) {
+// Elements that never have contents or an end tag. The ones without a tag id
+// are found by name, since nothing else about them matters here.
+int is_void_tag(int tag, int name) {
     if (tag == TAG_BR || tag == TAG_HR || tag == TAG_IMG) { return 1; }
+    if (str_eq(name, "meta") == 1 || str_eq(name, "link") == 1
+        || str_eq(name, "wbr") == 1 || str_eq(name, "input") == 1
+        || str_eq(name, "base") == 1 || str_eq(name, "col") == 1
+        || str_eq(name, "area") == 1 || str_eq(name, "embed") == 1
+        || str_eq(name, "source") == 1 || str_eq(name, "track") == 1
+        || str_eq(name, "param") == 1) { return 1; }
     return 0;
 }
 
@@ -184,11 +208,25 @@ int is_void_tag(int tag) {
 // block-level thing whether or not anyone wrote </p>, and leaving that out
 // is very visible, since every following block nests one level deeper and inherits
 // the paragraph's style.
-int closes_paragraph(int tag) {
+// Whether the start of this element ends an open <p>, which is true of every
+// block element in HTML. The block elements without a tag id are found by
+// name.
+int closes_paragraph(int tag, int name) {
     if (tag == TAG_P || tag == TAG_DIV || tag == TAG_UL || tag == TAG_LI) { return 1; }
     if (tag == TAG_H1 || tag == TAG_H2 || tag == TAG_H3) { return 1; }
     if (tag == TAG_HR || tag == TAG_BODY) { return 1; }
     if (tag == TAG_TABLE || tag == TAG_TR) { return 1; }
+    if (tag == TAG_OL || tag == TAG_PRE || tag == TAG_DT || tag == TAG_DD) { return 1; }
+    if (str_eq(name, "h4") == 1 || str_eq(name, "h5") == 1 || str_eq(name, "h6") == 1
+        || str_eq(name, "section") == 1 || str_eq(name, "article") == 1
+        || str_eq(name, "header") == 1 || str_eq(name, "footer") == 1
+        || str_eq(name, "nav") == 1 || str_eq(name, "main") == 1
+        || str_eq(name, "aside") == 1 || str_eq(name, "blockquote") == 1
+        || str_eq(name, "dl") == 1 || str_eq(name, "figure") == 1
+        || str_eq(name, "figcaption") == 1 || str_eq(name, "address") == 1
+        || str_eq(name, "details") == 1 || str_eq(name, "summary") == 1
+        || str_eq(name, "fieldset") == 1 || str_eq(name, "form") == 1
+        || str_eq(name, "center") == 1) { return 1; }
     return 0;
 }
 
@@ -201,9 +239,8 @@ int at(int i) {
 
 int starts_with(int lit) {
     int i = 0;
-    while (lit[i] != 0) {
+    for (i = 0; lit[i] != 0; i += 1) {
         if (to_lower(at(i)) != to_lower(lit[i])) { return 0; }
-        i = i + 1;
     }
     return 1;
 }
@@ -211,8 +248,8 @@ int starts_with(int lit) {
 void skip_to_after(int lit) {
     int n = str_len(lit);
     while (pos < src_len) {
-        if (starts_with(lit) == 1) { pos = pos + n; return; }
-        pos = pos + 1;
+        if (starts_with(lit) == 1) { pos += n; return; }
+        pos += 1;
     }
     return;
 }
@@ -227,22 +264,22 @@ void skip_to_after(int lit) {
 // and advances `pos` past it only in the first case.
 int read_entity() {
     if (at(0) != '&') { return -1; }
-    if (starts_with("&amp;") == 1)  { pos = pos + 5; return '&'; }
-    if (starts_with("&lt;") == 1)   { pos = pos + 4; return '<'; }
-    if (starts_with("&gt;") == 1)   { pos = pos + 4; return '>'; }
-    if (starts_with("&quot;") == 1) { pos = pos + 6; return '"'; }
-    if (starts_with("&apos;") == 1) { pos = pos + 6; return 39; }
+    if (starts_with("&amp;") == 1)  { pos += 5; return '&'; }
+    if (starts_with("&lt;") == 1)   { pos += 4; return '<'; }
+    if (starts_with("&gt;") == 1)   { pos += 4; return '>'; }
+    if (starts_with("&quot;") == 1) { pos += 6; return '"'; }
+    if (starts_with("&apos;") == 1) { pos += 6; return 39; }
     // A non-breaking space is a space that does not collapse and does not
     // break a line. The collapsing half is what matters here; the line
     // breaker works on runs between ordinary spaces, so handing it an
     // ordinary space would be wrong in exactly the case the author wrote
     // this to prevent. Byte 1 is a private stand-in the flow layer knows.
-    if (starts_with("&nbsp;") == 1) { pos = pos + 6; return 1; }
+    if (starts_with("&nbsp;") == 1) { pos += 6; return 1; }
     if (starts_with("&#") == 1) {
         int save = pos;
         int p = pos + 2;
         int base = 10;
-        if (p < src_len && to_lower(src[p]) == 'x') { base = 16; p = p + 1; }
+        if (p < src_len && to_lower(src[p]) == 'x') { base = 16; p += 1; }
         int v = 0;
         int any = 0;
         while (p < src_len) {
@@ -253,7 +290,7 @@ int read_entity() {
             if (d < 0) { break; }
             v = v * base + d;
             any = 1;
-            p = p + 1;
+            p += 1;
         }
         if (any == 1 && p < src_len && src[p] == ';') {
             pos = p + 1;
@@ -279,20 +316,39 @@ int read_entity() {
 // line start anyway -- but it would still occupy a word slot and could push
 // a line over, and dropping it is what makes markup indented for
 // readability lay out the same as markup written on one line.
-int read_text() {
+// Reads a run of text up to the next tag. Whitespace collapses to one space,
+// except inside <pre> (`pre` is 1), where every space and line break is kept.
+// `pre` is 2 for the first text straight inside a <pre>, whose leading line
+// break is dropped, as HTML says. A tab becomes a space, since the font has
+// no tab.
+int read_text(int pre) {
     int start = pos;
     // Worst case the collapsed text is exactly as long as the source run.
-    while (pos < src_len && src[pos] != '<') { pos = pos + 1; }
+    while (pos < src_len && src[pos] != '<') { pos += 1; }
     int n = pos - start;
-    if (n == 0) { return 0; }
+    if (!n) { return 0; }
     int out = doc_alloc(n + 1);
-    if (out == 0) { return 0; }
+    if (!out) { return 0; }
     int save = pos;
     pos = start;
     int len = 0;
     int nonspace = 0;
+    if (pre == 2) {
+        pre = 1;
+        if (pos < save && src[pos] == 13) { pos += 1; }
+        if (pos < save && src[pos] == 10) { pos += 1; }
+    }
     while (pos < save) {
         int c = src[pos];
+        if (pre == 1 && is_space(c) == 1) {
+            if (c == 9) { c = ' '; }
+            if (c == 13) { pos += 1; continue; }
+            out[len] = c;
+            len += 1;
+            nonspace = 1;
+            pos += 1;
+            continue;
+        }
         if (is_space(c) == 1) {
             // One space per run of whitespace. A LEADING space is kept, and
             // that is not an oversight. A text node does not know whether it
@@ -304,25 +360,25 @@ int read_text() {
             // breaker answers it. flow_text ignores a space when the pen is
             // at the left edge, which is the same rule and the right place
             // for it.
-            if (len == 0 || out[len - 1] != ' ') { out[len] = ' '; len = len + 1; }
-            pos = pos + 1;
+            if (len == 0 || out[len - 1] != ' ') { out[len] = ' '; len += 1; }
+            pos += 1;
         } else {
             if (c == '&') {
                 int e = read_entity();
-                if (e >= 0) { c = e; } else { pos = pos + 1; }
+                if (e >= 0) { c = e; } else { pos += 1; }
             } else {
-                pos = pos + 1;
+                pos += 1;
             }
             out[len] = c;
-            len = len + 1;
+            len += 1;
             nonspace = 1;
         }
     }
     pos = save;
     out[len] = 0;
-    if (nonspace == 0) { return 0; }
+    if (!nonspace) { return 0; }
     int t = node_new(KIND_TEXT, TAG_UNKNOWN);
-    if (t == 0) { return 0; }
+    if (!t) { return 0; }
     t.n_text = out;
     return t;
 }
@@ -340,45 +396,51 @@ int read_text() {
 // after the call, since the next start tag overwrites it.
 int attr_href;
 int attr_src;      // <img src>, raw bytes for the same reason as href
+int attr_id;       // id, raw, since a script looks it up as written
+int attr_type;     // type, lowercased
+int attr_onclick;  // onclick, raw, handed to a script engine as it is
 
 int read_attrs() {
     int class_val = 0;
     attr_href = 0;
     attr_src = 0;
+    attr_id = 0;
+    attr_type = 0;
+    attr_onclick = 0;
     while (pos < src_len) {
-        while (pos < src_len && is_space(src[pos]) == 1) { pos = pos + 1; }
+        while (pos < src_len && is_space(src[pos]) == 1) { pos += 1; }
         if (pos >= src_len) { break; }
         if (src[pos] == '>' || src[pos] == '/') { break; }
         int nstart = pos;
-        while (pos < src_len && is_name_char(src[pos]) == 1) { pos = pos + 1; }
+        while (pos < src_len && is_name_char(src[pos]) == 1) { pos += 1; }
         if (pos == nstart) {
             // Not a name and not the end of the tag, so junk. Skip one byte so
             // this cannot loop forever on malformed markup.
-            pos = pos + 1;
+            pos += 1;
         } else {
             int name = str_dup_lower(src, nstart, pos - nstart);
-            while (pos < src_len && is_space(src[pos]) == 1) { pos = pos + 1; }
+            while (pos < src_len && is_space(src[pos]) == 1) { pos += 1; }
             int value = 0;
             // The raw span of the value as written, kept alongside the
             // lowercased copy because href needs the original bytes.
             int vpos = 0;
             int vlen = 0;
             if (pos < src_len && src[pos] == '=') {
-                pos = pos + 1;
-                while (pos < src_len && is_space(src[pos]) == 1) { pos = pos + 1; }
+                pos += 1;
+                while (pos < src_len && is_space(src[pos]) == 1) { pos += 1; }
                 if (pos < src_len && (src[pos] == '"' || src[pos] == 39)) {
                     int q = src[pos];
-                    pos = pos + 1;
+                    pos += 1;
                     int vstart = pos;
-                    while (pos < src_len && src[pos] != q) { pos = pos + 1; }
+                    while (pos < src_len && src[pos] != q) { pos += 1; }
                     vpos = vstart;
                     vlen = pos - vstart;
                     value = str_dup_lower(src, vstart, pos - vstart);
-                    if (pos < src_len) { pos = pos + 1; }
+                    if (pos < src_len) { pos += 1; }
                 } else {
                     int vstart = pos;
                     while (pos < src_len && is_space(src[pos]) == 0
-                           && src[pos] != '>') { pos = pos + 1; }
+                           && src[pos] != '>') { pos += 1; }
                     vpos = vstart;
                     vlen = pos - vstart;
                     value = str_dup_lower(src, vstart, pos - vstart);
@@ -391,6 +453,11 @@ int read_attrs() {
             if (str_eq(name, "src") == 1 && vlen > 0) {
                 attr_src = str_dup(src, vpos, vlen);
             }
+            if (str_eq(name, "id") == 1 && vlen > 0) { attr_id = str_dup(src, vpos, vlen); }
+            if (str_eq(name, "type") == 1 && value != 0) { attr_type = value; }
+            if (str_eq(name, "onclick") == 1 && vlen > 0) {
+                attr_onclick = str_dup(src, vpos, vlen);
+            }
         }
     }
     return class_val;
@@ -400,20 +467,49 @@ int read_attrs() {
 // stylesheet parser will work through. Raw because CSS is not HTML. A '<'
 // inside a stylesheet is an operator, not a tag, so the only thing that ends
 // the element is the literal </style>.
+// A <script>'s contents, everything up to </script>, kept as they are in
+// one text child, entities and all. They are not HTML, so a "<p>" inside a
+// string must not become a paragraph. They are what the scripting engine
+// is handed, see script.c0.
+void read_script_block(int e) {
+    int start = pos;
+    while (pos < src_len) {
+        if (starts_with("</script") == 1) { break; }
+        pos += 1;
+    }
+    int t = node_new(KIND_TEXT, TAG_UNKNOWN);
+    if (t != 0) {
+        t.n_text = str_dup(src, start, pos - start);
+        node_append(e, t);
+    }
+    skip_to_after(">");
+    return;
+}
+
+// 1 when an open <pre> encloses the parser's position.
+int in_pre(int open) {
+    int n = open;
+    while (n != 0) {
+        if (n.n_tag == TAG_PRE) { return 1; }
+        n = n.n_parent;
+    }
+    return 0;
+}
+
 void read_style_block() {
     int start = pos;
     while (pos < src_len) {
         if (starts_with("</style") == 1) { break; }
-        pos = pos + 1;
+        pos += 1;
     }
     int text = str_dup(src, start, pos - start);
     skip_to_after(">");
-    if (text == 0) { return; }
+    if (!text) { return; }
     int b = doc_alloc(sizeof(StyleBlock));
-    if (b == 0) { return; }
+    if (!b) { return; }
     b.sb_text = text;
     b.sb_next = 0;
-    if (style_blocks == 0) { style_blocks = b; } else {
+    if (!style_blocks) { style_blocks = b; } else {
         int t = style_blocks_tail;
         t.sb_next = b;
     }
@@ -426,6 +522,20 @@ void read_style_block() {
 // Walks up from `open` looking for an element with this tag and closes it,
 // along with everything still open inside it. Returns the new open element.
 // An end tag matching nothing open is dropped, and `open` comes back unchanged.
+// Closes the nearest open element with this name, as an end tag does. By
+// name rather than by tag id, since every element without an id shares
+// TAG_UNKNOWN, and </section> must not close an open <article>.
+int close_named(int open, int name) {
+    int n = open;
+    while (n != 0) {
+        if (n.n_tag != TAG_ROOT && n.n_name != 0 && str_eq(n.n_name, name) == 1) {
+            return n.n_parent;
+        }
+        n = n.n_parent;
+    }
+    return open;
+}
+
 int close_tag(int open, int tag) {
     int n = open;
     while (n != 0) {
@@ -444,41 +554,43 @@ int html_parse(int text) {
     style_blocks = 0;
     style_blocks_tail = 0;
     int root = node_new(KIND_ELEM, TAG_ROOT);
-    if (root == 0) { return 0; }
+    if (!root) { return 0; }
     root.n_name = "#root";
     int open = root;
     while (pos < src_len) {
         if (src[pos] != '<') {
-            int t = read_text();
+            int pre = in_pre(open);
+            if (open.n_tag == TAG_PRE && open.n_first == 0) { pre = 2; }
+            int t = read_text(pre);
             if (t != 0) { node_append(open, t); }
         } else if (starts_with("<!--") == 1) {
-            pos = pos + 4;
+            pos += 4;
             skip_to_after("-->");
         } else if (at(1) == '!' || at(1) == '?') {
             // A doctype or a processing instruction. Neither affects
             // anything utsikt does yet, so both are skipped whole.
             skip_to_after(">");
         } else if (at(1) == '/') {
-            pos = pos + 2;
+            pos += 2;
             int nstart = pos;
-            while (pos < src_len && is_name_char(src[pos]) == 1) { pos = pos + 1; }
+            while (pos < src_len && is_name_char(src[pos]) == 1) { pos += 1; }
             int name = str_dup_lower(src, nstart, pos - nstart);
             skip_to_after(">");
-            open = close_tag(open, tag_id(name));
+            open = close_named(open, name);
         } else if (is_name_char(at(1)) == 1) {
-            pos = pos + 1;
+            pos += 1;
             int nstart = pos;
-            while (pos < src_len && is_name_char(src[pos]) == 1) { pos = pos + 1; }
+            while (pos < src_len && is_name_char(src[pos]) == 1) { pos += 1; }
             int name = str_dup_lower(src, nstart, pos - nstart);
             int tag = tag_id(name);
             int class_val = read_attrs();
             int href_val = attr_href;
             int src_val = attr_src;
             int self_closing = 0;
-            if (pos < src_len && src[pos] == '/') { self_closing = 1; pos = pos + 1; }
-            if (pos < src_len && src[pos] == '>') { pos = pos + 1; }
+            if (pos < src_len && src[pos] == '/') { self_closing = 1; pos += 1; }
+            if (pos < src_len && src[pos] == '>') { pos += 1; }
 
-            if (open.n_tag == TAG_P && closes_paragraph(tag) == 1) {
+            if (open.n_tag == TAG_P && closes_paragraph(tag, name) == 1) {
                 open = close_tag(open, TAG_P);
             }
             if (open.n_tag == TAG_LI && tag == TAG_LI) {
@@ -496,20 +608,30 @@ int html_parse(int text) {
             if (open.n_tag == TAG_TR && tag == TAG_TR) {
                 open = close_tag(open, TAG_TR);
             }
+            // A definition term and its description close each other.
+            if ((open.n_tag == TAG_DT || open.n_tag == TAG_DD)
+                && (tag == TAG_DT || tag == TAG_DD)) {
+                open = close_tag(open, open.n_tag);
+            }
 
             int e = node_new(KIND_ELEM, tag);
-            if (e == 0) { return root; }
+            if (!e) { return root; }
             e.n_name = name;
             e.n_class = class_val;
             e.n_href = href_val;
             e.n_src = src_val;
+            e.n_id = attr_id;
+            e.n_type = attr_type;
+            e.n_onclick = attr_onclick;
             // Loaded while the document is parsed, into memory the document
             // owns, so an image is given back with the page it was on.
             if (tag == TAG_IMG && src_val != 0) { e.n_img = img_load(src_val); }
             node_append(open, e);
             if (tag == TAG_STYLE) {
                 read_style_block();
-            } else if (is_void_tag(tag) == 0 && self_closing == 0) {
+            } else if (tag == TAG_SCRIPT) {
+                read_script_block(e);
+            } else if (is_void_tag(tag, name) == 0 && !self_closing) {
                 open = e;
             }
         } else {
@@ -519,7 +641,7 @@ int html_parse(int text) {
                 t.n_text = str_dup(src, pos, 1);
                 node_append(open, t);
             }
-            pos = pos + 1;
+            pos += 1;
         }
     }
     // Anything still open is closed by the end of the file. There is nothing
