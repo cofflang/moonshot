@@ -1,0 +1,801 @@
+// pensel.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// pensel -- the pixel art editor. It draws sprites on Moonshot itself, and a
+// game reads them with readfile(). `draw moon.spr` in the shell starts it,
+// `draw moon.spr 32` for a 32x32 canvas, and so does a click on a picture in
+// hylla. A name that does not exist yet is a new picture, and so is no name
+// at all, which F2 asks for (a name without an ending gets .spr).
+//
+// The left button paints with the colour picked from the palette on the
+// right, and the right button erases. Keys
+//   F2 save
+//   Alt+W   quit, asking first when there are unsaved changes (a second
+//           Alt+W quits without saving)
+//   Ctrl+Z, Ctrl+Y   undo and redo, one stroke at a time
+//   n   a new frame after this one, a copy of it
+//   d   delete the frame on screen
+//   left, right   the frame before or after
+//   c   clear the frame on screen
+//   Esc   close the quit question
+//
+// FILE FORMAT (little-endian, the shape gnista's `Sprite` layout expects)
+//     0..7    width in pixels
+//     8..15   height
+//    16..23   frame count
+//    24..     frames * width * height * 4 bytes, BGR0 per pixel
+// Colour 0 means transparent, matching SYS_BLIT, which skips it.
+//
+// FRAMES. A sprite can hold several frames, one after another, which is what
+// an animation is. On every frame but the first, a pixel left empty shows the
+// frame before it faintly through the checkerboard (onion skinning), so
+// movement is drawn against where things just were. All frames share one
+// buffer of MAX_DIM squared pixels, so how many fit depends on the size, 8 at
+// 16x16 (the cap), 4 at 32x32, 1 at 64x64.
+
+include "moon.c0";
+
+int DEF_DIM = 16;
+int MIN_DIM = 4;
+int MAX_DIM = 64;
+int MAX_FRAMES = 8;
+int HEADER = 24;
+int COLORS = 16;
+int SWATCH = 20;
+int MARGIN = 12;
+int UNDO_MAX = 64;
+
+// In memory a pixel is a packed 0xRRGGBB, or EMPTY for transparent. Not 0,
+// since 0 is black, and black has to be paintable.
+int EMPTY = -1;
+
+int COL_BG = 0x161e28;
+int COL_BAR = 0x101820;
+int COL_TEXT = 0xe0e4e8;
+int COL_DIM = 0x8890a0;
+int COL_KEY = 0xffb43c;
+int COL_WARN = 0xff7a6a;
+
+int fb;
+int fb_w;
+int fb_h;
+int fb_max_w;
+int fb_max_h;
+int cell_w;
+int cell_h;
+int font;
+int numbuf;
+
+int name = 0;
+int dim = 16;
+int frames = 1;
+int frame = 0;
+int pixels;          // MAX_DIM * MAX_DIM ints, the frames one after another
+int palette;
+int color = 1;
+int modified = 0;
+int asking = 0;      // 1 while the quit question is shown
+int naming = 0;      // 1 while the bottom line asks for a name to save as
+int naming_quit = 0; // 1 when the save it asks for is the last thing
+int nbuf;            // what is typed there
+int nlen = 0;
+int shift = 0;
+int message = 0;
+int message_warn = 0;
+
+int zoom = 8;
+int ox = 0;          // the canvas, in window pixels
+int oy = 0;
+int pal_x = 0;       // the palette
+
+// Undo and redo keep whole copies of the frames, taken before each change.
+// A 64x64 picture is 32KB, so 64 steps stay small.
+int undo;
+int undo_n = 0;
+int redo;
+int redo_n = 0;
+
+// --- small strings and drawing ----------------------------------------------
+
+int len(int s) {
+    int n = 0;
+    while (s[n] != 0) { n += 1; }
+    return n;
+}
+
+int dup(int s) {
+    int n = len(s);
+    int d = alloc(n + 1);
+    if (!d) { return 0; }
+    int i = 0;
+    for (i = 0; i <= n; i += 1) { d[i] = s[i]; }
+    return d;
+}
+
+int num(int n) {
+    int i = 23;
+    numbuf[i] = 0;
+    if (n == 0) { i -= 1; numbuf[i] = '0'; }
+    while (n > 0) {
+        i -= 1;
+        numbuf[i] = '0' + n % 10;
+        n = n / 10;
+    }
+    return numbuf + i;
+}
+
+int to_int(int s) {
+    int n = 0;
+    int i = 0;
+    while (s[i] >= '0' && s[i] <= '9') { n = n * 10 + s[i] - '0'; i += 1; }
+    return n;
+}
+
+void say(int s, int warn) {
+    message = s;
+    message_warn = warn;
+    return;
+}
+
+int rgb(int r, int g, int b) { return (r << 16) | (g << 8) | b; }
+
+void box(int x, int y, int w, int h, int c) {
+    int x0 = x;
+    int y0 = y;
+    int x1 = x + w;
+    int y1 = y + h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > fb_w) { x1 = fb_w; }
+    if (y1 > fb_h) { y1 = fb_h; }
+    int row = 0;
+    for (row = y0; row < y1; row += 1) {
+        int p = fb + (row * fb_w + x0) * 4;
+        int col = 0;
+        for (col = x0; col < x1; col += 1) {
+            store32(p, c);
+            p += 4;
+        }
+    }
+    return;
+}
+
+int font_init() {
+    int d = glyph('M', 0);
+    if (d <= 0) { return 0; }
+    cell_w = d >> 16;
+    cell_h = d & 65535;
+    font = alloc(128 * cell_h);
+    if (!font) { return 0; }
+    int c = 0;
+    for (c = 0; c < 128; c += 1) { glyph(c, font + c * cell_h); }
+    return 1;
+}
+
+int text(int x, int y, int s, int c) {
+    int i = 0;
+    while (s[i] != 0) {
+        int ch = s[i];
+        if (ch > 32 && ch < 128) {
+            int r = 0;
+            for (r = 0; r < cell_h; r += 1) {
+                int bits = load8(font + ch * cell_h + r);
+                int yy = y + r;
+                int k = 0;
+                for (k = 0; k < cell_w && bits != 0; k += 1) {
+                    int xx = x + k;
+                    if (((bits >> (cell_w - 1 - k)) & 1) == 1 && xx >= 0 && xx < fb_w
+                        && yy >= 0 && yy < fb_h) {
+                        store32(fb + (yy * fb_w + xx) * 4, c);
+                    }
+                }
+            }
+        }
+        x += cell_w;
+        i += 1;
+    }
+    return x;
+}
+
+int hint(int x, int y, int key, int what) {
+    if (x + (len(key) + 1 + len(what)) * cell_w > fb_w) { return fb_w; }
+    x = text(x, y, key, COL_KEY);
+    x = text(x + cell_w, y, what, COL_DIM);
+    return x + cell_w * 3;
+}
+
+// --- the picture --------------------------------------------------------------
+
+int area() { return dim * dim; }
+
+int max_frames() {
+    int f = MAX_DIM * MAX_DIM / area();
+    if (f > MAX_FRAMES) { f = MAX_FRAMES; }
+    return f;
+}
+
+int frame_base(int f) { return pixels + f * area() * 8; }
+
+int pixel(int f, int x, int y) { return load64(frame_base(f) + (y * dim + x) * 8); }
+
+void copy_frame(int to, int from) {
+    int a = frame_base(to);
+    int b = frame_base(from);
+    int i = 0;
+    for (i = 0; i < area(); i += 1) { store64(a + i * 8, load64(b + i * 8)); }
+    return;
+}
+
+void palette_init() {
+    int p = palette;
+    store64(p, EMPTY);
+    // Near-black, since colour 0 is SYS_BLIT's transparency marker.
+    store64(p + 8, rgb(10, 10, 10));
+    store64(p + 16, rgb(255, 255, 255));
+    store64(p + 24, rgb(140, 140, 140));
+    store64(p + 32, rgb(200, 40, 40));
+    store64(p + 40, rgb(255, 140, 0));
+    store64(p + 48, rgb(255, 220, 0));
+    store64(p + 56, rgb(60, 180, 60));
+    store64(p + 64, rgb(0, 130, 90));
+    store64(p + 72, rgb(60, 120, 220));
+    store64(p + 80, rgb(30, 40, 120));
+    store64(p + 88, rgb(150, 70, 200));
+    store64(p + 96, rgb(230, 130, 180));
+    store64(p + 104, rgb(140, 90, 40));
+    store64(p + 112, rgb(220, 190, 150));
+    store64(p + 120, rgb(90, 200, 220));
+    return;
+}
+
+// --- undo ---------------------------------------------------------------------
+
+// A copy of the whole picture, frames and which one is on screen.
+int snapshot() {
+    int n = area() * frames * 8;
+    int s = alloc(24 + n);
+    if (!s) { return 0; }
+    store64(s, dim);
+    store64(s + 8, frames);
+    store64(s + 16, frame);
+    int i = 0;
+    for (i = 0; i < n; i += 8) { store64(s + 24 + i, load64(pixels + i)); }
+    return s;
+}
+
+void restore(int s) {
+    dim = load64(s);
+    frames = load64(s + 8);
+    frame = load64(s + 16);
+    int n = area() * frames * 8;
+    int i = 0;
+    for (i = 0; i < n; i += 8) { store64(pixels + i, load64(s + 24 + i)); }
+    return;
+}
+
+void push(int stack, int n, int s) {
+    if (n == UNDO_MAX) {
+        dealloc(load64(stack));
+        int i = 0;
+        for (i = 1; i < UNDO_MAX; i += 1) { store64(stack + (i - 1) * 8, load64(stack + i * 8)); }
+        n -= 1;
+    }
+    store64(stack + n * 8, s);
+    return;
+}
+
+// Called before every change, so the change can be taken back.
+void remember() {
+    int s = snapshot();
+    if (!s) { return; }
+    push(undo, undo_n, s);
+    if (undo_n < UNDO_MAX) { undo_n += 1; }
+    while (redo_n > 0) {
+        redo_n -= 1;
+        dealloc(load64(redo + redo_n * 8));
+    }
+    modified = 1;
+    return;
+}
+
+void do_undo() {
+    if (undo_n == 0) { say("nothing to undo", 0); return; }
+    int now = snapshot();
+    if (!now) { return; }
+    undo_n -= 1;
+    int s = load64(undo + undo_n * 8);
+    restore(s);
+    dealloc(s);
+    push(redo, redo_n, now);
+    if (redo_n < UNDO_MAX) { redo_n += 1; }
+    modified = 1;
+    return;
+}
+
+void do_redo() {
+    if (redo_n == 0) { say("nothing to redo", 0); return; }
+    int now = snapshot();
+    if (!now) { return; }
+    redo_n -= 1;
+    int s = load64(redo + redo_n * 8);
+    restore(s);
+    dealloc(s);
+    push(undo, undo_n, now);
+    if (undo_n < UNDO_MAX) { undo_n += 1; }
+    modified = 1;
+    return;
+}
+
+// --- files --------------------------------------------------------------------
+
+// Reads a whole file into a new buffer. Returns the buffer and its size, or
+// 0 and -1 when it cannot be read.
+(int, int) read_all(int path) {
+    int fd = open_read(path);
+    if (fd < 0) { return 0, 0 - 1; }
+    int cap = 4096;
+    int buf = alloc(cap);
+    int n = 0;
+    while (buf) {
+        int got = read(fd, buf + n, cap - n);
+        if (got <= 0) { break; }
+        n += got;
+        if (n == cap) {
+            int nb = alloc(cap * 2);
+            if (nb) {
+                int i = 0;
+                for (i = 0; i < n; i += 1) { nb[i] = buf[i]; }
+            }
+            dealloc(buf);
+            buf = nb;
+            cap = cap * 2;
+        }
+    }
+    close(fd);
+    if (!buf) { return 0, 0 - 1; }
+    return buf, n;
+}
+
+// Loads the picture when the file is there. Anything pensel cannot hold (not
+// square, out of the size range, more frames than fit) is refused whole,
+// since dropping someone's frames would be worse. Returns 1 loaded, 0 no
+// file, -1 refused.
+int load() {
+    int buf = 0;
+    int n = 0;
+    buf, n = read_all(name);
+    if (n < 0) { return 0; }
+    defer dealloc(buf);
+    if (n < HEADER) { return 0 - 1; }
+    int w = load64(buf);
+    int h = load64(buf + 8);
+    int fc = load64(buf + 16);
+    if (w != h || w < MIN_DIM || w > MAX_DIM) { return 0 - 1; }
+    if (fc < 1 || HEADER + w * h * 4 * fc > n) { return 0 - 1; }
+    int fit = MAX_DIM * MAX_DIM / (w * w);
+    if (fit > MAX_FRAMES) { fit = MAX_FRAMES; }
+    if (fc > fit) { return 0 - 1; }
+    dim = w;
+    frames = fc;
+    frame = 0;
+    int i = 0;
+    for (i = 0; i < w * w * fc; i += 1) {
+        int off = buf + HEADER + i * 4;
+        int c = load32(off) & 0xFFFFFF;
+        // All-zero is transparent in the file. b g r in memory order is
+        // 0xRRGGBB read as one 32-bit number.
+        if (c == 0) { c = EMPTY; }
+        store64(pixels + i * 8, c);
+    }
+    return 1;
+}
+
+int save() {
+    if (!name) {
+        naming = 1;
+        nlen = 0;
+        return 0;
+    }
+    int n = area() * frames;
+    int total = HEADER + n * 4;
+    int buf = alloc(total);
+    if (!buf) { say("out of memory, not saved", 1); return 0; }
+    defer dealloc(buf);
+    store64(buf, dim);
+    store64(buf + 8, dim);
+    store64(buf + 16, frames);
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int c = load64(pixels + i * 8);
+        if (c == EMPTY) { c = 0; }
+        store32(buf + HEADER + i * 4, c & 0xFFFFFF);
+    }
+    int fd = open_write(name);
+    int wrote = -1;
+    if (fd >= 0) {
+        wrote = write(fd, buf, total);
+        close(fd);
+    }
+    if (wrote != total) { say("could not save, is the folder there?", 1); return 0; }
+    modified = 0;
+    say("saved", 0);
+    return 1;
+}
+
+// --- drawing the window -------------------------------------------------------
+
+void layout_canvas() {
+    int pal_w = SWATCH * 2 + MARGIN;
+    int room_w = fb_w - pal_w - MARGIN * 2;
+    int room_h = fb_h - cell_h * 2 - MARGIN * 2;
+    int z = room_w / dim;
+    if (room_h / dim < z) { z = room_h / dim; }
+    if (z > 32) { z = 32; }
+    if (z < 2) { z = 2; }
+    zoom = z;
+    ox = MARGIN;
+    oy = cell_h + MARGIN;
+    pal_x = ox + dim * zoom + MARGIN;
+    return;
+}
+
+int shade(int x, int y) {
+    if ((x + y) % 2 == 1) { return rgb(60, 60, 60); }
+    return rgb(40, 40, 40);
+}
+
+void draw_cell(int x, int y) {
+    int sx = ox + x * zoom;
+    int sy = oy + y * zoom;
+    int c = pixel(frame, x, y);
+    if (c == EMPTY) {
+        c = shade(x, y);
+        if (frame > 0) {
+            int prev = pixel(frame - 1, x, y);
+            if (prev != EMPTY) {
+                int sh = c & 255;
+                int r = (prev >> 16) & 255;
+                int g = (prev >> 8) & 255;
+                int b = prev & 255;
+                c = rgb(sh + (r - sh) / 3, sh + (g - sh) / 3, sh + (b - sh) / 3);
+            }
+        }
+    }
+    box(sx, sy, zoom, zoom, c);
+    if (zoom >= 4) {
+        box(sx + zoom - 1, sy, 1, zoom, rgb(20, 20, 20));
+        box(sx, sy + zoom - 1, zoom, 1, rgb(20, 20, 20));
+    }
+    return;
+}
+
+void draw_swatch(int i) {
+    int x = pal_x + (i % 2) * SWATCH;
+    int y = oy + (i / 2) * SWATCH;
+    int c = load64(palette + i * 8);
+    if (c == EMPTY) {
+        box(x, y, SWATCH - 2, SWATCH - 2, rgb(50, 50, 50));
+        int d = 0;
+        for (d = 0; d < SWATCH - 2; d += 1) { box(x + d, y + d, 1, 1, rgb(200, 80, 80)); }
+    } else {
+        box(x, y, SWATCH - 2, SWATCH - 2, c);
+    }
+    int ring = rgb(30, 30, 30);
+    if (i == color) { ring = rgb(255, 255, 255); }
+    box(x - 2, y - 2, SWATCH + 2, 2, ring);
+    box(x - 2, y + SWATCH - 2, SWATCH + 2, 2, ring);
+    box(x - 2, y - 2, 2, SWATCH + 2, ring);
+    box(x + SWATCH - 2, y - 2, 2, SWATCH + 2, ring);
+    return;
+}
+
+void render() {
+    layout_canvas();
+    box(0, 0, fb_w, fb_h, COL_BG);
+
+    box(0, 0, fb_w, cell_h, COL_BAR);
+    int x = 0;
+    if (name) { x = text(cell_w, 0, name, COL_TEXT); }
+    else { x = text(cell_w, 0, "unnamed", COL_DIM); }
+    if (modified) { text(x + cell_w, 0, "*", COL_KEY); }
+    int info = alloc(64);
+    if (info) {
+        int k = 0;
+        int part = 0;
+        for (part = 0; part < 6; part += 1) {
+            int s = num(dim);
+            if (part == 1) { s = "x"; }
+            if (part == 2) { s = num(dim); }
+            if (part == 3) { s = "  frame "; }
+            if (part == 4) { s = num(frame + 1); }
+            if (part == 5) { info[k] = '/'; k += 1; s = num(frames); }
+            int i = 0;
+            while (s[i]) { info[k] = s[i]; k += 1; i += 1; }
+        }
+        info[k] = 0;
+        text(fb_w - (k + 1) * cell_w, 0, info, COL_DIM);
+        dealloc(info);
+    }
+
+    int y = 0;
+    for (y = 0; y < dim; y += 1) {
+        int xx = 0;
+        for (xx = 0; xx < dim; xx += 1) { draw_cell(xx, y); }
+    }
+    int i = 0;
+    for (i = 0; i < COLORS; i += 1) { draw_swatch(i); }
+
+    int by = fb_h - cell_h;
+    box(0, by, fb_w, cell_h, COL_BAR);
+    x = cell_w;
+    if (naming) {
+        nbuf[nlen] = 0;
+        x = text(x, by, "save as ", COL_KEY);
+        x = text(x, by, nbuf, COL_TEXT);
+        box(x, by, cell_w / 2, cell_h, COL_TEXT);
+        x += cell_w * 3;
+        x = hint(x, by, "Enter", "save");
+        hint(x, by, "Esc", "keep drawing");
+    } else if (asking) {
+        x = text(x, by, "unsaved changes", COL_WARN);
+        x += cell_w * 3;
+        x = hint(x, by, "F2", "save and quit");
+        x = hint(x, by, "Alt+W", "quit without saving");
+        hint(x, by, "Esc", "keep drawing");
+    } else if (message) {
+        int c = COL_TEXT;
+        if (message_warn) { c = COL_WARN; }
+        text(x, by, message, c);
+    } else {
+        x = hint(x, by, "F2", "save");
+        x = hint(x, by, "^Z", "undo");
+        x = hint(x, by, "^Y", "redo");
+        x = hint(x, by, "N", "new frame");
+        x = hint(x, by, "D", "delete frame");
+        x = hint(x, by, "<- ->", "frames");
+        x = hint(x, by, "C", "clear");
+        hint(x, by, "right button", "erases");
+    }
+    present(fb);
+    return;
+}
+
+// --- input --------------------------------------------------------------------
+
+void paint(int x, int y, int c) {
+    if (x < 0 || y < 0 || x >= dim || y >= dim) { return; }
+    store64(frame_base(frame) + (y * dim + x) * 8, c);
+    return;
+}
+
+// Every cell from (x0, y0) to (x1, y1), so a fast drag leaves no gaps
+// between the points the pointer was seen at.
+void paint_line(int x0, int y0, int x1, int y1, int c) {
+    int dx = x1 - x0;
+    int dy = y1 - y0;
+    int sx = 1;
+    int sy = 1;
+    if (dx < 0) { dx = 0 - dx; sx = -1; }
+    if (dy < 0) { dy = 0 - dy; sy = -1; }
+    int err = dx - dy;
+    while (1) {
+        paint(x0, y0, c);
+        if (x0 == x1 && y0 == y1) { break; }
+        int e2 = err * 2;
+        if (e2 > 0 - dy) { err -= dy; x0 += sx; }
+        if (e2 < dx) { err += dx; y0 += sy; }
+    }
+    return;
+}
+
+int new_frame() {
+    if (frames >= max_frames()) { say("no room for another frame at this size", 1); return 0; }
+    remember();
+    int f = 0;
+    for (f = frames; f > frame + 1; f -= 1) { copy_frame(f, f - 1); }
+    copy_frame(frame + 1, frame);
+    frames += 1;
+    frame += 1;
+    return 1;
+}
+
+void delete_frame() {
+    if (frames <= 1) { say("the last frame stays", 0); return; }
+    remember();
+    int g = 0;
+    for (g = frame; g < frames - 1; g += 1) { copy_frame(g, g + 1); }
+    frames -= 1;
+    if (frame >= frames) { frame = frames - 1; }
+    return;
+}
+
+void clear_frame() {
+    remember();
+    int b = frame_base(frame);
+    int i = 0;
+    for (i = 0; i < area(); i += 1) { store64(b + i * 8, EMPTY); }
+    return;
+}
+
+// A key while the bottom line asks for a name. Returns 1 when pensel
+// should quit.
+int naming_key(int make) {
+    if (make == 1) { naming = 0; naming_quit = 0; return 0; }
+    if (make == 14) { if (nlen > 0) { nlen -= 1; } return 0; }
+    if (make == 28) {
+        if (nlen == 0) { return 0; }
+        int dot = 0;
+        int i = 0;
+        for (i = 0; i < nlen; i += 1) { if (nbuf[i] == '.') { dot = 1; } }
+        int n = alloc(nlen + 5);
+        if (!n) { return 0; }
+        for (i = 0; i < nlen; i += 1) { n[i] = nbuf[i]; }
+        n[nlen] = 0;
+        if (!dot) {
+            int ending = ".spr";
+            for (i = 0; i < 5; i += 1) { n[nlen + i] = ending[i]; }
+        }
+        name = n;
+        naming = 0;
+        if (save() && naming_quit) { return 1; }
+        naming_quit = 0;
+        return 0;
+    }
+    int ch = key_char(make, shift);
+    if (ch > 32 && ch < 127 && nlen < 60) { nbuf[nlen] = ch; nlen += 1; }
+    return 0;
+}
+
+// One key going down. Returns 1 when pensel should quit.
+int key(int make, int ctrl) {
+    message = 0;
+    // Alt+W quits, and asks first when there are unsaved changes. Asked, a
+    // second Alt+W quits without saving.
+    if (make == KEY_CLOSE) {
+        naming = 0;
+        naming_quit = 0;
+        if (asking || !modified) { return 1; }
+        asking = 1;
+        return 0;
+    }
+    if (naming) { return naming_key(make); }
+    if (asking) {
+        if (make == 1) { asking = 0; }
+        if (make == 60) {
+            asking = 0;
+            if (save()) { return 1; }
+            if (naming) { naming_quit = 1; }
+        }
+        return 0;
+    }
+    if (make == 60) { save(); return 0; }
+    if (ctrl) {
+        if (make == 44) { do_undo(); }
+        if (make == 21) { do_redo(); }
+        return 0;
+    }
+    if (make == 49) { new_frame(); }
+    if (make == 32) { delete_frame(); }
+    if (make == 46) { clear_frame(); }
+    if (make == 75 && frame > 0) { frame -= 1; }
+    if (make == 77 && frame < frames - 1) { frame += 1; }
+    return 0;
+}
+
+int main() {
+    int wi = win_info();
+    if (!wi) {
+        print("pensel: no window, run me with start pensel.elf name.spr\n");
+        return 2;
+    }
+    int wm = win_max();
+    fb_max_w = wm >> 16;
+    fb_max_h = wm & 65535;
+    fb = alloc(fb_max_w * fb_max_h * 4);
+    numbuf = alloc(24);
+    pixels = alloc(MAX_DIM * MAX_DIM * 8);
+    palette = alloc(COLORS * 8);
+    undo = alloc(UNDO_MAX * 8);
+    redo = alloc(UNDO_MAX * 8);
+    nbuf = alloc(64);
+    if (!fb || !numbuf || !pixels || !palette || !undo || !redo || !nbuf) { return 3; }
+    if (font_init() == 0) { return 4; }
+    palette_init();
+    close_key(1);
+    if (argc() >= 2) { name = dup(argv(1)); }
+    dim = DEF_DIM;
+    if (argc() >= 3) { dim = to_int(argv(2)); }
+    if (dim < MIN_DIM || dim > MAX_DIM) { dim = DEF_DIM; }
+    int i = 0;
+    for (i = 0; i < MAX_DIM * MAX_DIM; i += 1) { store64(pixels + i * 8, EMPTY); }
+    int got = 0;
+    if (name) { got = load(); }
+    if (got == 0) { say("a new picture, F2 saves it", 0); }
+    if (got < 0) { say("this picture is not one pensel can open, F2 would replace it", 1); }
+
+    int dirty = 1;
+    int ctrl = 0;
+    int held = 0;        // 1 left, 2 right, while a stroke is going on
+    int last_x = -1;
+    int last_y = -1;
+    while (1) {
+        int w = win_info();
+        int ww = w >> 16;
+        int wh = w & 65535;
+        if (ww > fb_max_w) { ww = fb_max_w; }
+        if (wh > fb_max_h) { wh = fb_max_h; }
+        if (ww != fb_w || wh != fb_h) { fb_w = ww; fb_h = wh; dirty = 1; }
+
+        int m = mouse_poll();
+        int buttons = 0;
+        int mx = -1;
+        int my = -1;
+        if (m >= 0) {
+            buttons = m % 8;
+            mx = (m / 8) / 1024;
+            my = (m / 8) % 1024;
+        }
+        int down = 0;
+        if ((buttons & 1) != 0) { down = 1; } else if ((buttons & 2) != 0) { down = 2; }
+        if (down == 0) {
+            held = 0;
+        } else if (!asking) {
+            if (mx >= pal_x && held == 0) {
+                int col = (mx - pal_x) / SWATCH;
+                int row = (my - oy) / SWATCH;
+                if (col >= 0 && col < 2 && row >= 0 && row * 2 + col < COLORS && my >= oy) {
+                    color = row * 2 + col;
+                    dirty = 1;
+                }
+                held = 3;    // a palette press paints nothing until let go
+            } else if (held != 3 && mx >= ox && my >= oy) {
+                int px = (mx - ox) / zoom;
+                int py = (my - oy) / zoom;
+                if (px < dim && py < dim) {
+                    int c = load64(palette + color * 8);
+                    if (down == 2) { c = EMPTY; }
+                    if (held == 0) {
+                        remember();
+                        message = 0;
+                        last_x = px;
+                        last_y = py;
+                        held = down;
+                    }
+                    paint_line(last_x, last_y, px, py, c);
+                    last_x = px;
+                    last_y = py;
+                    dirty = 1;
+                }
+            }
+        }
+
+        int k = key_poll();
+        while (k >= 0) {
+            int make = k / 2;
+            int is_down = k % 2 == 0;
+            if (make == 29) {
+                ctrl = is_down;
+            } else if (make == 42 || make == 54) {
+                shift = is_down;
+            } else if (is_down) {
+                if (key(make, ctrl) == 1) { exit_close(0); }
+                dirty = 1;
+            }
+            k = key_poll();
+        }
+
+        if (dirty == 1 && fb_w > 0 && fb_h > 0) {
+            render();
+            dirty = 0;
+        } else {
+            sleep(1);
+        }
+    }
+    return 0;
+}

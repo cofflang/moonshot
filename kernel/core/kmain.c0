@@ -1,0 +1,166 @@
+// kmain.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// kmain.c0 -- Moonshot's entry point, compiled by coff1 (see build.sh).
+// This file is deliberately thin. It holds the few fixed data addresses
+// boot.s and c0 share (below), and a set of `include` directives pulling in
+// the actual kernel code -- knekt (core/entry), serial, interrupts, jenna
+// (memory/paging + kernel heap), chrone (scheduler), vga (text-mode
+// fallback), punkt (pixel framebuffer + font renderer), kakel (the tiled
+// windowing layer), keyboard, skalman (the interactive shell).
+//
+// The kernel is split into files so it stays organized as it grows. Textual
+// `include` is enough for that, since the problem is file organization, not
+// a compilation model. Include order below does not affect correctness
+// (c0's two-pass resolve makes forward references across the whole expanded
+// program work regardless of which file a name was written in), just
+// reading order.
+//
+// `main` cannot take parameters (coff0.c requires zero), so the Multiboot
+// info pointer GRUB leaves in EBX at boot does not arrive as an argument.
+// boot.s stashes it into a fixed memory slot (linker.ld pins .mbinfo's
+// address at exactly 1048576 = 0x100000 = 1M) as its very first
+// instruction, and main() (knekt.c0) reads it back from that literal
+// address -- no new compiler builtin needed.
+//
+// Code in boot.s is reached by NAME. `extern int isr_mouse_entry;` makes the
+// name evaluate to the stub's address (lea rax, [name]), and smed links
+// boot.s and the kernel as one, so the IDT is filled with
+// idt_set(44, isr_mouse_entry) and a routine is called as `int h = halt_cpu;
+// h();`. Every address is then one the linker resolves and checks, rather
+// than a hand-kept literal that no tool checks.
+//
+// The kernel's own functions are reached by name the same way, since a bare
+// function name is its address. The JIT emits calls to its helpers with
+// jit_print_helper as a value.
+//
+// What is left at fixed addresses is DATA that boot.s reads or writes before
+// or outside c0, which is the Multiboot pointer, the IDTR, the boot CR3 and
+// the scheduler's swap slots, all at the very start of the image where
+// nothing is ever added in front of them. See linker.ld.
+
+int MBINFO_ADDR = 0x100000;
+int IDTR_ADDR = 0x100018;
+int CR3INFO_ADDR = 0x100028;
+// .sched slots (chrone). See linker.ld for the full rationale. Briefly, they hold
+// the address isr_common should save the outgoing task's rsp into
+// (SCHED_SAVE_SLOT_ADDR); the incoming task's saved rsp for isr_common to
+// load (SCHED_NEXT_RSP); the switch-requested flag, set by sched_tick and
+// cleared by isr_common (SCHED_SWITCH_PENDING); the incoming task's CR3
+// (SCHED_NEXT_CR3) and kernel-stack top for TSS.RSP0 (SCHED_NEXT_RSP0).
+// sched_current (which task is running) is pure c0-side bookkeeping asm
+// never touches, so it is an ordinary global in chrone.c0 rather than a
+// slot. The section's first two quads and the one at 0x100098 are unused
+// and kept so nothing after them moves.
+int SCHED_SAVE_SLOT_ADDR = 0x100080;
+int SCHED_NEXT_RSP = 0x100088;
+int SCHED_SWITCH_PENDING = 0x100090;
+int SCHED_NEXT_CR3 = 0x1000A0;
+int SCHED_NEXT_RSP0 = 0x1000A8;
+// 1 when GRUB passed `test` on the kernel's command line (grub_test.cfg),
+// which is how the test scripts boot. Read in main, before anything uses it.
+int boot_test = 0;
+
+// Linker-resolved symbols (see linker.ld), the scancode tables, the
+// named scratch buffers, the IDT, the dispatch table and the end of the image. An
+// extern name in expression context evaluates to its address.
+extern int sctable_start;
+extern int punkt_scratch;
+extern int kakel_scratch;
+extern int jakel_name_scratch;
+extern int jakel_path_scratch;
+extern int repl_scratch;
+extern int shell_scratch;
+extern int shell_users;
+extern int shell_mirror;
+extern int elf_scratch;
+extern int idt_start;
+extern int dispatch_start;
+extern int _kernel_end;
+int SCANCODE_TABLE_ADDR = 0;          // = sctable_start, set in main
+int SCANCODE_SHIFT_TABLE_ADDR = 0;    // = sctable_start + 256
+
+// boot.s's entry stubs and routines, reached by name (see above).
+extern int isr_timer_entry;
+extern int isr_keyboard_entry;
+extern int isr_mouse_entry;
+extern int isr_oljud_entry;
+extern int isr_pagefault_entry;
+extern int isr_divide_entry;
+extern int isr_invalidop_entry;
+extern int isr_gpf_entry;
+extern int isr_debug_entry;
+extern int isr_nmi_entry;
+extern int isr_breakpoint_entry;
+extern int isr_overflow_entry;
+extern int isr_boundrange_entry;
+extern int isr_devnotavail_entry;
+extern int isr_invalidtss_entry;
+extern int isr_segnotpresent_entry;
+extern int isr_stackfault_entry;
+extern int isr_fpuerror_entry;
+extern int isr_alignment_entry;
+extern int isr_machinecheck_entry;
+extern int isr_simdfp_entry;
+extern int isr_doublefault_entry;
+extern int enter_ring3;
+extern int sched_launch;
+extern int halt_cpu;
+extern int yield_cpu;            // boot.s, int 48, see sched_yield
+extern int isr_yield_entry;
+extern int enable_interrupts;
+extern int disable_interrupts;
+extern int flush_tlb;
+extern int cpuid_into;           // boot.s, cpuid leaf rdi into four words at rsi
+
+include "../drivers/serial.c0";
+include "interrupts.c0";
+include "jenna.c0";
+include "chrone.c0";
+include "lager.c0";
+include "../drivers/vga.c0";
+include "../screen/punkt.c0";
+include "../screen/kakel.c0";
+include "../shell/skalman.c0";
+include "../shell/sk_script.c0";
+// The debug commands, or none. build.sh writes this file, see
+// skalman_debug.c0.
+include "../../build/debug.c0";
+include "../shell/raket.c0";
+include "../drivers/keyboard.c0";
+include "../drivers/klick.c0";
+include "../drivers/ata.c0";
+include "../drivers/oljud.c0";
+include "../files/jakel.c0";
+// The ring-3 programs the kernel carries, built into build/ by
+// gen_programs.sh and gen_elf_tests.sh (build.sh runs both first). Each name
+// is the address of the file's bytes and name_size their length; jakel_init
+// writes them onto the filesystem. The compiler never opens these files, the
+// assembler copies them in (.incbin).
+embed alloc_test_elf "../../build/alloc_test.elf";
+embed ticks_test_elf "../../build/ticks_test.elf";
+embed crash_test_elf "../../build/crash_test.elf";
+embed mouse_probe_elf "../../build/mouse_probe.elf";
+embed tone_elf "../../build/tone.elf";
+embed infecteria_elf "../../build/infecteria.elf";
+embed fps_probe_elf "../../build/fps_probe.elf";
+embed utsikt_elf "../../build/utsikt.elf";
+embed lira_elf "../../build/lira.elf";
+embed hylla_elf "../../build/hylla.elf";
+embed skrift_elf "../../build/skrift.elf";
+embed pensel_elf "../../build/pensel.elf";
+embed insyn_elf "../../build/insyn.elf";
+embed form_elf "../../build/form.elf";
+embed coff_elf "../../build/coff.elf";
+embed smed_elf "../../build/smed.elf";
+embed elf_tests_pack "../../build/elf_tests.pack";
+include "../files/index_html.c0";
+include "../shell/jit.c0";
+include "../shell/repl.c0";
+include "syscall.c0";
+include "knekt.c0";

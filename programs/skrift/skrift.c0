@@ -1,0 +1,1506 @@
+// skrift.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// skrift -- the text editor. There are no modes. Typing types, and the keys
+// for everything else are shown along the bottom of the window, changing
+// with what can be done at that moment. `edit notes.txt` in the shell starts
+// it, and so does a click on a text file in hylla. A name that does not exist
+// yet is a new file, saved there. Names start from the folder skrift was
+// started in.
+//
+// Keys
+//   arrows, Home, End, PgUp, PgDn   move (Home goes to the first non-blank
+//                                   character, then to the line's start)
+//   Ctrl+left, Ctrl+right           move by word
+//   Ctrl+Home, Ctrl+End             the start and the end of the file
+//   Shift with any of these         select
+//   Ctrl+A                          select everything
+//   Ctrl+C, Ctrl+X, Ctrl+V          copy, cut, paste (the whole line when
+//                                   nothing is selected)
+//   Ctrl+Z, Ctrl+Y                  undo, redo
+//   F2 save   F3 find   F4 go to line
+//   Alt+W                           quit, asking first when something is
+//                                   unsaved (a second Alt+W quits without
+//                                   saving)
+//   F5                              save and run the file, for c0, in a new
+//                                   shell window with `execute`, or with
+//                                   text selected, run only that
+//   F6                              work out the selection or the line, a
+//                                   c0 expression, and show its value
+//   Esc                             close the find or line prompt, or drop
+//                                   the selection
+//
+// F5 on a selection writes it to .skrift-run.c0 beside the file and runs
+// that. A selection with a main in it is a program as it is, any other is
+// main's body.
+//
+// F6 builds the expression as a program of its own, with coff and smed in the
+// background, runs it and shows what it returned, so nothing runs in the
+// kernel. Its three files are removed again afterwards.
+//
+// The text lives in a gap buffer, so typing at one place moves nothing but the
+// gap. Undo keeps every edit, and the letters of one word typed in a row are
+// one step.
+
+include "moon.c0";
+
+int TAB = 4;
+int PROMPT_MAX = 120;
+
+int COL_BG = 0x161e28;
+int COL_BAR = 0x101820;
+int COL_TEXT = 0xe0e4e8;
+int COL_DIM = 0x8890a0;
+int COL_GUTTER = 0x56606e;
+int COL_SEL = 0x34465c;
+int COL_KEY = 0xffb43c;
+int COL_KEYWORD = 0xffb43c;
+int COL_STRING = 0x9ccc7c;
+int COL_COMMENT = 0x7a8494;
+int COL_NUMBER = 0x8cc4ff;
+int COL_WARN = 0xff7a6a;
+
+int PROMPT_NONE = 0;
+int PROMPT_FIND = 1;
+int PROMPT_LINE = 2;
+int PROMPT_QUIT = 3;
+int PROMPT_SAVE_AS = 4;
+
+int fb;              // the frame, composited here and presented whole
+int fb_w;
+int fb_h;
+int fb_max_w;
+int fb_max_h;
+int cell_w;
+int cell_h;
+int font;            // 128 glyphs, cell_h bytes each
+
+int buf;             // the gap buffer
+int cap;
+int gs;              // the gap's start
+int ge;              // and its end
+
+int cursor = 0;
+int anchor = -1;     // the selection's other end, or -1
+int want_col = -1;   // the column up and down aim for, or -1
+int top_line = 0;    // the first line shown
+int left_col = 0;    // the first column shown
+int text_rows = 1;
+int text_cols = 1;
+int gutter = 3;      // line numbers, in cells
+
+int name = 0;        // the file, or 0 until saved under a name
+int is_c0 = 0;
+int message = 0;     // shown in the bottom bar until the next key
+int message_warn = 0;
+
+int shift = 0;
+int ctrl = 0;
+int caps = 0;
+
+int prompt = 0;
+int pbuf;            // what is typed into the prompt
+int plen = 0;
+int find_from = 0;   // where the cursor was when find opened
+int quit_after_save = 0;
+
+int clip = 0;
+int clip_len = 0;
+int clip_line = 0;   // 1 when the clipboard holds whole lines
+
+layout Edit {
+    int ed_kind;     // 1 inserted, 2 deleted
+    int ed_pos;
+    int ed_text;
+    int ed_len;
+    int ed_cap;
+    int ed_group;    // the edits of one action undo together
+    int ed_before;   // the cursor before the action
+}
+
+int undo;            // Edit pointers
+int undo_n = 0;
+int undo_cap = 0;
+int redo;
+int redo_n = 0;
+int redo_cap = 0;
+int group = 0;
+int merge_ok = 0;    // 1 when the next typed character may join the last step
+int can_merge = 0;
+int action_before = 0;
+int clean_mark = 0;  // undo_n when the file was last saved, or -1
+
+// --- small strings ------------------------------------------------------------
+
+int len(int s) {
+    int n = 0;
+    while (s[n] != 0) { n += 1; }
+    return n;
+}
+
+void copy(int to, int from, int n) {
+    int i = 0;
+    for (i = 0; i < n; i += 1) { to[i] = from[i]; }
+    return;
+}
+
+int dup(int s, int n) {
+    int d = alloc(n + 1);
+    if (!d) { return 0; }
+    copy(d, s, n);
+    d[n] = 0;
+    return d;
+}
+
+int ends(int s, int e) {
+    int ls = len(s);
+    int le = len(e);
+    if (le > ls) { return 0; }
+    int i = 0;
+    for (i = 0; i < le; i += 1) {
+        if (s[ls - le + i] != e[i]) { return 0; }
+    }
+    return 1;
+}
+
+int numbuf;
+
+// n in decimal, in a buffer shared by every call.
+int num(int n) {
+    int i = 23;
+    numbuf[i] = 0;
+    int neg = n < 0;
+    if (n == 0) { i -= 1; numbuf[i] = '0'; }
+    // Digit by digit from the number as it is, so -2^63 works too.
+    while (n != 0) {
+        int d = n % 10;
+        if (d < 0) { d = 0 - d; }
+        i -= 1;
+        numbuf[i] = '0' + d;
+        n = n / 10;
+    }
+    if (neg) { i -= 1; numbuf[i] = '-'; }
+    return numbuf + i;
+}
+
+// A new string, a and b joined.
+int join(int a, int b) {
+    int la = len(a);
+    int lb = len(b);
+    int s = alloc(la + lb + 1);
+    if (!s) { return 0; }
+    copy(s, a, la);
+    copy(s + la, b, lb);
+    s[la + lb] = 0;
+    return s;
+}
+
+int is_word(int c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+        || c == '_';
+}
+
+void say(int s, int warn) {
+    message = s;
+    message_warn = warn;
+    return;
+}
+
+// --- the gap buffer -----------------------------------------------------------
+
+int size() { return cap - (ge - gs); }
+
+int at(int i) {
+    if (i < gs) { return buf[i]; }
+    return buf[i + ge - gs];
+}
+
+void move_gap(int pos) {
+    while (gs > pos) {
+        gs -= 1;
+        ge -= 1;
+        buf[ge] = buf[gs];
+    }
+    while (gs < pos) {
+        buf[gs] = buf[ge];
+        gs += 1;
+        ge += 1;
+    }
+    return;
+}
+
+// Makes the gap hold at least n bytes. Returns 0 when there is no memory.
+int grow(int n) {
+    if (ge - gs >= n) { return 1; }
+    int ncap = cap * 2 + n + 4096;
+    int nb = alloc(ncap);
+    if (!nb) { return 0; }
+    copy(nb, buf, gs);
+    int tail = cap - ge;
+    copy(nb + ncap - tail, buf + ge, tail);
+    dealloc(buf);
+    buf = nb;
+    ge = ncap - tail;
+    cap = ncap;
+    return 1;
+}
+
+int raw_insert(int pos, int s, int n) {
+    if (grow(n) == 0) { return 0; }
+    move_gap(pos);
+    copy(buf + gs, s, n);
+    gs += n;
+    return 1;
+}
+
+void raw_delete(int pos, int n) {
+    move_gap(pos);
+    ge += n;
+    return;
+}
+
+// A fresh copy of the n bytes from pos.
+int text_of(int pos, int n) {
+    int d = alloc(n + 1);
+    if (!d) { return 0; }
+    int i = 0;
+    for (i = 0; i < n; i += 1) { d[i] = at(pos + i); }
+    d[n] = 0;
+    return d;
+}
+
+// --- undo ---------------------------------------------------------------------
+
+(int, int) grow_stack(int stack, int c) {
+    int nc = c * 2 + 64;
+    int ns = alloc(nc * 8);
+    if (!ns) { return stack, c; }
+    int i = 0;
+    for (i = 0; i < c; i += 1) { store64(ns + i * 8, load64(stack + i * 8)); }
+    if (stack) { dealloc(stack); }
+    return ns, nc;
+}
+
+void push_undo(int e) {
+    if (undo_n >= undo_cap) { undo, undo_cap = grow_stack(undo, undo_cap); }
+    if (undo_n < undo_cap) { store64(undo + undo_n * 8, e); undo_n += 1; }
+    return;
+}
+
+void push_redo(int e) {
+    if (redo_n >= redo_cap) { redo, redo_cap = grow_stack(redo, redo_cap); }
+    if (redo_n < redo_cap) { store64(redo + redo_n * 8, e); redo_n += 1; }
+    return;
+}
+
+void free_edit(int e) {
+    dealloc(e.ed_text);
+    dealloc(e);
+    return;
+}
+
+// Adds n bytes of s to an edit's text, at the front or at the end.
+int edit_add(int e, int s, int n, int front) {
+    if (e.ed_len + n > e.ed_cap) {
+        int nc = (e.ed_len + n) * 2 + 16;
+        int nt = alloc(nc);
+        if (!nt) { return 0; }
+        copy(nt, e.ed_text, e.ed_len);
+        dealloc(e.ed_text);
+        e.ed_text = nt;
+        e.ed_cap = nc;
+    }
+    if (front) {
+        int i = e.ed_len;
+        while (i > 0) {
+            i -= 1;
+            store8(e.ed_text + i + n, load8(e.ed_text + i));
+        }
+        copy(e.ed_text, s, n);
+    } else {
+        copy(e.ed_text + e.ed_len, s, n);
+    }
+    e.ed_len += n;
+    return 1;
+}
+
+// Starts one action of the user's. merge is 1 for a typed character or a
+// single Backspace or Delete, which may join the step before it.
+void begin(int merge) {
+    can_merge = merge && merge_ok;
+    if (!can_merge) { group += 1; }
+    action_before = cursor;
+    return;
+}
+
+void remember(int kind, int pos, int s, int n) {
+    while (redo_n > 0) {
+        redo_n -= 1;
+        free_edit(load64(redo + redo_n * 8));
+    }
+    if (clean_mark > undo_n) { clean_mark = -1; }
+    if (can_merge && undo_n > 0) {
+        int t = load64(undo + (undo_n - 1) * 8);
+        if (t.ed_kind == kind && t.ed_group == group) {
+            if (kind == 1 && pos == t.ed_pos + t.ed_len) {
+                edit_add(t, s, n, 0);
+                return;
+            }
+            if (kind == 2 && pos + n == t.ed_pos) {
+                edit_add(t, s, n, 1);
+                t.ed_pos = pos;
+                return;
+            }
+            if (kind == 2 && pos == t.ed_pos) {
+                edit_add(t, s, n, 0);
+                return;
+            }
+        }
+    }
+    int e = alloc(sizeof(Edit));
+    if (!e) { return; }
+    e.ed_kind = kind;
+    e.ed_pos = pos;
+    e.ed_text = 0;
+    e.ed_len = 0;
+    e.ed_cap = 0;
+    e.ed_group = group;
+    e.ed_before = action_before;
+    edit_add(e, s, n, 0);
+    push_undo(e);
+    return;
+}
+
+int insert(int pos, int s, int n) {
+    if (n <= 0) { return 1; }
+    if (raw_insert(pos, s, n) == 0) {
+        say("out of memory, nothing was inserted", 1);
+        return 0;
+    }
+    remember(1, pos, s, n);
+    return 1;
+}
+
+void delete(int pos, int n) {
+    if (n <= 0) { return; }
+    int t = text_of(pos, n);
+    if (!t) { return; }
+    remember(2, pos, t, n);
+    dealloc(t);
+    raw_delete(pos, n);
+    return;
+}
+
+void do_undo() {
+    if (undo_n == 0) { say("nothing to undo", 0); return; }
+    int g = load64(undo + (undo_n - 1) * 8).ed_group;
+    int before = cursor;
+    while (undo_n > 0 && load64(undo + (undo_n - 1) * 8).ed_group == g) {
+        undo_n -= 1;
+        int e = load64(undo + undo_n * 8);
+        if (e.ed_kind == 1) {
+            raw_delete(e.ed_pos, e.ed_len);
+        } else {
+            raw_insert(e.ed_pos, e.ed_text, e.ed_len);
+        }
+        before = e.ed_before;
+        push_redo(e);
+    }
+    cursor = before;
+    if (cursor > size()) { cursor = size(); }
+    anchor = -1;
+    merge_ok = 0;
+    return;
+}
+
+void do_redo() {
+    if (redo_n == 0) { say("nothing to redo", 0); return; }
+    int g = load64(redo + (redo_n - 1) * 8).ed_group;
+    while (redo_n > 0 && load64(redo + (redo_n - 1) * 8).ed_group == g) {
+        redo_n -= 1;
+        int e = load64(redo + redo_n * 8);
+        if (e.ed_kind == 1) {
+            raw_insert(e.ed_pos, e.ed_text, e.ed_len);
+            cursor = e.ed_pos + e.ed_len;
+        } else {
+            raw_delete(e.ed_pos, e.ed_len);
+            cursor = e.ed_pos;
+        }
+        push_undo(e);
+    }
+    anchor = -1;
+    merge_ok = 0;
+    return;
+}
+
+int modified() { return undo_n != clean_mark; }
+
+// --- lines and columns --------------------------------------------------------
+
+int line_start(int p) {
+    while (p > 0 && at(p - 1) != '\n') { p -= 1; }
+    return p;
+}
+
+int line_end(int p) {
+    int n = size();
+    while (p < n && at(p) != '\n') { p += 1; }
+    return p;
+}
+
+int line_of(int p) {
+    int n = 0;
+    int i = 0;
+    for (i = 0; i < p; i += 1) {
+        if (at(i) == '\n') { n += 1; }
+    }
+    return n;
+}
+
+int line_count() { return line_of(size()) + 1; }
+
+// The position where line number `line` (from 0) starts, or the end.
+int start_of_line(int line) {
+    int n = size();
+    int p = 0;
+    while (line > 0 && p < n) {
+        if (at(p) == '\n') { line -= 1; }
+        p += 1;
+    }
+    return p;
+}
+
+int next_col(int c, int ch) {
+    if (ch == '\t') { return (c / TAB + 1) * TAB; }
+    return c + 1;
+}
+
+// The column p is drawn at, counted from its line's start ls.
+int col_of(int ls, int p) {
+    int c = 0;
+    int i = 0;
+    for (i = ls; i < p; i += 1) { c = next_col(c, at(i)); }
+    return c;
+}
+
+// The position on the line starting at ls that is drawn at column col, or the
+// line's end when it is shorter.
+int pos_at_col(int ls, int col) {
+    int n = size();
+    int p = ls;
+    int c = 0;
+    while (p < n && at(p) != '\n') {
+        int nc = next_col(c, at(p));
+        if (nc > col) { return p; }
+        c = nc;
+        p += 1;
+    }
+    return p;
+}
+
+int first_text(int ls) {
+    int n = size();
+    int p = ls;
+    while (p < n && (at(p) == ' ' || at(p) == '\t')) { p += 1; }
+    return p;
+}
+
+// --- moving -------------------------------------------------------------------
+
+int has_sel() { return anchor >= 0 && anchor != cursor; }
+
+(int, int) sel() {
+    if (anchor < cursor) { return anchor, cursor; }
+    return cursor, anchor;
+}
+
+void move_to(int p, int select) {
+    if (select) {
+        if (anchor < 0) { anchor = cursor; }
+    } else {
+        anchor = -1;
+    }
+    cursor = p;
+    merge_ok = 0;
+    return;
+}
+
+int line_up(int p) {
+    int ls = line_start(p);
+    if (want_col < 0) { want_col = col_of(ls, p); }
+    if (ls == 0) { return 0; }
+    return pos_at_col(line_start(ls - 1), want_col);
+}
+
+int line_down(int p) {
+    int ls = line_start(p);
+    if (want_col < 0) { want_col = col_of(ls, p); }
+    int le = line_end(p);
+    if (le >= size()) { return size(); }
+    return pos_at_col(le + 1, want_col);
+}
+
+int word_left(int p) {
+    while (p > 0 && !is_word(at(p - 1))) { p -= 1; }
+    while (p > 0 && is_word(at(p - 1))) { p -= 1; }
+    return p;
+}
+
+int word_right(int p) {
+    int n = size();
+    while (p < n && !is_word(at(p))) { p += 1; }
+    while (p < n && is_word(at(p))) { p += 1; }
+    return p;
+}
+
+// --- editing ------------------------------------------------------------------
+
+void delete_sel() {
+    int lo = 0;
+    int hi = 0;
+    lo, hi = sel();
+    delete(lo, hi - lo);
+    cursor = lo;
+    anchor = -1;
+    return;
+}
+
+void type_text(int s, int n, int merge) {
+    begin(merge && !has_sel());
+    if (has_sel()) { delete_sel(); }
+    if (insert(cursor, s, n)) { cursor += n; }
+    merge_ok = merge;
+    return;
+}
+
+void type_char(int ch) {
+    int one = alloc(1);
+    if (!one) { return; }
+    one[0] = ch;
+    // A space ends a word, so the next one is a step of its own.
+    type_text(one, 1, ch != ' ');
+    if (ch == ' ') { merge_ok = 0; }
+    dealloc(one);
+    return;
+}
+
+// Enter keeps the indentation of the line it splits.
+void newline() {
+    int ls = line_start(cursor);
+    int ft = first_text(ls);
+    if (ft > cursor) { ft = cursor; }
+    int n = ft - ls + 1;
+    int s = alloc(n);
+    if (!s) { return; }
+    s[0] = '\n';
+    int i = 0;
+    for (i = 1; i < n; i += 1) { s[i] = at(ls + i - 1); }
+    type_text(s, n, 0);
+    dealloc(s);
+    return;
+}
+
+void tab() {
+    int c = col_of(line_start(cursor), cursor);
+    int n = TAB - c % TAB;
+    type_text("        ", n, 0);
+    return;
+}
+
+void backspace() {
+    if (has_sel()) { begin(0); delete_sel(); merge_ok = 0; return; }
+    if (cursor == 0) { return; }
+    begin(1);
+    delete(cursor - 1, 1);
+    cursor -= 1;
+    anchor = -1;
+    merge_ok = 1;
+    return;
+}
+
+void delete_key() {
+    if (has_sel()) { begin(0); delete_sel(); merge_ok = 0; return; }
+    if (cursor >= size()) { return; }
+    begin(1);
+    delete(cursor, 1);
+    anchor = -1;
+    merge_ok = 1;
+    return;
+}
+
+// The range Ctrl+C and Ctrl+X act on, the selection or the cursor's line with
+// its newline.
+(int, int) clip_range() {
+    int lo = 0;
+    int hi = 0;
+    if (has_sel()) {
+        lo, hi = sel();
+        return lo, hi;
+    }
+    int ls = line_start(cursor);
+    int le = line_end(cursor);
+    if (le < size()) { le += 1; }
+    return ls, le;
+}
+
+void copy_out() {
+    int lo = 0;
+    int hi = 0;
+    lo, hi = clip_range();
+    int whole = !has_sel();
+    if (clip) { dealloc(clip); }
+    clip = text_of(lo, hi - lo);
+    clip_len = hi - lo;
+    clip_line = whole;
+    // The last line has no newline of its own, so its copy gets one.
+    if (whole && clip && (clip_len == 0 || clip[clip_len - 1] != '\n')) {
+        int c2 = alloc(clip_len + 2);
+        if (c2) {
+            copy(c2, clip, clip_len);
+            c2[clip_len] = '\n';
+            c2[clip_len + 1] = 0;
+            dealloc(clip);
+            clip = c2;
+            clip_len += 1;
+        }
+    }
+    return;
+}
+
+void cut() {
+    int lo = 0;
+    int hi = 0;
+    lo, hi = clip_range();
+    copy_out();
+    begin(0);
+    delete(lo, hi - lo);
+    cursor = lo;
+    anchor = -1;
+    if (cursor > size()) { cursor = size(); }
+    merge_ok = 0;
+    return;
+}
+
+void paste() {
+    if (!clip || clip_len == 0) { say("the clipboard is empty", 0); return; }
+    if (clip_line && !has_sel()) {
+        // Whole lines go in above the cursor's line, wherever on it the
+        // cursor is.
+        begin(0);
+        if (insert(line_start(cursor), clip, clip_len)) { cursor += clip_len; }
+        merge_ok = 0;
+        return;
+    }
+    type_text(clip, clip_len, 0);
+    merge_ok = 0;
+    return;
+}
+
+// --- files --------------------------------------------------------------------
+
+// Reads the file into a new gap buffer. Returns 0 when there is no memory,
+// and leaves an empty buffer for a file that does not exist yet.
+int load(int path) {
+    cap = 4096;
+    buf = alloc(cap);
+    if (!buf) { return 0; }
+    gs = 0;
+    ge = cap;
+    if (!path) { return 1; }
+    int fd = open_read(path);
+    if (fd < 0) {
+        say("a new file, F2 saves it", 0);
+        return 1;
+    }
+    int got = read(fd, buf, cap);
+    while (got > 0) {
+        gs += got;
+        ge = cap;
+        if (grow(1024) == 0) { close(fd); return 0; }
+        got = read(fd, buf + gs, ge - gs);
+    }
+    close(fd);
+    return 1;
+}
+
+int save() {
+    if (!name) {
+        prompt = PROMPT_SAVE_AS;
+        plen = 0;
+        return 0;
+    }
+    move_gap(size());
+    int n = size();
+    int fd = open_write(name);
+    int wrote = -1;
+    if (fd >= 0) {
+        wrote = write(fd, buf, n);
+        close(fd);
+    }
+    if (wrote != n) {
+        say("could not save, is the folder there?", 1);
+        return 0;
+    }
+    clean_mark = undo_n;
+    merge_ok = 0;
+    message = 0;
+    say("saved", 0);
+    is_c0 = ends(name, ".c0");
+    return 1;
+}
+
+// --- find and go to line -------------------------------------------------------
+
+int matches(int p) {
+    if (p + plen > size()) { return 0; }
+    int i = 0;
+    for (i = 0; i < plen; i += 1) {
+        if (at(p + i) != pbuf[i]) { return 0; }
+    }
+    return 1;
+}
+
+// Selects the next match from p (or the one before p), wrapping around.
+int find(int p, int back) {
+    int n = size();
+    if (plen == 0 || n == 0) { return 0; }
+    int k = 0;
+    for (k = 0; k <= n; k += 1) {
+        int q = 0;
+        if (back) {
+            q = p - k;
+            if (q < 0) { q += n + 1; }
+        } else {
+            q = p + k;
+            if (q > n) { q -= n + 1; }
+        }
+        if (matches(q)) {
+            anchor = q;
+            cursor = q + plen;
+            want_col = -1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void open_find() {
+    prompt = PROMPT_FIND;
+    find_from = cursor;
+    if (has_sel()) {
+        int lo = 0;
+        int hi = 0;
+        lo, hi = sel();
+        if (hi - lo < PROMPT_MAX && line_of(lo) == line_of(hi)) {
+            plen = 0;
+            int i = 0;
+            for (i = lo; i < hi; i += 1) { pbuf[plen] = at(i); plen += 1; }
+            find_from = lo;
+        }
+    }
+    return;
+}
+
+void go_to_line() {
+    int n = 0;
+    int i = 0;
+    for (i = 0; i < plen; i += 1) { n = n * 10 + pbuf[i] - '0'; }
+    if (n < 1) { n = 1; }
+    move_to(start_of_line(n - 1), 0);
+    return;
+}
+
+// --- running ------------------------------------------------------------------
+
+// F5 with text selected. The selection is the program, see the top.
+void run_selection() {
+    int lo = 0;
+    int hi = 0;
+    lo, hi = sel();
+    int t = text_of(lo, hi - lo);
+    if (!t) { return; }
+    int src = 0;
+    if (has_word(t, "main")) {
+        src = join(t, "\n");
+    } else {
+        int a = join("int main() {\n", t);
+        src = join(a, "\n    return 0;\n}\n");
+        dealloc(a);
+    }
+    dealloc(t);
+    if (!src) { return; }
+    int fd = open_write(".skrift-run.c0");
+    if (fd < 0) { dealloc(src); say("could not write the selection to run it", 1); return; }
+    write(fd, src, len(src));
+    close(fd);
+    dealloc(src);
+    int w = shell("execute .skrift-run.c0");
+    if (w == 0 - 3) { say("no room for a shell window, close one first", 1); }
+    else if (w < 0) { say("could not open a shell window", 1); }
+    else { say("running the selection", 0); }
+    return;
+}
+
+void run_file() {
+    if (is_c0 && has_sel()) { run_selection(); return; }
+    if (!is_c0 && name) { say("F5 runs c0 programs, and this is not a .c0 file", 1); return; }
+    if (modified() || !name) {
+        if (!save()) { return; }
+    }
+    if (!is_c0) { say("F5 runs c0 programs, and this is not a .c0 file", 1); return; }
+    int line = join("execute ", name);
+    if (!line) { return; }
+    int w = shell(line);
+    dealloc(line);
+    if (w == 0 - 3) { say("no room for a shell window, close one first", 1); }
+    else if (w < 0) { say("could not open a shell window", 1); }
+    return;
+}
+
+// Runs a command line in the background and waits for it. Returns its exit
+// code.
+int run_quietly(int line) {
+    int t = spawn_with(line, 3);
+    if (t < 0) { return 0 - 1001; }
+    return wait(t);
+}
+
+// The text F6 works out, the selection or else the cursor's line, without the
+// blanks around it or a ';' at its end. A new string, or 0.
+int eval_text() {
+    int lo = line_start(cursor);
+    int hi = line_end(cursor);
+    if (has_sel()) { lo, hi = sel(); }
+    while (lo < hi && (at(lo) == ' ' || at(lo) == '\t' || at(lo) == '\n')) { lo += 1; }
+    while (hi > lo && (at(hi - 1) == ' ' || at(hi - 1) == '\t' || at(hi - 1) == '\n'
+                       || at(hi - 1) == ';')) { hi -= 1; }
+    if (hi == lo) { return 0; }
+    return text_of(lo, hi - lo);
+}
+
+// 1 when s has the word w in it.
+int has_word(int s, int w) {
+    int n = len(w);
+    int i = 0;
+    while (s[i] != 0) {
+        int j = 0;
+        while (j < n && s[i + j] == w[j]) { j += 1; }
+        if (j == n && (i == 0 || !is_word(s[i - 1])) && !is_word(s[i + n])) { return 1; }
+        i += 1;
+    }
+    return 0;
+}
+
+void eval() {
+    int t = eval_text();
+    if (!t) { say("nothing to work out, select an expression or put the cursor on one", 0); return; }
+    // An expression becomes what main returns. Text that returns something
+    // itself is main's body as it is.
+    int src = 0;
+    if (has_word(t, "return")) {
+        src = join("int main() {\n", t);
+        int s2 = join(src, ";\n}\n");
+        dealloc(src);
+        src = s2;
+    } else {
+        src = join("int main() {\n    return (", t);
+        int s3 = join(src, ");\n}\n");
+        dealloc(src);
+        src = s3;
+    }
+    dealloc(t);
+    if (!src) { return; }
+    say("working it out...", 0);
+    render();
+    int fd = open_write(".skrift-eval.c0");
+    if (fd < 0) { dealloc(src); say("could not write the program F6 builds", 1); return; }
+    write(fd, src, len(src));
+    close(fd);
+    dealloc(src);
+    int r = run_quietly("/coff.elf --elf .skrift-eval.c0 .skrift-eval.s");
+    if (r != 0) {
+        say("that does not compile as c0", 1);
+    } else if (run_quietly("/smed.elf --base 0x80000000 .skrift-eval.s .skrift-eval.elf") != 0) {
+        say("smed could not link it", 1);
+    } else {
+        // Its own code may never end, so it gets three seconds.
+        int t = spawn_with(".skrift-eval.elf", 3);
+        r = 0 - 1001;
+        if (t >= 0) {
+            r = wait_for(t, 300);
+            if (r == 0 - 1002) { kill(t); }
+        }
+        if (r == 0 - 1002) {
+            say("it ran three seconds without an answer, so it was stopped", 1);
+        } else if (r == 0 - 1000 || r == 0 - 1001) {
+            say("it crashed", 1);
+        } else {
+            message = join("= ", num(r));
+            message_warn = 0;
+        }
+    }
+    remove(".skrift-eval.c0");
+    remove(".skrift-eval.s");
+    remove(".skrift-eval.elf");
+    return;
+}
+
+// --- drawing ------------------------------------------------------------------
+
+void box(int x, int y, int w, int h, int color) {
+    int x0 = x;
+    int y0 = y;
+    int x1 = x + w;
+    int y1 = y + h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > fb_w) { x1 = fb_w; }
+    if (y1 > fb_h) { y1 = fb_h; }
+    int row = 0;
+    for (row = y0; row < y1; row += 1) {
+        int p = fb + (row * fb_w + x0) * 4;
+        int col = 0;
+        for (col = x0; col < x1; col += 1) {
+            store32(p, color);
+            p += 4;
+        }
+    }
+    return;
+}
+
+int font_init() {
+    int d = glyph('M', 0);
+    if (d <= 0) { return 0; }
+    cell_w = d >> 16;
+    cell_h = d & 65535;
+    font = alloc(128 * cell_h);
+    if (!font) { return 0; }
+    int c = 0;
+    for (c = 0; c < 128; c += 1) { glyph(c, font + c * cell_h); }
+    return 1;
+}
+
+void draw_char(int x, int y, int ch, int color) {
+    if (ch <= 32 || ch >= 128) { return; }
+    int r = 0;
+    for (r = 0; r < cell_h; r += 1) {
+        int bits = load8(font + ch * cell_h + r);
+        int yy = y + r;
+        int c = 0;
+        for (c = 0; c < cell_w && bits != 0; c += 1) {
+            int xx = x + c;
+            if (((bits >> (cell_w - 1 - c)) & 1) == 1 && xx >= 0 && xx < fb_w
+                && yy >= 0 && yy < fb_h) {
+                store32(fb + (yy * fb_w + xx) * 4, color);
+            }
+        }
+    }
+    return;
+}
+
+// s at (x, y). Returns the x after it.
+int text(int x, int y, int s, int color) {
+    int i = 0;
+    while (s[i] != 0) {
+        draw_char(x, y, s[i], color);
+        x += cell_w;
+        i += 1;
+    }
+    return x;
+}
+
+// One key and what it does, in the bottom bar. A hint that does not fit is
+// left out, and so is every one after it.
+int hint(int x, int y, int key, int what) {
+    if (x + (len(key) + 1 + len(what)) * cell_w > fb_w) { return fb_w; }
+    x = text(x, y, key, COL_KEY);
+    x = text(x + cell_w, y, what, COL_DIM);
+    return x + cell_w * 3;
+}
+
+int is_keyword(int p, int n) {
+    int words = "int void if else while for return break continue defer layout extern sizeof include embed ";
+    int i = 0;
+    while (words[i] != 0) {
+        int j = 0;
+        while (words[i + j] != ' ' && j < n && words[i + j] == at(p + j)) { j += 1; }
+        if (j == n && words[i + j] == ' ') { return 1; }
+        while (words[i] != ' ') { i += 1; }
+        i += 1;
+    }
+    return 0;
+}
+
+void draw_line(int row, int p, int line, int cur_line, int lo, int hi) {
+    int y = (row + 1) * cell_h;
+    int nstr = num(line + 1);
+    int gx = (gutter - 1 - len(nstr)) * cell_w;
+    int gcol = COL_GUTTER;
+    if (line == cur_line) { gcol = COL_DIM; }
+    text(gx, y, nstr, gcol);
+
+    int n = size();
+    int c = 0;
+    int quote = 0;        // the quote a string or character began with
+    int escaped = 0;
+    int comment = 0;
+    int word_left = 0;    // characters left in the current word
+    int word_col = COL_TEXT;
+    while (p < n && at(p) != '\n') {
+        int ch = at(p);
+        int color = COL_TEXT;
+        if (is_c0) {
+            if (comment) {
+                color = COL_COMMENT;
+            } else if (quote) {
+                color = COL_STRING;
+                if (escaped) {
+                    escaped = 0;
+                } else if (ch == '\\') {
+                    escaped = 1;
+                } else if (ch == quote) {
+                    quote = 0;
+                }
+            } else if (word_left > 0) {
+                color = word_col;
+            } else if (ch == '/' && p + 1 < n && at(p + 1) == '/') {
+                comment = 1;
+                color = COL_COMMENT;
+            } else if (ch == '"' || ch == 39) {
+                quote = ch;
+                color = COL_STRING;
+            } else if (is_word(ch)) {
+                int k = 0;
+                while (p + k < n && is_word(at(p + k))) { k += 1; }
+                word_left = k;
+                word_col = COL_TEXT;
+                if (ch >= '0' && ch <= '9') {
+                    word_col = COL_NUMBER;
+                } else if (is_keyword(p, k)) {
+                    word_col = COL_KEYWORD;
+                }
+                color = word_col;
+            }
+            if (word_left > 0) { word_left -= 1; }
+        }
+        int nc = next_col(c, ch);
+        if (nc > left_col && c - left_col < text_cols) {
+            int x = (gutter + c - left_col) * cell_w;
+            if (p >= lo && p < hi) { box(x, y, (nc - c) * cell_w, cell_h, COL_SEL); }
+            draw_char(x, y, ch, color);
+        }
+        c = nc;
+        p += 1;
+    }
+    // A selected newline shows as one selected cell after the text.
+    if (p < n && p >= lo && p < hi && c >= left_col && c - left_col < text_cols) {
+        box((gutter + c - left_col) * cell_w, y, cell_w, cell_h, COL_SEL);
+    }
+    return;
+}
+
+void draw_top(int cur_line, int lines, int col) {
+    box(0, 0, fb_w, cell_h, COL_BAR);
+    int x = cell_w;
+    if (name) {
+        x = text(x, 0, name, COL_TEXT);
+    } else {
+        x = text(x, 0, "new file", COL_DIM);
+    }
+    if (modified()) { text(x + cell_w, 0, "*", COL_KEY); }
+
+    int right = alloc(96);
+    if (!right) { return; }
+    int r = 0;
+    if (has_sel()) {
+        int lo = 0;
+        int hi = 0;
+        lo, hi = sel();
+        int s = "selected ";
+        int i = 0;
+        while (s[i]) { right[r] = s[i]; r += 1; i += 1; }
+        s = num(hi - lo);
+        i = 0;
+        while (s[i]) { right[r] = s[i]; r += 1; i += 1; }
+        right[r] = ' '; r += 1;
+        right[r] = ' '; r += 1;
+    }
+    int parts = 0;
+    for (parts = 0; parts < 5; parts += 1) {
+        int s = "line ";
+        if (parts == 1) { s = num(cur_line + 1); }
+        if (parts == 2) { right[r] = '/'; r += 1; s = num(lines); }
+        if (parts == 3) { s = "  col "; }
+        if (parts == 4) { s = num(col + 1); }
+        int i = 0;
+        while (s[i]) { right[r] = s[i]; r += 1; i += 1; }
+    }
+    right[r] = 0;
+    text(fb_w - (r + 1) * cell_w, 0, right, COL_DIM);
+    dealloc(right);
+    return;
+}
+
+void draw_bottom() {
+    int y = fb_h - cell_h;
+    box(0, y, fb_w, cell_h, COL_BAR);
+    int x = cell_w;
+    if (prompt == PROMPT_FIND || prompt == PROMPT_LINE || prompt == PROMPT_SAVE_AS) {
+        int label = "find";
+        if (prompt == PROMPT_LINE) { label = "go to line"; }
+        if (prompt == PROMPT_SAVE_AS) { label = "save as"; }
+        x = text(x, y, label, COL_DIM);
+        x += cell_w;
+        pbuf[plen] = 0;
+        x = text(x, y, pbuf, COL_TEXT);
+        box(x, y, 2, cell_h, COL_TEXT);
+        x += cell_w * 3;
+        if (message) {
+            x = text(x, y, message, COL_WARN);
+            x += cell_w * 3;
+        }
+        if (prompt == PROMPT_FIND) {
+            x = hint(x, y, "Enter", "next");
+            x = hint(x, y, "Shift+Enter", "previous");
+        } else if (prompt == PROMPT_LINE) {
+            x = hint(x, y, "Enter", "go");
+        } else {
+            x = hint(x, y, "Enter", "save");
+        }
+        hint(x, y, "Esc", "close");
+        return;
+    }
+    if (prompt == PROMPT_QUIT) {
+        x = text(x, y, "unsaved changes", COL_WARN);
+        x += cell_w * 3;
+        x = hint(x, y, "F2", "save and quit");
+        x = hint(x, y, "Alt+W", "quit without saving");
+        hint(x, y, "Esc", "keep editing");
+        return;
+    }
+    if (message) {
+        int color = COL_TEXT;
+        if (message_warn) { color = COL_WARN; }
+        text(x, y, message, color);
+        return;
+    }
+    if (has_sel()) {
+        x = hint(x, y, "^C", "copy");
+        x = hint(x, y, "^X", "cut");
+        x = hint(x, y, "Del", "delete");
+        x = hint(x, y, "F3", "find this");
+        if (is_c0) {
+            x = hint(x, y, "F5", "run this");
+            x = hint(x, y, "F6", "value");
+        }
+        hint(x, y, "Esc", "deselect");
+        return;
+    }
+    x = hint(x, y, "F2", "save");
+    x = hint(x, y, "F3", "find");
+    x = hint(x, y, "F4", "line");
+    if (is_c0) {
+        x = hint(x, y, "F5", "run");
+        x = hint(x, y, "F6", "value");
+    }
+    x = hint(x, y, "^Z", "undo");
+    x = hint(x, y, "^Y", "redo");
+    hint(x, y, "^V", "paste");
+    return;
+}
+
+void render() {
+    text_rows = fb_h / cell_h - 2;
+    if (text_rows < 1) { text_rows = 1; }
+    int lines = line_count();
+    gutter = len(num(lines)) + 2;
+    text_cols = fb_w / cell_w - gutter;
+    if (text_cols < 1) { text_cols = 1; }
+
+    int cur_line = line_of(cursor);
+    int ls = line_start(cursor);
+    int col = col_of(ls, cursor);
+    if (cur_line < top_line) { top_line = cur_line; }
+    if (cur_line >= top_line + text_rows) { top_line = cur_line - text_rows + 1; }
+    if (col < left_col) { left_col = col; }
+    if (col >= left_col + text_cols) { left_col = col - text_cols + 1; }
+
+    box(0, 0, fb_w, fb_h, COL_BG);
+    int lo = 0;
+    int hi = 0;
+    if (has_sel()) { lo, hi = sel(); }
+    int p = start_of_line(top_line);
+    int n = size();
+    int row = 0;
+    for (row = 0; row < text_rows && top_line + row < lines; row += 1) {
+        draw_line(row, p, top_line + row, cur_line, lo, hi);
+        p = line_end(p);
+        if (p < n) { p += 1; }
+    }
+    // The cursor, a bar before the character it is at.
+    if (prompt == PROMPT_NONE || prompt == PROMPT_QUIT) {
+        box((gutter + col - left_col) * cell_w, (cur_line - top_line + 1) * cell_h,
+            2, cell_h, COL_TEXT);
+    }
+    draw_top(cur_line, lines, col);
+    draw_bottom();
+    present(fb);
+    return;
+}
+
+// --- input --------------------------------------------------------------------
+
+// The position under the point (x, y) of the window.
+int pos_at(int x, int y) {
+    int row = y / cell_h - 1;
+    if (row < 0) { row = 0; }
+    int line = top_line + row;
+    if (line >= line_count()) { return size(); }
+    int col = x / cell_w - gutter + left_col;
+    if (col < 0) { col = 0; }
+    return pos_at_col(start_of_line(line), col);
+}
+
+// A key while a prompt is open. Returns 1 when skrift should quit.
+int prompt_key(int make, int ch) {
+    if (make == 1) {
+        prompt = PROMPT_NONE;
+        message = 0;
+        return 0;
+    }
+    if (prompt == PROMPT_QUIT) {
+        if (make == 60) {
+            prompt = PROMPT_NONE;
+            if (save()) { return 1; }
+            quit_after_save = 1;
+        }
+        return 0;
+    }
+    message = 0;
+    if (make == 14) {
+        if (plen > 0) { plen -= 1; }
+        if (prompt == PROMPT_FIND && plen > 0 && !find(find_from, 0)) { say("no match", 1); }
+        return 0;
+    }
+    if (ch == '\n' || (prompt == PROMPT_FIND && make == 61)) {
+        if (prompt == PROMPT_FIND) {
+            int lo = cursor;
+            int hi = cursor;
+            if (has_sel()) { lo, hi = sel(); }
+            int found = 0;
+            if (shift) { found = find(lo - 1, 1); } else { found = find(lo + 1, 0); }
+            if (!found) { say("no match", 1); }
+            return 0;
+        }
+        if (prompt == PROMPT_LINE) {
+            if (plen > 0) { go_to_line(); }
+            prompt = PROMPT_NONE;
+            return 0;
+        }
+        if (plen == 0) { return 0; }
+        name = dup(pbuf, plen);
+        prompt = PROMPT_NONE;
+        if (save() && quit_after_save) { return 1; }
+        return 0;
+    }
+    if (ch < 32 || plen >= PROMPT_MAX) { return 0; }
+    if (prompt == PROMPT_LINE && (ch < '0' || ch > '9')) { return 0; }
+    pbuf[plen] = ch;
+    plen += 1;
+    if (prompt == PROMPT_FIND && !find(find_from, 0)) { say("no match", 1); }
+    return 0;
+}
+
+// One key going down. Returns 1 when skrift should quit.
+int key(int make) {
+    int ch = 0;
+    if (!ctrl) {
+        int up = shift;
+        int base = key_char(make, 0);
+        if (caps && base >= 'a' && base <= 'z') { up = !up; }
+        ch = key_char(make, up);
+    }
+    // Alt+W quits, and asks first when there is something unsaved. Asked,
+    // a second Alt+W quits without saving.
+    if (make == KEY_CLOSE) {
+        if (prompt == PROMPT_QUIT || !modified()) { return 1; }
+        prompt = PROMPT_QUIT;
+        return 0;
+    }
+    if (prompt != PROMPT_NONE) { return prompt_key(make, ch); }
+    message = 0;
+
+    if (make == 72 || make == 80) {
+        int p = cursor;
+        if (make == 72) { p = line_up(cursor); } else { p = line_down(cursor); }
+        int keep = want_col;
+        move_to(p, shift);
+        want_col = keep;
+        return 0;
+    }
+    if (make == 73 || make == 81) {
+        int keep2 = want_col;
+        int p2 = cursor;
+        int i = 0;
+        for (i = 0; i < text_rows - 1; i += 1) {
+            if (make == 73) { p2 = line_up(p2); } else { p2 = line_down(p2); }
+        }
+        keep2 = want_col;
+        move_to(p2, shift);
+        want_col = keep2;
+        if (make == 73) { top_line -= text_rows - 1; } else { top_line += text_rows - 1; }
+        if (top_line < 0) { top_line = 0; }
+        return 0;
+    }
+    want_col = -1;
+    if (make == 75) {
+        if (has_sel() && !shift) {
+            int lo = 0;
+            int hi = 0;
+            lo, hi = sel();
+            move_to(lo, 0);
+        } else if (ctrl) {
+            move_to(word_left(cursor), shift);
+        } else if (cursor > 0) {
+            move_to(cursor - 1, shift);
+        }
+        return 0;
+    }
+    if (make == 77) {
+        if (has_sel() && !shift) {
+            int lo2 = 0;
+            int hi2 = 0;
+            lo2, hi2 = sel();
+            move_to(hi2, 0);
+        } else if (ctrl) {
+            move_to(word_right(cursor), shift);
+        } else if (cursor < size()) {
+            move_to(cursor + 1, shift);
+        }
+        return 0;
+    }
+    if (make == 71) {
+        if (ctrl) { move_to(0, shift); return 0; }
+        int ls = line_start(cursor);
+        int ft = first_text(ls);
+        if (cursor == ft) { move_to(ls, shift); } else { move_to(ft, shift); }
+        return 0;
+    }
+    if (make == 79) {
+        if (ctrl) { move_to(size(), shift); } else { move_to(line_end(cursor), shift); }
+        return 0;
+    }
+    if (make == 1) { anchor = -1; return 0; }
+    if (make == 60) { save(); return 0; }
+    if (make == 61) { open_find(); return 0; }
+    if (make == 62) { prompt = PROMPT_LINE; plen = 0; return 0; }
+    if (make == 63) { run_file(); return 0; }
+    if (make == 64) {
+        if (is_c0) { eval(); } else { say("F6 works out c0, and this is not a .c0 file", 1); }
+        return 0;
+    }
+    if (make == 14) { backspace(); return 0; }
+    if (make == 83) { delete_key(); return 0; }
+    if (ctrl) {
+        if (make == 30) { anchor = 0; cursor = size(); merge_ok = 0; }
+        if (make == 46) { copy_out(); say("copied", 0); }
+        if (make == 45) { cut(); }
+        if (make == 47) { paste(); }
+        if (make == 44 && shift) { do_redo(); } else if (make == 44) { do_undo(); }
+        if (make == 21) { do_redo(); }
+        return 0;
+    }
+    if (ch == '\n') { newline(); return 0; }
+    if (ch == '\t') { tab(); return 0; }
+    if (ch != 0) { type_char(ch); }
+    return 0;
+}
+
+int main() {
+    int wi = win_info();
+    if (!wi) {
+        print("skrift: no window, run me with start skrift.elf name\n");
+        return 2;
+    }
+    int wm = win_max();
+    fb_max_w = wm >> 16;
+    fb_max_h = wm & 65535;
+    fb = alloc(fb_max_w * fb_max_h * 4);
+    numbuf = alloc(24);
+    pbuf = alloc(PROMPT_MAX + 1);
+    if (!fb || !numbuf || !pbuf) { return 3; }
+    if (font_init() == 0) { return 4; }
+    int path = 0;
+    if (argc() >= 2) {
+        path = argv(1);
+        name = dup(path, len(path));
+        is_c0 = ends(name, ".c0");
+    }
+    if (load(path) == 0) { return 3; }
+    close_key(1);
+
+    int dirty = 1;
+    int last_left = 0;
+    while (1) {
+        int w = win_info();
+        int ww = w >> 16;
+        int wh = w & 65535;
+        if (ww > fb_max_w) { ww = fb_max_w; }
+        if (wh > fb_max_h) { wh = fb_max_h; }
+        if (ww != fb_w || wh != fb_h) { fb_w = ww; fb_h = wh; dirty = 1; }
+
+        int m = mouse_poll();
+        if (m >= 0 && fb_h > 0) {
+            int left = m % 2;
+            int mx = (m / 8) / 1024;
+            int my = (m / 8) % 1024;
+            if (left == 1 && prompt == PROMPT_NONE && my >= cell_h && my < fb_h - cell_h) {
+                int p = pos_at(mx, my);
+                if (!last_left) {
+                    message = 0;
+                    want_col = -1;
+                    move_to(p, shift);
+                    if (!shift) { anchor = p; }
+                    dirty = 1;
+                } else if (p != cursor) {
+                    cursor = p;
+                    dirty = 1;
+                }
+            }
+            last_left = left;
+        } else {
+            last_left = 0;
+        }
+
+        int k = key_poll();
+        while (k >= 0) {
+            int make = k / 2;
+            int down = k % 2 == 0;
+            if (make == 42 || make == 54) {
+                shift = down;
+            } else if (make == 29) {
+                ctrl = down;
+            } else if (make == 58) {
+                if (down) { caps = !caps; }
+            } else if (down) {
+                if (key(make) == 1) { exit_close(0); }
+                dirty = 1;
+            }
+            k = key_poll();
+        }
+
+        if (dirty == 1 && fb_w > 0 && fb_h > 0) {
+            render();
+            dirty = 0;
+        } else {
+            sleep(1);
+        }
+    }
+    return 0;
+}

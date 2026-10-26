@@ -1,0 +1,79 @@
+// 19_stereo.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// expect: 7
+// oljud's 16-bit formats (SYS_SOUND_FORMAT 31). Each check that holds adds
+// one. It plays half a second of 441 Hz on the left only, half a second of
+// 882 Hz on the right only, then half a second of 441 Hz as 16-bit mono, a
+// gap of silence between each. verify_oljud_stereo.sh measures the channels.
+include "moon.c0";
+
+// Waits until everything queued has been played.
+void drain() {
+    while (sound(0, 0) > 0) { sleep(5); }
+    return;
+}
+
+// n frames of a square wave of `period` samples into buf, at `amp` on the
+// side `side` (0 left, 1 right) of stereo frames, or as mono when side is 2.
+void square(int buf, int n, int period, int amp, int side) {
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int v = amp;
+        if (i % period >= period / 2) { v = 0 - amp; }
+        if (side == 2) {
+            store8(buf + i * 2, v & 255);
+            store8(buf + i * 2 + 1, (v >> 8) & 255);
+        } else {
+            int l = 0;
+            int r = 0;
+            if (side == 0) { l = v; } else { r = v; }
+            store32(buf + i * 4, (l & 65535) | ((r & 65535) << 16));
+        }
+    }
+    return;
+}
+
+int main() {
+    int ok = 0;
+    int buf = alloc(44100);
+
+    // 1. An unknown format is refused.
+    if (sound_format(3) == 0 - 1) { ok += 1; }
+
+    // 2. Stereo is taken.
+    if (sound_format(2) == 0) { ok += 1; }
+
+    // 3. Only whole frames are queued, four bytes each.
+    if (sound(buf, 6) == 4) { ok += 1; }
+    sound(0, 0 - 1);
+
+    // 4. Half a second of 441 Hz on the left, the right silent.
+    square(buf, 11025, 50, 16000, 0);
+    if (sound(buf, 44100) == 44100) { ok += 1; }
+    drain();
+    sleep(40);
+
+    // 5. Half a second of 882 Hz on the right, the left silent.
+    square(buf, 11025, 25, 16000, 1);
+    if (sound(buf, 44100) == 44100) { ok += 1; }
+    drain();
+    sleep(40);
+
+    // 6. A change of format drops what is queued.
+    sound(buf, 400);
+    sound_format(1);
+    if (sound(0, 0) == 0) { ok += 1; }
+
+    // 7. Half a second of 441 Hz as 16-bit mono, heard on both sides.
+    square(buf, 11025, 50, 16000, 2);
+    if (sound(buf, 22050) == 22050) { ok += 1; }
+    drain();
+    return ok;
+}

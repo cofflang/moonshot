@@ -1,0 +1,519 @@
+// insyn.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// insyn -- a look inside the machine, for finding out what it is doing. One
+// screen, the processes, memory, the last two minutes as graphs and the
+// hardware beside the last graph. It only looks. Everything comes from
+// SYS_INFO, read twice a second.
+//
+// A process's cpu is the share of timer ticks that found it working rather
+// than waiting, and its redraws are how many times a second it put a new
+// picture in its window. The window number is the one in that window's title.
+
+include "moon.c0";
+
+int COL_BG = 0x161e28;
+int COL_BAR = 0x101820;
+int COL_TEXT = 0xe0e4e8;
+int COL_DIM = 0x8890a0;
+int COL_SEL = 0x34465c;
+int COL_GOOD = 0x5ad07a;
+int COL_WARN = 0xe0a040;
+int COL_HOT = 0xe05a4a;
+
+int SYS_INFO = 34;
+int TASK_BYTES = 96;
+int MAX_SLOTS = 16;
+int HISTORY = 240;          // samples, two minutes at two a second
+int METRICS = 5;            // syscalls, keys, mouse, sound bytes, redraws, each a second
+int SYS_BYTES = 136;
+int SAMPLE_MS = 500;
+
+int fb;
+int fb_w;
+int fb_h;
+int fb_max_w;
+int fb_max_h;
+int cell_w;
+int cell_h;
+int font;
+int numbuf;
+int line;
+int line_n = 0;
+
+int sys;          // the machine, now and half a second ago
+int sys_old;
+int tasks;        // every task slot, now and before
+int tasks_old;
+int task_count = 0;
+int hw;
+int history;      // METRICS rows of HISTORY samples
+int hist_n = 0;
+int last_sample = 0;
+int dt_ticks = 1;
+
+// --- text -------------------------------------------------------------------------
+
+int num(int n) {
+    int i = 23;
+    numbuf[i] = 0;
+    int neg = n < 0;
+    if (n == 0) { i -= 1; numbuf[i] = '0'; }
+    while (n != 0) {
+        int d = n % 10;
+        if (d < 0) { d = 0 - d; }
+        i -= 1;
+        numbuf[i] = '0' + d;
+        n = n / 10;
+    }
+    if (neg) { i -= 1; numbuf[i] = '-'; }
+    return numbuf + i;
+}
+
+void line_reset() {
+    line_n = 0;
+    line[0] = 0;
+    return;
+}
+
+void add(int s) {
+    int i = 0;
+    while (s[i] != 0 && line_n < 120) {
+        line[line_n] = s[i];
+        line_n += 1;
+        i += 1;
+    }
+    line[line_n] = 0;
+    return;
+}
+
+// n bytes as KB or MB with one decimal.
+void add_size(int n) {
+    if (n >= 1048576) {
+        add(num(n / 1048576));
+        add(".");
+        add(num((n % 1048576) * 10 / 1048576));
+        add(" MB");
+    } else {
+        add(num((n + 1023) / 1024));
+        add(" KB");
+    }
+    return;
+}
+
+void pad(int to) {
+    while (line_n < to) { add(" "); }
+    return;
+}
+
+// --- drawing ------------------------------------------------------------------
+
+void box(int x, int y, int w, int h, int c) {
+    int x0 = x;
+    int y0 = y;
+    int x1 = x + w;
+    int y1 = y + h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > fb_w) { x1 = fb_w; }
+    if (y1 > fb_h) { y1 = fb_h; }
+    int row = 0;
+    for (row = y0; row < y1; row += 1) {
+        int p = fb + (row * fb_w + x0) * 4;
+        int col = 0;
+        for (col = x0; col < x1; col += 1) {
+            store32(p, c);
+            p += 4;
+        }
+    }
+    return;
+}
+
+int font_init() {
+    int d = glyph('M', 0);
+    if (d <= 0) { return 0; }
+    cell_w = d >> 16;
+    cell_h = d & 65535;
+    font = alloc(128 * cell_h);
+    if (!font) { return 0; }
+    int c = 0;
+    for (c = 0; c < 128; c += 1) { glyph(c, font + c * cell_h); }
+    return 1;
+}
+
+int text(int x, int y, int s, int c) {
+    int i = 0;
+    while (s[i] != 0) {
+        int ch = s[i];
+        if (ch > 32 && ch < 128) {
+            int r = 0;
+            for (r = 0; r < cell_h; r += 1) {
+                int bits = load8(font + ch * cell_h + r);
+                int yy = y + r;
+                int k = 0;
+                for (k = 0; k < cell_w && bits != 0; k += 1) {
+                    int xx = x + k;
+                    if (((bits >> (cell_w - 1 - k)) & 1) == 1 && xx >= 0 && xx < fb_w
+                        && yy >= 0 && yy < fb_h) {
+                        store32(fb + (yy * fb_w + xx) * 4, c);
+                    }
+                }
+            }
+        }
+        x += cell_w;
+        i += 1;
+    }
+    return x;
+}
+
+// A bar w pixels wide, filled for used out of total, its colour by how full.
+void meter(int x, int y, int w, int used, int total) {
+    box(x, y, w, cell_h, COL_SEL);
+    if (total <= 0) { return; }
+    int fill = used * w / total;
+    if (fill > w) { fill = w; }
+    int c = COL_GOOD;
+    if (used * 4 > total * 3) { c = COL_WARN; }
+    if (used * 10 > total * 9) { c = COL_HOT; }
+    box(x, y, fill, cell_h, c);
+    return;
+}
+
+// --- sampling -----------------------------------------------------------------
+
+int ms() { return syscall(33, 1, 0, 0, 0, 0); }
+
+void swap_buffers() {
+    int t = sys_old;
+    sys_old = sys;
+    sys = t;
+    t = tasks_old;
+    tasks_old = tasks;
+    tasks = t;
+    return;
+}
+
+int field(int base, int i) { return load64(base + i * 8); }
+
+void sample() {
+    swap_buffers();
+    syscall(SYS_INFO, 0, sys, SYS_BYTES, 0, 0);
+    task_count = syscall(SYS_INFO, 1, tasks, MAX_SLOTS * TASK_BYTES, 0, 0) / TASK_BYTES;
+    dt_ticks = field(sys, 0) - field(sys_old, 0);
+    if (dt_ticks <= 0) { dt_ticks = 1; }
+    // Rates a second, from the change since the last sample.
+    int frames = 0;
+    int t = 0;
+    for (t = 0; t < task_count; t += 1) {
+        int now = load64(tasks + t * TASK_BYTES + 32);
+        int before = load64(tasks_old + t * TASK_BYTES + 32);
+        if (now >= before) { frames += now - before; }
+    }
+    int m = 0;
+    if (hist_n == HISTORY) {
+        for (m = 0; m < METRICS; m += 1) {
+            int row = history + m * HISTORY * 8;
+            int i = 0;
+            for (i = 1; i < HISTORY; i += 1) { store64(row + (i - 1) * 8, load64(row + i * 8)); }
+        }
+        hist_n -= 1;
+    }
+    int vals = 0;
+    for (m = 0; m < METRICS; m += 1) {
+        int v = 0;
+        if (m < 3) { v = field(sys, 8 + m) - field(sys_old, 8 + m); }
+        else if (m == 3) { v = field(sys, 16) - field(sys_old, 16); }
+        else { v = frames; }
+        v = v * 100 / dt_ticks;
+        store64(history + (m * HISTORY + hist_n) * 8, v);
+    }
+    hist_n += 1;
+    return;
+}
+
+// --- pages --------------------------------------------------------------------
+
+int state_name(int st) {
+    if (st == 1) { return "running"; }
+    if (st == 2) { return "ended"; }
+    if (st == 3) { return "waiting"; }
+    return "free";
+}
+
+// The process table from y down. Returns the y after it.
+int draw_processes(int y) {
+    line_reset();
+    add("id  name              state     cpu   heap       window  redraws/s");
+    text(cell_w, y, line, COL_DIM);
+    y += cell_h + 6;
+    int t = 0;
+    for (t = 0; t < task_count; t += 1) {
+        int r = tasks + t * TASK_BYTES;
+        int ro = tasks_old + t * TASK_BYTES;
+        int st = load64(r);
+        if (st != 0) {
+            line_reset();
+            add(num(t));
+            pad(4);
+            add(r + 48);
+            pad(22);
+            add(state_name(st));
+            pad(32);
+            int used = load64(r + 8) - load64(ro + 8);
+            if (used < 0) { used = 0; }
+            add(num(used * 100 / dt_ticks));
+            add("%");
+            pad(38);
+            add_size(load64(r + 16));
+            pad(49);
+            if (load64(r + 24) >= 0) { add(num(load64(r + 24))); } else { add("-"); }
+            pad(57);
+            int fr = load64(r + 32) - load64(ro + 32);
+            if (fr < 0) { fr = 0; }
+            add(num(fr * 100 / dt_ticks));
+            int c = COL_TEXT;
+            if (st == 2) { c = COL_DIM; }
+            text(cell_w, y, line, c);
+            y += cell_h + 4;
+        }
+    }
+    return y;
+}
+
+// One labelled meter row. Returns the y after it.
+int meter_row(int y, int label, int used, int total) {
+    text(cell_w, y, label, COL_TEXT);
+    int bx = cell_w * 18;
+    int bw = fb_w - bx - cell_w * 22;
+    if (bw < 40) { bw = 40; }
+    meter(bx, y, bw, used, total);
+    line_reset();
+    add_size(used);
+    add(" of ");
+    add_size(total);
+    text(bx + bw + cell_w, y, line, COL_DIM);
+    return y + cell_h + 10;
+}
+
+// The machine's memory from y down. Returns the y after it. Each program's
+// heap is in the process table.
+int draw_memory(int y) {
+    y = meter_row(y, "physical", (field(sys, 2) - field(sys, 3)) * 4096, field(sys, 2) * 4096);
+    y = meter_row(y, "kernel heap", field(sys, 5), field(sys, 4));
+    y = meter_row(y, "files (jakel)", field(sys, 6), field(sys, 7));
+    return y;
+}
+
+void draw_graph(int x, int y, int w, int h, int m, int label) {
+    box(x, y, w, h, COL_BAR);
+    int row = history + m * HISTORY * 8;
+    int most = 1;
+    int i = 0;
+    for (i = 0; i < hist_n; i += 1) {
+        if (load64(row + i * 8) > most) { most = load64(row + i * 8); }
+    }
+    // Newest on the right, one column a sample, as many as fit.
+    int cols = hist_n;
+    if (cols > w) { cols = w; }
+    for (i = 0; i < cols; i += 1) {
+        int v = load64(row + (hist_n - cols + i) * 8);
+        int bh = v * (h - 2) / most;
+        box(x + w - cols + i, y + h - 1 - bh, 1, bh, COL_GOOD);
+    }
+    line_reset();
+    add(label);
+    add("  ");
+    if (m == 3) {
+        if (hist_n > 0) { add_size(load64(row + (hist_n - 1) * 8)); }
+        add(" a second");
+    } else {
+        if (hist_n > 0) { add(num(load64(row + (hist_n - 1) * 8))); }
+        add(" a second, top ");
+        add(num(most));
+    }
+    text(x + 4, y + 2, line, COL_TEXT);
+    return;
+}
+
+// The graphs, two to a row, in what is left from y down, and the hardware in
+// the slot after the last one.
+void draw_performance(int y) {
+    int rows = (METRICS + 2) / 2;
+    int bottom = fb_h - cell_h;
+    int gh = (bottom - y) / rows - 8;
+    if (gh < cell_h * 2) { gh = cell_h * 2; }
+    int gw = (fb_w - cell_w * 3) / 2;
+    int m = 0;
+    for (m = 0; m < METRICS; m += 1) {
+        int label = "system calls";
+        if (m == 1) { label = "keyboard interrupts"; }
+        if (m == 2) { label = "mouse packets"; }
+        if (m == 3) { label = "sound played"; }
+        if (m == 4) { label = "redraws"; }
+        int gx = cell_w + (m % 2) * (gw + cell_w);
+        int gy = y + (m / 2) * (gh + 8);
+        draw_graph(gx, gy, gw, gh, m, label);
+    }
+    draw_hardware(cell_w + (METRICS % 2) * (gw + cell_w), y + (METRICS / 2) * (gh + 8), gw, gh);
+    return;
+}
+
+int info_x;
+int info_bottom;
+int info_chars;   // how many characters of a value fit on one line
+int piece;
+
+// One row of the hardware box, the value carried on to more lines at a space
+// when it is too wide, and whatever would not fit below the box left out.
+// Returns the y after it.
+int info_row(int y, int label, int value) {
+    if (y + cell_h > info_bottom) { return y; }
+    text(info_x, y, label, COL_DIM);
+    int at = 0;
+    while (value[at] != 0 && y + cell_h <= info_bottom) {
+        int n = 0;
+        while (value[at + n] != 0 && n < info_chars) { n += 1; }
+        if (value[at + n] != 0) {
+            int cut = n;
+            while (cut > 0 && value[at + cut] != ' ') { cut -= 1; }
+            if (cut > 0) { n = cut; }
+        }
+        int i = 0;
+        for (i = 0; i < n; i += 1) { piece[i] = value[at + i]; }
+        piece[n] = 0;
+        text(info_x + cell_w * 10, y, piece, COL_TEXT);
+        y += cell_h + 4;
+        at += n;
+        while (value[at] == ' ') { at += 1; }
+    }
+    if (at == 0) { y += cell_h + 4; }
+    return y;
+}
+
+void draw_hardware(int x, int y, int w, int h) {
+    box(x, y, w, h, COL_BAR);
+    text(x + 4, y + 2, "hardware", COL_TEXT);
+    info_x = x + 4;
+    info_bottom = y + h;
+    info_chars = (w - 8) / cell_w - 10;
+    if (info_chars < 8) { info_chars = 8; }
+    if (info_chars > 120) { info_chars = 120; }
+    y += cell_h + 10;
+    y = info_row(y, "cpu", hw + 16);
+    int sig = field(hw, 8);
+    line_reset();
+    add(hw);
+    add(", family ");
+    int fam = (sig >> 8) & 15;
+    if (fam == 15) { fam += (sig >> 20) & 255; }
+    add(num(fam));
+    add(" model ");
+    add(num(((sig >> 4) & 15) | (((sig >> 16) & 15) << 4)));
+    add(" stepping ");
+    add(num(sig & 15));
+    y = info_row(y, "", line);
+    line_reset();
+    int ecx = field(hw, 9);
+    int edx = field(hw, 10);
+    if ((edx >> 26) & 1) { add("sse2 "); }
+    if (ecx & 1) { add("sse3 "); }
+    if ((ecx >> 19) & 1) { add("sse4.1 "); }
+    if ((ecx >> 20) & 1) { add("sse4.2 "); }
+    if ((ecx >> 28) & 1) { add("avx "); }
+    if ((ecx >> 23) & 1) { add("popcnt "); }
+    if ((edx >> 4) & 1) { add("tsc "); }
+    if ((edx >> 6) & 1) { add("pae "); }
+    y = info_row(y, "features", line);
+    line_reset();
+    add(num(field(sys, 12)));
+    add(" x ");
+    add(num(field(sys, 13)));
+    add(" x ");
+    add(num(field(hw, 11)));
+    add(" bits");
+    y = info_row(y, "screen", line);
+    line_reset();
+    add_size(field(sys, 2) * 4096);
+    y = info_row(y, "memory", line);
+    line_reset();
+    if (field(hw, 12)) { add("ATA, "); add_size(field(hw, 13) * 512); add(" for files"); }
+    else { add("none"); }
+    y = info_row(y, "disk", line);
+    if (field(hw, 14)) { y = info_row(y, "mouse", "PS/2"); } else { y = info_row(y, "mouse", "none"); }
+    line_reset();
+    int dsp = field(hw, 15);
+    if (dsp) { add("Sound Blaster 16, DSP "); add(num(dsp / 256)); add("."); add(num(dsp % 256)); }
+    else { add("none"); }
+    info_row(y, "sound", line);
+    return;
+}
+
+void render() {
+    box(0, 0, fb_w, fb_h, COL_BG);
+    int y = draw_processes(cell_h);
+    y = draw_memory(y + cell_h);
+    draw_performance(y + cell_h);
+    present(fb);
+    return;
+}
+
+int main() {
+    int wi = win_info();
+    if (!wi) {
+        print("insyn: no window, run me with start insyn.elf\n");
+        return 2;
+    }
+    int wm = win_max();
+    fb_max_w = wm >> 16;
+    fb_max_h = wm & 65535;
+    fb = alloc(fb_max_w * fb_max_h * 4);
+    numbuf = alloc(24);
+    line = alloc(128);
+    piece = alloc(128);
+    sys = alloc(SYS_BYTES);
+    sys_old = alloc(SYS_BYTES);
+    tasks = alloc(MAX_SLOTS * TASK_BYTES);
+    tasks_old = alloc(MAX_SLOTS * TASK_BYTES);
+    hw = alloc(128);
+    history = alloc(METRICS * HISTORY * 8);
+    if (!fb || !numbuf || !line || !piece || !sys || !sys_old || !tasks || !tasks_old || !hw || !history) {
+        return 3;
+    }
+    if (font_init() == 0) { return 4; }
+    syscall(SYS_INFO, 2, hw, 128, 0, 0);
+    syscall(SYS_INFO, 0, sys, SYS_BYTES, 0, 0);
+    task_count = syscall(SYS_INFO, 1, tasks, MAX_SLOTS * TASK_BYTES, 0, 0) / TASK_BYTES;
+    sample();
+    last_sample = ms();
+
+    int dirty = 1;
+    while (1) {
+        int w = win_info();
+        int ww = w >> 16;
+        int wh = w & 65535;
+        if (ww > fb_max_w) { ww = fb_max_w; }
+        if (wh > fb_max_h) { wh = fb_max_h; }
+        if (ww != fb_w || wh != fb_h) { fb_w = ww; fb_h = wh; dirty = 1; }
+
+        // No keys of its own, Alt+W is the window's.
+        while (key_poll() >= 0) { }
+        if (ms() - last_sample >= SAMPLE_MS) {
+            sample();
+            last_sample = ms();
+            dirty = 1;
+        }
+        if (dirty && fb_w > 0 && fb_h > 0) {
+            render();
+            dirty = 0;
+        } else {
+            sleep(5);
+        }
+    }
+    return 0;
+}

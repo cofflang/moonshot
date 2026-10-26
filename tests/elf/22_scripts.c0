@@ -1,0 +1,41 @@
+// 22_scripts.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// expect: 7
+// Writes the scripts verify_scripts.sh runs into test/, one for each thing
+// the script language does. Each file written adds one.
+
+int len(int s) {
+    int n = 0;
+    while (s[n] != 0) { n += 1; }
+    return n;
+}
+
+int put(int name, int text) {
+    if (writefile(name, text, len(text)) == len(text)) { return 1; }
+    return 0;
+}
+
+int main() {
+    int ok = 0;
+    ok += put("test/count.sk",
+        "# count down\nn = 3\nwhile (n > 0) {\n    echo n is $n\n    n = n - 1\n}\necho done\n");
+    ok += put("test/args.sk",
+        "if ($# == 0) {\n    echo no arguments\n} else if ($1 == \"hi\") {\n    echo greeting $1\n} else {\n    echo other $1 and $2\n}\ntotal = 2 * (3 + 4) - 1\necho total $total\ns = \"moon\" + \"shot\"\necho $s\nif (!(1 < 2) || 0) {\n    echo wrong\n}\n");
+    ok += put("test/empty.sk",
+        "if (0) {\n} else {\n    echo else ran\n}\nif (1) {\n    echo then ran\n} else {\n    echo wrong two\n}\n");
+    ok += put("test/bad.sk", "x = 1 +\necho never\n");
+    ok += put("test/loop.sk", "i = 0\nwhile (1) {\n    i = i + 1\n}\n");
+    ok += put("test/outer.sk", "echo outer starts\nrun test/count.sk\necho outer ends\n");
+    // For verify_spawn_kill.sh, programs started and stopped before they
+    // run. Task 4 is the shell.
+    ok += put("test/killrace.sk",
+        "i = 0\nwhile (i < 20) {\n    start test/mouse.elf\n    kill 0\n    kill 1\n    kill 2\n    kill 3\n    kill 5\n    kill 6\n    kill 7\n    i = i + 1\n}\necho killrace done\n");
+    return ok;
+}

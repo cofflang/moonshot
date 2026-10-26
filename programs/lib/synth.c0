@@ -7,9 +7,10 @@
 // License version 3 or (at your option) any later version, WITHOUT ANY
 // WARRANTY; see the LICENSE file for the full text.
 //
-// synth -- turns a noter song into sound oljud can play, 8-bit unsigned mono
-// at 22050 samples a second, 128 being silence. A ring-3 library, included
-// after noter.c0.
+// synth -- turns a noter song into sound oljud can play at 22050 samples a
+// second, either 8-bit unsigned mono, 128 being silence (synth_render), or
+// 16-bit signed stereo (synth_render16), where each instrument sits where its
+// pan in the song puts it. A ring-3 library, included after noter.c0.
 //
 // A note's instrument picks its wave, a square, a triangle, a sawtooth, or
 // noise that dies away over the note for a drum. Its loudness is its
@@ -32,6 +33,10 @@ int SYNTH_RATE = 22050;
 int SYNTH_RAMP = 64;          // samples, about 3ms
 int SYNTH_AMP = 16;           // a full-velocity voice swings +-16
 int SYNTH_ONE = 4294967296;   // one whole cycle of phase
+
+// Instruments not heard, one bit each, bit 0 the square. A player's mute and
+// solo set it. The song itself does not change.
+int synth_muted = 0;
 
 // MIDI 60-71 (C4 to B4) in millihertz, equal temperament, A4 = 440 Hz.
 int synth_mhz(int n) {
@@ -79,9 +84,6 @@ int synth_length(int s) {
     return synth_at(s, end);
 }
 
-// Renders samples [from, from + n) of the song into `out`, one byte each.
-// `mix` is scratch space for n int64 sums, owned by the caller so a player
-// rendering block after block allocates it once.
 // A well-mixed 64-bit hash of x, splitmix64's finisher. Consecutive inputs
 // give unrelated outputs, which is what noise needs. Simpler hashes of a
 // counter come out nearly periodic, and that is heard as a tone. c0's >> keeps
@@ -117,9 +119,14 @@ int synth_wave(int inst, int phase, int k, int len, int pitch, int amp) {
     return amp;
 }
 
-void synth_render(int s, int from, int n, int out, int mix) {
+// Adds every note sounding in samples [from, from + n) into `mix`, in the
+// 8-bit scale. Mono, one int64 a sample, when stereo is 0. Left and right
+// apart, two a sample, when it is 1, each side's share out of 8 from the
+// note's pan (noter_note_pan). The middle is the whole voice on both sides, as mono
+// is, and a side falls to nothing as the pan goes to the other end.
+void synth_voices(int s, int from, int n, int mix, int stereo) {
     int i = 0;
-    for (i = 0; i < n; i += 1) { store64(mix + i * 8, 0); }
+    for (i = 0; i < n * (1 + stereo); i += 1) { store64(mix + i * 8, 0); }
     int to = from + n;
     int k = 0;
     for (k = 0; k < s.nh_count; k += 1) {
@@ -127,18 +134,23 @@ void synth_render(int s, int from, int n, int out, int mix) {
         int a = synth_at(s, r.nn_start);
         if (a >= to) { break; }   // sorted by start, so nothing later sounds here
         int b = synth_at(s, r.nn_start + r.nn_length);
-        if (b > from) {
+        int inst = r.nn_instrument;
+        if (b > from && ((synth_muted >> inst) & 1) == 0) {
             int amp = r.nn_velocity * SYNTH_AMP / 127;
             int inc = synth_step(r.nn_pitch);
             int t = a;
             if (t < from) { t = from; }
             int stop = b;
             if (stop > to) { stop = to; }
+            int pan = noter_note_pan(s, r);
+            int gl = 2 * (NOTER_PAN_MAX - pan);
+            int gr = 2 * pan;
+            if (gl > 8) { gl = 8; }
+            if (gr > 8) { gr = 8; }
             // The phase is carried from sample to sample, which gives the
             // same value as working it out from t each time without a
             // division per sample. Only its start needs one.
             int phase = (t - a) * inc % SYNTH_ONE;
-            int inst = r.nn_instrument;
             while (t < stop) {
                 int v = amp;
                 if (inst == 0) {
@@ -149,15 +161,30 @@ void synth_render(int s, int from, int n, int out, int mix) {
                 // The ramps, in and out, so the edges do not click.
                 if (t - a < SYNTH_RAMP) { v = v * (t - a) / SYNTH_RAMP; }
                 if (b - t < SYNTH_RAMP) { v = v * (b - t) / SYNTH_RAMP; }
-                int p = mix + (t - from) * 8;
-                store64(p, load64(p) + v);
+                if (stereo) {
+                    int p = mix + (t - from) * 16;
+                    store64(p, load64(p) + v * gl);
+                    store64(p + 8, load64(p + 8) + v * gr);
+                } else {
+                    int q = mix + (t - from) * 8;
+                    store64(q, load64(q) + v);
+                }
                 phase += inc;
                 if (phase >= SYNTH_ONE) { phase -= SYNTH_ONE; }
                 t += 1;
             }
         }
     }
-    i = 0;
+    return;
+}
+
+// Renders samples [from, from + n) of the song into `out`, one byte each,
+// 8-bit unsigned mono. `mix` is scratch space for n int64 sums, owned by the
+// caller so a player rendering block after block allocates it once. Pans do
+// not matter here.
+void synth_render(int s, int from, int n, int out, int mix) {
+    synth_voices(s, from, n, mix, 0);
+    int i = 0;
     for (i = 0; i < n; i += 1) {
         int v = load64(mix + i * 8) + 128;
         // Only a song with more than eight notes at once can get here; lira
@@ -165,6 +192,26 @@ void synth_render(int s, int from, int n, int out, int mix) {
         if (v < 0) { v = 0; }
         if (v > 255) { v = 255; }
         store8(out + i, v);
+    }
+    return;
+}
+
+// Renders samples [from, from + n) as 16-bit signed stereo frames into
+// `out`, four bytes each, for a program that called sound_format(2). `mix`
+// is scratch for 2n int64 sums. The 8-bit scale times 256, so a song is as
+// loud as through synth_render, with 256 times the steps.
+void synth_render16(int s, int from, int n, int out, int mix) {
+    synth_voices(s, from, n, mix, 1);
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        // Each side was added up out of 8, so 256 / 8.
+        int l = load64(mix + i * 16) * 32;
+        int r = load64(mix + i * 16 + 8) * 32;
+        if (l > 32767) { l = 32767; }
+        if (l < 0 - 32768) { l = 0 - 32768; }
+        if (r > 32767) { r = 32767; }
+        if (r < 0 - 32768) { r = 0 - 32768; }
+        store32(out + i * 4, (l & 65535) | ((r & 65535) << 16));
     }
     return;
 }

@@ -178,16 +178,16 @@ gate smed "$SMED"
 # never leaks into the next ordinary one.
 mkdir -p build
 if [ "${MOONSHOT_DEBUG:-0}" = 1 ]; then
-  echo 'include "../skalman_debug.c0";' > build/debug.c0
+  echo 'include "../kernel/shell/skalman_debug.c0";' > build/debug.c0
   echo "debug build, with the shell's debug commands"
 else
-  echo 'include "../skalman_nodebug.c0";' > build/debug.c0
+  echo 'include "../kernel/shell/skalman_nodebug.c0";' > build/debug.c0
 fi
 
-./gen_programs.sh >/dev/null
-./gen_elf_tests.sh >/dev/null
+./tools/gen_programs.sh >/dev/null
+./tools/gen_elf_tests.sh >/dev/null
 
-"$COFF1" kmain.c0 kmain.s
+"$COFF1" kernel/core/kmain.c0 build/kmain.s
 # kmain.c0's `include`s pull knekt.c0/interrupts.c0/jenna.c0/chrone.c0/
 # vga.c0/punkt.c0/keyboard.c0 in before compilation even starts (see
 # kmain.c0's own comment) -- coff1 sees and compiles ONE flat file
@@ -212,7 +212,7 @@ fi
 # -- thread_b is only referenced by address via c0's function-reference
 # feature, and sched_launch itself is called indirectly through the
 # .sched slot).
-sed -i '1i .global main\n.global int_dispatch\n.global paging_verify\n.global kernel_post_init\n.global sched_start\n.global sys_dispatch' kmain.s
+sed -i '1i .global main\n.global int_dispatch\n.global paging_verify\n.global kernel_post_init\n.global sched_start\n.global sys_dispatch' build/kmain.s
 # One call assembles all three files and links them per linker.ld, because
 # smed resolves every symbol across its inputs at once and has no object
 # files to combine. The .global lines above are kept for as, which still
@@ -220,6 +220,7 @@ sed -i '1i .global main\n.global int_dispatch\n.global paging_verify\n.global ke
 # in the test scripts); smed itself sees every symbol regardless.
 # moonshot.map lists every symbol's final address, for reading a crash
 # address back to a function.
-"$SMED" -T linker.ld -m moonshot.map boot.s kmain.s ring3_handlers.s moonshot.elf
+"$SMED" -T kernel/core/linker.ld -m build/moonshot.map kernel/core/boot.s build/kmain.s \
+  kernel/core/ring3_handlers.s build/moonshot.elf
 
-echo "built moonshot.elf"
+echo "built build/moonshot.elf"

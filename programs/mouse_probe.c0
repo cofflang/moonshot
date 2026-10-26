@@ -12,16 +12,41 @@
 // square centred on the pointer. verify_mouse.sh looks for the square at the
 // pointer, and for its absence while a press was only focusing the window.
 // verify_tavla.sh uses it as a program that paints every pixel it owns.
-// Esc quits.
+// Each time the wheel turns over it, it prints "wheel N", N the sum of
+// every step so far, for verify_mouse.sh. Esc quits.
 include "moon.c0";
 
 int BG = 0x101418;
 int MARK = 0xFF8C00;
 int SIZE = 12;
 
+// Prints "wheel N\n".
+void print_wheel(int buf, int n) {
+    int neg = 0;
+    if (n < 0) { neg = 1; n = 0 - n; }
+    int i = 31;
+    buf[i] = 0;
+    i -= 1;
+    buf[i] = '\n';
+    i -= 1;
+    if (n == 0) { buf[i] = '0'; i -= 1; }
+    while (n > 0) {
+        buf[i] = '0' + n % 10;
+        n = n / 10;
+        i -= 1;
+    }
+    if (neg == 1) { buf[i] = '-'; i -= 1; }
+    print("wheel ");
+    print(buf + i + 1);
+    return;
+}
+
 int main() {
     int wi = win_info();
     if (!wi) { return 2; }
+    int buf = alloc(32);
+    if (!buf) { return 3; }
+    int turned = 0;
     fill(0, 0, wi >> 16, wi & 65535, BG);
     int shown = 0;
     int sx = 0;
@@ -58,6 +83,11 @@ int main() {
             sy = y;
             fill(sx - SIZE / 2, sy - SIZE / 2, SIZE, SIZE, MARK);
             shown = 1;
+        }
+        int dz = wheel();
+        if (dz != 0) {
+            turned += dz;
+            print_wheel(buf, turned);
         }
         sleep(1);
     }

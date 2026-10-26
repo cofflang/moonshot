@@ -27,7 +27,7 @@ int sleep(int t) {
 }
 
 // The entries of a directory, from the root ("" is the root itself), as
-// 48-byte records in buf, at most max of them: +0 the type (1 file, 2
+// 48-byte records in buf, at most max of them. +0 the type (1 file, 2
 // directory), +8 the size, +16 the name, NUL-terminated. Returns how many
 // were written, with buf == 0 how many there are, or -1 when the path is not
 // a directory.
@@ -42,9 +42,48 @@ int spawn(int line) {
     return syscall(20, line, 0, 0, 0, 0);
 }
 
-// Opens a file in the kernel's own editor for it, a sprite (.spr) in pensel
-// and anything else in skrift, in a new window that takes the focus. Names
-// are found from the root. Returns the window's id, -2 when that editor is
+// spawn with flags. 1 runs the program in the background, with no window
+// and with what it prints going to the serial line only. 2 finds names from
+// this program's own folder, as the shell does, where a name starting with
+// '/' is still from the root.
+int spawn_with(int line, int flags) {
+    return syscall(20, line, flags, 0, 0, 0);
+}
+
+// Waits for a task started with spawn to end. Returns its exit code, -1000
+// when it crashed or was killed, -1001 when there is no such task.
+int wait(int tid) {
+    return syscall(29, tid, 0, 0, 0, 0);
+}
+
+// wait, giving up after `ticks` (hundredths of a second), when it returns
+// -1002 and the task goes on running.
+int wait_for(int tid, int ticks) {
+    return syscall(29, tid, ticks, 0, 0, 0);
+}
+
+// Stops a task this program started with spawn. Returns 0, or -1 for a task
+// it did not start or one that has already ended.
+int kill(int tid) {
+    return syscall(35, tid, 0, 0, 0, 0);
+}
+
+// Opens a new shell window in this program's folder, gives it the focus and
+// types the line into it, so it runs as if typed there. Returns the
+// window's id, or -3 when there is no room for another window.
+int shell(int line) {
+    return syscall(28, line, 0, 0, 0, 0);
+}
+
+// Deletes a file, from this program's folder. Never a folder. Returns 0, or
+// -1 when there is no such file or it may not be changed.
+int remove(int path) {
+    return syscall(30, path, 0, 0, 0, 0);
+}
+
+// Opens a file in its editor, a sprite (.spr) in pensel and anything else in
+// skrift, in a new window that takes the focus. Names are found from the
+// root. Returns a number of 0 or more when it opened, -2 when pensel is
 // already open, -3 when there is no room for another window, -1 otherwise.
 int edit(int path) {
     return syscall(22, path, 0, 0, 0, 0);
@@ -56,4 +95,98 @@ int edit(int path) {
 // 0, or -1 when a page is not the program's own.
 int protect(int addr, int pages, int mode) {
     return syscall(21, addr, pages, mode, 0, 0);
+}
+
+// Ends the program and closes its window, where returning from main would
+// leave the last frame on screen. Does not return.
+int exit_close(int code) {
+    return syscall(27, code, 0, 0, 0, 0);
+}
+
+// What this program's sound() bytes are from now on. 0 is 8-bit unsigned
+// mono, where 128 is silence, and every program starts there. 1 is 16-bit
+// signed mono, 2 is 16-bit signed stereo, left then right. Sound still queued
+// is dropped. Returns 0, or -1 for an unknown format or no sound card.
+int sound_format(int fmt) {
+    return syscall(31, fmt, 0, 0, 0, 0);
+}
+
+// The make code key_poll() reports for Alt+W once a program has asked for it
+// with close_key(1).
+int KEY_CLOSE = 127;
+
+// With on 1, Alt+W on this program's window becomes the key KEY_CLOSE instead
+// of stopping the program, so it can save or ask first. A program that does
+// not read it within a second is stopped by the next Alt+W anyway. Returns 0.
+int close_key(int on) {
+    return syscall(32, on, 0, 0, 0, 0);
+}
+
+// The wall clock. what 0 gives seconds since 1970 in UTC, 1 milliseconds
+// since boot, 2 the minutes the time is shown with ahead of UTC, and 3 sets
+// those to value (from -1440 to 1440). Returns -1 for anything else.
+int clock(int what, int value) {
+    return syscall(33, what, value, 0, 0, 0);
+}
+
+// Read-only facts about the machine, as insyn shows them, into buf, at most
+// max bytes, which must be this program's own heap. what 0 the machine's
+// counters, 1 every task slot, 2 the hardware (see sys_info in the kernel for
+// the layouts). Returns the bytes written, or -1.
+int sysinfo(int what, int buf, int max) {
+    return syscall(34, what, buf, max, 0, 0);
+}
+
+// How the mouse pointer looks while it is over this program's window.
+// POINTER_BLOCK is the usual block, POINTER_STRETCH a left-right arrow for
+// something that can be made longer or shorter, POINTER_DRAG a four-way
+// arrow for something that can be dragged. Returns 0, or -1.
+int POINTER_BLOCK = 0;
+int POINTER_STRETCH = 1;
+int POINTER_DRAG = 2;
+int pointer(int shape) {
+    return syscall(36, shape, 0, 0, 0, 0);
+}
+
+// The steps the mouse wheel turned over this program's window since the
+// last call, positive towards the user (scrolling down), negative away.
+int wheel() {
+    return syscall(37, 0, 0, 0, 0, 0);
+}
+
+// The character a key types, from key_poll's make code (PS/2 set 1, US
+// layout) and whether Shift is held, or 0 for a key that types nothing.
+// Space, Tab and Enter are included and Backspace is not. Caps Lock is the
+// program's to track, as a Shift for the letters.
+int key_char(int make, int shift) {
+    int lo = 0;
+    int hi = 0;
+    int base = 0;
+    if (make >= 2 && make <= 13) {
+        lo = "1234567890-=";
+        hi = "!@#$%^&*()_+";
+        base = 2;
+    } else if (make >= 16 && make <= 27) {
+        lo = "qwertyuiop[]";
+        hi = "QWERTYUIOP{}";
+        base = 16;
+    } else if (make >= 30 && make <= 41) {
+        lo = "asdfghjkl;'`";
+        hi = "ASDFGHJKL:\"~";
+        base = 30;
+    } else if (make >= 43 && make <= 53) {
+        lo = "\\zxcvbnm,./";
+        hi = "|ZXCVBNM<>?";
+        base = 43;
+    } else if (make == 57) {
+        return ' ';
+    } else if (make == 15) {
+        return '\t';
+    } else if (make == 28) {
+        return '\n';
+    } else {
+        return 0;
+    }
+    if (shift) { return hi[make - base]; }
+    return lo[make - base];
 }

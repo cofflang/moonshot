@@ -56,11 +56,11 @@ export GDK_BACKEND="${GDK_BACKEND:-x11}"
 isodir=isoroot
 rm -rf "$isodir" moonshot.iso
 mkdir -p "$isodir/boot/grub"
-cp moonshot.elf "$isodir/boot/moonshot.elf"
-cp grub.cfg "$isodir/boot/grub/grub.cfg"
+cp build/moonshot.elf "$isodir/boot/moonshot.elf"
+cp kernel/core/grub.cfg "$isodir/boot/grub/grub.cfg"
 grub-mkrescue -o moonshot.iso "$isodir" >grub-mkrescue.log 2>&1
 if [ ! -f moonshot.iso ]; then
-  echo "FAIL: grub-mkrescue didn't produce moonshot.iso"
+  echo "FAIL: grub-mkrescue did not produce moonshot.iso"
   cat grub-mkrescue.log
   exit 1
 fi

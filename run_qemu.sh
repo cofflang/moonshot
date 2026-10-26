@@ -37,11 +37,11 @@ fi
 isodir=isoroot
 rm -rf "$isodir" moonshot.iso
 mkdir -p "$isodir/boot/grub"
-cp moonshot.elf "$isodir/boot/moonshot.elf"
-cp grub.cfg "$isodir/boot/grub/grub.cfg"
+cp build/moonshot.elf "$isodir/boot/moonshot.elf"
+cp kernel/core/grub_test.cfg "$isodir/boot/grub/grub.cfg"
 grub-mkrescue -o moonshot.iso "$isodir" >grub-mkrescue.log 2>&1
 if [ ! -f moonshot.iso ]; then
-  echo "FAIL: grub-mkrescue didn't produce moonshot.iso"
+  echo "FAIL: grub-mkrescue did not produce moonshot.iso"
   cat grub-mkrescue.log
   exit 1
 fi
@@ -65,7 +65,7 @@ timeout 5 qemu-system-x86_64 -cdrom moonshot.iso \
 # compiled.
 tick_count=$(grep -c "^tick " serial.log)
 
-# The allocator is now checked in three parts (see kmain.c0's main()), all
+# The allocator is checked in three parts (see kmain.c0's main()), all
 # by real arithmetic on the printed addresses -- not just "N numbers got
 # printed":
 #   pmm bump:  a0 a1 a2 a3  -- four fresh pages, each exactly 4096 apart
@@ -191,8 +191,8 @@ done < <(grep -E "^\[sched\] -> task [0-9]+ \(counter=[0-9]+\)$" serial.log \
 [ "${#seen_task[@]}" -ge 3 ] || sched_ok=0
 grep -qE "^\[sched\] task 3 exited$" serial.log || sched_ok=0
 # Reaper. After task 3 (the boot exiter) exits, sched_reap must free its stack
-# page from another task's context -- proving the 4KB-per-task leak that exit/
-# kill left behind is now reclaimed. The freed address must match the page
+# page from another task's context, so the 4KB stack of a task that exits or
+# is killed comes back. The freed address must match the page
 # task 3 was spawned on (same "stack=" value), i.e. it is really task 3's stack
 # going back to pmm, not some unrelated free.
 spawn3=$(grep -oE "^\[sched\] spawned task 3 stack=[0-9]+$" serial.log | head -1 | grep -oE "[0-9]+$")

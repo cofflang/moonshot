@@ -1,0 +1,1361 @@
+// form.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// form -- the 3D modeller. It shapes low-poly meshes for gnista's djup, a
+// cube at a time, by pulling faces out of them and moving corners about.
+// `start form.elf ship.form`, or a click on a .form in hylla. A name that
+// does not exist yet starts as one cube, and so does no name at all, which
+// F2 asks for.
+//
+// Mouse
+//   drag         turn the camera around the model
+//   wheel        nearer, further
+//   click        pick the corner under the pointer, or else the side
+//   Shift+click  add to what is picked, or take away from it
+//   drag a handle  move what is picked along that axis, the red one x,
+//                the green one y (up), the blue one z
+// Keys
+//   Tab          the next side
+//   t            pick sides or single triangles
+//   arrows       move what is picked along the floor, the way the camera
+//                looks (or turn the camera when nothing is picked)
+//   Shift+up/down  move it up or down
+//   PgUp, PgDn   nearer, further
+//   e            pull the picked sides out, with sides of their own
+//   = -          what is picked a quarter bigger or a fifth smaller,
+//                around its own middle
+//   m            a mirrored copy of the picked sides on the other side of
+//                x = 0, or of the whole model when nothing is picked.
+//                Corners on x = 0 are shared, so the two halves stay joined
+//   d            a copy of the picked sides, or of the whole model, half a
+//                unit to the right on the screen, picked to be moved on
+//   g            the picked corners, or all of them, onto the 1/16 grid
+//   1 to 9       colour the picked sides
+//   Del          take the picked sides away
+//   n            a new cube where the camera looks
+//   w            the edges and corners drawn over the faces, or not
+//   Ctrl+Z, Ctrl+Y  undo, redo
+//   F2 save
+//   Alt+W        quit, asking first when there are unsaved changes (a
+//                second Alt+W quits without saving)
+//   Esc          pick nothing
+//
+// A side of a cube is two triangles, so picking takes the flat triangle
+// beside the picked one along, and a square side acts as one, unless t has
+// switched to single triangles. The edges are drawn white and the corners
+// black, only where they can be seen.
+
+include "moon.c0";
+include "djup.c0";
+
+int VCAP = 512;
+int FCAP = 1024;
+int UNDO_MAX = 32;
+int STEP = 8192;           // 1/8 of a unit, what one arrow press moves
+int PULL = 32768;          // 1/2, how far e pulls a face out
+
+int COL_BG = 0x161e28;
+int COL_BAR = 0x101820;
+int COL_TEXT = 0xe0e4e8;
+int COL_DIM = 0x8890a0;
+int COL_KEY = 0xffb43c;
+int COL_WARN = 0xff7a6a;
+int COL_GRID = 0x26303e;
+int COL_PICK = 0xffd84a;
+
+int fb;
+int fb_w;
+int fb_h;
+int fb_max_w;
+int fb_max_h;
+int zbuf;
+int idbuf;
+int cell_w;
+int cell_h;
+int font;
+int numbuf;
+int scratch;               // a few words for projections
+
+int name = 0;
+int mesh;
+int cam;
+int fsel;                  // per face, 1 when it is picked
+int vsel;                  // per corner, 1 when it is picked
+int pick_tri = 0;          // 1 when a click picks one triangle, not a side
+int last_face = 0 - 1;     // the face Tab goes on from
+int wire = 1;
+int COL_EDGE = 0xf0f0f0;
+int COL_CORNER = 0x080808;
+int HANDLE = 49152;        // 3/4 of a unit, a handle's length
+int GRID_SNAP = 4096;      // 1/16 of a unit, what a handle moves by
+int modified = 0;
+int asking = 0;
+int naming = 0;            // 1 while the bottom line asks for a name to save as
+int naming_quit = 0;       // 1 when the save it asks for is the last thing
+int nbuf;                  // what is typed there
+int nlen = 0;
+int message = 0;
+int message_warn = 0;
+int undo;
+int undo_n = 0;
+int redo;
+int redo_n = 0;
+
+int palette(int i) {
+    if (i == 1) { return 0xd04a3a; }
+    if (i == 2) { return 0xe8913a; }
+    if (i == 3) { return 0xe8d04a; }
+    if (i == 4) { return 0x5ab85a; }
+    if (i == 5) { return 0x3a9ad0; }
+    if (i == 6) { return 0x7a5ad0; }
+    if (i == 7) { return 0xd07ab0; }
+    if (i == 8) { return 0xd8d8d8; }
+    return 0x585858;
+}
+
+// --- small things -----------------------------------------------------------
+
+int len(int s) {
+    int n = 0;
+    while (s[n] != 0) { n += 1; }
+    return n;
+}
+
+int dup(int s) {
+    int n = len(s);
+    int d = alloc(n + 1);
+    int i = 0;
+    for (i = 0; i <= n; i += 1) { d[i] = s[i]; }
+    return d;
+}
+
+int num(int n) {
+    int i = 23;
+    numbuf[i] = 0;
+    if (n == 0) { i -= 1; numbuf[i] = '0'; }
+    while (n > 0) {
+        i -= 1;
+        numbuf[i] = '0' + n % 10;
+        n = n / 10;
+    }
+    return numbuf + i;
+}
+
+void say(int s, int warn) {
+    message = s;
+    message_warn = warn;
+    return;
+}
+
+void box(int x, int y, int w, int h, int c) {
+    int x0 = x;
+    int y0 = y;
+    int x1 = x + w;
+    int y1 = y + h;
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > fb_w) { x1 = fb_w; }
+    if (y1 > fb_h) { y1 = fb_h; }
+    int row = 0;
+    for (row = y0; row < y1; row += 1) {
+        int p = fb + (row * fb_w + x0) * 4;
+        int col = 0;
+        for (col = x0; col < x1; col += 1) {
+            store32(p, c);
+            p += 4;
+        }
+    }
+    return;
+}
+
+int font_init() {
+    int d = glyph('M', 0);
+    if (d <= 0) { return 0; }
+    cell_w = d >> 16;
+    cell_h = d & 65535;
+    font = alloc(128 * cell_h);
+    if (!font) { return 0; }
+    int c = 0;
+    for (c = 0; c < 128; c += 1) { glyph(c, font + c * cell_h); }
+    return 1;
+}
+
+int text(int x, int y, int s, int c) {
+    int i = 0;
+    while (s[i] != 0) {
+        int ch = s[i];
+        if (ch > 32 && ch < 128) {
+            int r = 0;
+            for (r = 0; r < cell_h; r += 1) {
+                int bits = load8(font + ch * cell_h + r);
+                int yy = y + r;
+                int k = 0;
+                for (k = 0; k < cell_w && bits != 0; k += 1) {
+                    int xx = x + k;
+                    if (((bits >> (cell_w - 1 - k)) & 1) == 1 && xx >= 0 && xx < fb_w
+                        && yy >= 0 && yy < fb_h) {
+                        store32(fb + (yy * fb_w + xx) * 4, c);
+                    }
+                }
+            }
+        }
+        x += cell_w;
+        i += 1;
+    }
+    return x;
+}
+
+int hint(int x, int y, int key, int what) {
+    if (x + (len(key) + 1 + len(what)) * cell_w > fb_w) { return fb_w; }
+    x = text(x, y, key, COL_KEY);
+    x = text(x + cell_w, y, what, COL_DIM);
+    return x + cell_w * 3;
+}
+
+// --- undo -----------------------------------------------------------------------
+
+int mesh_bytes() { return djup_bytes(VCAP, FCAP); }
+
+int snapshot() {
+    int s = alloc(mesh_bytes());
+    if (!s) { return 0; }
+    int i = 0;
+    for (i = 0; i < mesh_bytes(); i += 8) { store64(s + i, load64(mesh + i)); }
+    return s;
+}
+
+void restore(int s) {
+    int i = 0;
+    for (i = 0; i < mesh_bytes(); i += 8) { store64(mesh + i, load64(s + i)); }
+    return;
+}
+
+void push(int stack, int n, int s) {
+    if (n == UNDO_MAX) {
+        dealloc(load64(stack));
+        int i = 0;
+        for (i = 1; i < UNDO_MAX; i += 1) { store64(stack + (i - 1) * 8, load64(stack + i * 8)); }
+        n -= 1;
+    }
+    store64(stack + n * 8, s);
+    return;
+}
+
+// Takes back the last remember(), for a step that changed nothing.
+void forget(int was_modified) {
+    if (undo_n > 0) {
+        undo_n -= 1;
+        dealloc(load64(undo + undo_n * 8));
+    }
+    modified = was_modified;
+    return;
+}
+
+void remember() {
+    int s = snapshot();
+    if (!s) { return; }
+    push(undo, undo_n, s);
+    if (undo_n < UNDO_MAX) { undo_n += 1; }
+    while (redo_n > 0) {
+        redo_n -= 1;
+        dealloc(load64(redo + redo_n * 8));
+    }
+    modified = 1;
+    return;
+}
+
+void step_undo(int back) {
+    int from = undo;
+    int from_n = undo_n;
+    int to = redo;
+    int to_n = redo_n;
+    if (!back) { from = redo; from_n = redo_n; to = undo; to_n = undo_n; }
+    if (from_n == 0) {
+        if (back) { say("nothing to undo", 0); } else { say("nothing to redo", 0); }
+        return;
+    }
+    int now = snapshot();
+    if (!now) { return; }
+    from_n -= 1;
+    int s = load64(from + from_n * 8);
+    int faces_were = mesh.dh_faces;
+    int verts_were = mesh.dh_verts;
+    restore(s);
+    dealloc(s);
+    push(to, to_n, now);
+    if (to_n < UNDO_MAX) { to_n += 1; }
+    if (back) { undo_n = from_n; redo_n = to_n; } else { redo_n = from_n; undo_n = to_n; }
+    // What is picked stays picked, unless the faces or corners it named are
+    // not the same ones any more.
+    if (mesh.dh_faces != faces_were || mesh.dh_verts != verts_were) { sel_clear(); }
+    modified = 1;
+    return;
+}
+
+// --- faces ----------------------------------------------------------------------
+
+// The face's corner k.
+int corner(int f, int k) { return load64(djup_face(mesh, f) + k * 8); }
+
+// Its normal, not of unit length, as three words in out.
+void normal(int f, int out) {
+    int a = djup_vert(mesh, corner(f, 0));
+    int b = djup_vert(mesh, corner(f, 1));
+    int c = djup_vert(mesh, corner(f, 2));
+    int ux = load64(b) - load64(a);
+    int uy = load64(b + 8) - load64(a + 8);
+    int uz = load64(b + 16) - load64(a + 16);
+    int vx = load64(c) - load64(a);
+    int vy = load64(c + 8) - load64(a + 8);
+    int vz = load64(c + 16) - load64(a + 16);
+    store64(out, fx_mul(uy, vz) - fx_mul(uz, vy));
+    store64(out + 8, fx_mul(uz, vx) - fx_mul(ux, vz));
+    store64(out + 16, fx_mul(ux, vy) - fx_mul(uy, vx));
+    return;
+}
+
+int shares(int f, int g) {
+    int n = 0;
+    int i = 0;
+    for (i = 0; i < 3; i += 1) {
+        int j = 0;
+        for (j = 0; j < 3; j += 1) {
+            if (corner(f, i) == corner(g, j)) { n += 1; }
+        }
+    }
+    return n;
+}
+
+// The flat triangle beside face f, sharing an edge and facing the same way,
+// or -1. With it a cube's square side acts as one face.
+int partner(int f) {
+    int nf = alloc(24);
+    int ng = alloc(24);
+    normal(f, nf);
+    int g = 0;
+    int found = 0 - 1;
+    for (g = 0; g < mesh.dh_faces && found < 0; g += 1) {
+        if (g != f && shares(f, g) == 2) {
+            normal(g, ng);
+            // Parallel and the same way, the cross product near nothing.
+            int cx = fx_mul(load64(nf + 8), load64(ng + 16)) - fx_mul(load64(nf + 16), load64(ng + 8));
+            int cy = fx_mul(load64(nf + 16), load64(ng)) - fx_mul(load64(nf), load64(ng + 16));
+            int cz = fx_mul(load64(nf), load64(ng + 8)) - fx_mul(load64(nf + 8), load64(ng));
+            int dot = fx_mul(load64(nf), load64(ng)) + fx_mul(load64(nf + 8), load64(ng + 8))
+                      + fx_mul(load64(nf + 16), load64(ng + 16));
+            if (cx < 64 && cx > -64 && cy < 64 && cy > -64 && cz < 64 && cz > -64 && dot > 0) {
+                found = g;
+            }
+        }
+    }
+    dealloc(nf);
+    dealloc(ng);
+    return found;
+}
+
+// --- what is picked -------------------------------------------------------------
+
+void sel_clear() {
+    int i = 0;
+    for (i = 0; i < FCAP; i += 1) { fsel[i] = 0; }
+    for (i = 0; i < VCAP; i += 1) { vsel[i] = 0; }
+    return;
+}
+
+int sel_faces() {
+    int n = 0;
+    int i = 0;
+    for (i = 0; i < mesh.dh_faces; i += 1) { if (fsel[i]) { n += 1; } }
+    return n;
+}
+
+int sel_any() {
+    if (sel_faces() > 0) { return 1; }
+    int i = 0;
+    for (i = 0; i < mesh.dh_verts; i += 1) { if (vsel[i]) { return 1; } }
+    return 0;
+}
+
+// Face f picked or not, and its partner with it unless picking triangles.
+void sel_face(int f, int on) {
+    fsel[f] = on;
+    if (!pick_tri) {
+        int p = partner(f);
+        if (p >= 0) { fsel[p] = on; }
+    }
+    last_face = f;
+    return;
+}
+
+// Every corner of what is picked, each once, into out (room for VCAP
+// words). Returns how many.
+int picked_corners(int out) {
+    int n = 0;
+    int i = 0;
+    for (i = 0; i < mesh.dh_verts; i += 1) {
+        int take = vsel[i];
+        if (!take) {
+            int f = 0;
+            for (f = 0; f < mesh.dh_faces && !take; f += 1) {
+                if (fsel[f] && (corner(f, 0) == i || corner(f, 1) == i || corner(f, 2) == i)) {
+                    take = 1;
+                }
+            }
+        }
+        if (take) { store64(out + n * 8, i); n += 1; }
+    }
+    return n;
+}
+
+// Moves what is picked, without a step for undo, which the caller takes.
+void shift_picked(int dx, int dy, int dz) {
+    int vs = alloc(VCAP * 8);
+    int n = picked_corners(vs);
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int v = djup_vert(mesh, load64(vs + i * 8));
+        store64(v, load64(v) + dx);
+        store64(v + 8, load64(v + 8) + dy);
+        store64(v + 16, load64(v + 16) + dz);
+    }
+    dealloc(vs);
+    return;
+}
+
+void move_picked(int dx, int dy, int dz) {
+    if (!sel_any()) { return; }
+    remember();
+    shift_picked(dx, dy, dz);
+    return;
+}
+
+void colour_picked(int colour) {
+    if (sel_faces() == 0) { say("pick a side to colour first", 0); return; }
+    remember();
+    int f = 0;
+    for (f = 0; f < mesh.dh_faces; f += 1) {
+        if (fsel[f]) { store64(djup_face(mesh, f) + 24, colour); }
+    }
+    return;
+}
+
+void delete_picked() {
+    if (sel_faces() == 0) { say("pick a side to take away first", 0); return; }
+    remember();
+    // From the last, since taking a face away moves the ones after it down.
+    int f = mesh.dh_faces - 1;
+    while (f >= 0) {
+        if (fsel[f]) { djup_remove_face(mesh, f); }
+        f -= 1;
+    }
+    sel_clear();
+    return;
+}
+
+// The middle of what is picked, as three words in out. Returns 0 when
+// nothing is.
+int picked_centre(int out) {
+    int vs = alloc(VCAP * 8);
+    int n = picked_corners(vs);
+    if (n == 0) { dealloc(vs); return 0; }
+    int sx = 0;
+    int sy = 0;
+    int sz = 0;
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int v = djup_vert(mesh, load64(vs + i * 8));
+        sx += load64(v);
+        sy += load64(v + 8);
+        sz += load64(v + 16);
+    }
+    store64(out, sx / n);
+    store64(out + 8, sy / n);
+    store64(out + 16, sz / n);
+    dealloc(vs);
+    return 1;
+}
+
+// Scales what is picked by num/den around its middle.
+void scale_picked(int num, int den) {
+    if (!sel_any()) { say("pick something to scale first", 0); return; }
+    int c = alloc(24);
+    picked_centre(c);
+    int vs = alloc(VCAP * 8);
+    int n = picked_corners(vs);
+    remember();
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int v = djup_vert(mesh, load64(vs + i * 8));
+        int k = 0;
+        for (k = 0; k < 3; k += 1) {
+            int m0 = load64(c + k * 8);
+            store64(v + k * 8, m0 + (load64(v + k * 8) - m0) * num / den);
+        }
+    }
+    dealloc(vs);
+    dealloc(c);
+    return;
+}
+
+int MIRROR_SEAM = 256;    // 1/256 of a unit, how near x = 0 a corner is on it
+
+// Adds a mirror image of the picked sides, or of every side when none is
+// picked, across x = 0. A corner on the seam is shared by both halves; the
+// others get a copy with x negated. A mirror turns a face inside out, so
+// each copy takes its corners in the other order to face outwards again.
+// The copies are what is picked afterwards.
+void mirror() {
+    int nf = mesh.dh_faces;
+    int all = sel_faces() == 0;
+    int src = alloc(FCAP * 8);    // the faces to mirror
+    int count = 0;
+    int f = 0;
+    for (f = 0; f < nf; f += 1) {
+        if (all || fsel[f]) { store64(src + count * 8, f); count += 1; }
+    }
+    if (count == 0) { say("there is nothing to mirror", 0); dealloc(src); return; }
+    int nv = mesh.dh_verts;
+    int twin = alloc(VCAP * 8);   // per corner, its mirror image, or -1
+    int i = 0;
+    for (i = 0; i < nv; i += 1) { store64(twin + i * 8, 0 - 1); }
+    int need = 0;
+    int k = 0;
+    for (k = 0; k < count; k += 1) {
+        f = load64(src + k * 8);
+        int c = 0;
+        for (c = 0; c < 3; c += 1) {
+            int v = corner(f, c);
+            if (load64(twin + v * 8) == 0 - 1) {
+                store64(twin + v * 8, v);
+                int x = load64(djup_vert(mesh, v));
+                if (x > MIRROR_SEAM || x < 0 - MIRROR_SEAM) { need += 1; store64(twin + v * 8, 0 - 2); }
+            }
+        }
+    }
+    if (nv + need > VCAP || nf + count > FCAP) {
+        say("no room for more, the mesh is full", 1);
+        dealloc(twin);
+        dealloc(src);
+        return;
+    }
+    remember();
+    for (i = 0; i < nv; i += 1) {
+        if (load64(twin + i * 8) == 0 - 2) {
+            int v = djup_vert(mesh, i);
+            store64(twin + i * 8, djup_add_vert(mesh, 0 - load64(v), load64(v + 8), load64(v + 16)));
+        }
+    }
+    sel_clear();
+    for (k = 0; k < count; k += 1) {
+        f = load64(src + k * 8);
+        int g = djup_add_face(mesh, load64(twin + corner(f, 0) * 8), load64(twin + corner(f, 2) * 8),
+                              load64(twin + corner(f, 1) * 8), load64(djup_face(mesh, f) + 24));
+        if (g >= 0) { fsel[g] = 1; }
+    }
+    dealloc(twin);
+    dealloc(src);
+    say("mirrored across x = 0", 0);
+    return;
+}
+
+// Right on the screen, as a floor direction, x and z each -1, 0 or 1.
+(int, int) floor_right() {
+    int q = ((cam.dc_yaw % 1024 + 1024 + 128) % 1024) / 256;
+    if (q == 1) { return 0, 0 - 1; }
+    if (q == 2) { return 0 - 1, 0; }
+    if (q == 3) { return 0, 1; }
+    return 1, 0;
+}
+
+// Adds a copy of the picked sides, or of every side when none is picked,
+// PULL to the right on the screen. Corners the sides share, the copies
+// share too. The copies are what is picked afterwards, so the arrows and
+// handles move them on from there.
+void duplicate() {
+    int nf = mesh.dh_faces;
+    int all = sel_faces() == 0;
+    int src = alloc(FCAP * 8);    // the faces to copy
+    int count = 0;
+    int f = 0;
+    for (f = 0; f < nf; f += 1) {
+        if (all || fsel[f]) { store64(src + count * 8, f); count += 1; }
+    }
+    if (count == 0) { say("there is nothing to copy", 0); dealloc(src); return; }
+    int nv = mesh.dh_verts;
+    int copy = alloc(VCAP * 8);   // per corner, its copy, or -1
+    int i = 0;
+    for (i = 0; i < nv; i += 1) { store64(copy + i * 8, 0 - 1); }
+    int need = 0;
+    int k = 0;
+    for (k = 0; k < count; k += 1) {
+        f = load64(src + k * 8);
+        int c = 0;
+        for (c = 0; c < 3; c += 1) {
+            int v = corner(f, c);
+            if (load64(copy + v * 8) == 0 - 1) { store64(copy + v * 8, 0 - 2); need += 1; }
+        }
+    }
+    if (nv + need > VCAP || nf + count > FCAP) {
+        say("no room for more, the mesh is full", 1);
+        dealloc(copy);
+        dealloc(src);
+        return;
+    }
+    remember();
+    int rx = 0;
+    int rz = 0;
+    rx, rz = floor_right();
+    for (i = 0; i < nv; i += 1) {
+        if (load64(copy + i * 8) == 0 - 2) {
+            int v = djup_vert(mesh, i);
+            store64(copy + i * 8, djup_add_vert(mesh, load64(v) + rx * PULL, load64(v + 8),
+                                                load64(v + 16) + rz * PULL));
+        }
+    }
+    sel_clear();
+    for (k = 0; k < count; k += 1) {
+        f = load64(src + k * 8);
+        int g = djup_add_face(mesh, load64(copy + corner(f, 0) * 8), load64(copy + corner(f, 1) * 8),
+                              load64(copy + corner(f, 2) * 8), load64(djup_face(mesh, f) + 24));
+        if (g >= 0) { fsel[g] = 1; }
+    }
+    dealloc(copy);
+    dealloc(src);
+    say("copied, half a unit to the right", 0);
+    return;
+}
+
+// The multiple of GRID_SNAP nearest to c.
+int snap(int c) {
+    int r = c % GRID_SNAP;
+    if (r < 0) { r += GRID_SNAP; }
+    c -= r;
+    if (r * 2 >= GRID_SNAP) { c += GRID_SNAP; }
+    return c;
+}
+
+// Puts the picked corners, or every corner when nothing is picked, on the
+// grid the handles move by, so a corner left between lines by a scale
+// meets its neighbours again.
+void snap_picked() {
+    int vs = alloc(VCAP * 8);
+    int n = 0;
+    if (sel_any()) { n = picked_corners(vs); }
+    else {
+        for (n = 0; n < mesh.dh_verts; n += 1) { store64(vs + n * 8, n); }
+    }
+    if (n == 0) { say("there is nothing to put on the grid", 0); dealloc(vs); return; }
+    remember();
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int v = djup_vert(mesh, load64(vs + i * 8));
+        int k = 0;
+        for (k = 0; k < 3; k += 1) { store64(v + k * 8, snap(load64(v + k * 8))); }
+    }
+    dealloc(vs);
+    say("on the grid", 0);
+    return;
+}
+
+// Pulls the picked sides out by PULL, along their normals added together.
+// Their corners are copied and moved, the faces take the copies, and every
+// edge of them not shared between two picked faces gets a side, two
+// triangles, joining the old corner to the new.
+void extrude() {
+    int nfaces = sel_faces();
+    if (nfaces == 0) { say("pick a side to pull out first", 0); return; }
+    int faces = alloc(nfaces * 8);
+    int k = 0;
+    int f = 0;
+    for (f = 0; f < mesh.dh_faces; f += 1) {
+        if (fsel[f]) { store64(faces + k * 8, f); k += 1; }
+    }
+    int old = alloc(VCAP * 8);
+    int n = 0;
+    for (k = 0; k < nfaces; k += 1) {
+        int c = 0;
+        for (c = 0; c < 3; c += 1) {
+            int v = corner(load64(faces + k * 8), c);
+            int have = 0;
+            int i = 0;
+            for (i = 0; i < n; i += 1) { if (load64(old + i * 8) == v) { have = 1; } }
+            if (!have) { store64(old + n * 8, v); n += 1; }
+        }
+    }
+    if (mesh.dh_verts + n > VCAP || mesh.dh_faces + nfaces * 6 > FCAP) {
+        say("no room for more, the mesh is full", 1);
+        dealloc(old);
+        dealloc(faces);
+        return;
+    }
+    remember();
+    int nrm = alloc(24);
+    int one = alloc(24);
+    store64(nrm, 0);
+    store64(nrm + 8, 0);
+    store64(nrm + 16, 0);
+    for (k = 0; k < nfaces; k += 1) {
+        normal(load64(faces + k * 8), one);
+        int m2 = djup_isqrt(fx_mul(load64(one), load64(one)) + fx_mul(load64(one + 8), load64(one + 8))
+                            + fx_mul(load64(one + 16), load64(one + 16)));
+        if (m2 <= 0) { m2 = 1; }
+        store64(nrm, load64(nrm) + fx_div(load64(one), m2 << 8));
+        store64(nrm + 8, load64(nrm + 8) + fx_div(load64(one + 8), m2 << 8));
+        store64(nrm + 16, load64(nrm + 16) + fx_div(load64(one + 16), m2 << 8));
+    }
+    int l = djup_isqrt(fx_mul(load64(nrm), load64(nrm)) + fx_mul(load64(nrm + 8), load64(nrm + 8))
+                       + fx_mul(load64(nrm + 16), load64(nrm + 16)));
+    if (l <= 0) { l = 1; }
+    // l is |n| in 8.8, since the squares were 16.16 times 16.16 >> 16.
+    int ox = fx_div(fx_mul(load64(nrm), PULL), l << 8);
+    int oy = fx_div(fx_mul(load64(nrm + 8), PULL), l << 8);
+    int oz = fx_div(fx_mul(load64(nrm + 16), PULL), l << 8);
+    int new = alloc(VCAP * 8);
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int v = djup_vert(mesh, load64(old + i * 8));
+        store64(new + i * 8, djup_add_vert(mesh, load64(v) + ox, load64(v + 8) + oy, load64(v + 16) + oz));
+    }
+    // The edges of the picked faces that only one of them has, with their
+    // direction and the colour of the face they belong to, before the
+    // corners change.
+    int edges = alloc(nfaces * 3 * 24);
+    int ne = 0;
+    for (k = 0; k < nfaces; k += 1) {
+        int fk = load64(faces + k * 8);
+        int c = 0;
+        for (c = 0; c < 3; c += 1) {
+            int a = corner(fk, c);
+            int b = corner(fk, (c + 1) % 3);
+            int inner = 0;
+            int k2 = 0;
+            for (k2 = 0; k2 < nfaces; k2 += 1) {
+                int g = load64(faces + k2 * 8);
+                if (g != fk) {
+                    int c2 = 0;
+                    for (c2 = 0; c2 < 3; c2 += 1) {
+                        if (corner(g, c2) == b && corner(g, (c2 + 1) % 3) == a) { inner = 1; }
+                    }
+                }
+            }
+            if (!inner) {
+                store64(edges + ne * 24, a);
+                store64(edges + ne * 24 + 8, b);
+                store64(edges + ne * 24 + 16, load64(djup_face(mesh, fk) + 24));
+                ne += 1;
+            }
+        }
+    }
+    // The faces move to the new corners.
+    for (k = 0; k < nfaces; k += 1) {
+        int f2 = djup_face(mesh, load64(faces + k * 8));
+        int c3 = 0;
+        for (c3 = 0; c3 < 3; c3 += 1) {
+            int v = load64(f2 + c3 * 8);
+            for (i = 0; i < n; i += 1) {
+                if (load64(old + i * 8) == v) { store64(f2 + c3 * 8, load64(new + i * 8)); }
+            }
+        }
+    }
+    // A side for each outer edge a to b, from the old pair up to the new.
+    int e = 0;
+    for (e = 0; e < ne; e += 1) {
+        int a = load64(edges + e * 24);
+        int b = load64(edges + e * 24 + 8);
+        int a2 = 0;
+        int b2 = 0;
+        for (i = 0; i < n; i += 1) {
+            if (load64(old + i * 8) == a) { a2 = load64(new + i * 8); }
+            if (load64(old + i * 8) == b) { b2 = load64(new + i * 8); }
+        }
+        djup_quad(mesh, a, b, b2, a2, load64(edges + e * 24 + 16));
+    }
+    dealloc(nrm);
+    dealloc(one);
+    dealloc(new);
+    dealloc(old);
+    dealloc(edges);
+    dealloc(faces);
+    say("pulled out, drag a handle or use the arrows to move it on", 0);
+    return;
+}
+
+// --- drawing --------------------------------------------------------------------
+
+void floor_grid() {
+    int a = scratch;
+    int b = scratch + 48;
+    int k = 0;
+    for (k = 0 - 4; k <= 4; k += 1) {
+        int t = k * DJUP_ONE;
+        int far = 4 * DJUP_ONE;
+        if (djup_project_point(cam, fb_w, fb_h, t, 0 - DJUP_ONE, 0 - far, a)
+            && djup_project_point(cam, fb_w, fb_h, t, 0 - DJUP_ONE, far, b)) {
+            djup_line(fb, fb_w, fb_h, load64(a), load64(a + 8), load64(b), load64(b + 8), COL_GRID);
+        }
+        if (djup_project_point(cam, fb_w, fb_h, 0 - far, 0 - DJUP_ONE, t, a)
+            && djup_project_point(cam, fb_w, fb_h, far, 0 - DJUP_ONE, t, b)) {
+            djup_line(fb, fb_w, fb_h, load64(a), load64(a + 8), load64(b), load64(b + 8), COL_GRID);
+        }
+    }
+    return;
+}
+
+// The edges of every picked face, and a box on every picked corner.
+void draw_pick() {
+    int f = 0;
+    for (f = 0; f < mesh.dh_faces; f += 1) {
+        if (fsel[f]) {
+            int c = 0;
+            for (c = 0; c < 3; c += 1) {
+                if (djup_project(mesh, cam, fb_w, fb_h, corner(f, c), scratch)
+                    && djup_project(mesh, cam, fb_w, fb_h, corner(f, (c + 1) % 3), scratch + 48)) {
+                    djup_line(fb, fb_w, fb_h, load64(scratch), load64(scratch + 8),
+                              load64(scratch + 48), load64(scratch + 56), COL_PICK);
+                }
+            }
+        }
+    }
+    int v = 0;
+    for (v = 0; v < mesh.dh_verts; v += 1) {
+        if (vsel[v] && djup_project(mesh, cam, fb_w, fb_h, v, scratch)) {
+            box(load64(scratch) - 3, load64(scratch + 8) - 3, 7, 7, COL_PICK);
+        }
+    }
+    return;
+}
+
+// Every corner that can be seen, a small black square.
+void draw_corners() {
+    int v = 0;
+    for (v = 0; v < mesh.dh_verts; v += 1) {
+        if (djup_vert_seen(mesh, cam, fb_w, fb_h, zbuf, v, scratch)) {
+            box(load64(scratch) - 2, load64(scratch + 8) - 2, 5, 5, COL_CORNER);
+        }
+    }
+    return;
+}
+
+// --- the handles ----------------------------------------------------------------
+//
+// Three arrows from the middle of what is picked, one along each axis. A
+// press on one's end (or near its shaft) drags what is picked along it, by
+// as much as the pointer moves along the arrow on the screen.
+
+int handle_col(int k) {
+    if (k == 0) { return 0xe04a3a; }
+    if (k == 1) { return 0x5ac85a; }
+    return 0x4a8ae8;
+}
+
+// Handle k's two ends on the screen, into out as x0 y0 x1 y1. Returns 0 when
+// there is nothing picked or it cannot be seen.
+int handle_ends(int k, int out) {
+    int c = alloc(24);
+    if (!picked_centre(c)) { dealloc(c); return 0; }
+    int p = alloc(48);
+    int ok = djup_project_point(cam, fb_w, fb_h, load64(c), load64(c + 8), load64(c + 16), p);
+    store64(out, load64(p));
+    store64(out + 8, load64(p + 8));
+    int hx = load64(c);
+    int hy = load64(c + 8);
+    int hz = load64(c + 16);
+    if (k == 0) { hx += HANDLE; }
+    if (k == 1) { hy += HANDLE; }
+    if (k == 2) { hz += HANDLE; }
+    if (ok) { ok = djup_project_point(cam, fb_w, fb_h, hx, hy, hz, p); }
+    store64(out + 16, load64(p));
+    store64(out + 24, load64(p + 8));
+    dealloc(p);
+    dealloc(c);
+    return ok;
+}
+
+void draw_handles() {
+    if (!sel_any()) { return; }
+    int e = alloc(32);
+    int k = 0;
+    for (k = 0; k < 3; k += 1) {
+        if (handle_ends(k, e)) {
+            int col = handle_col(k);
+            int x0 = load64(e);
+            int y0 = load64(e + 8);
+            int x1 = load64(e + 16);
+            int y1 = load64(e + 24);
+            djup_line(fb, fb_w, fb_h, x0, y0, x1, y1, col);
+            djup_line(fb, fb_w, fb_h, x0 + 1, y0, x1 + 1, y1, col);
+            box(x1 - 4, y1 - 4, 9, 9, col);
+        }
+    }
+    dealloc(e);
+    return;
+}
+
+// The handle whose end is within 8 pixels of (x, y), or -1.
+int handle_at(int x, int y) {
+    if (!sel_any()) { return 0 - 1; }
+    int e = alloc(32);
+    int best = 0 - 1;
+    int k = 0;
+    for (k = 0; k < 3; k += 1) {
+        if (handle_ends(k, e)) {
+            int dx = load64(e + 16) - x;
+            int dy = load64(e + 24) - y;
+            if (dx * dx + dy * dy <= 64) { best = k; }
+        }
+    }
+    dealloc(e);
+    return best;
+}
+
+int drag_handle = 0 - 1;   // the handle being dragged, or -1
+int drag_sx = 0;           // its arrow on the screen when the press came
+int drag_sy = 0;
+int drag_px = 0;           // where the press was
+int drag_py = 0;
+int drag_done = 0;         // how far it has moved what is picked, fixed point
+int drag_was_modified = 0; // whether there were unsaved changes before it
+
+void handle_press(int k, int x, int y) {
+    int e = alloc(32);
+    handle_ends(k, e);
+    drag_sx = load64(e + 16) - load64(e);
+    drag_sy = load64(e + 24) - load64(e + 8);
+    dealloc(e);
+    drag_handle = k;
+    drag_px = x;
+    drag_py = y;
+    drag_done = 0;
+    drag_was_modified = modified;
+    remember();
+    return;
+}
+
+// The pointer at (x, y) with a handle held. The pointer's way along the
+// arrow, against the arrow's own length on the screen, is how far along
+// the axis, in steps of GRID_SNAP.
+void handle_move(int x, int y) {
+    int l2 = drag_sx * drag_sx + drag_sy * drag_sy;
+    if (l2 < 4) { return; }
+    int along = (x - drag_px) * drag_sx + (y - drag_py) * drag_sy;
+    // along / l2 handle lengths, each HANDLE, in fixed point.
+    int want = along * HANDLE / l2;
+    want = (want / GRID_SNAP) * GRID_SNAP;
+    int d = want - drag_done;
+    if (d == 0) { return; }
+    if (drag_handle == 0) { shift_picked(d, 0, 0); }
+    if (drag_handle == 1) { shift_picked(0, d, 0); }
+    if (drag_handle == 2) { shift_picked(0, 0, d); }
+    drag_done = want;
+    return;
+}
+
+void render() {
+    box(0, 0, fb_w, fb_h, COL_BG);
+    floor_grid();
+    djup_render(mesh, fb, fb_w, fb_h, cam, zbuf, idbuf);
+    if (wire) {
+        djup_wire_z(mesh, fb, fb_w, fb_h, cam, zbuf, COL_EDGE);
+        draw_corners();
+    }
+    draw_pick();
+    draw_handles();
+
+    box(0, 0, fb_w, cell_h, COL_BAR);
+    int x = 0;
+    if (name) { x = text(cell_w, 0, name, COL_TEXT); }
+    else { x = text(cell_w, 0, "unnamed", COL_DIM); }
+    if (modified) { text(x + cell_w, 0, "*", COL_KEY); }
+    int info = alloc(64);
+    int k = 0;
+    int parts = 0;
+    for (parts = 0; parts < 4; parts += 1) {
+        int s = num(mesh.dh_verts);
+        if (parts == 1) { s = " corners  "; }
+        if (parts == 2) { s = num(mesh.dh_faces); }
+        if (parts == 3) { s = " faces"; }
+        int i = 0;
+        while (s[i]) { info[k] = s[i]; k += 1; i += 1; }
+    }
+    info[k] = 0;
+    text(fb_w - (k + 1) * cell_w, 0, info, COL_DIM);
+    dealloc(info);
+
+    int by = fb_h - cell_h;
+    box(0, by, fb_w, cell_h, COL_BAR);
+    x = cell_w;
+    if (naming) {
+        nbuf[nlen] = 0;
+        x = text(x, by, "save as ", COL_KEY);
+        x = text(x, by, nbuf, COL_TEXT);
+        box(x, by, cell_w / 2, cell_h, COL_TEXT);
+        x += cell_w * 3;
+        x = hint(x, by, "Enter", "save");
+        hint(x, by, "Esc", "keep working");
+    } else if (asking) {
+        x = text(x, by, "unsaved changes", COL_WARN);
+        x += cell_w * 3;
+        x = hint(x, by, "F2", "save and quit");
+        x = hint(x, by, "Alt+W", "quit without saving");
+        hint(x, by, "Esc", "keep working");
+    } else if (message) {
+        int c = COL_TEXT;
+        if (message_warn) { c = COL_WARN; }
+        text(x, by, message, c);
+    } else if (sel_any()) {
+        x = hint(x, by, "handles", "move");
+        x = hint(x, by, "e", "pull out");
+        x = hint(x, by, "= -", "scale");
+        x = hint(x, by, "m", "mirror");
+        x = hint(x, by, "d", "copy");
+        x = hint(x, by, "g", "grid");
+        x = hint(x, by, "1-9", "colour");
+        x = hint(x, by, "Del", "take away");
+        x = hint(x, by, "Shift+click", "add");
+        hint(x, by, "Esc", "pick nothing");
+    } else {
+        x = hint(x, by, "drag", "turn");
+        x = hint(x, by, "wheel", "zoom");
+        x = hint(x, by, "click", "pick");
+        if (pick_tri) { x = hint(x, by, "t", "triangles"); } else { x = hint(x, by, "t", "sides"); }
+        x = hint(x, by, "Tab", "next side");
+        x = hint(x, by, "n", "cube");
+        x = hint(x, by, "F2", "save");
+        hint(x, by, "^Z", "undo");
+    }
+    present(fb);
+    return;
+}
+
+// --- input ----------------------------------------------------------------------
+
+// The corner within 6 pixels of (x, y), nearest first, or -1.
+int corner_at(int x, int y) {
+    int best = 0 - 1;
+    int bestd = 37;
+    int i = 0;
+    for (i = 0; i < mesh.dh_verts; i += 1) {
+        if (djup_project(mesh, cam, fb_w, fb_h, i, scratch)) {
+            int dx = load64(scratch) - x;
+            int dy = load64(scratch + 8) - y;
+            if (dx * dx + dy * dy < bestd) { bestd = dx * dx + dy * dy; best = i; }
+        }
+    }
+    return best;
+}
+
+// A click at (x, y). It picks the corner there, or else the side (or the
+// triangle) there, instead of what was picked, or with `add` as well as it,
+// or not any more when it already was.
+void click(int x, int y, int add) {
+    message = 0;
+    if (!add) { sel_clear(); }
+    int c = corner_at(x, y);
+    if (c >= 0) {
+        vsel[c] = 1 - vsel[c];
+        return;
+    }
+    if (x >= 0 && y >= 0 && x < fb_w && y < fb_h) {
+        int id = load32(idbuf + (y * fb_w + x) * 4);
+        if (id > 0) {
+            sel_face(id - 1, 1 - fsel[id - 1]);
+            return;
+        }
+    }
+    return;
+}
+
+int save() {
+    if (!name) {
+        naming = 1;
+        nlen = 0;
+        return 0;
+    }
+    if (djup_save(mesh, name) == 1) {
+        modified = 0;
+        say("saved", 0);
+        return 1;
+    }
+    say("could not save, is the folder there?", 1);
+    return 0;
+}
+
+// The arrows, turned to the floor axis nearest the camera's own left-right
+// and near-far.
+void arrow(int make, int shift) {
+    if (!sel_any()) {
+        if (make == 75) { cam.dc_yaw -= 32; }
+        if (make == 77) { cam.dc_yaw += 32; }
+        if (make == 72 && cam.dc_pitch < 224) { cam.dc_pitch += 32; }
+        if (make == 80 && cam.dc_pitch > 0 - 224) { cam.dc_pitch -= 32; }
+        return;
+    }
+    if (shift && (make == 72 || make == 80)) {
+        if (make == 72) { move_picked(0, STEP, 0); } else { move_picked(0, 0 - STEP, 0); }
+        return;
+    }
+    int rx = 0;
+    int rz = 0;
+    rx, rz = floor_right();
+    // Away from the camera, a quarter turn from right.
+    int ax = 0 - rz;
+    int az = rx;
+    if (make == 77) { move_picked(rx * STEP, 0, rz * STEP); }
+    if (make == 75) { move_picked(0 - rx * STEP, 0, 0 - rz * STEP); }
+    if (make == 72) { move_picked(ax * STEP, 0, az * STEP); }
+    if (make == 80) { move_picked(0 - ax * STEP, 0, 0 - az * STEP); }
+    return;
+}
+
+// A key while the bottom line asks for a name. Returns 1 when form should
+// quit. A name without an ending gets .form.
+int naming_key(int make, int shift) {
+    if (make == 1) { naming = 0; naming_quit = 0; return 0; }
+    if (make == 14) { if (nlen > 0) { nlen -= 1; } return 0; }
+    if (make == 28) {
+        if (nlen == 0) { return 0; }
+        nbuf[nlen] = 0;
+        int dot = 0;
+        int i = 0;
+        for (i = 0; i < nlen; i += 1) { if (nbuf[i] == '.') { dot = 1; } }
+        int n = alloc(nlen + 6);
+        if (!n) { return 0; }
+        for (i = 0; i <= nlen; i += 1) { n[i] = nbuf[i]; }
+        if (!dot) {
+            int ending = ".form";
+            for (i = 0; i < 6; i += 1) { n[nlen + i] = ending[i]; }
+        }
+        name = n;
+        naming = 0;
+        if (save() && naming_quit) { return 1; }
+        naming_quit = 0;
+        return 0;
+    }
+    int ch = key_char(make, shift);
+    if (ch > 32 && ch < 127 && nlen < 60) { nbuf[nlen] = ch; nlen += 1; }
+    return 0;
+}
+
+// One key going down. Returns 1 when form should quit.
+int key(int make, int ctrl, int shift) {
+    // Alt+W quits, and asks first when there are unsaved changes. Asked, a
+    // second Alt+W quits without saving.
+    if (make == KEY_CLOSE) {
+        naming = 0;
+        naming_quit = 0;
+        if (asking || !modified) { return 1; }
+        asking = 1;
+        return 0;
+    }
+    message = 0;
+    if (naming) { return naming_key(make, shift); }
+    if (asking) {
+        if (make == 1) { asking = 0; }
+        if (make == 60) {
+            asking = 0;
+            if (save()) { return 1; }
+            if (naming) { naming_quit = 1; }
+        }
+        return 0;
+    }
+    if (make == 60) { save(); return 0; }
+    if (ctrl) {
+        if (make == 44) { step_undo(1); }
+        if (make == 21) { step_undo(0); }
+        return 0;
+    }
+    if (make == 1) { sel_clear(); }
+    if (make == 20) {
+        pick_tri = 1 - pick_tri;
+        if (pick_tri) { say("a click picks one triangle", 0); }
+        else { say("a click picks a side, both its triangles", 0); }
+    }
+    if (make == 15 && mesh.dh_faces > 0) {
+        // On past the partner, so a square side is one press.
+        int nxt = (last_face + 1) % mesh.dh_faces;
+        if (!pick_tri && last_face >= 0 && nxt == partner(last_face)) {
+            nxt = (nxt + 1) % mesh.dh_faces;
+        }
+        sel_clear();
+        sel_face(nxt, 1);
+    }
+    if (make >= 72 && make <= 80 && make != 73 && make != 79 && make != 76 && make != 78
+        && make != 74) {
+        arrow(make, shift);
+    }
+    if (make == 73 && cam.dc_dist > 2 * DJUP_ONE) { cam.dc_dist = cam.dc_dist * 4 / 5; }
+    if (make == 81 && cam.dc_dist < 60 * DJUP_ONE) { cam.dc_dist = cam.dc_dist * 5 / 4; }
+    if (make == 18) { extrude(); }
+    if (make == 13) { scale_picked(5, 4); }
+    if (make == 12) { scale_picked(4, 5); }
+    if (make == 50) { mirror(); }
+    if (make == 32) { duplicate(); }
+    if (make == 34) { snap_picked(); }
+    if (make == 17) { wire = !wire; }
+    if (make >= 2 && make <= 10) { colour_picked(palette(make - 1)); }
+    if (make == 83) { delete_picked(); }
+    if (make == 49) {
+        remember();
+        if (djup_add_cube(mesh, cam.dc_x, cam.dc_y, cam.dc_z, DJUP_ONE / 2, palette(8)) < 0) {
+            say("no room for another cube", 1);
+        }
+    }
+    return 0;
+}
+
+int main() {
+    int wi = win_info();
+    if (!wi) {
+        print("form: no window, run me with start form.elf name.form\n");
+        return 2;
+    }
+    djup_init();
+    int wm = win_max();
+    fb_max_w = wm >> 16;
+    fb_max_h = wm & 65535;
+    fb = alloc(fb_max_w * fb_max_h * 4);
+    zbuf = alloc(fb_max_w * fb_max_h * 4);
+    idbuf = alloc(fb_max_w * fb_max_h * 4);
+    numbuf = alloc(24);
+    scratch = alloc(96);
+    nbuf = alloc(64);
+    fsel = alloc(FCAP);
+    vsel = alloc(VCAP);
+    undo = alloc(UNDO_MAX * 8);
+    redo = alloc(UNDO_MAX * 8);
+    cam = alloc(sizeof(DjupCam));
+    if (!fb || !zbuf || !idbuf || !numbuf || !scratch || !undo || !redo || !cam || !nbuf || !fsel || !vsel) { return 3; }
+    sel_clear();
+    if (font_init() == 0) { return 4; }
+    close_key(1);
+    if (argc() >= 2) {
+        name = dup(argv(1));
+        mesh = djup_load(name, VCAP, FCAP);
+    }
+    if (!mesh && !name) {
+        mesh = djup_new(VCAP, FCAP);
+        djup_add_cube(mesh, 0, 0, 0, DJUP_ONE, palette(5));
+        say("a new model, F2 saves it under a name", 0);
+    }
+    if (!mesh) {
+        mesh = djup_new(VCAP, FCAP);
+        djup_add_cube(mesh, 0, 0, 0, DJUP_ONE, palette(5));
+        int there = open_read(name);
+        if (there >= 0) {
+            close(there);
+            say("this file is not one form can open, F2 would replace it", 1);
+        } else {
+            say("a new model, one cube to start from", 0);
+        }
+    }
+    cam.dc_yaw = 96;
+    cam.dc_pitch = 80;
+    cam.dc_dist = 7 * DJUP_ONE;
+    cam.dc_x = 0;
+    cam.dc_y = 0;
+    cam.dc_z = 0;
+
+    int dirty = 1;
+    int ctrl = 0;
+    int shift = 0;
+    int held = 0;
+    int dragged = 0;
+    int press_x = 0;
+    int press_y = 0;
+    int last_x = 0;
+    int last_y = 0;
+    while (1) {
+        int w = win_info();
+        int ww = w >> 16;
+        int wh = w & 65535;
+        if (ww > fb_max_w) { ww = fb_max_w; }
+        if (wh > fb_max_h) { wh = fb_max_h; }
+        if (ww != fb_w || wh != fb_h) { fb_w = ww; fb_h = wh; dirty = 1; }
+
+        int m = mouse_poll();
+        if (m >= 0) {
+            int left = m % 2;
+            int mx = (m / 8) / 1024;
+            int my = (m / 8) % 1024;
+            if (left && !held) {
+                held = 1;
+                dragged = 0;
+                press_x = mx;
+                press_y = my;
+                int hk = handle_at(mx, my);
+                if (hk >= 0) { handle_press(hk, mx, my); }
+            } else if (left && held && drag_handle >= 0) {
+                handle_move(mx, my);
+                dragged = 1;
+                dirty = 1;
+            } else if (left && held) {
+                if (mx - press_x > 3 || press_x - mx > 3 || my - press_y > 3 || press_y - my > 3) {
+                    dragged = 1;
+                }
+                if (dragged && (mx != last_x || my != last_y)) {
+                    cam.dc_yaw += (mx - last_x) * 2;
+                    cam.dc_pitch += (my - last_y) * 2;
+                    if (cam.dc_pitch > 240) { cam.dc_pitch = 240; }
+                    if (cam.dc_pitch < 0 - 240) { cam.dc_pitch = 0 - 240; }
+                    dirty = 1;
+                }
+            } else if (!left && held) {
+                held = 0;
+                if (drag_handle >= 0) {
+                    // A press on a handle that went nowhere took a step of
+                    // undo for nothing, give it back.
+                    if (drag_done == 0) { forget(drag_was_modified); }
+                    drag_handle = 0 - 1;
+                } else if (!dragged && !asking) {
+                    click(press_x, press_y, shift);
+                }
+                dirty = 1;
+            }
+            last_x = mx;
+            last_y = my;
+        } else {
+            held = 0;
+        }
+
+        // The wheel, towards the user further away, away from them nearer.
+        int wz = wheel();
+        while (wz > 0 && cam.dc_dist < 60 * DJUP_ONE) {
+            cam.dc_dist = cam.dc_dist * 9 / 8;
+            wz -= 1;
+            dirty = 1;
+        }
+        while (wz < 0 && cam.dc_dist > 2 * DJUP_ONE) {
+            cam.dc_dist = cam.dc_dist * 8 / 9;
+            wz += 1;
+            dirty = 1;
+        }
+
+        int k = key_poll();
+        while (k >= 0) {
+            int make = k / 2;
+            int down = k % 2 == 0;
+            if (make == 29) {
+                ctrl = down;
+            } else if (make == 42 || make == 54) {
+                shift = down;
+            } else if (down) {
+                if (key(make, ctrl, shift) == 1) { exit_close(0); }
+                dirty = 1;
+            }
+            k = key_poll();
+        }
+        if (dirty && fb_w > 0 && fb_h > 0) {
+            render();
+            dirty = 0;
+        } else {
+            sleep(1);
+        }
+    }
+    return 0;
+}

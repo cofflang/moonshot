@@ -1,0 +1,519 @@
+// raket.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+// raket.c0 -- the init system. Gates every shell session behind a login
+// prompt (username, then password) before handing control to skalman's
+// interactive shell, instead of booting straight into an already-logged-in
+// root shell. Named for the boot sequence's own "moonshot" theme -- raket
+// (Swedish for "rocket") is what launches everything else.
+//
+// Deliberately NOT a separate task, since shell_task (skalman.c0) already owns
+// the per-session input loop (block on empty queue, dequeue a char, hand it
+// to a line-buffer-driven handler on Enter), and every character's
+// echo/backspace/history/tab-complete mechanics are identical whether the
+// line being typed is a login field or a shell command. Rather than
+// duplicating that machinery in a second task, shell_input (skalman.c0)
+// checks raket_authed_base and routes a completed line to raket_login_line
+// below instead of shell_run, right up until the session authenticates.
+
+// Per-session state, KAKEL_MAX_WIN-sized parallel arrays -- same idiom as
+// skalman's sk_uid_base/sk_cwd_base. raket_authed_base is 0 while still at
+// the login prompt, 1 once authenticated and handed off to the shell.
+// raket_stage_base says which field is currently being typed (username or
+// password). raket_pending_uid_base is the uid matched from the typed
+// username, kept around across the username->password exchange so the
+// password stage does not need a second lookup, and reset to -1 on any
+// failure so a stale match can never leak into the next attempt.
+int raket_authed_base = 0;
+int raket_stage_base = 0;
+int raket_pending_uid_base = 0;
+
+int raket_user = -1;        // the user logged in on the screen, or -1
+int RAKET_STAGE_USER = 0;
+int RAKET_STAGE_PASS = 1;
+
+void raket_init() {
+    raket_authed_base = kmalloc(KAKEL_MAX_WIN * 8);
+    raket_stage_base = kmalloc(KAKEL_MAX_WIN * 8);
+    raket_pending_uid_base = kmalloc(KAKEL_MAX_WIN * 8);
+    int i = 0;
+    for (i = 0; i < KAKEL_MAX_WIN; i += 1) {
+        store64(raket_authed_base + i * 8, 0);
+        store64(raket_stage_base + i * 8, RAKET_STAGE_USER);
+        store64(raket_pending_uid_base + i * 8, 0 - 1);
+    }
+    return;
+}
+
+// Returns session f to a fresh, unauthenticated state. Called from
+// kakel_win_new, so every newly allocated window slot starts at the login
+// prompt.
+//
+// This exists because window ids are REUSED. Closing the last window frees
+// its slot and immediately allocates a replacement, which gets the same id
+// back -- and every per-session array here is indexed by window id. Without
+// this reset the replacement would inherit `authed = 1` from the session that was
+// just closed, so `close` on the last window would hand back a shell that is
+// already logged in, straight past the gate raket exists to be.
+//
+// skalman's own per-session state is reset to the same defaults shell_init
+// uses (uid 0, cwd at root) rather than left alone. A successful login always
+// writes sk_uid_base, so uid would be corrected anyway -- but nothing rewrites
+// sk_cwd_base, and a stale cwd is a jakel node id that the previous session
+// may since have removed.
+//
+// Guarded the same way raket_authed is, since kakel_init allocates window 0 before
+// raket_init and shell_init have allocated any of these arrays, and storing
+// through a null base would write straight to physical address 0.
+void raket_reset_session(int f) {
+    // Once a user has logged in on the screen, a new window is theirs.
+    int who = 0;
+    int authed = 0;
+    if (raket_user >= 0) { who = raket_user; authed = 1; }
+    if (raket_authed_base != 0) {
+        store64(raket_authed_base + f * 8, authed);
+        store64(raket_stage_base + f * 8, RAKET_STAGE_USER);
+        store64(raket_pending_uid_base + f * 8, 0 - 1);
+    }
+    if (sk_uid_base != 0) { store64(sk_uid_base + f * 8, who); }
+    if (sk_cwd_base != 0) { store64(sk_cwd_base + f * 8, 0); }
+    return;
+}
+
+// True once session f has logged in -- shell_input (skalman.c0) checks
+// this on every completed line to decide whether it goes to raket or to
+// the real shell. Guards against calls before raket_init() has allocated
+// the arrays (a stray keypress right at boot, before shell_init has run --
+// the same early-key race shell_enqueue already guards against).
+int raket_authed(int f) {
+    if (!raket_authed_base) { return 0; }
+    return load64(raket_authed_base + f * 8);
+}
+
+// Whether session f's next typed character should be masked ('*' instead
+// of the real glyph) as it echoes to the screen -- true only while at
+// raket's password stage. keyboard_handler (keyboard.c0) checks this at
+// echo time; the real character still reaches shell_input/raket_login_line
+// unmasked via the ordinary input queue, only the ON-SCREEN glyph differs.
+int raket_should_mask(int f) {
+    if (!raket_authed_base) { return 0; }
+    if (load64(raket_authed_base + f * 8) == 1) { return 0; }
+    if (load64(raket_stage_base + f * 8) != RAKET_STAGE_PASS) { return 0; }
+    return 1;
+}
+
+// Prints the login prompt appropriate to session f's current stage. Called
+// once when raket takes over a fresh session and again after every failed
+// or partial attempt.
+void raket_prompt(int f) {
+    int stage = load64(raket_stage_base + f * 8);
+    if (kakel_active == 1) {
+        if (stage == RAKET_STAGE_USER) {
+            kakel_print(f, "moonshot login: ");
+        } else {
+            kakel_print(f, "password: ");
+        }
+        // Record where typed input begins, exactly as shell_prompt_win does.
+        // Without this the login and password prompts inherited whatever
+        // column the previous prompt left behind, and the keyboard ISR's
+        // backspace guard (keyboard.c0, "col > prompt col") let backspace
+        // chew straight through "moonshot login: " / "password: " itself.
+        store64(kakel_prompt_col_base + f * 8,
+                load64(kakel_col_base + f * 8));
+    } else {
+        if (stage == RAKET_STAGE_USER) {
+            sk_print("moonshot login: ");
+        } else {
+            sk_print("password: ");
+        }
+    }
+    return;
+}
+
+// Called from shell_input's Enter handler (skalman.c0), instead of
+// shell_run, while session f is not yet authenticated. `line` is the
+// just-typed field, a username at RAKET_STAGE_USER, a password at
+// RAKET_STAGE_PASS. Deliberately does not touch sk_hist_buf -- a typed
+// password has no business sitting in shell command history.
+void raket_login_line(int f, int line) {
+    int stage = load64(raket_stage_base + f * 8);
+
+    if (stage == RAKET_STAGE_USER) {
+        // An unknown username still advances to the password stage (rather
+        // than failing immediately) so a failed login cannot be used to
+        // enumerate which usernames exist -- the SAME timing/shape of
+        // interaction either way. raket_pending_uid_base stays -1 for an
+        // unknown name, so the password stage below always rejects it,
+        // regardless of what gets typed.
+        int uid = sk_user_lookup(line);
+        serial_print("[raket] session ");
+        serial_print_int(f);
+        serial_print(" username='");
+        serial_print(line);
+        serial_print("' uid=");
+        serial_print_int(uid);
+        serial_print("\n");
+        store64(raket_pending_uid_base + f * 8, uid);
+        store64(raket_stage_base + f * 8, RAKET_STAGE_PASS);
+        if (kakel_active == 1) { kakel_print(f, "\n"); } else { sk_print("\n"); }
+        raket_prompt(f);
+        return;
+    }
+
+    // Password stage. An account with NO password set (sk_user_has_pass ==
+    // 0 -- true for root/guest on a fresh boot, since nothing has ever
+    // called `passwd`) logs in on an EMPTY password line only, since there is
+    // nothing to check, so the trivial response is what is accepted, not
+    // "any string works." This is also what makes first boot possible at
+    // all -- `passwd` itself is a shell command, unreachable before login.
+    int uid = load64(raket_pending_uid_base + f * 8);
+    int ok = 0;
+    if (uid >= 0) {
+        if (sk_user_has_pass(uid) == 0) {
+            if (load8(line) == 0) { ok = 1; }
+        } else {
+            ok = sk_user_check_pass(uid, line);
+        }
+    }
+
+    serial_print("[raket] session ");
+    serial_print_int(f);
+    serial_print(" password check uid=");
+    serial_print_int(uid);
+    serial_print(" ok=");
+    serial_print_int(ok);
+    serial_print("\n");
+    if (ok == 1) {
+        store64(sk_uid_base + f * 8, uid);
+        jakel_current_uid = uid;
+        store64(raket_authed_base + f * 8, 1);
+        store64(raket_stage_base + f * 8, RAKET_STAGE_USER);
+        store64(raket_pending_uid_base + f * 8, 0 - 1);
+        if (kakel_active == 1) {
+            kakel_print(f, "\nlogin correct.\n\ntype 'help' for commands.\n");
+        } else {
+            sk_print("\nlogin correct.\n\ntype 'help' for commands.\n");
+        }
+        shell_prompt_win(f);
+        if (!kakel_active) { shell_prompt(); }
+    } else {
+        store64(raket_stage_base + f * 8, RAKET_STAGE_USER);
+        store64(raket_pending_uid_base + f * 8, 0 - 1);
+        if (kakel_active == 1) {
+            kakel_print(f, "\nlogin incorrect\n\n");
+        } else {
+            sk_print("\nlogin incorrect\n\n");
+        }
+        raket_prompt(f);
+    }
+    return;
+}
+
+// --- the login screen ------------------------------------------------------------
+//
+// With windows (kakel), the login is the whole screen rather than a prompt in
+// each window. kakel_locked hides every window, so nothing else draws, and
+// every key comes here (keyboard.c0) until a user logs in. Then all sessions
+// are that user's, and so is every window opened afterwards. Alt+L locks the
+// screen again, everything still running behind it, and only the same user's
+// password opens it. The text prompt in each window stays for the screen
+// without windows (VGA).
+
+int lock_name = 0;          // what is typed, 32 and 64 bytes
+int lock_pass = 0;
+int lock_name_n = 0;
+int lock_pass_n = 0;
+int lock_field = 0;         // 0 the username, 1 the password
+int lock_wrong = 0;
+
+// The block the screen's text sits in, centred. Nothing is drawn for it, the
+// whole screen is one colour.
+int LOCK_W = 360;
+int LOCK_H = 200;
+
+int lock_bufs() {
+    if (!lock_name) {
+        lock_name = kmalloc(33);
+        lock_pass = kmalloc(65);
+    }
+    return lock_name != 0 && lock_pass != 0;
+}
+
+int lock_bg() { return fb_rgb(28, 40, 56); }
+int lock_field_bg() { return fb_rgb(16, 24, 32); }
+int lock_text_fg() { return fb_rgb(224, 228, 232); }
+int lock_dim_fg() { return fb_rgb(150, 160, 176); }
+int lock_x() { return (fb_width - LOCK_W) / 2 + 40; }
+int lock_y() { return (fb_height - LOCK_H) / 2; }
+int lock_fw() { return LOCK_W - 80; }
+// The top of field 0 (username) or 1 (password).
+int lock_field_y(int field) { return lock_y() + 86 + field * 38; }
+
+// One character of the kernel font at (x, y), each pixel a square of `scale`.
+void lock_char(int x, int y, int ch, int fg, int scale) {
+    int hi = font_hi(ch);
+    int lo = font_lo(ch);
+    int row = 0;
+    for (row = 0; row < 8; row += 1) {
+        int bits = 0;
+        if (row < 4) { bits = (hi >> ((3 - row) * 8)) & 255; }
+        else { bits = (lo >> ((7 - row) * 8)) & 255; }
+        int col = 0;
+        for (col = 0; col < 8; col += 1) {
+            if (((bits >> (7 - col)) & 1) == 1) {
+                fb_fill_rect(x + col * scale, y + row * scale, scale, scale, fg);
+            }
+        }
+    }
+    return;
+}
+
+void lock_text(int x, int y, int s, int fg, int scale) {
+    int i = 0;
+    while (load8(s + i) != 0) {
+        lock_char(x + i * 8 * scale, y, load8(s + i), fg, scale);
+        i += 1;
+    }
+    return;
+}
+
+// A line of text at the normal size with its own background, over
+// whatever was there, every pixel written once. `cells` is how many
+// character cells the line owns, so a shorter text clears the rest.
+void lock_line(int x, int y, int s, int fg, int cells) {
+    int i = 0;
+    while (s != 0 && load8(s + i) != 0 && i < cells) {
+        fb_draw_char(x + i * 8, y, load8(s + i), fg, lock_bg());
+        i += 1;
+    }
+    if (i < cells) { fb_fill_rect(x + i * 8, y, (cells - i) * 8, 8, lock_bg()); }
+    return;
+}
+
+int lock_len(int s) {
+    int n = 0;
+    while (load8(s + n) != 0) { n += 1; }
+    return n;
+}
+
+// One field, its frame and what is typed in it. Every pixel is written
+// once with its final colour, nothing is cleared first, so typing never
+// shows a blank field for a moment.
+void lock_field_paint(int field) {
+    int x = lock_x();
+    int y = lock_field_y(field);
+    int w = lock_fw();
+    int edge = fb_rgb(70, 86, 108);
+    if (lock_field == field) { edge = fb_rgb(255, 180, 60); }
+    fb_fill_rect(x, y, w, 1, edge);
+    fb_fill_rect(x, y + 13, w, 1, edge);
+    fb_fill_rect(x, y + 1, 1, 12, edge);
+    fb_fill_rect(x + w - 1, y + 1, 1, 12, edge);
+    int fbg = lock_field_bg();
+    int fg = lock_text_fg();
+    fb_fill_rect(x + 1, y + 1, w - 2, 2, fbg);
+    fb_fill_rect(x + 1, y + 11, w - 2, 2, fbg);
+    fb_fill_rect(x + 1, y + 3, 3, 8, fbg);
+    int cells = (w - 8) / 8;
+    int i = 0;
+    if (field == 0) {
+        for (i = 0; i < lock_name_n && i < cells; i += 1) {
+            fb_draw_char(x + 4 + i * 8, y + 3, load8(lock_name + i), fg, fbg);
+        }
+    } else {
+        // A dot per character, its cell drawn in pieces that do not overlap.
+        for (i = 0; i < lock_pass_n && i < cells; i += 1) {
+            int cx = x + 4 + i * 8;
+            fb_fill_rect(cx, y + 3, 8, 2, fbg);
+            fb_fill_rect(cx, y + 5, 2, 4, fbg);
+            fb_fill_rect(cx + 2, y + 5, 4, 4, fg);
+            fb_fill_rect(cx + 6, y + 5, 2, 4, fbg);
+            fb_fill_rect(cx, y + 9, 8, 2, fbg);
+        }
+    }
+    fb_fill_rect(x + 4 + i * 8, y + 3, w - 5 - 4 - i * 8, 8, fbg);
+    return;
+}
+
+void lock_status_paint() {
+    int x = lock_x();
+    int y = lock_y() + 162;
+    if (lock_wrong) {
+        lock_line(x, y, "wrong username or password", fb_rgb(255, 122, 106), lock_fw() / 8);
+    } else {
+        lock_line(x, y, 0, 0, lock_fw() / 8);
+    }
+    return;
+}
+
+// What changes with a key, the two fields and the line under them.
+void raket_lock_refresh() {
+    if (kakel_active != 1 || lock_bufs() == 0) { return; }
+    lock_field_paint(0);
+    lock_field_paint(1);
+    lock_status_paint();
+    return;
+}
+
+void raket_lock_draw() {
+    if (kakel_active != 1 || lock_bufs() == 0) { return; }
+    fb_fill_rect(0, 0, fb_width, fb_height, lock_bg());
+    int x = lock_x();
+    int y = lock_y();
+    int text = lock_text_fg();
+    int dim = lock_dim_fg();
+    lock_text((fb_width - 8 * 3 * 8) / 2, y + 18, "moonshot", text, 3);
+    if (raket_user >= 0) {
+        lock_text((fb_width - 6 * 8) / 2, y + 50, "locked", dim, 1);
+    }
+    lock_text(x, lock_field_y(0) - 12, "username", dim, 1);
+    lock_text(x, lock_field_y(1) - 12, "password", dim, 1);
+    lock_text((fb_width - 44 * 8) / 2, y + LOCK_H - 14, "Tab or a click switches field, Enter logs in", dim, 1);
+    raket_lock_refresh();
+    return;
+}
+
+// Shows the windows again after a login, each session that user's.
+void raket_unlock() {
+    kakel_locked = 0;
+    lock_pass_n = 0;
+    lock_wrong = 0;
+    fb_fill_rect(0, 0, fb_width, fb_height, fb_rgb(0, 0, 0));
+    kakel_reflow();
+    kakel_nudge_live();
+    kakel_paint_titles();
+    stats_last_secs = 0 - 1;
+    shell_reprompt_others(0 - 1);
+    shell_prompt_session(kakel_focus);
+    return;
+}
+
+void raket_lock_try() {
+    store8(lock_name + lock_name_n, 0);
+    store8(lock_pass + lock_pass_n, 0);
+    int uid = sk_user_lookup(lock_name);
+    int ok = 0;
+    if (uid >= 0 && (raket_user < 0 || uid == raket_user)) {
+        if (sk_user_has_pass(uid) == 0) {
+            if (lock_pass_n == 0) { ok = 1; }
+        } else {
+            ok = sk_user_check_pass(uid, lock_pass);
+        }
+    }
+    serial_print("[raket] screen login username='");
+    serial_print(lock_name);
+    serial_print("' uid=");
+    serial_print_int(uid);
+    serial_print(" ok=");
+    serial_print_int(ok);
+    serial_print("\n");
+    lock_pass_n = 0;
+    if (!ok) {
+        lock_wrong = 1;
+        lock_field = 1;
+        raket_lock_refresh();
+        return;
+    }
+    // The first login of the boot starts every shell window clean, since
+    // what boot wrote into them behind the screen (the text login's prompt)
+    // means nothing now. Unlocking after Alt+L keeps everything.
+    if (raket_user < 0) {
+        int sw = 0;
+        for (sw = 0; sw < KAKEL_MAX_WIN; sw += 1) {
+            if (load64(kakel_rows_base + sw * 8) > 0 && kakel_is_tavla(sw) == 0
+                && sw != kakel_stats_win) {
+                kakel_clear(sw);
+            }
+        }
+    }
+    if (raket_user < 0) {
+        shell_autostart_pending = 1;
+        if (shell_task_id >= 0) { task_wake(shell_task_id); }
+    }
+    raket_user = uid;
+    jakel_current_uid = uid;
+    int w = 0;
+    for (w = 0; w < KAKEL_MAX_WIN; w += 1) {
+        store64(raket_authed_base + w * 8, 1);
+        store64(raket_stage_base + w * 8, RAKET_STAGE_USER);
+        store64(raket_pending_uid_base + w * 8, 0 - 1);
+        store64(sk_uid_base + w * 8, uid);
+    }
+    raket_unlock();
+    return;
+}
+
+// A key while the screen is locked, from keyboard_handler.
+void raket_lock_key(int make, int ascii) {
+    if (lock_bufs() == 0) { return; }
+    if (make == 15 || make == 0x48 || make == 0x50) {
+        // Tab, or up or down, between the fields, unless a user is locked
+        // out, whose name stays what it is.
+        if (raket_user < 0) {
+            if (make == 0x48) { lock_field = 0; }
+            else if (make == 0x50) { lock_field = 1; }
+            else { lock_field = 1 - lock_field; }
+        }
+    } else if (ascii == 8) {
+        if (lock_field == 0 && lock_name_n > 0) { lock_name_n -= 1; }
+        if (lock_field == 1 && lock_pass_n > 0) { lock_pass_n -= 1; }
+    } else if (ascii == '\n') {
+        if (lock_field == 0) {
+            if (lock_name_n > 0) { lock_field = 1; }
+        } else {
+            raket_lock_try();
+            return;
+        }
+    } else if (ascii >= 32 && ascii < 127) {
+        lock_wrong = 0;
+        if (lock_field == 0 && lock_name_n < 32) {
+            store8(lock_name + lock_name_n, ascii);
+            lock_name_n += 1;
+        }
+        if (lock_field == 1 && lock_pass_n < 64) {
+            store8(lock_pass + lock_pass_n, ascii);
+            lock_pass_n += 1;
+        }
+    }
+    raket_lock_refresh();
+    return;
+}
+
+// A left click while the screen is locked, from kakel_click. A click on a
+// field moves the typing there.
+void raket_lock_click(int px, int py) {
+    if (lock_bufs() == 0 || raket_user >= 0) { return; }
+    int x = lock_x();
+    int f = 0;
+    for (f = 0; f < 2; f += 1) {
+        int y = lock_field_y(f);
+        if (px >= x && px < x + lock_fw() && py >= y - 2 && py < y + 16) {
+            lock_field = f;
+            raket_lock_refresh();
+        }
+    }
+    return;
+}
+
+// Alt+L. The screen locks for the user logged in.
+void raket_lock() {
+    if (kakel_active != 1 || raket_user < 0 || lock_bufs() == 0) { return; }
+    kakel_locked = 1;
+    int name = sk_user_name(raket_user);
+    lock_name_n = 0;
+    while (name && load8(name + lock_name_n) != 0 && lock_name_n < 32) {
+        store8(lock_name + lock_name_n, load8(name + lock_name_n));
+        lock_name_n += 1;
+    }
+    lock_pass_n = 0;
+    lock_field = 1;
+    lock_wrong = 0;
+    serial_print("[raket] screen locked\n");
+    raket_lock_draw();
+    return;
+}

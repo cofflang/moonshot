@@ -87,6 +87,6 @@ case "${1:-}" in
     ./build.sh
     echo
     echo "sync_utsikt.sh: utsikt $ref is in $prefix and built into the kernel."
-    echo "Run the verify_utsikt*.sh tests."
+    echo "Run tests/verify_utsikt*.sh."
     ;;
 esac

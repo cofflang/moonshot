@@ -1,0 +1,188 @@
+// expect: 20
+// noter -- lira's song format (programs/lib/noter.c0) and writefile()
+// (SYS_WRITEFILE 15) on real moonshot. Each check that holds adds one, so the
+// exit code counts them.
+include "noter.c0";
+
+// 1 when the n bytes at a and b are the same.
+int same(int a, int b, int n) {
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+    }
+    return 1;
+}
+
+int main() {
+    int ok = 0;
+    int s = noter_new(16, 4, 120);
+
+    // 1. Notes go in sorted by start, then pitch, whatever order they are
+    // added in, and a second note at the same start and pitch replaces the
+    // first rather than joining it.
+    noter_add(s, 16, 64, 4, 2, 100);
+    noter_add(s, 16, 60, 0, 4, 100);
+    noter_add(s, 16, 67, 0, 1, 90);
+    noter_add(s, 16, 60, 0, 2, 80);
+    int a = noter_note(s, 0);
+    int b = noter_note(s, 1);
+    int c = noter_note(s, 2);
+    if (noter_count(s) == 3 && a.nn_pitch == 60 && a.nn_length == 2
+        && a.nn_velocity == 80 && b.nn_pitch == 67 && c.nn_start == 4) { ok += 1; }
+
+    // 2. Fields the format cannot hold are refused.
+    if (noter_add(s, 16, 128, 0, 1, 100) == 0 - 1
+        && noter_add(s, 16, 60, 8, 0, 100) == 0 - 1
+        && noter_add(s, 16, 60, 8, 1, 0) == 0 - 1) { ok += 1; }
+
+    // 3. A click lands on the note sounding there, and only while it sounds.
+    if (noter_find(s, 60, 1) == 0 && noter_find(s, 60, 2) == 0 - 1
+        && noter_find(s, 64, 5) == 2) { ok += 1; }
+
+    // 4. Two notes overlap at step 0, one at step 4.
+    if (noter_voices(s, 0, 8) == 2 && noter_voices(s, 4, 4) == 1) { ok += 1; }
+
+    // 5. Saved into a directory, a path with a '/' in it, which readfile
+    // has to resolve to the file and not the directory.
+    if (noter_save(s, "test/song.not") == 1) { ok += 1; }
+    if (readfile("test/song.not", 0, 0) == sizeof(NoterHead) + 3 * 48) { ok += 1; }
+
+    // 6. Loaded back byte for byte, with room for the cap asked for.
+    int l = noter_load("test/song.not", 16);
+    if (l != 0 && same(l, s, sizeof(NoterHead) + 3 * 48) == 1) { ok += 1; }
+    if (l != 0 && noter_add(l, 16, 72, 8, 1, 100) == 3) { ok += 1; }
+    // Everything below builds on the loaded copy. Without one, stop here
+    // with the count so far rather than fault on a null buffer.
+    if (!l) { return ok; }
+
+    // 7. A shorter save makes the file shorter, since writefile replaces, it does
+    // not leave the previous tail behind.
+    noter_remove(s, 1);
+    noter_save(s, "test/song.not");
+    if (readfile("test/song.not", 0, 0) == sizeof(NoterHead) + 2 * 48) { ok += 1; }
+
+    // 8. Malformed files are refused, a wrong magic, notes out of order, a
+    // count that does not match the size, more notes than the cap.
+    int bad = alloc(sizeof(NoterHead) + 3 * 48);
+    int i = 0;
+    while (i < sizeof(NoterHead) + 3 * 48) { store8(bad + i, load8(l + i)); i += 1; }
+    bad.nh_count = 3;   // l has a fourth note by now; this copy holds three
+    store8(bad, 'N');
+    writefile("test/bad.not", bad, sizeof(NoterHead) + 3 * 48);
+    int r1 = noter_load("test/bad.not", 16);
+    store8(bad, 'n');
+    int n0 = noter_note(bad, 0);
+    n0.nn_start = 9;
+    writefile("test/bad.not", bad, sizeof(NoterHead) + 3 * 48);
+    int r2 = noter_load("test/bad.not", 16);
+    n0.nn_start = 0;
+    writefile("test/bad.not", bad, sizeof(NoterHead) + 2 * 48);
+    int r3 = noter_load("test/bad.not", 16);
+    writefile("test/bad.not", bad, sizeof(NoterHead) + 3 * 48);
+    int r4 = noter_load("test/bad.not", 2);
+    int r5 = noter_load("test/bad.not", 3);
+    if (r1 == 0 && r2 == 0 && r3 == 0 && !r4) { ok += 1; }
+    if (r5 != 0) { ok += 1; }
+
+    // 9. writefile's refusals, a kernel buffer, a missing directory, a name
+    // longer than jakel keeps, and a directory.
+    if (writefile("test/k.not", 4096, 8) == 0 - 1) { ok += 1; }
+    if (writefile("nodir/x.not", s, 8) == 0 - 1) { ok += 1; }
+    if (writefile("test/a_name_that_is_far_too_long_for_jakel.not", s, 8) == 0 - 1
+        && writefile("test", s, 8) == 0 - 1) { ok += 1; }
+
+    // 10. Instruments. A note keeps the one it was given through a save and
+    // a load, and one past the last is refused.
+    int t = noter_new(4, 4, 120);
+    if (noter_add_with(t, 4, 60, 0, 1, 100, 2) == 0
+        && noter_add_with(t, 4, 62, 0, 1, 100, NOTER_INSTRUMENTS) == 0 - 1) { ok += 1; }
+    noter_save(t, "test/inst.not");
+    int tl = noter_load("test/inst.not", 4);
+    if (tl != 0) {
+        int t0 = noter_note(tl, 0);
+        if (t0.nn_instrument == 2) { ok += 1; }
+    }
+
+    // 11. A version 1 file, 32 bytes a note and no instrument, loads as
+    // version 4 with every note a square wave, every pan in the middle and
+    // nothing else changed.
+    int v1 = alloc(40 + 2 * 32);
+    noter_put_magic(v1);
+    store64(v1 + 8, 1);
+    store64(v1 + 16, 4);
+    store64(v1 + 24, 120);
+    store64(v1 + 32, 2);
+    store64(v1 + 40, 60); store64(v1 + 48, 0); store64(v1 + 56, 2); store64(v1 + 64, 100);
+    store64(v1 + 72, 64); store64(v1 + 80, 2); store64(v1 + 88, 1); store64(v1 + 96, 90);
+    writefile("test/old.not", v1, 40 + 2 * 32);
+    int ol = noter_load("test/old.not", 4);
+    if (ol != 0 && ol.nh_version == 4 && ol.nh_count == 2 && noter_pan(ol, 3) == 4) {
+        int o0 = noter_note(ol, 0);
+        int o1 = noter_note(ol, 1);
+        if (o0.nn_pitch == 60 && o0.nn_length == 2 && o0.nn_velocity == 100
+            && o1.nn_pitch == 64 && o1.nn_start == 2 && o1.nn_length == 1
+            && o1.nn_velocity == 90 && o0.nn_instrument == 0
+            && o1.nn_instrument == 0) { ok += 1; }
+    }
+
+    // 12. A version 2 file, no pans, loads as version 4 with its notes and
+    // instruments where they were and every pan in the middle.
+    int v2 = alloc(40 + 2 * 40);
+    noter_put_magic(v2);
+    store64(v2 + 8, 2);
+    store64(v2 + 16, 4);
+    store64(v2 + 24, 120);
+    store64(v2 + 32, 2);
+    store64(v2 + 40, 60); store64(v2 + 48, 0); store64(v2 + 56, 2); store64(v2 + 64, 100);
+    store64(v2 + 72, 1);
+    store64(v2 + 80, 64); store64(v2 + 88, 2); store64(v2 + 96, 1); store64(v2 + 104, 90);
+    store64(v2 + 112, 3);
+    writefile("test/two.not", v2, 40 + 2 * 40);
+    int tw = noter_load("test/two.not", 4);
+    if (tw != 0 && tw.nh_version == 4 && noter_pan(tw, 0) == 4 && noter_pan(tw, 2) == 4) {
+        int w0 = noter_note(tw, 0);
+        int w1 = noter_note(tw, 1);
+        if (w0.nn_pitch == 60 && w0.nn_instrument == 1 && w1.nn_pitch == 64
+            && w1.nn_velocity == 90 && w1.nn_instrument == 3) { ok += 1; }
+    }
+
+    // 13. A pan goes through a save and a load, and one out of range is
+    // held to the ends.
+    noter_set_pan(t, 1, 7);
+    noter_set_pan(t, 2, 12);
+    noter_save(t, "test/pan.not");
+    int pl = noter_load("test/pan.not", 4);
+    if (pl != 0 && noter_pan(pl, 1) == 7 && noter_pan(pl, 2) == 8 && noter_pan(pl, 0) == 4) {
+        ok += 1;
+    }
+
+    // 14. A version 3 file, pans for the instruments but none for the
+    // notes, loads as version 4 with its instrument pans kept and every
+    // note's own pan in the middle. A note's own pan then goes through a
+    // save and a load, and moves it from where its instrument sits.
+    int v3 = alloc(72 + 40);
+    noter_put_magic(v3);
+    store64(v3 + 8, 3);
+    store64(v3 + 16, 4);
+    store64(v3 + 24, 120);
+    store64(v3 + 32, 1);
+    store64(v3 + 40, 6); store64(v3 + 48, 4); store64(v3 + 56, 4); store64(v3 + 64, 4);
+    store64(v3 + 72, 60); store64(v3 + 80, 0); store64(v3 + 88, 2); store64(v3 + 96, 100);
+    store64(v3 + 104, 0);
+    writefile("test/three.not", v3, 72 + 40);
+    int th = noter_load("test/three.not", 4);
+    if (th != 0 && th.nh_version == 4 && noter_pan(th, 0) == 6) {
+        int h0 = noter_note(th, 0);
+        if (h0.nn_pan == 4 && noter_note_pan(th, h0) == 6) {
+            h0.nn_pan = 0;
+            noter_save(th, "test/three.not");
+            int again = noter_load("test/three.not", 4);
+            if (again != 0) {
+                int a0 = noter_note(again, 0);
+                if (a0.nn_pan == 0 && noter_note_pan(again, a0) == 2) { ok += 1; }
+            }
+        }
+    }
+
+    return ok;
+}

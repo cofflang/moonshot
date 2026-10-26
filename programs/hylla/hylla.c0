@@ -11,14 +11,23 @@
 // shelf of icons, and a click opens what it is clicked on. A folder is
 // entered, a program (.elf) is started, a page (.html) opens in utsikt, a
 // song (.not) in lira, a picture (.spr) in pensel and source or text (.c0,
-// .txt) in skrift, each in a window of its own. Nothing is renamed,
+// .txt) in skrift, each in a window of its own, and a script (.sk) runs in
+// a new shell window, and a model (.form) in form. Nothing is renamed,
 // moved or deleted here, and there are no dialogs. Names are made in the
 // shell, and hylla is for finding things and opening them. Start it with
 // `start hylla.elf`, or `start hylla.elf test` to open a folder.
 //
+// Two views, the shelf of icons and a tree of every folder from the root,
+// switched with t or a click on the word at the right of the top bar. On the
+// shelf a name too long for its cell wraps onto more lines, and its row
+// grows to fit. Names are shown without their ending, the icon says that.
+//
 // Keys
-//   click        open whatever is under the pointer
-//   Backspace    up one folder
+//   click        open whatever is under the pointer (in the tree, a folder
+//                opens or closes)
+//   t            the shelf or the tree
+//   up, down     scroll
+//   Backspace    up one folder (shelf)
 //   r            read the folder and the background again
 //   Esc          quit
 //
@@ -247,6 +256,12 @@ int slot_record(int k) {
     return entries + k * REC;
 }
 
+int rows_total() {
+    int c = fb_w / CELL_W;
+    if (c < 1) { c = 1; }
+    return (slots() + c - 1) / c;
+}
+
 int columns() {
     int c = fb_w / CELL_W;
     if (c < 1) { c = 1; }
@@ -262,6 +277,8 @@ int K_SONG = 4;
 int K_PICTURE = 5;
 int K_FILE = 6;
 int K_TEXT = 7;
+int K_SCRIPT = 8;
+int K_MODEL = 9;
 
 int kind_of(int rec) {
     if (!rec) { return K_UP; }
@@ -272,6 +289,8 @@ int kind_of(int rec) {
     if (ends(name, ".not") == 1) { return K_SONG; }
     if (ends(name, ".spr") == 1) { return K_PICTURE; }
     if (ends(name, ".c0") == 1 || ends(name, ".txt") == 1) { return K_TEXT; }
+    if (ends(name, ".sk") == 1) { return K_SCRIPT; }
+    if (ends(name, ".form") == 1 || ends(name, ".lera") == 1) { return K_MODEL; }
     return K_FILE;
 }
 
@@ -311,6 +330,8 @@ void icon(int x, int y, int kind) {
     if (kind == K_SONG) { mark = 0x9050c0; }
     if (kind == K_PICTURE) { mark = 0xe08030; }
     if (kind == K_TEXT) { mark = 0x30a8a0; }
+    if (kind == K_SCRIPT) { mark = 0x40a060; }
+    if (kind == K_MODEL) { mark = 0x3a9ad0; }
     box(x + 6, y + 2, 16, 28, paper);
     box(x + 22, y + 8, 6, 22, paper);
     box(x + 22, y + 2, 1, 6, 0xb0b0b0);
@@ -323,6 +344,19 @@ void icon(int x, int y, int kind) {
     } else if (kind == K_PICTURE) {
         box(x + 9, y + 12, 7, 7, mark);
         box(x + 16, y + 18, 8, 7, 0x40a0d0);
+    } else if (kind == K_MODEL) {
+        // A little cube, its top and two sides.
+        box(x + 11, y + 11, 8, 3, 0x8ac0e8);
+        box(x + 9, y + 14, 6, 8, mark);
+        box(x + 15, y + 14, 6, 8, 0x2a6a98);
+    } else if (kind == K_SCRIPT) {
+        // A prompt, > and a line after it.
+        box(x + 9, y + 10, 2, 2, mark);
+        box(x + 11, y + 12, 2, 2, mark);
+        box(x + 9, y + 14, 2, 2, mark);
+        box(x + 15, y + 14, 7, 2, mark);
+        box(x + 9, y + 20, 12, 2, mark);
+        box(x + 9, y + 24, 8, 2, mark);
     } else if (kind == K_TEXT) {
         // Lines of code, indented the way code is.
         box(x + 9, y + 9, 12, 2, mark);
@@ -339,34 +373,321 @@ void icon(int x, int y, int kind) {
     return;
 }
 
+// --- names -------------------------------------------------------------------
+
+// How much of a name is shown, all of a folder's, a file's without its
+// ending, since the icon already says what kind of file it is.
+int shown_len(int name, int kind) {
+    int n = len(name);
+    if (kind == K_UP || kind == K_DIR) { return n; }
+    int k = n - 1;
+    while (k > 0 && name[k] != '.') { k -= 1; }
+    if (k > 0) { return k; }
+    return n;
+}
+
+// The length of the line of a wrapped name that starts at `start`, at most
+// `fit` characters, broken after a - _ . or space in its second half when
+// there is one.
+int line_len(int s, int start, int n, int fit) {
+    int rest = n - start;
+    if (rest <= fit) { return rest; }
+    int k = fit;
+    while (k > fit / 2) {
+        int c = s[start + k - 1];
+        if (c == '-' || c == '_' || c == ' ' || c == '.') { return k; }
+        k -= 1;
+    }
+    return fit;
+}
+
+int MAX_LINES = 4;
+
+// How many lines a name takes under its icon.
+int name_lines(int name, int n) {
+    int fit = (CELL_W - 4) / cell_w;
+    int lines = 0;
+    int at = 0;
+    while (at < n && lines < MAX_LINES) {
+        at += line_len(name, at, n, fit);
+        lines += 1;
+    }
+    if (lines == 0) { lines = 1; }
+    return lines;
+}
+
+int slot_name(int k) {
+    int rec = slot_record(k);
+    if (rec == 0) { return ".."; }
+    return rec + 16;
+}
+
+// The height of icon row `row`, taller when a name in it wraps.
+int row_height(int row) {
+    int cols = columns();
+    int n = slots();
+    int most = 1;
+    int k = row * cols;
+    while (k < n && k < (row + 1) * cols) {
+        int name = slot_name(k);
+        int lines = name_lines(name, shown_len(name, kind_of(slot_record(k))));
+        if (lines > most) { most = lines; }
+        k += 1;
+    }
+    return CELL_H + (most - 1) * (cell_h + 2);
+}
+
+// --- the tree -----------------------------------------------------------------
+//
+// The other way to look, every folder from the root as a list, each one
+// opened or closed with a click.
+
+int view_tree = 0;           // 1 when the tree is shown instead of the shelf
+int TREE_MAX = 512;
+int TREE_ROW = 18;
+int TREE_DEPTH = 8;
+int tree_path;               // per row, the full path (in tree_chars)
+int tree_kind;               // per row, its kind
+int tree_depth;              // per row, how deep
+int tree_name;               // per row, the name, inside its path
+int tree_n = 0;
+int tree_chars;              // the paths, one after another
+int tree_chars_used = 0;
+int TREE_CHARS = 65536;
+int tree_bufs;               // a listdir buffer per depth
+int OPEN_MAX = 32;
+int open_paths;              // the open folders, 128 bytes each
+int open_n = 0;
+int tree_scroll = 0;
+
+int str_same(int a, int b) {
+    int i = 0;
+    while (a[i] != 0 && a[i] == b[i]) { i += 1; }
+    return a[i] == b[i];
+}
+
+int is_open(int p) {
+    int i = 0;
+    for (i = 0; i < open_n; i += 1) {
+        if (str_same(open_paths + i * 128, p)) { return 1; }
+    }
+    return 0;
+}
+
+void set_open(int p, int on) {
+    int i = 0;
+    for (i = 0; i < open_n; i += 1) {
+        if (str_same(open_paths + i * 128, p)) {
+            if (!on) {
+                int j = 0;
+                for (j = 0; j < 128; j += 1) {
+                    open_paths[i * 128 + j] = open_paths[(open_n - 1) * 128 + j];
+                }
+                open_n -= 1;
+            }
+            return;
+        }
+    }
+    if (on && open_n < OPEN_MAX && len(p) < 127) {
+        int k = 0;
+        while (p[k] != 0) { open_paths[open_n * 128 + k] = p[k]; k += 1; }
+        open_paths[open_n * 128 + k] = 0;
+        open_n += 1;
+    }
+    return;
+}
+
+// dir/name into tree_chars, or 0 when it is full.
+int tree_join(int dir, int name) {
+    int ld = len(dir);
+    int ln = len(name);
+    if (tree_chars_used + ld + ln + 2 > TREE_CHARS) { return 0; }
+    int s = tree_chars + tree_chars_used;
+    int o = 0;
+    int i = 0;
+    for (i = 0; i < ld; i += 1) { s[o] = dir[i]; o += 1; }
+    if (ld > 0) { s[o] = '/'; o += 1; }
+    for (i = 0; i < ln; i += 1) { s[o] = name[i]; o += 1; }
+    s[o] = 0;
+    tree_chars_used += o + 1;
+    return s;
+}
+
+void tree_add(int dir, int depth) {
+    if (depth >= TREE_DEPTH) { return; }
+    int buf = load64(tree_bufs + depth * 8);
+    int n = listdir(dir, buf, MAX_ENTRIES);
+    int i = 0;
+    for (i = 0; i < n && tree_n < TREE_MAX; i += 1) {
+        int rec = buf + i * REC;
+        int full = tree_join(dir, rec + 16);
+        if (!full) { return; }
+        int kind = kind_of(rec);
+        store64(tree_path + tree_n * 8, full);
+        store64(tree_kind + tree_n * 8, kind);
+        store64(tree_depth + tree_n * 8, depth);
+        store64(tree_name + tree_n * 8, full + len(full) - len(rec + 16));
+        tree_n += 1;
+        if (kind == K_DIR && is_open(full)) { tree_add(full, depth + 1); }
+    }
+    return;
+}
+
+void tree_build() {
+    tree_n = 0;
+    tree_chars_used = 0;
+    tree_add("", 0);
+    if (tree_scroll >= tree_n) { tree_scroll = 0; }
+    return;
+}
+
+int tree_init() {
+    tree_path = alloc(TREE_MAX * 8);
+    tree_kind = alloc(TREE_MAX * 8);
+    tree_depth = alloc(TREE_MAX * 8);
+    tree_name = alloc(TREE_MAX * 8);
+    tree_chars = alloc(TREE_CHARS);
+    tree_bufs = alloc(TREE_DEPTH * 8);
+    open_paths = alloc(OPEN_MAX * 128);
+    if (!tree_path || !tree_kind || !tree_depth || !tree_name || !tree_chars
+        || !tree_bufs || !open_paths) { return 0; }
+    int d = 0;
+    for (d = 0; d < TREE_DEPTH; d += 1) {
+        int b = alloc(MAX_ENTRIES * REC);
+        if (!b) { return 0; }
+        store64(tree_bufs + d * 8, b);
+    }
+    return 1;
+}
+
+// Opens every folder on the way to `p`, so the tree starts where the shelf was.
+void open_chain(int p) {
+    int n = len(p);
+    int buf = alloc(n + 1);
+    if (!buf) { return; }
+    int i = 0;
+    for (i = 1; i <= n; i += 1) {
+        if (i == n || p[i] == '/') {
+            int k = 0;
+            for (k = 0; k < i; k += 1) { buf[k] = p[k]; }
+            buf[i] = 0;
+            set_open(buf, 1);
+        }
+    }
+    return;
+}
+
+// A small icon for a tree row, 12 pixels square.
+void mini_icon(int x, int y, int kind) {
+    if (kind == K_DIR) {
+        box(x, y + 1, 5, 2, 0xd8a850);
+        box(x, y + 3, 12, 8, 0xd8a850);
+        return;
+    }
+    if (kind == K_PROGRAM) {
+        box(x + 1, y, 10, 11, 0x2c7848);
+        box(x + 4, y + 3, 2, 5, 0xe8f0e8);
+        box(x + 6, y + 4, 2, 3, 0xe8f0e8);
+        return;
+    }
+    int mark = 0x808890;
+    if (kind == K_PAGE) { mark = 0x3070d0; }
+    if (kind == K_SONG) { mark = 0x9050c0; }
+    if (kind == K_PICTURE) { mark = 0xe08030; }
+    if (kind == K_TEXT) { mark = 0x30a8a0; }
+    if (kind == K_SCRIPT) { mark = 0x40a060; }
+    if (kind == K_MODEL) { mark = 0x3a9ad0; }
+    box(x + 2, y, 9, 11, 0xe8e8e4);
+    box(x + 4, y + 3, 5, 1, mark);
+    box(x + 4, y + 5, 5, 1, mark);
+    box(x + 4, y + 7, 4, 1, mark);
+    return;
+}
+
+int tree_rows_shown() { return (fb_h - BAR_H - STATUS_H - 4) / TREE_ROW; }
+
+// The tree row under window point (mx, my), or -1.
+int tree_at(int mx, int my) {
+    if (my < BAR_H + 2 || my >= fb_h - STATUS_H) { return 0 - 1; }
+    int r = (my - BAR_H - 2) / TREE_ROW + tree_scroll;
+    if (r >= tree_n || r >= tree_scroll + tree_rows_shown()) { return 0 - 1; }
+    return r;
+}
+
+void render_tree(int hover) {
+    int r = 0;
+    int shown = tree_rows_shown();
+    for (r = tree_scroll; r < tree_n && r < tree_scroll + shown; r += 1) {
+        int y = BAR_H + 2 + (r - tree_scroll) * TREE_ROW;
+        if (r == hover) { box(0, y, fb_w, TREE_ROW, COL_HOVER); }
+        int x = 8 + load64(tree_depth + r * 8) * 16;
+        int kind = load64(tree_kind + r * 8);
+        int p = load64(tree_path + r * 8);
+        int ty = y + (TREE_ROW - cell_h) / 2;
+        if (kind == K_DIR) {
+            int mark = "+";
+            if (is_open(p)) { mark = "-"; }
+            text(x, ty, mark, 1, COL_DIM);
+        }
+        mini_icon(x + 12, y + 3, kind);
+        int name = load64(tree_name + r * 8);
+        text(x + 30, ty, name, shown_len(name, kind), COL_TEXT);
+    }
+    return;
+}
+
 // --- the frame ----------------------------------------------------------------
+
+// The label at the right of the top bar that switches the view.
+int view_label() {
+    if (view_tree) { return "icons"; }
+    return "tree";
+}
+
+int view_label_x() { return fb_w - (len(view_label()) + 1) * cell_w; }
 
 void render(int hover) {
     draw_background();
     // The path along the top.
     box(0, 0, fb_w, BAR_H, COL_BAR);
     int x = text(4, (BAR_H - cell_h) / 2, "/", 1, COL_DIM);
-    text(x, (BAR_H - cell_h) / 2, path, len(path), COL_TEXT);
-    // The shelf.
-    int cols = columns();
-    int n = slots();
-    int k = 0;
-    for (k = scroll * cols; k < n; k += 1) {
-        int row = k / cols - scroll;
-        int cx = (k % cols) * CELL_W;
-        int cy = BAR_H + 4 + row * CELL_H;
-        if (cy + CELL_H > fb_h - STATUS_H) { k = n; }
-        else {
-            if (k == hover) { box(cx + 2, cy, CELL_W - 4, CELL_H - 2, COL_HOVER); }
-            int rec = slot_record(k);
-            icon(cx + (CELL_W - ICON) / 2, cy + 4, kind_of(rec));
-            int name = "..";
-            if (rec != 0) { name = rec + 16; }
-            // As much of the name as fits under the icon.
-            int nl = len(name);
-            int fit = (CELL_W - 4) / cell_w;
-            if (nl > fit) { nl = fit; }
-            text(cx + (CELL_W - nl * cell_w) / 2, cy + 4 + ICON + 6, name, nl, COL_TEXT);
+    if (!view_tree) { text(x, (BAR_H - cell_h) / 2, path, len(path), COL_TEXT); }
+    if (hover == 0 - 2) { box(view_label_x() - 4, 0, fb_w - view_label_x() + 4, BAR_H, COL_HOVER); }
+    text(view_label_x(), (BAR_H - cell_h) / 2, view_label(), len(view_label()), COL_DIM);
+    if (view_tree) { render_tree(hover); }
+    else {
+        // The shelf, a row at a time, each as tall as its longest name.
+        int cols = columns();
+        int n = slots();
+        int fit = (CELL_W - 4) / cell_w;
+        int row = scroll;
+        int cy = BAR_H + 4;
+        while (row * cols < n) {
+            int rh = row_height(row);
+            if (cy + rh > fb_h - STATUS_H) { row = n; }
+            else {
+                int k = row * cols;
+                while (k < n && k < (row + 1) * cols) {
+                    int cx = (k % cols) * CELL_W;
+                    if (k == hover) { box(cx + 2, cy, CELL_W - 4, rh - 2, COL_HOVER); }
+                    int kind = kind_of(slot_record(k));
+                    icon(cx + (CELL_W - ICON) / 2, cy + 4, kind);
+                    int name = slot_name(k);
+                    int nl = shown_len(name, kind);
+                    int at = 0;
+                    int line = 0;
+                    while (at < nl && line < MAX_LINES) {
+                        int ll = line_len(name, at, nl, fit);
+                        text(cx + (CELL_W - ll * cell_w) / 2, cy + 4 + ICON + 6 + line * (cell_h + 2),
+                             name + at, ll, COL_TEXT);
+                        at += ll;
+                        line += 1;
+                    }
+                    k += 1;
+                }
+                cy += rh;
+                row += 1;
+            }
         }
     }
     // The message along the bottom.
@@ -383,11 +704,39 @@ int icon_at(int mx, int my) {
     if (my < BAR_H + 4 || my >= fb_h - STATUS_H) { return 0 - 1; }
     int cols = columns();
     int col = mx / CELL_W;
-    int row = (my - BAR_H - 4) / CELL_H + scroll;
     if (col >= cols) { return 0 - 1; }
-    int k = row * cols + col;
-    if (k >= slots()) { return 0 - 1; }
-    return k;
+    int n = slots();
+    int row = scroll;
+    int cy = BAR_H + 4;
+    while (row * cols < n) {
+        int rh = row_height(row);
+        if (my < cy + rh) {
+            int k = row * cols + col;
+            if (k >= n) { return 0 - 1; }
+            return k;
+        }
+        cy += rh;
+        row += 1;
+    }
+    return 0 - 1;
+}
+
+// What is under window point (mx, my), -2 for the view switch, an icon or a
+// tree row, or -1.
+int thing_at(int mx, int my) {
+    if (my < BAR_H && mx >= view_label_x() - 4) { return 0 - 2; }
+    if (view_tree) { return tree_at(mx, my); }
+    return icon_at(mx, my);
+}
+
+void switch_view() {
+    view_tree = 1 - view_tree;
+    if (view_tree) {
+        open_chain(path);
+        tree_build();
+    }
+    message = 0;
+    return;
 }
 
 // --- opening things ---------------------------------------------------------
@@ -421,11 +770,8 @@ void start(int program, int file) {
     return;
 }
 
-void open_slot(int k) {
-    int rec = slot_record(k);
-    int kind = kind_of(rec);
-    if (kind == K_UP) { go_up(); return; }
-    int full = join(path, "/", rec + 16);
+// Opens the file or folder at `full`, of kind `kind`, named `name`.
+void open_path(int full, int kind, int name) {
     if (kind == K_DIR) {
         path = full;
         message = 0;
@@ -435,14 +781,20 @@ void open_slot(int k) {
     if (kind == K_PROGRAM) { start(0, full); return; }
     if (kind == K_PAGE) { start("utsikt.elf", full); return; }
     if (kind == K_SONG) { start("lira.elf", full); return; }
+    if (kind == K_MODEL) { start("form.elf", full); return; }
+    if (kind == K_SCRIPT) {
+        // In a shell window of its own, where what it prints stays.
+        int line = join("run", " ", full);
+        if (shell(line) < 0) { message = "no room for another window, close one first"; }
+        else { message = join("ran", " ", full); }
+        return;
+    }
     if (kind == K_PICTURE || kind == K_TEXT) {
         int w = edit(full);
         if (w >= 0) {
             message = join("opened", " ", full);
         } else if (w == 0 - 2 && kind == K_PICTURE) {
             message = "pensel is already open, quit it first";
-        } else if (w == 0 - 2) {
-            message = "skrift is already open, quit it first";
         } else if (w == 0 - 3) {
             message = "no room for another window, close one first";
         } else {
@@ -450,7 +802,32 @@ void open_slot(int k) {
         }
         return;
     }
-    message = join("nothing opens", " ", rec + 16);
+    message = join("nothing opens", " ", name);
+    return;
+}
+
+void open_slot(int k) {
+    int rec = slot_record(k);
+    int kind = kind_of(rec);
+    if (kind == K_UP) { go_up(); return; }
+    open_path(join(path, "/", rec + 16), kind, rec + 16);
+    return;
+}
+
+// A click on tree row r. A folder opens or closes, and becomes the folder
+// the shelf shows, anything else opens as it would on the shelf.
+void open_row(int r) {
+    int p = load64(tree_path + r * 8);
+    int kind = load64(tree_kind + r * 8);
+    if (kind == K_DIR) {
+        set_open(p, 1 - is_open(p));
+        // A copy, since tree_build reuses the space its paths live in.
+        path = join(p, "", "");
+        read_folder();
+        tree_build();
+        return;
+    }
+    open_path(join(p, "", ""), kind, load64(tree_name + r * 8));
     return;
 }
 
@@ -466,7 +843,7 @@ int main() {
     fb = alloc(fb_max_w * fb_max_h * 4);
     entries = alloc(MAX_ENTRIES * REC);
     if (!fb || !entries) { return 3; }
-    if (font_init() == 0) { return 4; }
+    if (font_init() == 0 || tree_init() == 0) { return 4; }
     path = "";
     if (argc() >= 2) { path = argv(1); }
     read_background();
@@ -488,13 +865,15 @@ int main() {
         int now = 0 - 1;
         if (m >= 0) {
             left = m % 2;
-            now = icon_at((m / 8) / 1024, (m / 8) % 1024);
+            now = thing_at((m / 8) / 1024, (m / 8) % 1024);
         }
         if (now != hover) { hover = now; dirty = 1; }
         // Opened on the press edge, the frame the button goes down, so a held
         // button opens once.
-        if (left == 1 && !last_left && now >= 0) {
-            open_slot(now);
+        if (left == 1 && !last_left && now != 0 - 1) {
+            if (now == 0 - 2) { switch_view(); }
+            else if (view_tree) { open_row(now); }
+            else { open_slot(now); }
             hover = 0 - 1;
             dirty = 1;
         }
@@ -505,14 +884,21 @@ int main() {
             int make = key / 2;
             if (key % 2 == 0) {
                 if (make == 1) { return 0; }                   // Esc
-                if (make == 14) { go_up(); dirty = 1; }        // Backspace
+                if (make == 14 && !view_tree) { go_up(); dirty = 1; }   // Backspace
                 if (make == 19) {                              // r
                     read_background();
                     read_folder();
+                    if (view_tree) { tree_build(); }
                     dirty = 1;
                 }
-                if (make == 80) { scroll += 1; dirty = 1; }    // down
-                if (make == 72 && scroll > 0) { scroll -= 1; dirty = 1; }  // up
+                if (make == 20) { switch_view(); dirty = 1; }  // t
+                if (view_tree) {
+                    if (make == 80 && tree_scroll + tree_rows_shown() < tree_n) { tree_scroll += 1; dirty = 1; }
+                    if (make == 72 && tree_scroll > 0) { tree_scroll -= 1; dirty = 1; }
+                } else {
+                    if (make == 80 && scroll + 1 < rows_total()) { scroll += 1; dirty = 1; }
+                    if (make == 72 && scroll > 0) { scroll -= 1; dirty = 1; }
+                }
             }
             key = key_poll();
         }

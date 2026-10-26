@@ -10,8 +10,13 @@
 // Takes the CPU exception its argument names, so verify_crash.sh can check
 // that a faulting program ends alone and the system carries on. div divides
 // by zero, null reads address 0 (kernel memory, a protection fault), wild
-// reads an address nothing maps, and gp reads a non-canonical address, one
-// past the lower half.
+// reads an address nothing maps, gp reads a non-canonical address, one past
+// the lower half, and heap runs an instruction it wrote into its own heap,
+// which may not be run. jit does the same on a page it made runnable with
+// protect() first, which works and returns 9. wcode writes into its own
+// code, which may only be run, and rundata runs a string, which may only be
+// read and written. deaf asks for Alt+W as a key and then never reads a key,
+// for verify_alt_w.sh.
 include "moon.c0";
 
 int str_same(int a, int b) {
@@ -33,5 +38,30 @@ int main() {
     if (str_same(kind, "null")) { return load64(zero); }
     if (str_same(kind, "wild")) { return load64(0x7000000000 + zero); }
     if (str_same(kind, "gp")) { return load64(0x800000000000 + zero); }
+    if (str_same(kind, "wcode")) {
+        int here = str_same;
+        store8(here + zero, 0x90);
+        return 1;
+    }
+    if (str_same(kind, "rundata")) {
+        int ret = "\t";        // 0x09, and the ret after it is written in
+        store8(ret, 0xC3);
+        return ret();
+    }
+    if (str_same(kind, "deaf")) {
+        close_key(1);
+        while (1) { sleep(100); }
+    }
+    if (str_same(kind, "heap") || str_same(kind, "jit")) {
+        int raw = alloc(8192);
+        int page = (raw + 4095) & (0 - 4096);
+        // mov eax, 9 then ret
+        store8(page, 0xB8);
+        store32(page + 1, 9);
+        store8(page + 5, 0xC3);
+        if (str_same(kind, "jit")) { protect(page, 1, 0); }
+        int code = page;
+        return code();
+    }
     return 1;
 }

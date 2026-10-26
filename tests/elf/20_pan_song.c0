@@ -1,0 +1,27 @@
+// 20_pan_song.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// expect: 3
+// Writes test/pan.not for verify_lira_pan.sh, two notes at once for two
+// beats, A4 on the square panned hard left and E5 on the triangle panned
+// hard right. Each check that holds adds one.
+include "noter.c0";
+
+int main() {
+    int ok = 0;
+    int s = noter_new(4, 4, 120);
+    if (noter_add_with(s, 4, 69, 0, 8, 127, 0) >= 0
+        && noter_add_with(s, 4, 76, 0, 8, 127, 1) >= 0) { ok += 1; }
+    noter_set_pan(s, 0, 0);
+    noter_set_pan(s, 1, NOTER_PAN_MAX);
+    if (noter_save(s, "test/pan.not") == 1) { ok += 1; }
+    int l = noter_load("test/pan.not", 4);
+    if (l != 0 && noter_pan(l, 0) == 0 && noter_pan(l, 1) == 8) { ok += 1; }
+    return ok;
+}

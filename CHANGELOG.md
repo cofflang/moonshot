@@ -5,6 +5,169 @@ Every release of Moonshot, newest first. The format follows
 [semantic versions](https://semver.org/), and each release also has a name.
 Each release says which coff it needs, since the two are released separately.
 
+## [0.6.0] "Busy Bertil" - 2026-10-26
+
+Needs coff v0.7.0.
+
+### Added
+
+- Moonshot builds programs on its own. It carries coff and smed as
+  `coff.elf` and `smed.elf`, built from the same sources as the coff and
+  smed on the host, and a `hello.c0` to try them on. The `hello.s` coff
+  writes on Moonshot is the same, byte for byte, as on Linux.
+- `execute file.c0` in the shell compiles a program with coff, links it with
+  smed and starts it. The program stays next to its source as `file.elf`.
+- `SYS_OPEN` (23), `SYS_READ` (24), `SYS_WRITE` (25) and `SYS_CLOSE` (26),
+  ordinary files for ring-3 programs, eight open at a time per program. A
+  path starts from the folder the program was started in.
+- Alt+M makes the focused window fill the screen and gives it back, with
+  every other window where it was. A tavla's title strip has a box, `[+]`
+  and `[-]`, that does the same on a click. Windows behind keep running and
+  draw nothing, and a program whose window comes back is made to draw again.
+- `SYS_CLOSE_KEY` (32), `close_key()` in `moon.c0`. A program can take Alt+W
+  as a key instead of being stopped by it. skrift, pensel and form do, so
+  Alt+W asks about unsaved changes, and a second Alt+W quits without
+  saving. A program that asks and then stops reading keys is stopped by the
+  next Alt+W a second later.
+- The kernel reads the real-time clock at boot, as UTC, and the status bar
+  shows the day, the date and the time. One offset, the minutes to add to
+  UTC, written by hand in `tid.zone` in the root, sets the local time. `SYS_CLOCK` (33), `clock()` in `moon.c0`.
+- insyn, a look inside the machine (`start insyn.elf`), with the
+  processes, memory, the last two minutes as graphs and the hardware on
+  one screen. It only looks. `SYS_INFO` (34), `sysinfo()` in
+  `moon.c0`, copies the kernel's counters out. smed knows `cpuid`.
+- A login screen. With windows, boot goes straight to a screen that covers
+  everything, a username and a password (Tab, the arrows or a click move
+  between them), and a correct pair shows the windows, every one of them
+  the user's, with the shell on the left and hylla on the right. Alt+L
+  locks the screen with everything running behind it, and only the same
+  user's password opens it. The prompt starts with the user's name.
+- Scripts, files ending in `.sk`, run with `run name.sk args` or a click in
+  hylla. Lines of shell commands with variables, `$1` and the other
+  arguments, `while` and `if`/`else if`/`else` blocks in braces, whole-number
+  arithmetic and string comparison. `name = value` and `$name` also work at
+  the prompt.
+- `SYS_WAIT` takes a time limit, and `SYS_KILL` (35), `kill()` in
+  `moon.c0`, stops a task the caller started itself. skrift's F6 stops code
+  that has not answered after three seconds instead of waiting forever.
+- form, a 3D modeller (`start form.elf name.form`), and djup, gnista's 3D,
+  which draws form's meshes with flat shading and a depth buffer in fixed
+  point. A model starts as a cube and grows by pulling sides out, moving
+  corners and colouring sides, with undo. Several sides can be picked at
+  once, or single triangles, and handles along the three axes drag them.
+  The edges and corners are drawn where they can be seen, and the wheel
+  zooms. hylla opens `.form` files in form.
+- The mouse wheel, for programs, `SYS_WHEEL` (37), `wheel()` in `moon.c0`,
+  and pointer shapes a program can ask for over its window, `SYS_POINTER`
+  (36), `pointer()` in `moon.c0`.
+- A tavla's title strip has a close box, `[x]`, beside `[+]`, and shows the
+  window's number. The name of a program's window leaves out `.elf`.
+- hylla has a tree of every folder beside its shelf of icons, `t` or a click
+  switches. Long names wrap onto more lines, and names leave out their
+  endings.
+- lira is played with the mouse. The left button puts a note in and a drag
+  makes it longer, the right button takes it away, a note's ends drag
+  shorter or longer, and its middle drags up and down for loudness and
+  sideways for where it sits between the speakers. The instruments are
+  buttons along the bottom.
+- skrift's F5 runs only the selected text when there is any.
+- lira, pensel and form open a new file with no name when started without
+  one, and ask for a name the first time it is saved.
+- A shell window keeps its text when the layout changes, a program opening
+  beside it, a window filling the screen and giving it back, the screen
+  locking and opening, where it used to come back blank with a new prompt.
+- Stereo sound. oljud plays 16-bit stereo, and `SYS_SOUND_FORMAT` (31),
+  `sound_format()` in `moon.c0`, lets a program hand it 16-bit mono or 16-bit
+  stereo instead of 8-bit mono. Programs that never ask sound as before.
+- lira mutes (m) and solos (o) an instrument and pans it (p and P, nine
+  steps). It plays in 16-bit stereo, and the pans are saved with the song.
+- noter format version 4, with a pan for each instrument and one for each
+  note. Older versions still load, everything in the middle.
+- `SYS_EXIT_CLOSE` (27), `SYS_SHELL` (28), `SYS_WAIT` (29) and
+  `SYS_REMOVE` (30), and two flags for `SYS_SPAWN`, one to run a program in
+  the background with no window and one to find names from the caller's
+  folder. `moon.c0` has `exit_close`, `shell`, `wait`, `remove`,
+  `spawn_with` and `key_char` for them.
+- form scales what is picked around its middle (`=` and `-`) and mirrors
+  the picked sides, or the whole model, across x = 0 (`m`), with the
+  corners on x = 0 shared so the halves stay joined. `d` copies the picked
+  sides half a unit to the right, and `g` puts corners back on the 1/16
+  grid.
+
+### Changed
+
+- The repository is sorted into folders by role. The kernel is in
+  `kernel/`, split into `core`, `drivers`, `screen`, `files` and `shell`,
+  the generators are in `tools/`, the test scripts in `tests/` and the
+  ring-3 test programs in `tests/elf/`. `build.sh`, the launchers and the
+  README stay at the top. What a build makes goes to `build/`, and what the
+  tests make to `out/`.
+- A task with nothing to do, sleeping or waiting, gives the CPU to the next
+  one at once instead of holding it, idle, until the next timer tick. With
+  two programs open and waiting, a third one drawing whole frames draws
+  about four times as many.
+- The status bar no longer shows the number of tasks.
+- `count` counts a last line with no newline after it, and names what it
+  prints, as in `3 lines, 12 words, 61 bytes`.
+- The test programs in `/test` are only put there when the kernel is booted
+  for the test scripts (`test` on its command line). Any other boot takes
+  them away again.
+- skrift, the text editor, is a ring-3 program and works differently. There
+  are no modes. Typing types, the keys for everything else are shown along
+  the bottom of the window, and they change with what can be done. F2 saves,
+  F3 finds, F4 goes to a line, F5 runs the file with `execute`, F6 shows the
+  value of a c0 expression and Alt+W quits. Ctrl+C, Ctrl+X and Ctrl+V copy, cut
+  and paste, and Ctrl+Z and Ctrl+Y undo and redo as far back as the file was
+  opened. A file can be any size, where it was 8KB, and a click places the
+  cursor. `edit` and hylla open it, and paths start from the shell's folder.
+- pensel, the pixel editor, is a ring-3 program too. F2 saves, Alt+W quits
+  and asks first about unsaved changes, Ctrl+Z and Ctrl+Y undo and redo a
+  stroke at a time, left and right step through frames. The grid grows to
+  fill the window, and a fast drag paints every cell it crosses. `draw` and
+  hylla open it.
+- The REPL's compiled code saves and restores `rbx`, which coff now keeps a
+  local variable in.
+- A ring-3 program's heap is 32MB instead of 8MB.
+- lager keeps each program's table of blocks in that program's own address
+  space, on pages only the kernel can reach, instead of in the kernel heap.
+  A program can hold about 174,000 blocks at once instead of 16,384.
+- A ring-3 program's heap and stack can no longer be run as code, only a
+  page `SYS_PROTECT` made runnable (and read-only) can. A program that
+  jumps into its heap stops with a page fault. Its own code can be run but
+  not written, and its data written but not run, since smed writes the two
+  as separate segments and the kernel maps each as it says.
+
+### Removed
+
+- The login prompt in each window when windows are on. A window opened after
+  the login, or after the last one is closed, belongs to the user logged in.
+- The kernel's own text editor and pixel editor, which ran inside the
+  keyboard and mouse interrupts.
+
+### Fixed
+
+- Starting a program kept a copy of its whole file in the kernel heap, so
+  after a few dozen starts no program would start at all.
+- The letter of Alt+W and the Tab of Alt+Tab also reached the program in
+  the focused window as ordinary keys. kakel's chords are now its own.
+- `echo --file` printed only the first 1008 bytes of a file and dropped the
+  rest without a word. It now prints the whole file.
+- A program stopped with `kill` while it was still starting kept its file
+  in the kernel heap for good. What a program is given to start with now
+  stays with its task until it is used, and the reaper frees what is left.
+- A file that begins like a program but is not one was refused, and its
+  task then went on running somewhere past the end of its stack. It now
+  ends there.
+- A number printed on serial could come out wrong when an interrupt
+  printed a number of its own in the middle of it, since both wrote their
+  digits into one buffer (10000 came out as 10156 next to a key's
+  scancode). The serial printers keep no digits in memory now.
+- A program closed with Alt+W while it was running could come back. It
+  ran on until the next tick, and its next sleep made it runnable again,
+  so it stayed in the task list, was never freed and held its slot. A
+  program that has been closed now does nothing more when it calls the
+  system.
+
 ## [0.5.0] "Kind Goran" - 2026-10-14
 
 Needs coff v0.6.0.
@@ -191,6 +354,7 @@ Needs coff v0.3.1.
   compiler, a disk-backed filesystem with permissions and ring-3 userspace.
   It ships with a pre-built image.
 
+[0.6.0]: https://github.com/cofflang/moonshot/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/cofflang/moonshot/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/cofflang/moonshot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/cofflang/moonshot/compare/v0.2.0...v0.3.0

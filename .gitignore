@@ -1,21 +1,19 @@
-# build artifacts -- everything in the repo is source and the kernel, the
-# ISO and every program are rebuilt from it
+# What build.sh and the generators make. Everything in the repository is
+# source, and the kernel, the ISO and every program are rebuilt from it.
 build/
-kmain.s
-*.o
-moonshot.elf
-*.iso
-isoroot*/
-*.log
-*.sock
-*.ppm
-*.bak
-*.panicbak
-*.dfbak
-*.wav
-shell_spawn_id.txt
-disk.img
-moonshot.map
-# written by build.sh after a passing bootstrap audit; describes binaries on
-# this machine, not source (see README, Trust)
+# Written by build.sh after a passing bootstrap audit. It describes binaries
+# on this machine, not source (see README, Trust).
 toolchain.sha256
+
+# What the tests and the launchers make as they run.
+out/
+isoroot/
+moonshot.iso
+grub-mkrescue.log
+serial.log
+*.sock
+*.wav
+screenshots/
+
+# The disk the launchers boot with, your own files.
+disk.img

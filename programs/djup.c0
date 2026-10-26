@@ -1,0 +1,580 @@
+// djup.c0 — part of gnista, a game engine for the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of gnista, a game engine written in c0 for moonshot.
+// gnista is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// djup -- gnista's 3D. Meshes of coloured triangles, seen through an orbit
+// camera, drawn with flat shading and a depth buffer into the frame a
+// program composites, all in whole numbers. form, the modeller, makes the
+// meshes, and a game draws them the same way.
+//
+// Numbers are fixed point, 16.16, so DJUP_ONE is 1.0. Angles are 1024 to a
+// whole turn. A mesh is a .form file read into memory with room to grow.
+//
+//   offset  field
+//    0      magic           "form" and four zero bytes ("lera" is read too)
+//    8      version         1
+//   16      vertex count    V
+//   24      face count      F
+//   32      V vertices, x y z, 24 bytes each
+//   ..      F faces, three vertex numbers and a colour 0xRRGGBB, 32 bytes each
+//
+// A face's corners go counterclockwise seen from outside, which is the side
+// that is drawn. In memory the vertices have room for vcap and the faces for
+// fcap, and the caps live in the header too, where the file has the counts.
+
+layout DjupHead {
+    int dh_magic;
+    int dh_version;
+    int dh_verts;
+    int dh_faces;
+    int dh_vcap;
+    int dh_fcap;
+}
+
+layout DjupCam {
+    int dc_yaw;        // around the up axis, 1024 to a turn
+    int dc_pitch;      // up and down, kept within a quarter turn, positive above
+    int dc_dist;       // from the target, fixed point
+    int dc_x;          // the point looked at
+    int dc_y;
+    int dc_z;
+}
+
+int DJUP_ONE = 65536;
+int DJUP_TURN = 1024;
+int DJUP_NEAR = 6554;   // 0.1, nothing nearer the camera is drawn
+
+int djup_sin_table = 0; // 1024 entries, fixed point
+
+// --- numbers --------------------------------------------------------------
+
+int fx_mul(int a, int b) { return (a * b) >> 16; }
+int fx_div(int a, int b) { return (a << 16) / b; }
+
+// The whole-number square root, rounded down.
+int djup_isqrt(int n) {
+    if (n <= 0) { return 0; }
+    int x = n;
+    int y = (x + 1) / 2;
+    while (y < x) {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    return x;
+}
+
+// The table, by the recurrence sin((k+1)d) = 2cos(d)sin(kd) - sin((k-1)d),
+// worked in 2^30 to keep the error of 1024 steps out of the 2^16 result.
+void djup_init() {
+    if (djup_sin_table) { return; }
+    djup_sin_table = alloc(DJUP_TURN * 8);
+    int c = 1073721611;   // cos(2pi/1024) * 2^30
+    int prev = 0;
+    int cur = 6588356;    // sin(2pi/1024) * 2^30
+    store64(djup_sin_table, 0);
+    int k = 1;
+    for (k = 1; k < DJUP_TURN; k += 1) {
+        store64(djup_sin_table + k * 8, (cur + 8192) >> 14);
+        int next = 2 * ((c * cur) >> 30) - prev;
+        prev = cur;
+        cur = next;
+    }
+    return;
+}
+
+int djup_sin(int a) {
+    a = a % DJUP_TURN;
+    if (a < 0) { a += DJUP_TURN; }
+    return load64(djup_sin_table + a * 8);
+}
+
+int djup_cos(int a) { return djup_sin(a + DJUP_TURN / 4); }
+
+// --- meshes ---------------------------------------------------------------
+
+int djup_bytes(int vcap, int fcap) { return sizeof(DjupHead) + vcap * 24 + fcap * 32; }
+
+int djup_new(int vcap, int fcap) {
+    int m = alloc(djup_bytes(vcap, fcap));
+    if (!m) { return 0; }
+    int magic = "form";
+    int i = 0;
+    for (i = 0; i < 8; i += 1) { store8(m + i, 0); }
+    for (i = 0; i < 4; i += 1) { store8(m + i, load8(magic + i)); }
+    m.dh_version = 1;
+    m.dh_verts = 0;
+    m.dh_faces = 0;
+    m.dh_vcap = vcap;
+    m.dh_fcap = fcap;
+    return m;
+}
+
+int djup_vert(int m, int i) { return m + sizeof(DjupHead) + i * 24; }
+int djup_face(int m, int i) { return m + sizeof(DjupHead) + m.dh_vcap * 24 + i * 32; }
+
+int djup_add_vert(int m, int x, int y, int z) {
+    if (m.dh_verts >= m.dh_vcap) { return 0 - 1; }
+    int v = djup_vert(m, m.dh_verts);
+    store64(v, x);
+    store64(v + 8, y);
+    store64(v + 16, z);
+    m.dh_verts += 1;
+    return m.dh_verts - 1;
+}
+
+int djup_add_face(int m, int a, int b, int c, int colour) {
+    if (m.dh_faces >= m.dh_fcap) { return 0 - 1; }
+    int f = djup_face(m, m.dh_faces);
+    store64(f, a);
+    store64(f + 8, b);
+    store64(f + 16, c);
+    store64(f + 24, colour);
+    m.dh_faces += 1;
+    return m.dh_faces - 1;
+}
+
+void djup_remove_face(int m, int i) {
+    int n = m.dh_faces;
+    if (i < 0 || i >= n) { return; }
+    while (i < n - 1) {
+        int to = djup_face(m, i);
+        int from = djup_face(m, i + 1);
+        int k = 0;
+        for (k = 0; k < 32; k += 8) { store64(to + k, load64(from + k)); }
+        i += 1;
+    }
+    m.dh_faces = n - 1;
+    return;
+}
+
+// A cube of side 2 * half, centred at (x, y, z), in colour. Returns the
+// first of its eight vertices, or -1 when there is no room.
+int djup_add_cube(int m, int x, int y, int z, int half, int colour) {
+    if (m.dh_verts + 8 > m.dh_vcap || m.dh_faces + 12 > m.dh_fcap) { return 0 - 1; }
+    int v = m.dh_verts;
+    int i = 0;
+    for (i = 0; i < 8; i += 1) {
+        int dx = half;
+        int dy = half;
+        int dz = half;
+        if ((i & 1) == 0) { dx = 0 - half; }
+        if ((i & 2) == 0) { dy = 0 - half; }
+        if ((i & 4) == 0) { dz = 0 - half; }
+        djup_add_vert(m, x + dx, y + dy, z + dz);
+    }
+    // Two triangles a side, corners counterclockwise from outside.
+    djup_quad(m, v + 0, v + 4, v + 6, v + 2, colour);   // x low
+    djup_quad(m, v + 1, v + 3, v + 7, v + 5, colour);   // x high
+    djup_quad(m, v + 0, v + 1, v + 5, v + 4, colour);   // y low
+    djup_quad(m, v + 2, v + 6, v + 7, v + 3, colour);   // y high
+    djup_quad(m, v + 0, v + 2, v + 3, v + 1, colour);   // z low
+    djup_quad(m, v + 4, v + 5, v + 7, v + 6, colour);   // z high
+    return v;
+}
+
+void djup_quad(int m, int a, int b, int c, int d, int colour) {
+    djup_add_face(m, a, b, c, colour);
+    djup_add_face(m, a, c, d, colour);
+    return;
+}
+
+// Writes the mesh to the file, the counts as caps. Returns 1 on success.
+int djup_save(int m, int name) {
+    int vcap = m.dh_vcap;
+    int fcap = m.dh_fcap;
+    int fd = open_write(name);
+    if (fd < 0) { return 0; }
+    m.dh_vcap = m.dh_verts;
+    m.dh_fcap = m.dh_faces;
+    int ok = 1;
+    if (write(fd, m, sizeof(DjupHead)) != sizeof(DjupHead)) { ok = 0; }
+    m.dh_vcap = vcap;
+    m.dh_fcap = fcap;
+    int vb = m.dh_verts * 24;
+    int fb2 = m.dh_faces * 32;
+    if (vb > 0 && write(fd, djup_vert(m, 0), vb) != vb) { ok = 0; }
+    if (fb2 > 0 && write(fd, djup_face(m, 0), fb2) != fb2) { ok = 0; }
+    close(fd);
+    return ok;
+}
+
+// Reads a mesh with room for vcap vertices and fcap faces, or 0 when the
+// file is missing, not a mesh, or bigger than that. A face naming a vertex
+// that is not there is refused too.
+int djup_load(int name, int vcap, int fcap) {
+    int fd = open_read(name);
+    if (fd < 0) { return 0; }
+    int head = alloc(sizeof(DjupHead));
+    int ok = read(fd, head, sizeof(DjupHead)) == sizeof(DjupHead);
+    // "lera" is another name for the same format, read as well.
+    int magic = "form";
+    int old = "lera";
+    int i = 0;
+    int same = ok;
+    int same_old = ok;
+    for (i = 0; i < 4; i += 1) {
+        if (load8(head + i) != load8(magic + i)) { same = 0; }
+        if (load8(head + i) != load8(old + i)) { same_old = 0; }
+    }
+    ok = same || same_old;
+    if (ok && (head.dh_version != 1 || head.dh_verts < 0 || head.dh_faces < 0
+               || head.dh_verts > vcap || head.dh_faces > fcap)) { ok = 0; }
+    int m = 0;
+    if (ok) { m = djup_new(vcap, fcap); }
+    if (m) {
+        int vb = head.dh_verts * 24;
+        int fb2 = head.dh_faces * 32;
+        if (vb > 0 && read(fd, djup_vert(m, 0), vb) != vb) { m = 0; }
+        if (m && fb2 > 0 && read(fd, djup_face(m, 0), fb2) != fb2) { m = 0; }
+        if (m) {
+            m.dh_verts = head.dh_verts;
+            m.dh_faces = head.dh_faces;
+            int bad = 0;
+            for (i = 0; i < m.dh_faces; i += 1) {
+                int f = djup_face(m, i);
+                int k = 0;
+                for (k = 0; k < 24; k += 8) {
+                    if (load64(f + k) < 0 || load64(f + k) >= m.dh_verts) { bad = 1; }
+                }
+            }
+            if (bad) {
+                dealloc(m);
+                m = 0;
+            }
+        }
+    }
+    close(fd);
+    return m;
+}
+
+// --- seeing -----------------------------------------------------------------
+
+// Vertex v as the camera sees it, x right, y up, z away, fixed point.
+(int, int) djup_view_xy(int cam, int v, int z_out) {
+    int x = load64(v) - cam.dc_x;
+    int y = load64(v + 8) - cam.dc_y;
+    int z = load64(v + 16) - cam.dc_z;
+    int sy = djup_sin(cam.dc_yaw);
+    int cy = djup_cos(cam.dc_yaw);
+    int x1 = fx_mul(x, cy) - fx_mul(z, sy);
+    int z1 = fx_mul(x, sy) + fx_mul(z, cy);
+    // Pitch turns the camera up over the target, so a positive pitch looks
+    // down on it. Higher points come nearer, and nearer ones go up on the
+    // screen.
+    int sp = djup_sin(cam.dc_pitch);
+    int cp = djup_cos(cam.dc_pitch);
+    int y2 = fx_mul(y, cp) + fx_mul(z1, sp);
+    int z2 = fx_mul(z1, cp) - fx_mul(y, sp) + cam.dc_dist;
+    store64(z_out, z2);
+    return x1, y2;
+}
+
+// Where vertex i lands in a w by h frame, and its depth, written to out as
+// three words. Returns 0 when it is behind the camera. djup_project_point
+// needs out to have room for six words.
+int djup_project(int m, int cam, int w, int h, int i, int out) {
+    int zq = out + 16;
+    int x = 0;
+    int y = 0;
+    x, y = djup_view_xy(cam, djup_vert(m, i), zq);
+    int z = load64(zq);
+    if (z < DJUP_NEAR) { return 0; }
+    int focal = h;
+    store64(out, w / 2 + (x * focal) / z);
+    store64(out + 8, h / 2 - (y * focal) / z);
+    return 1;
+}
+
+// Where the point (x, y, z) lands, written to out as x, y and depth.
+// Returns 0 when it is behind the camera.
+int djup_project_point(int cam, int w, int h, int x, int y, int z, int out) {
+    djup_init();
+    int v = out + 24;
+    store64(v, x);
+    store64(v + 8, y);
+    store64(v + 16, z);
+    int zq = out + 16;
+    int vx = 0;
+    int vy = 0;
+    vx, vy = djup_view_xy(cam, v, zq);
+    int d = load64(zq);
+    if (d < DJUP_NEAR) { return 0; }
+    store64(out, w / 2 + (vx * h) / d);
+    store64(out + 8, h / 2 - (vy * h) / d);
+    return 1;
+}
+
+// The light, as the camera sees things, from above, a little to the left
+// and from behind the viewer, so the faces turned to the camera are the lit
+// ones wherever it goes round. A unit vector in fixed point, z away from
+// the eye.
+int DJUP_LX = 0 - 22938;  // -0.35
+int DJUP_LY = 49152;      // 0.75
+int DJUP_LZ = 0 - 36045;  // -0.55
+
+// The colour of a face lit from DJUP_L, between 35% and 100% of its own.
+// Its normal is turned the way the camera turns the world, then met with
+// the light.
+int djup_shade(int m, int f, int colour, int cam) {
+    int a = djup_vert(m, load64(f));
+    int b = djup_vert(m, load64(f + 8));
+    int c = djup_vert(m, load64(f + 16));
+    int ux = load64(b) - load64(a);
+    int uy = load64(b + 8) - load64(a + 8);
+    int uz = load64(b + 16) - load64(a + 16);
+    int vx = load64(c) - load64(a);
+    int vy = load64(c + 8) - load64(a + 8);
+    int vz = load64(c + 16) - load64(a + 16);
+    int nx = fx_mul(uy, vz) - fx_mul(uz, vy);
+    int ny = fx_mul(uz, vx) - fx_mul(ux, vz);
+    int nz = fx_mul(ux, vy) - fx_mul(uy, vx);
+    // As djup_view_xy turns a point, without moving it.
+    int sy = djup_sin(cam.dc_yaw);
+    int cy = djup_cos(cam.dc_yaw);
+    int x1 = fx_mul(nx, cy) - fx_mul(nz, sy);
+    int z1 = fx_mul(nx, sy) + fx_mul(nz, cy);
+    int sp = djup_sin(cam.dc_pitch);
+    int cp = djup_cos(cam.dc_pitch);
+    int y2 = fx_mul(ny, cp) + fx_mul(z1, sp);
+    int z2 = fx_mul(z1, cp) - fx_mul(ny, sp);
+    int len = djup_isqrt(x1 * x1 + y2 * y2 + z2 * z2);
+    int lit = 0;
+    if (len > 0) {
+        lit = (x1 * DJUP_LX + y2 * DJUP_LY + z2 * DJUP_LZ) / len;
+        if (lit < 0) { lit = 0; }
+    }
+    // 0.35 + 0.65 * lit, in 1/65536.
+    int k = 22938 + fx_mul(42598, lit);
+    int r = ((colour >> 16) & 255) * k >> 16;
+    int g = ((colour >> 8) & 255) * k >> 16;
+    int bl = (colour & 255) * k >> 16;
+    return (r << 16) | (g << 8) | bl;
+}
+
+// Draws the mesh into fb (w by h pixels, stride w) through the camera.
+// zbuf has room for w * h words and is cleared here. idbuf, unless 0,
+// gets each drawn pixel's face number plus one, for picking with a click.
+// Faces turned away and faces reaching behind the camera are left out.
+void djup_render(int m, int fb, int w, int h, int cam, int zbuf, int idbuf) {
+    djup_init();
+    int i = 0;
+    for (i = 0; i < w * h; i += 1) { store32(zbuf + i * 4, 2147483647); }
+    if (idbuf) { for (i = 0; i < w * h; i += 1) { store32(idbuf + i * 4, 0); } }
+    int pv = alloc(m.dh_verts * 32 + 32);
+    if (!pv) { return; }
+    // Every vertex once, x y z and whether it can be seen.
+    for (i = 0; i < m.dh_verts; i += 1) {
+        store64(pv + i * 32 + 24, djup_project(m, cam, w, h, i, pv + i * 32));
+    }
+    int f = 0;
+    for (f = 0; f < m.dh_faces; f += 1) {
+        int face = djup_face(m, f);
+        int pa = pv + load64(face) * 32;
+        int pb = pv + load64(face + 8) * 32;
+        int pc = pv + load64(face + 16) * 32;
+        if (load64(pa + 24) && load64(pb + 24) && load64(pc + 24)) {
+            djup_triangle(fb, w, h, zbuf, idbuf, pa, pb, pc,
+                          djup_shade(m, face, load64(face + 24), cam), f + 1);
+        }
+    }
+    dealloc(pv);
+    return;
+}
+
+// One triangle, its corners as projected (x, y, depth), flat in colour.
+// A face's corners go counterclockwise seen from outside, and the view has
+// z going away from the eye, so a face turned to the camera comes out with
+// a positive area on the screen, whose y runs down. Those are drawn, the
+// rest are its back. The rasterising below wants a negative area, so a
+// face that is drawn has two corners swapped first.
+void djup_triangle(int fb, int w, int h, int zbuf, int idbuf, int pa, int pb, int pc,
+                   int colour, int id) {
+    int x0 = load64(pa);
+    int y0 = load64(pa + 8);
+    int z0 = load64(pa + 16);
+    int x1 = load64(pc);
+    int y1 = load64(pc + 8);
+    int z1 = load64(pc + 16);
+    int x2 = load64(pb);
+    int y2 = load64(pb + 8);
+    int z2 = load64(pb + 16);
+    int area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    if (area >= 0) { return; }   // turned away, or edge on
+    int minx = x0;
+    if (x1 < minx) { minx = x1; }
+    if (x2 < minx) { minx = x2; }
+    int maxx = x0;
+    if (x1 > maxx) { maxx = x1; }
+    if (x2 > maxx) { maxx = x2; }
+    int miny = y0;
+    if (y1 < miny) { miny = y1; }
+    if (y2 < miny) { miny = y2; }
+    int maxy = y0;
+    if (y1 > maxy) { maxy = y1; }
+    if (y2 > maxy) { maxy = y2; }
+    if (minx < 0) { minx = 0; }
+    if (miny < 0) { miny = 0; }
+    if (maxx > w - 1) { maxx = w - 1; }
+    if (maxy > h - 1) { maxy = h - 1; }
+    if (minx > maxx || miny > maxy) { return; }
+    // Edge functions at the box's first pixel, then stepped, each one
+    // negative inside since area is negative.
+    int a0 = y1 - y2;
+    int b0 = x2 - x1;
+    int a1 = y2 - y0;
+    int b1 = x0 - x2;
+    int a2 = y0 - y1;
+    int b2 = x1 - x0;
+    int w0r = (x1 - minx) * (y2 - miny) - (x2 - minx) * (y1 - miny);
+    int w1r = (x2 - minx) * (y0 - miny) - (x0 - minx) * (y2 - miny);
+    int w2r = (x0 - minx) * (y1 - miny) - (x1 - minx) * (y0 - miny);
+    int y = miny;
+    while (y <= maxy) {
+        int w0 = w0r;
+        int w1 = w1r;
+        int w2 = w2r;
+        int x = minx;
+        int row = y * w;
+        while (x <= maxx) {
+            if (w0 <= 0 && w1 <= 0 && w2 <= 0) {
+                int z = (w0 * z0 + w1 * z1 + w2 * z2) / area;
+                int at = (row + x) * 4;
+                if (z < load32(zbuf + at)) {
+                    store32(zbuf + at, z);
+                    store32(fb + at, colour);
+                    if (idbuf) { store32(idbuf + at, id); }
+                }
+            }
+            w0 += a0;
+            w1 += a1;
+            w2 += a2;
+            x += 1;
+        }
+        w0r += b0;
+        w1r += b1;
+        w2r += b2;
+        y += 1;
+    }
+    return;
+}
+
+// The mesh's edges as lines in colour, over whatever is in fb.
+void djup_wire(int m, int fb, int w, int h, int cam, int colour) {
+    djup_init();
+    int pa = alloc(32);
+    int pb = alloc(32);
+    int f = 0;
+    for (f = 0; f < m.dh_faces; f += 1) {
+        int face = djup_face(m, f);
+        int k = 0;
+        for (k = 0; k < 3; k += 1) {
+            int ia = load64(face + k * 8);
+            int ib = load64(face + ((k + 1) % 3) * 8);
+            if (djup_project(m, cam, w, h, ia, pa) && djup_project(m, cam, w, h, ib, pb)) {
+                djup_line(fb, w, h, load64(pa), load64(pa + 8), load64(pb), load64(pb + 8), colour);
+            }
+        }
+    }
+    dealloc(pa);
+    dealloc(pb);
+    return;
+}
+
+void djup_line(int fb, int w, int h, int x0, int y0, int x1, int y1, int colour) {
+    int dx = x1 - x0;
+    int dy = y1 - y0;
+    int sx = 1;
+    int sy = 1;
+    if (dx < 0) { dx = 0 - dx; sx = -1; }
+    if (dy < 0) { dy = 0 - dy; sy = -1; }
+    int err = dx - dy;
+    int steps = 0;
+    while (steps < 4096) {
+        if (x0 >= 0 && y0 >= 0 && x0 < w && y0 < h) { store32(fb + (y0 * w + x0) * 4, colour); }
+        if (x0 == x1 && y0 == y1) { return; }
+        int e2 = err * 2;
+        if (e2 > 0 - dy) { err -= dy; x0 += sx; }
+        if (e2 < dx) { err += dx; y0 += sy; }
+        steps += 1;
+    }
+    return;
+}
+
+// --- edges and corners in front ------------------------------------------------
+//
+// Lines and points drawn over a rendered mesh, kept to what the depth buffer
+// says can be seen, so the edges and corners behind the model stay hidden.
+// DJUP_BIAS is how far behind the surface a pixel may be and still count as
+// on it, since an edge's depth and its face's are worked out apart.
+
+int DJUP_BIAS = 2048;
+
+// A line from (x0, y0) at depth z0 to (x1, y1) at z1, each pixel drawn only
+// where nothing in zbuf is nearer.
+void djup_line_z(int fb, int w, int h, int zbuf, int x0, int y0, int z0,
+                 int x1, int y1, int z1, int colour) {
+    int dx = x1 - x0;
+    int dy = y1 - y0;
+    int sx = 1;
+    int sy = 1;
+    if (dx < 0) { dx = 0 - dx; sx = -1; }
+    if (dy < 0) { dy = 0 - dy; sy = -1; }
+    int n = dx;
+    if (dy > n) { n = dy; }
+    if (n == 0) { n = 1; }
+    int err = dx - dy;
+    int steps = 0;
+    while (steps <= n && steps < 4096) {
+        if (x0 >= 0 && y0 >= 0 && x0 < w && y0 < h) {
+            int z = z0 + (z1 - z0) * steps / n;
+            int at = (y0 * w + x0) * 4;
+            if (z <= load32(zbuf + at) + DJUP_BIAS) { store32(fb + at, colour); }
+        }
+        if (x0 == x1 && y0 == y1) { return; }
+        int e2 = err * 2;
+        if (e2 > 0 - dy) { err -= dy; x0 += sx; }
+        if (e2 < dx) { err += dx; y0 += sy; }
+        steps += 1;
+    }
+    return;
+}
+
+// The edges of every face that can be seen, in colour, after djup_render
+// filled zbuf.
+void djup_wire_z(int m, int fb, int w, int h, int cam, int zbuf, int colour) {
+    djup_init();
+    int pa = alloc(32);
+    int pb = alloc(32);
+    int f = 0;
+    for (f = 0; f < m.dh_faces; f += 1) {
+        int face = djup_face(m, f);
+        int k = 0;
+        for (k = 0; k < 3; k += 1) {
+            int ia = load64(face + k * 8);
+            int ib = load64(face + ((k + 1) % 3) * 8);
+            if (djup_project(m, cam, w, h, ia, pa) && djup_project(m, cam, w, h, ib, pb)) {
+                djup_line_z(fb, w, h, zbuf, load64(pa), load64(pa + 8), load64(pa + 16),
+                            load64(pb), load64(pb + 8), load64(pb + 16), colour);
+            }
+        }
+    }
+    dealloc(pa);
+    dealloc(pb);
+    return;
+}
+
+// 1 when vertex i of the mesh can be seen, nothing in zbuf in front of it.
+// out gets its projection, as for djup_project.
+int djup_vert_seen(int m, int cam, int w, int h, int zbuf, int i, int out) {
+    if (!djup_project(m, cam, w, h, i, out)) { return 0; }
+    int x = load64(out);
+    int y = load64(out + 8);
+    if (x < 0 || y < 0 || x >= w || y >= h) { return 0; }
+    return load64(out + 16) <= load32(zbuf + (y * w + x) * 4) + DJUP_BIAS;
+}
+

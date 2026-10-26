@@ -8,25 +8,31 @@
 // WARRANTY; see the LICENSE file for the full text.
 //
 // lira -- the piano roll. A tavla with a grid of pitches (rows) against time
-// (columns, one per step, four steps to a beat). Click an empty cell to put a
-// note there and click a note to take it away. Space plays the song through
-// oljud and stops it, s saves it.
+// (columns, one per step, four steps to a beat). The left button puts a note
+// in, and dragging before letting go makes it longer. The right button takes
+// a note away. A note's ends drag to make it shorter or longer, and its
+// middle drags up and down for how loud it is and left and right for where
+// it sits between the speakers. The pointer shows which, arrows left and
+// right on an end, four ways on a middle. The instruments are buttons along
+// the bottom, the one new notes get lit. Space plays the song through oljud
+// and stops it, s saves it.
 //
 // It edits the file named on its command line (`start lira.elf NAME`, or a
 // click on a song in hylla), a new song when there is none yet, in the noter
 // format (noter.c0), and plays it with the synth (synth.c0). Without a name
-// it edits song.not, starting from demo.not, which the kernel seeds at boot,
-// when there is no song.not yet. It saves to song.not even then, so the demo
-// stays what it is and a person's own song is theirs. A save changes jakel
-// in memory, and the shell's `sync` puts it on disk.
+// it is a new song with no name, and s asks for one along the bottom (a
+// name without an ending gets .not). A save changes jakel in memory, and
+// the shell's `sync` puts it on disk.
 //
 // Keys
-//   click        put a note of the current length there, or remove the note
-//                that is there
-//   [ and ]      halve or double the length new notes get (1 to 16 steps)
 //   , and .      quieter or louder new notes (velocity, in steps of 16)
-//   1 to 4       the instrument new notes get, square, triangle, sawtooth
-//                or drum, each drawn in its own colour
+//   1 to 4       the instrument new notes get, as its button does, square,
+//                triangle, sawtooth or drum, each drawn in its own colour,
+//                and the one m, o and p act on
+//   m            mute that instrument, or hear it again
+//   o            solo it, only it is heard, or everything again
+//   p and P      pan it a step right or left, nine steps from hard left
+//                to hard right, saved with the song
 //   - and =      tempo down or up by 5 beats per minute
 //   arrows       scroll up and down a semitone, left and right a beat
 //   PgUp, PgDn   scroll an octave
@@ -46,7 +52,12 @@
 // empties oljud's queue with sound(0, -1), so the sound stops at once.
 //
 // Each note shows its velocity as a pale bar along its bottom edge, as long
-// as the note is loud, so a full-length bar is velocity 127.
+// as the note is loud, so a full-length bar is velocity 127. The notes of an
+// instrument that is not heard, muted or left out by a solo, are drawn in
+// their darker edge colour.
+//
+// The song plays as 16-bit stereo (sound_format(2)), each instrument where
+// its pan puts it.
 
 include "noter.c0";
 include "synth.c0";
@@ -55,6 +66,7 @@ include "moon.c0";
 int SONG_CAP = 1024;            // notes, 32KB of song
 int PLAY_BLOCK = 1024;          // samples rendered at a time
 int PLAY_AHEAD = 5120;          // samples kept queued while playing
+int FRAME = 4;                  // bytes of one stereo sample in oljud's queue
 
 // --- drawing ---------------------------------------------------------------
 //
@@ -215,11 +227,17 @@ void line_add(int s) {
 }
 
 void line_num(int n) {
-    if (n < 0) { line_add("-"); n = 0 - n; }
+    if (n < 0) { line_add("-"); }
     int digits = alloc(24);
     int k = 0;
     if (!n) { store8(digits, '0'); k = 1; }
-    while (n > 0) { store8(digits + k, '0' + n % 10); n /= 10; k += 1; }
+    while (n != 0) {
+        int d = n % 10;
+        if (d < 0) { d = 0 - d; }
+        store8(digits + k, '0' + d);
+        n /= 10;
+        k += 1;
+    }
     while (k > 0) {
         k -= 1;
         if (line_n < 255) { store8(line + line_n, load8(digits + k)); line_n += 1; }
@@ -238,6 +256,21 @@ int first_step;       // the step in the leftmost column
 int note_len = 4;     // steps a new note gets
 int note_vel = 100;   // velocity a new note gets
 int note_inst = 0;    // instrument a new note gets
+int muted = 0;        // instruments muted, one bit each
+int solo = -1;        // the instrument soloed, or -1
+int shift = 0;
+
+// Tells the synth who is heard, from the mutes and the solo.
+void update_heard() {
+    if (solo >= 0) {
+        synth_muted = 15 - (1 << solo);
+    } else {
+        synth_muted = muted;
+    }
+    return;
+}
+
+int heard(int inst) { return ((synth_muted >> inst) & 1) == 0; }
 int looping = 0;      // 1 means playback starts over at the end
 int fitted = 0;       // 1 once the view has been centred on the song
 int message;          // the status line's message, or 0
@@ -325,7 +358,7 @@ void view_fit() {
 // The playhead's sample, as far as can be told from here, what has been
 // rendered, less what is still waiting in oljud's queue.
 int play_sample() {
-    int waiting = sound(0, 0);
+    int waiting = sound(0, 0) / FRAME;
     if (waiting < 0) { waiting = 0; }
     int at = play_done - waiting;
     if (at < 0) { at = 0; }
@@ -399,7 +432,9 @@ void render() {
             if (x1 > x0) {
                 int y = HEAD_H + row * ROW_H;
                 fill_rect(x0 + 1, y + 1, x1 - x0 - 1, ROW_H - 3, note_edge(n.nn_instrument));
-                fill_rect(x0 + 2, y + 2, x1 - x0 - 3, ROW_H - 5, note_colour(n.nn_instrument));
+                int fillc = note_colour(n.nn_instrument);
+                if (!heard(n.nn_instrument)) { fillc = note_edge(n.nn_instrument); }
+                fill_rect(x0 + 2, y + 2, x1 - x0 - 3, ROW_H - 5, fillc);
                 // The velocity bar, along the bottom two rows of the note,
                 // measured against the note's whole length even when part
                 // of it is scrolled off the left edge.
@@ -410,6 +445,15 @@ void render() {
                 if (vx < x0 + 2) { vx = x0 + 2; }
                 if (vx1 > x1 - 1) { vx1 = x1 - 1; }
                 if (vx1 > vx) { fill_rect(vx, y + ROW_H - 5, vx1 - vx, 2, COL_VEL); }
+                // A note moved between the speakers has a mark along its
+                // top, at the place it sits, left end hard left.
+                if (n.nn_pan != NOTER_PAN_MIDDLE) {
+                    int px2 = step_x(n.nn_start) + 2 + full * n.nn_pan / NOTER_PAN_MAX - 1;
+                    // Kept inside the note, so hard left and hard right show too.
+                    if (px2 < step_x(n.nn_start) + 2) { px2 = step_x(n.nn_start) + 2; }
+                    if (px2 + 2 > step_x(n.nn_start) + 2 + full) { px2 = step_x(n.nn_start) + full; }
+                    if (px2 >= x0 + 2 && px2 + 2 <= x1 - 1) { fill_rect(px2, y + 2, 2, 3, COL_HEAD); }
+                }
             }
         }
     }
@@ -417,23 +461,35 @@ void render() {
     head_x = play_x();
     if (head_x >= 0) { fill_rect(head_x, HEAD_H, 2, gh, COL_HEAD); }
 
-    // The status panel along the bottom.
-    int py = view_h - PANEL_H + (PANEL_H - cell_h) / 2;
+    // The panel along the bottom, the instrument buttons and under them the
+    // status line.
+    draw_buttons();
+    int py = view_h - cell_h - 4;
     line_reset();
     line_add(song_name);
     line_add("  ");
     line_num(song.nh_tempo);
-    line_add(" bpm  note ");
-    line_num(note_len);
-    line_add(" steps  vel ");
+    line_add(" bpm  vel ");
     line_num(note_vel);
     line_add("  ");
     line_add(instrument_name(note_inst));
+    // Where it sits, C in the middle, L4 hard left to R4 hard right.
+    line_add(" pan ");
+    line_pan(noter_pan(song, note_inst) - NOTER_PAN_MIDDLE);
+    if (solo == note_inst) { line_add(" solo"); }
+    else if (!heard(note_inst)) { line_add(" muted"); }
     line_add("  ");
     line_num(noter_count(song));
     line_add(" notes");
     if (looping == 1) { line_add("  loop"); }
     if (playing == 1) { line_add("  playing"); }
+    if (naming) {
+        nbuf[nlen] = 0;
+        line_reset();
+        line_add("save as ");
+        line_add(nbuf);
+        line_add("_    Enter saves, Esc keeps working");
+    }
     // The help hint first, so a narrow window never cuts it off.
     int x = draw_text(4, py, "h help", COL_DIM);
     x = draw_text(x + cell_w * 2, py, line, COL_TEXT);
@@ -445,7 +501,7 @@ void render() {
 // The help, drawn over the grid in a box. Everything a person needs to make
 // a first song, since the keys are not written anywhere else they can see.
 void draw_help() {
-    int lines = alloc(26 * 8);
+    int lines = alloc(32 * 8);
     int n = 0;
     store64(lines + n * 8, "lira, the piano roll"); n += 1;
     store64(lines + n * 8, ""); n += 1;
@@ -453,9 +509,13 @@ void draw_help() {
     store64(lines + n * 8, "in full colour. Columns are steps, four steps"); n += 1;
     store64(lines + n * 8, "to a beat and four beats to a numbered bar."); n += 1;
     store64(lines + n * 8, ""); n += 1;
-    store64(lines + n * 8, "click      put a note in, or take one out"); n += 1;
-    store64(lines + n * 8, "1 2 3 4    square, triangle, saw or drum"); n += 1;
-    store64(lines + n * 8, "[ ]        shorter or longer new notes"); n += 1;
+    store64(lines + n * 8, "left       put a note in, drag to lengthen"); n += 1;
+    store64(lines + n * 8, "right      take a note out"); n += 1;
+    store64(lines + n * 8, "drag ends  a note shorter or longer"); n += 1;
+    store64(lines + n * 8, "drag middle up/down loudness, sideways pan"); n += 1;
+    store64(lines + n * 8, "buttons    the instrument, or 1 2 3 4"); n += 1;
+    store64(lines + n * 8, "m o        mute or solo that instrument"); n += 1;
+    store64(lines + n * 8, "p P        pan it right or left"); n += 1;
     store64(lines + n * 8, ", .        quieter or louder new notes"); n += 1;
     store64(lines + n * 8, "- =        slower or faster"); n += 1;
     store64(lines + n * 8, "arrows     a semitone or a beat"); n += 1;
@@ -467,7 +527,7 @@ void draw_help() {
     store64(lines + n * 8, "h          this help"); n += 1;
     store64(lines + n * 8, "Esc        close this, or quit lira"); n += 1;
     store64(lines + n * 8, ""); n += 1;
-    store64(lines + n * 8, "The bottom line shows what new notes get."); n += 1;
+    store64(lines + n * 8, "The bottom shows what new notes get."); n += 1;
     store64(lines + n * 8, "s saves to the name at its start. Type sync"); n += 1;
     store64(lines + n * 8, "in the shell to keep it after a restart."); n += 1;
     int w = 46 * cell_w + 16;
@@ -490,20 +550,103 @@ void draw_help() {
 
 // --- actions ----------------------------------------------------------------
 
-void click(int mx, int my) {
-    if (mx < LABEL_W || my < HEAD_H) { return; }
+// What the left button is doing while it is held. DRAG_NONE when it is not.
+int DRAG_NONE = 0;
+int DRAG_END = 1;     // the note's end, its length
+int DRAG_START = 2;   // the note's start, its end stays
+int DRAG_BODY = 3;    // its middle, loudness or pan, whichever way it moves first
+int drag = 0;
+int drag_note = 0 - 1;     // the note's pitch and start, which find it again
+int drag_pitch = 0;
+int drag_start = 0;
+int drag_x = 0;            // where the press was
+int drag_y = 0;
+int drag_axis = 0;         // 1 up and down, 2 left and right, 0 not yet
+int drag_moved = 0;        // 1 once the pointer has gone a few pixels
+int drag_vel = 0;          // the note's loudness and pan when it was pressed
+int drag_pan = 0;
+int pointer_now = 0;       // the shape last asked for
+
+// The grid cell at window point (mx, my), as pitch and step, or -1 and -1.
+(int, int) cell_at(int mx, int my) {
+    if (mx < LABEL_W || my < HEAD_H) { return 0 - 1, 0 - 1; }
     int col = (mx - LABEL_W) / COL_W;
     int row = (my - HEAD_H) / ROW_H;
-    if (col >= grid_cols() || row >= grid_rows()) { return; }
+    if (col >= grid_cols() || row >= grid_rows()) { return 0 - 1, 0 - 1; }
     int pitch = top_pitch - row;
-    int step = first_step + col;
-    if (pitch < 0 || pitch > 127) { return; }
+    if (pitch < 0 || pitch > 127) { return 0 - 1, 0 - 1; }
+    return pitch, first_step + col;
+}
+
+// The note at window point (mx, my) and which part of it, DRAG_END or
+// DRAG_START within a few pixels of an end, else DRAG_BODY. -1 and 0 when
+// there is none.
+(int, int) note_at(int mx, int my) {
+    int pitch = 0;
+    int step = 0;
+    pitch, step = cell_at(mx, my);
+    if (pitch < 0) { return 0 - 1, 0; }
     int hit = noter_find(song, pitch, step);
-    if (hit >= 0) {
-        noter_remove(song, hit);
-        message = 0;
-        return;
+    if (hit < 0) { return 0 - 1, 0; }
+    int n = noter_note(song, hit);
+    int x0 = step_x(n.nn_start);
+    int x1 = step_x(n.nn_start + n.nn_length);
+    int grip = 4;
+    if (x1 - x0 < 12) { grip = 2; }
+    if (mx >= x1 - grip) { return hit, DRAG_END; }
+    if (mx < x0 + grip && n.nn_length > 1) { return hit, DRAG_START; }
+    return hit, DRAG_BODY;
+}
+
+// The pointer for what is under (mx, my).
+void hover(int mx, int my) {
+    int shape = POINTER_BLOCK;
+    if (drag == DRAG_END || drag == DRAG_START) { shape = POINTER_STRETCH; }
+    else if (drag == DRAG_BODY) { shape = POINTER_DRAG; }
+    else {
+        int hit = 0;
+        int part = 0;
+        hit, part = note_at(mx, my);
+        if (hit >= 0) {
+            shape = POINTER_DRAG;
+            if (part != DRAG_BODY) { shape = POINTER_STRETCH; }
+        }
     }
+    if (shape != pointer_now) {
+        pointer_now = shape;
+        pointer(shape);
+    }
+    return;
+}
+
+// The note being dragged, found again by its pitch and start, since adding
+// and removing notes moves the others in the list.
+int dragged() { return noter_find(song, drag_pitch, drag_start); }
+
+// Puts a note back with new fields, where its start may have moved.
+void replace_note(int i, int start, int length) {
+    int n = noter_note(song, i);
+    int pitch = n.nn_pitch;
+    int vel = n.nn_velocity;
+    int inst = n.nn_instrument;
+    int pan = n.nn_pan;
+    noter_remove(song, i);
+    int k = noter_add_with(song, SONG_CAP, pitch, start, length, vel, inst);
+    if (k >= 0) {
+        int r = noter_note(song, k);
+        r.nn_pan = pan;
+    }
+    drag_start = start;
+    return;
+}
+
+// Adds a note at the press. It is dragged by its end straight away, so
+// holding the button and moving right makes it longer.
+void place(int mx, int my) {
+    int pitch = 0;
+    int step = 0;
+    pitch, step = cell_at(mx, my);
+    if (pitch < 0) { return; }
     if (noter_voices(song, step, note_len) >= 8) {
         message = "eight notes already sound there";
         return;
@@ -512,7 +655,180 @@ void click(int mx, int my) {
         message = "the song is full";
         return;
     }
+    drag = DRAG_END;
+    drag_pitch = pitch;
+    drag_start = step;
+    drag_x = mx;
+    drag_y = my;
+    drag_moved = 0;
     message = 0;
+    return;
+}
+
+void press(int mx, int my) {
+    if (my >= view_h - PANEL_H) { panel_click(mx, my); return; }
+    int hit = 0;
+    int part = 0;
+    hit, part = note_at(mx, my);
+    if (hit < 0) {
+        place(mx, my);
+        return;
+    }
+    int n = noter_note(song, hit);
+    drag = part;
+    drag_pitch = n.nn_pitch;
+    drag_start = n.nn_start;
+    drag_x = mx;
+    drag_y = my;
+    drag_axis = 0;
+    drag_moved = 0;
+    drag_vel = n.nn_velocity;
+    drag_pan = n.nn_pan;
+    message = 0;
+    return;
+}
+
+// The button held and the pointer at (mx, my).
+void move(int mx, int my) {
+    // A press that has not gone anywhere yet is a click, nothing to drag.
+    if (!drag_moved) {
+        int ddx = mx - drag_x;
+        int ddy = my - drag_y;
+        if (ddx < 3 && ddx > 0 - 3 && ddy < 3 && ddy > 0 - 3) { return; }
+        drag_moved = 1;
+    }
+    int i = dragged();
+    if (i < 0) { drag = DRAG_NONE; return; }
+    int n = noter_note(song, i);
+    // The step under the pointer, even past the grid's edges.
+    int step = first_step + (mx - LABEL_W) / COL_W;
+    if (mx < LABEL_W) { step = first_step - 1; }
+    if (drag == DRAG_END) {
+        int len = step - n.nn_start + 1;
+        if (len < 1) { len = 1; }
+        if (len != n.nn_length) {
+            n.nn_length = len;
+            note_len = len;
+        }
+        return;
+    }
+    if (drag == DRAG_START) {
+        int end = n.nn_start + n.nn_length;
+        int start = step;
+        if (start < 0) { start = 0; }
+        if (start > end - 1) { start = end - 1; }
+        if (start != n.nn_start) { replace_note(i, start, end - start); }
+        return;
+    }
+    // The middle. Whichever way it moves first, a few pixels, is the one.
+    int dx = mx - drag_x;
+    int dy = my - drag_y;
+    if (drag_axis == 0) {
+        int ax = dx;
+        if (ax < 0) { ax = 0 - ax; }
+        int ay = dy;
+        if (ay < 0) { ay = 0 - ay; }
+        if (ay >= 4 && ay >= ax) { drag_axis = 1; }
+        else if (ax >= 4) { drag_axis = 2; }
+    }
+    if (drag_axis == 1) {
+        int v = drag_vel - dy;
+        if (v < 1) { v = 1; }
+        if (v > 127) { v = 127; }
+        n.nn_velocity = v;
+        line_reset();
+        line_add("velocity ");
+        line_num(v);
+        message = line_copy();
+    }
+    if (drag_axis == 2) {
+        int pan = drag_pan + dx / 8;
+        if (pan < 0) { pan = 0; }
+        if (pan > NOTER_PAN_MAX) { pan = NOTER_PAN_MAX; }
+        n.nn_pan = pan;
+        line_reset();
+        line_add("note pan ");
+        line_pan(pan - NOTER_PAN_MIDDLE);
+        message = line_copy();
+    }
+    return;
+}
+
+// The right button, which takes away the note under it.
+void erase(int mx, int my) {
+    int pitch = 0;
+    int step = 0;
+    pitch, step = cell_at(mx, my);
+    if (pitch < 0) { return; }
+    int hit = noter_find(song, pitch, step);
+    if (hit >= 0) {
+        noter_remove(song, hit);
+        message = 0;
+    }
+    return;
+}
+
+// --- the instrument buttons ---------------------------------------------------
+
+int button_w(int inst) { return (len(instrument_name(inst)) + 4) * cell_w; }
+int buttons_y() { return view_h - PANEL_H + 4; }
+
+void draw_buttons() {
+    int x = 4;
+    int y = buttons_y();
+    int inst = 0;
+    for (inst = 0; inst < NOTER_INSTRUMENTS; inst += 1) {
+        int w = button_w(inst);
+        int edge = COL_STEP;
+        if (inst == note_inst) { edge = COL_TEXT; }
+        fill_rect(x, y, w, cell_h + 6, edge);
+        fill_rect(x + 1, y + 1, w - 2, cell_h + 4, COL_BG_BLACK);
+        fill_rect(x + 4, y + 4, cell_w, cell_h - 2, note_colour(inst));
+        int c = COL_DIM;
+        if (inst == note_inst) { c = COL_TEXT; }
+        if (!heard(inst)) { c = note_edge(inst); }
+        draw_text(x + 4 + cell_w * 2, y + 3, instrument_name(inst), c);
+        x += w + 6;
+    }
+    return;
+}
+
+void panel_click(int mx, int my) {
+    int y = buttons_y();
+    if (my < y || my >= y + cell_h + 6) { return; }
+    int x = 4;
+    int inst = 0;
+    for (inst = 0; inst < NOTER_INSTRUMENTS; inst += 1) {
+        int w = button_w(inst);
+        if (mx >= x && mx < x + w) { note_inst = inst; return; }
+        x += w + 6;
+    }
+    return;
+}
+
+int len(int s) {
+    int n = 0;
+    while (s[n] != 0) { n += 1; }
+    return n;
+}
+
+// The line, copied into the one buffer drag messages share, for a message
+// that outlives the line.
+int msgbuf = 0;
+int line_copy() {
+    if (!msgbuf) { msgbuf = alloc(128); }
+    if (!msgbuf) { return 0; }
+    int i = 0;
+    for (i = 0; i <= line_n && i < 127; i += 1) { msgbuf[i] = load8(line + i); }
+    msgbuf[127] = 0;
+    return msgbuf;
+}
+
+// A pan from the middle, C, L1 to L4 or R1 to R4.
+void line_pan(int pan) {
+    if (!pan) { line_add("C"); }
+    else if (pan < 0) { line_add("L"); line_num(0 - pan); }
+    else { line_add("R"); line_num(pan); }
     return;
 }
 
@@ -540,7 +856,7 @@ void play_stop() {
 // when the song is over.
 void play_feed() {
     if (!playing) { return; }
-    while (sound(0, 0) + PLAY_BLOCK <= PLAY_AHEAD) {
+    while (sound(0, 0) / FRAME + PLAY_BLOCK <= PLAY_AHEAD) {
         // At the end of the song a loop starts over. The synth keeps no
         // state between blocks, so the start follows the end seamlessly.
         if (play_at >= play_len) {
@@ -549,10 +865,10 @@ void play_feed() {
         }
         int n = PLAY_BLOCK;
         if (play_len - play_at < n) { n = play_len - play_at; }
-        synth_render(song, play_at, n, play_out, play_mix);
+        synth_render16(song, play_at, n, play_out, play_mix);
         int sent = 0;
-        while (sent < n) {
-            int got = sound(play_out + sent, n - sent);
+        while (sent < n * FRAME) {
+            int got = sound(play_out + sent, n * FRAME - sent);
             if (got < 0) { playing = 0; return; }
             sent += got;
         }
@@ -566,10 +882,46 @@ void play_feed() {
     return;
 }
 
-// The file a save writes, song.not, or the one named on the command line.
+// The file a save writes, the one named on the command line or asked for,
+// or 0 before there is one.
 int save_name = 0;
+int naming = 0;       // 1 while the bottom line asks for a name to save as
+int nbuf;
+int nlen = 0;
+
+// A key while the bottom line asks for a name.
+void naming_key(int make) {
+    if (make == 1) { naming = 0; return; }
+    if (make == 14) { if (nlen > 0) { nlen -= 1; } return; }
+    if (make == 28) {
+        if (nlen == 0) { return; }
+        int dot = 0;
+        int i = 0;
+        for (i = 0; i < nlen; i += 1) { if (nbuf[i] == '.') { dot = 1; } }
+        int n = alloc(nlen + 5);
+        if (!n) { return; }
+        for (i = 0; i < nlen; i += 1) { n[i] = nbuf[i]; }
+        n[nlen] = 0;
+        if (!dot) {
+            int ending = ".not";
+            for (i = 0; i < 5; i += 1) { n[nlen + i] = ending[i]; }
+        }
+        save_name = n;
+        naming = 0;
+        save();
+        return;
+    }
+    int ch = key_char(make, shift);
+    if (ch > 32 && ch < 127 && nlen < 60) { nbuf[nlen] = ch; nlen += 1; }
+    return;
+}
 
 void save() {
+    if (!save_name) {
+        naming = 1;
+        nlen = 0;
+        return;
+    }
     if (noter_save(song, save_name) == 1) {
         song_name = save_name;
         message = "saved, sync to keep";
@@ -587,29 +939,28 @@ int main() {
     if (!fb) { print("lira: cannot allocate a frame buffer\n"); return 2; }
     if (font_init() == 0) { print("lira: the kernel would not hand over its font\n"); return 3; }
     line = alloc(256);
-    play_out = alloc(PLAY_BLOCK);
-    play_mix = alloc(PLAY_BLOCK * 8);
+    play_out = alloc(PLAY_BLOCK * FRAME);
+    play_mix = alloc(PLAY_BLOCK * 16);
+    // A machine with no sound card says no, and play_start tells the user.
+    sound_format(2);
     if (line == 0 || play_out == 0 || !play_mix) { print("lira: out of memory\n"); return 4; }
     head_x = 0 - 1;
     ROW_H = cell_h + 4;
     LABEL_W = cell_w * 4 + 6;
     HEAD_H = cell_h + 6;
-    PANEL_H = cell_h + 8;
+    PANEL_H = cell_h * 2 + 16;
 
     // `start lira.elf NAME` edits NAME, a new song when there is none yet,
-    // and saves to it. Without a name, song.not, starting from the demo.
-    save_name = "song.not";
-    if (argc() >= 2) { save_name = argv(1); }
-    song_name = save_name;
-    song = noter_load(save_name, SONG_CAP);
-    if (!song && argc() < 2) {
-        song_name = "demo.not";
-        song = noter_load("demo.not", SONG_CAP);
-    }
-    if (!song) {
+    // and saves to it. Without a name, a new song with none.
+    nbuf = alloc(64);
+    if (!nbuf) { print("lira: out of memory\n"); return 4; }
+    song_name = "unnamed";
+    if (argc() >= 2) {
+        save_name = argv(1);
         song_name = save_name;
-        song = noter_new(SONG_CAP, 4, 120);
+        song = noter_load(save_name, SONG_CAP);
     }
+    if (!song) { song = noter_new(SONG_CAP, 4, 120); }
     if (!song) { print("lira: out of memory\n"); return 5; }
     // Nothing may be printed past this point, since a task with a window has its
     // prints drawn into that window, over the grid.
@@ -617,6 +968,7 @@ int main() {
     int last_w = 0;
     int last_h = 0;
     int last_left = 0;
+    int last_right = 0;
     while (1) {
         int wi = win_info();
         int ww = wi >> 16;
@@ -628,24 +980,44 @@ int main() {
         view_h = wh;
         if (fitted == 0 && grid_rows() > 0) { view_fit(); fitted = 1; dirty = 1; }
 
-        // A click is the press edge, not the held state, or one click would
-        // add and remove the same note on alternate frames.
+        // A press is the edge, not the held state, or one click would add
+        // and remove the same note on alternate frames.
         int mp = mouse_poll();
-        int buttons = 0;
         if (mp >= 0) {
-            buttons = mp % 8;
+            int buttons = mp % 8;
             int packed = mp / 8;
-            if (buttons % 2 == 1 && !last_left) {
-                if (help_open == 1) { help_open = 0; } else { click(packed / 1024, packed % 1024); }
+            int mx = packed / 1024;
+            int my = packed % 1024;
+            int left = buttons % 2;
+            int right = (buttons / 2) % 2;
+            if (left && !last_left) {
+                if (help_open == 1) { help_open = 0; } else { press(mx, my); }
+                dirty = 1;
+            } else if (left && drag != DRAG_NONE) {
+                move(mx, my);
                 dirty = 1;
             }
+            if (!left && drag != DRAG_NONE) {
+                drag = DRAG_NONE;
+                dirty = 1;
+            }
+            if (right && !last_right && help_open == 0) {
+                erase(mx, my);
+                dirty = 1;
+            }
+            last_left = left;
+            last_right = right;
+            hover(mx, my);
         }
-        last_left = buttons % 2;
 
         int key = key_poll();
         while (key >= 0) {
             int make = key / 2;
-            if (key % 2 == 0) {
+            if (make == 42 || make == 54) { shift = key % 2 == 0; }
+            if (key % 2 == 0 && naming) {
+                dirty = 1;
+                naming_key(make);
+            } else if (key % 2 == 0) {
                 dirty = 1;
                 if (make == 1 && help_open == 1) {                            // Esc
                     help_open = 0;
@@ -661,9 +1033,17 @@ int main() {
                 if (make == 52 && note_vel < 127) { note_vel += 16; } // .
                 if (note_vel > 127) { note_vel = 127; }
                 if (make >= 2 && make <= 5) { note_inst = make - 2; }        // 1 to 4
+                if (make == 50) { muted = muted ^ (1 << note_inst); update_heard(); }  // m
+                if (make == 24) {                                             // o
+                    if (solo == note_inst) { solo = -1; } else { solo = note_inst; }
+                    update_heard();
+                }
+                if (make == 25) {                                             // p, P
+                    int d = 1;
+                    if (shift) { d = -1; }
+                    noter_set_pan(song, note_inst, noter_pan(song, note_inst) + d);
+                }
                 if (make == 31) { save(); }                                   // s
-                if (make == 26 && note_len > 1) { note_len /= 2; }  // [
-                if (make == 27 && note_len < 16) { note_len *= 2; } // ]
                 if (make == 12 && song.nh_tempo > 40) { song.nh_tempo -= 5; }  // -
                 if (make == 13 && song.nh_tempo < 300) { song.nh_tempo += 5; } // =
                 if (make == 72 && top_pitch < 127) { top_pitch += 1; }  // up

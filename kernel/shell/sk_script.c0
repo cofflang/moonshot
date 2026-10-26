@@ -1,0 +1,765 @@
+// sk_script.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// skalman scripts, files ending in .sk, run with `run name.sk args` or a
+// click in hylla. A script is lines, and a line is one of
+//
+//   # a comment
+//   name = expression
+//   while (expression) {        ...        }
+//   if (expression) {   } else if (expression) {   } else {   }
+//   anything else, a shell command, after $name, $1 to $9 and $# are
+//   replaced by their values
+//
+// Every value is a string. Arithmetic, + - * / %, and < > <= >= work on
+// numbers, whole and possibly negative, and + of anything else joins the two
+// strings. == and != compare strings, so "07" and "7" differ. && || ! and
+// parentheses as in c0, "strings" in double quotes, and a name in an
+// expression is that variable, $name too. A value is true unless it is
+// empty or 0.
+//
+// At the prompt, `name = expression` sets a variable of that window's
+// session and $name works in any command, but if and while are for files.
+//
+// A script stops at the first line it cannot make sense of, saying where,
+// and after SKS_STEPS lines run, so a loop that never ends does not hold the
+// shell forever.
+
+int SKS_ARENA = 65536;
+int SKS_VARS = 32;
+int SKS_NAME = 24;
+int SKS_VALUE = 232;
+int SKS_STEPS = 100000;
+int SKS_DEPTH = 4;
+
+int SKS_BLANK = 0;
+int SKS_CMD = 1;
+int SKS_ASSIGN = 2;
+int SKS_WHILE = 3;
+int SKS_IF = 4;
+int SKS_ELSEIF = 5;
+int SKS_ELSE = 6;
+int SKS_CLOSE = 7;
+
+int sks_arena = 0;       // scratch for the values of one statement
+int sks_top = 0;
+int sks_session_base = 0; // per window, its prompt's variable table, or 0
+int sks_vars = 0;        // the table names are looked up in
+int sks_args = 0;        // ten argument strings, $0 to $9
+int sks_argc = 0;
+int sks_err = 0;         // the first error's message, or 0
+int sks_p = 0;           // where the expression being read has got to
+int sks_running = 0;     // scripts running, nested
+
+// --- strings ----------------------------------------------------------------------
+
+int sks_alloc(int n) {
+    if (!sks_arena) {
+        sks_arena = kmalloc(SKS_ARENA);
+        if (!sks_arena) { return 0; }
+    }
+    if (sks_top + n > SKS_ARENA) {
+        if (!sks_err) { sks_err = "out of room for values"; }
+        return 0;
+    }
+    int p = sks_arena + sks_top;
+    sks_top += n;
+    return p;
+}
+
+int sks_slice(int s, int n) {
+    int d = sks_alloc(n + 1);
+    if (!d) { return ""; }
+    int i = 0;
+    for (i = 0; i < n; i += 1) { store8(d + i, load8(s + i)); }
+    store8(d + n, 0);
+    return d;
+}
+
+int sks_len(int s) {
+    int n = 0;
+    while (load8(s + n) != 0) { n += 1; }
+    return n;
+}
+
+int sks_cat(int a, int b) {
+    int la = sks_len(a);
+    int lb = sks_len(b);
+    int d = sks_alloc(la + lb + 1);
+    if (!d) { return ""; }
+    int i = 0;
+    for (i = 0; i < la; i += 1) { store8(d + i, load8(a + i)); }
+    for (i = 0; i <= lb; i += 1) { store8(d + la + i, load8(b + i)); }
+    return d;
+}
+
+int sks_word_char(int c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+int sks_from_int(int v) {
+    int buf = sks_alloc(24);
+    if (!buf) { return "0"; }
+    int i = 23;
+    store8(buf + i, 0);
+    int neg = v < 0;
+    if (!v) { i -= 1; store8(buf + i, '0'); }
+    while (v != 0) {
+        int d = v % 10;
+        if (d < 0) { d = 0 - d; }
+        i -= 1;
+        store8(buf + i, '0' + d);
+        v = v / 10;
+    }
+    if (neg) { i -= 1; store8(buf + i, '-'); }
+    return buf + i;
+}
+
+// 1 and the number when s is a whole number, optionally negative.
+(int, int) sks_num(int s) {
+    int i = 0;
+    int neg = 0;
+    if (load8(s) == '-') { neg = 1; i = 1; }
+    if (load8(s + i) < '0' || load8(s + i) > '9') { return 0, 0; }
+    int v = 0;
+    while (load8(s + i) >= '0' && load8(s + i) <= '9') {
+        v = v * 10 + load8(s + i) - '0';
+        i += 1;
+    }
+    if (load8(s + i) != 0) { return 0, 0; }
+    if (neg) { v = 0 - v; }
+    return 1, v;
+}
+
+int sks_true(int s) {
+    if (load8(s) == 0) { return 0; }
+    if (load8(s) == '0' && load8(s + 1) == 0) { return 0; }
+    return 1;
+}
+
+// --- variables ------------------------------------------------------------------
+
+int sks_table_new() {
+    int t = kmalloc(SKS_VARS * (SKS_NAME + SKS_VALUE));
+    if (!t) { return 0; }
+    int i = 0;
+    for (i = 0; i < SKS_VARS; i += 1) { store8(t + i * (SKS_NAME + SKS_VALUE), 0); }
+    return t;
+}
+
+int sks_name_is(int slot, int name, int n) {
+    if (n >= SKS_NAME) { return 0; }
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        if (load8(slot + i) != load8(name + i)) { return 0; }
+    }
+    return load8(slot + n) == 0;
+}
+
+int sks_get(int name, int n) {
+    if (!sks_vars) { return 0; }
+    int i = 0;
+    for (i = 0; i < SKS_VARS; i += 1) {
+        int slot = sks_vars + i * (SKS_NAME + SKS_VALUE);
+        if (load8(slot) != 0 && sks_name_is(slot, name, n)) { return slot + SKS_NAME; }
+    }
+    return 0;
+}
+
+void sks_set(int name, int n, int value) {
+    if (!sks_vars || n >= SKS_NAME) { if (!sks_err) { sks_err = "a name too long"; } return; }
+    int free = 0 - 1;
+    int i = 0;
+    for (i = 0; i < SKS_VARS; i += 1) {
+        int slot = sks_vars + i * (SKS_NAME + SKS_VALUE);
+        if (load8(slot) != 0 && sks_name_is(slot, name, n)) { free = i; break; }
+        if (load8(slot) == 0 && free < 0) { free = i; }
+    }
+    if (free < 0) { if (!sks_err) { sks_err = "too many variables"; } return; }
+    int s2 = sks_vars + free * (SKS_NAME + SKS_VALUE);
+    for (i = 0; i < n; i += 1) { store8(s2 + i, load8(name + i)); }
+    store8(s2 + n, 0);
+    int v = s2 + SKS_NAME;
+    int k = 0;
+    while (k < SKS_VALUE - 1 && load8(value + k) != 0) {
+        store8(v + k, load8(value + k));
+        k += 1;
+    }
+    store8(v + k, 0);
+    return;
+}
+
+// The value of $ followed by what is at p, a digit, #, or a name, and how many
+// characters that was. A name nobody has set is empty.
+(int, int) sks_dollar(int p) {
+    int c = load8(p);
+    if (c >= '0' && c <= '9') {
+        int a = 0;
+        if (c - '0' < sks_argc && sks_args) { a = load64(sks_args + (c - '0') * 8); }
+        if (!a) { a = ""; }
+        return a, 1;
+    }
+    if (c == '#') { return sks_from_int(sks_argc - 1), 1; }
+    int n = 0;
+    while (sks_word_char(load8(p + n))) { n += 1; }
+    if (n == 0) { return "$", 0; }
+    int v = sks_get(p, n);
+    if (!v) { v = ""; }
+    return v, n;
+}
+
+// The line s with every $ replaced, in the arena.
+int sks_subst(int s) {
+    int out = "";
+    int start = 0;
+    int i = 0;
+    while (load8(s + i) != 0) {
+        if (load8(s + i) == '$') {
+            out = sks_cat(out, sks_slice(s + start, i - start));
+            int v = 0;
+            int used = 0;
+            v, used = sks_dollar(s + i + 1);
+            out = sks_cat(out, v);
+            i += 1 + used;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    return sks_cat(out, sks_slice(s + start, i - start));
+}
+
+// --- expressions ----------------------------------------------------------------
+
+void sks_space() {
+    while (load8(sks_p) == ' ' || load8(sks_p) == '\t') { sks_p += 1; }
+    return;
+}
+
+int sks_at(int s) {
+    sks_space();
+    int n = sks_len(s);
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        if (load8(sks_p + i) != load8(s + i)) { return 0; }
+    }
+    return 1;
+}
+
+int sks_primary() {
+    sks_space();
+    int c = load8(sks_p);
+    if (c == '(') {
+        sks_p += 1;
+        int v = sks_or();
+        if (!sks_at(")")) { if (!sks_err) { sks_err = "a ( without its )"; } return ""; }
+        sks_p += 1;
+        return v;
+    }
+    if (c == '"') {
+        int st = sks_p + 1;
+        int n = 0;
+        while (load8(st + n) != 0 && load8(st + n) != '"') { n += 1; }
+        if (load8(st + n) != '"') { if (!sks_err) { sks_err = "a string without its closing quote"; } return ""; }
+        sks_p = st + n + 1;
+        return sks_slice(st, n);
+    }
+    if (c == '$') {
+        int v = 0;
+        int used = 0;
+        v, used = sks_dollar(sks_p + 1);
+        sks_p += 1 + used;
+        return v;
+    }
+    if (c >= '0' && c <= '9') {
+        int n2 = 0;
+        while (load8(sks_p + n2) >= '0' && load8(sks_p + n2) <= '9') { n2 += 1; }
+        int v2 = sks_slice(sks_p, n2);
+        sks_p += n2;
+        return v2;
+    }
+    if (sks_word_char(c)) {
+        int n3 = 0;
+        while (sks_word_char(load8(sks_p + n3))) { n3 += 1; }
+        int v3 = sks_get(sks_p, n3);
+        sks_p += n3;
+        if (!v3) { v3 = ""; }
+        return v3;
+    }
+    if (!sks_err) { sks_err = "an expression was expected"; }
+    return "";
+}
+
+int sks_unary() {
+    sks_space();
+    if (load8(sks_p) == '!' && load8(sks_p + 1) != '=') {
+        sks_p += 1;
+        if (sks_true(sks_unary())) { return "0"; }
+        return "1";
+    }
+    if (load8(sks_p) == '-') {
+        sks_p += 1;
+        int ok = 0;
+        int v = 0;
+        ok, v = sks_num(sks_unary());
+        if (!ok) { if (!sks_err) { sks_err = "- needs a number"; } return "0"; }
+        return sks_from_int(0 - v);
+    }
+    return sks_primary();
+}
+
+// a op b for + - * / %, numbers, or + joining strings.
+int sks_arith(int a, int b, int op) {
+    int oka = 0;
+    int va = 0;
+    int okb = 0;
+    int vb = 0;
+    oka, va = sks_num(a);
+    okb, vb = sks_num(b);
+    if (!oka || !okb) {
+        if (op == '+') { return sks_cat(a, b); }
+        if (!sks_err) { sks_err = "arithmetic needs numbers"; }
+        return "0";
+    }
+    if ((op == '/' || op == '%') && vb == 0) {
+        if (!sks_err) { sks_err = "division by zero"; }
+        return "0";
+    }
+    if (op == '+') { return sks_from_int(va + vb); }
+    if (op == '-') { return sks_from_int(va - vb); }
+    if (op == '*') { return sks_from_int(va * vb); }
+    if (op == '/') { return sks_from_int(va / vb); }
+    return sks_from_int(va % vb);
+}
+
+int sks_mul() {
+    int v = sks_unary();
+    while (1) {
+        sks_space();
+        int c = load8(sks_p);
+        if (c != '*' && c != '/' && c != '%') { return v; }
+        sks_p += 1;
+        v = sks_arith(v, sks_unary(), c);
+    }
+    return v;
+}
+
+int sks_add() {
+    int v = sks_mul();
+    while (1) {
+        sks_space();
+        int c = load8(sks_p);
+        if (c != '+' && c != '-') { return v; }
+        sks_p += 1;
+        v = sks_arith(v, sks_mul(), c);
+    }
+    return v;
+}
+
+int sks_streq(int a, int b) {
+    int i = 0;
+    while (load8(a + i) != 0 && load8(a + i) == load8(b + i)) { i += 1; }
+    return load8(a + i) == load8(b + i);
+}
+
+int sks_cmp() {
+    int v = sks_add();
+    sks_space();
+    int op = 0;
+    if (sks_at("==")) { op = 1; } else if (sks_at("!=")) { op = 2; }
+    else if (sks_at("<=")) { op = 3; } else if (sks_at(">=")) { op = 4; }
+    else if (sks_at("<")) { op = 5; } else if (sks_at(">")) { op = 6; }
+    if (!op) { return v; }
+    if (op <= 4) { sks_p += 2; } else { sks_p += 1; }
+    int w = sks_add();
+    int r = 0;
+    if (op == 1) { r = sks_streq(v, w); }
+    else if (op == 2) { r = !sks_streq(v, w); }
+    else {
+        int oka = 0;
+        int va = 0;
+        int okb = 0;
+        int vb = 0;
+        oka, va = sks_num(v);
+        okb, vb = sks_num(w);
+        if (!oka || !okb) { if (!sks_err) { sks_err = "< and > need numbers"; } return "0"; }
+        if (op == 3) { r = va <= vb; }
+        if (op == 4) { r = va >= vb; }
+        if (op == 5) { r = va < vb; }
+        if (op == 6) { r = va > vb; }
+    }
+    if (r) { return "1"; }
+    return "0";
+}
+
+int sks_and() {
+    int v = sks_cmp();
+    while (sks_at("&&")) {
+        sks_p += 2;
+        int w = sks_cmp();
+        if (sks_true(v) && sks_true(w)) { v = "1"; } else { v = "0"; }
+    }
+    return v;
+}
+
+int sks_or() {
+    int v = sks_and();
+    while (sks_at("||")) {
+        sks_p += 2;
+        int w = sks_and();
+        if (sks_true(v) || sks_true(w)) { v = "1"; } else { v = "0"; }
+    }
+    return v;
+}
+
+// The value of the whole expression s.
+int sks_eval(int s) {
+    sks_p = s;
+    int v = sks_or();
+    sks_space();
+    if (load8(sks_p) != 0 && !sks_err) { sks_err = "something left over after the expression"; }
+    return v;
+}
+
+// --- lines ------------------------------------------------------------------------
+
+// The name's length and where the expression starts when line is
+// `name = expression`, or 0 and 0.
+(int, int) sks_assign_form(int line) {
+    int n = 0;
+    if (load8(line) >= '0' && load8(line) <= '9') { return 0, 0; }
+    while (sks_word_char(load8(line + n))) { n += 1; }
+    if (n == 0) { return 0, 0; }
+    int i = n;
+    while (load8(line + i) == ' ') { i += 1; }
+    if (load8(line + i) != '=' || load8(line + i + 1) == '=') { return 0, 0; }
+    return n, i + 1;
+}
+
+int sks_starts(int s, int p) {
+    int i = 0;
+    while (load8(p + i) != 0) {
+        if (load8(s + i) != load8(p + i)) { return 0; }
+        i += 1;
+    }
+    return 1;
+}
+
+// For `kw (cond) {`, the condition as its own string, or 0 when the line is
+// not of that shape.
+int sks_cond(int line, int kw) {
+    if (!sks_starts(line, kw)) { return 0; }
+    int i = sks_len(kw);
+    while (load8(line + i) == ' ') { i += 1; }
+    if (load8(line + i) != '(') { return 0; }
+    int e = sks_len(line) - 1;
+    if (e < 0 || load8(line + e) != '{') { return 0; }
+    e -= 1;
+    while (e > i && load8(line + e) == ' ') { e -= 1; }
+    if (load8(line + e) != ')') { return 0; }
+    return sks_slice(line + i + 1, e - i - 1);
+}
+
+int sks_kind(int line) {
+    if (load8(line) == 0 || load8(line) == '#') { return SKS_BLANK; }
+    if (sks_streq(line, "}")) { return SKS_CLOSE; }
+    if (sks_starts(line, "}")) {
+        int i = 1;
+        while (load8(line + i) == ' ') { i += 1; }
+        if (sks_starts(line + i, "else")) {
+            int j = i + 4;
+            while (load8(line + j) == ' ') { j += 1; }
+            if (sks_streq(line + j, "{")) { return SKS_ELSE; }
+            if (sks_cond(line + j, "if")) { return SKS_ELSEIF; }
+        }
+        return SKS_CMD;
+    }
+    if (sks_cond(line, "while")) { return SKS_WHILE; }
+    if (sks_cond(line, "if")) { return SKS_IF; }
+    int n = 0;
+    int at = 0;
+    n, at = sks_assign_form(line);
+    if (n > 0) { return SKS_ASSIGN; }
+    return SKS_CMD;
+}
+
+// --- running a file ---------------------------------------------------------------
+
+void sks_say(int file, int line_no, int msg) {
+    sk_print("run: ");
+    sk_print(file);
+    sk_print(":");
+    sk_print_int(line_no);
+    sk_print(": ");
+    sk_print(msg);
+    sk_print("\n");
+    serial_print("[run] ");
+    serial_print(file);
+    serial_print(":");
+    serial_print_int(line_no);
+    serial_print(": ");
+    serial_print(msg);
+    serial_print("\n");
+    return;
+}
+
+// Runs the script `path` (from session f's folder) with the arguments in
+// `rest`, words split at spaces.
+void sks_run(int f, int path, int rest) {
+    if (sks_running >= SKS_DEPTH) { sk_print("run: scripts nested too deeply\n"); return; }
+    int cwd = 0;
+    if (kakel_active == 1) { cwd = load64(sk_cwd_base + f * 8); }
+    int fid = jakel_open(cwd, path);
+    if (fid < 0 || load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) {
+        sk_print("run: no such script: ");
+        sk_print(path);
+        sk_print("\n");
+        return;
+    }
+    int size = load64(jakel_size_base + fid * 8);
+    int text = kmalloc(size + 1);
+    if (!text) { sk_print("run: out of memory\n"); return; }
+    jakel_read(fid, 0, text, size);
+    store8(text + size, 0);
+
+    // The lines, cut in place, each with its kind and its partner.
+    int lines = 1;
+    int i = 0;
+    for (i = 0; i < size; i += 1) { if (load8(text + i) == '\n') { lines += 1; } }
+    int start = kmalloc(lines * 8);
+    int kind = kmalloc(lines * 8);
+    int jump = kmalloc(lines * 8);   // see below
+    int stack = kmalloc(lines * 8);
+    if (!start || !kind || !jump || !stack) {
+        sk_print("run: out of memory\n");
+        kfree(text); kfree(start); kfree(kind); kfree(jump); kfree(stack);
+        return;
+    }
+    int saved_vars = sks_vars;
+    int saved_args = sks_args;
+    int saved_argc = sks_argc;
+    int saved_top = sks_top;
+    sks_running += 1;
+    sks_err = 0;
+
+    int n = 0;
+    int p = text;
+    while (n < lines) {
+        while (load8(p) == ' ' || load8(p) == '\t') { p += 1; }
+        store64(start + n * 8, p);
+        int e = p;
+        while (load8(e) != 0 && load8(e) != '\n') { e += 1; }
+        int last = load8(e);
+        int t = e;
+        while (t > p && (load8(t - 1) == ' ' || load8(t - 1) == '\t' || load8(t - 1) == 13)) { t -= 1; }
+        store8(t, 0);
+        n += 1;
+        if (last == 0) { break; }
+        p = e + 1;
+    }
+    lines = n;
+
+    // jump, for an opening line, the line that closes its block; for a
+    // closing line of a while, the while; for a closing } or an else of an
+    // if chain, the chain's final }.
+    int depth = 0;
+    int bad = 0;
+    int bad_line = 0;
+    sks_top = 0;
+    for (i = 0; i < lines && !bad; i += 1) {
+        int k = sks_kind(load64(start + i * 8));
+        sks_top = 0;
+        store64(kind + i * 8, k);
+        store64(jump + i * 8, 0 - 1);
+        if (k == SKS_WHILE || k == SKS_IF) {
+            store64(stack + depth * 8, i);
+            depth += 1;
+        } else if (k == SKS_ELSEIF || k == SKS_ELSE || k == SKS_CLOSE) {
+            if (depth == 0) { bad = 1; bad_line = i; }
+            else {
+                int open = load64(stack + (depth - 1) * 8);
+                store64(jump + open * 8, i);
+                if (k == SKS_CLOSE) {
+                    depth -= 1;
+                    if (load64(kind + open * 8) == SKS_WHILE) { store64(jump + i * 8, open); }
+                } else {
+                    if (load64(kind + open * 8) == SKS_WHILE) { bad = 1; bad_line = i; }
+                    store64(stack + (depth - 1) * 8, i);
+                }
+            }
+        }
+    }
+    if (!bad && depth > 0) { bad = 1; bad_line = load64(stack + (depth - 1) * 8); }
+    // Every link of an if chain, and its last }, jumps to the line after the
+    // chain once a branch has run.
+    for (i = 0; i < lines && !bad; i += 1) {
+        int ki = load64(kind + i * 8);
+        if (ki == SKS_IF) {
+            int link = load64(jump + i * 8);
+            int final = link;
+            while (load64(kind + final * 8) != SKS_CLOSE) { final = load64(jump + final * 8); }
+            int l2 = link;
+            while (l2 != final) {
+                int nxt = load64(jump + l2 * 8);
+                store64(stack + l2 * 8, final);
+                l2 = nxt;
+            }
+        }
+    }
+
+    if (bad) {
+        sks_say(path, bad_line + 1, "a block without its { or }");
+    } else {
+        // The script's own variables and arguments.
+        int table = sks_table_new();
+        int args = kmalloc(80);
+        int argbuf = sks_alloc(sks_len(path) + sks_len(rest) + 2);
+        if (!table || !args || !argbuf) {
+            sk_print("run: out of memory\n");
+        } else {
+            sks_vars = table;
+            sks_args = args;
+            int a = 0;
+            for (a = 0; a < 10; a += 1) { store64(args + a * 8, 0); }
+            store64(args, path);
+            sks_argc = 1;
+            int q = 0;
+            int r = rest;
+            while (load8(r) == ' ') { r += 1; }
+            while (load8(r) != 0 && sks_argc < 10) {
+                store64(args + sks_argc * 8, argbuf + q);
+                while (load8(r) != 0 && load8(r) != ' ') { store8(argbuf + q, load8(r)); q += 1; r += 1; }
+                store8(argbuf + q, 0);
+                q += 1;
+                sks_argc += 1;
+                while (load8(r) == ' ') { r += 1; }
+            }
+            int keep = sks_top;
+            int pc = 0;
+            int steps = 0;
+            while (pc < lines && !sks_err) {
+                steps += 1;
+                if (steps > SKS_STEPS) {
+                    sks_say(path, pc + 1, "stopped after 100000 steps");
+                    break;
+                }
+                sks_top = keep;
+                int line = load64(start + pc * 8);
+                int k2 = load64(kind + pc * 8);
+                int next = pc + 1;
+                if (k2 == SKS_CMD) {
+                    int cmd = sks_subst(line);
+                    if (!sks_err) { shell_run(f, cmd); }
+                } else if (k2 == SKS_ASSIGN) {
+                    int nl = 0;
+                    int at = 0;
+                    nl, at = sks_assign_form(line);
+                    int v = sks_eval(line + at);
+                    if (!sks_err) { sks_set(line, nl, v); }
+                } else if (k2 == SKS_WHILE) {
+                    if (!sks_true(sks_eval(sks_cond(line, "while")))) {
+                        next = load64(jump + pc * 8) + 1;
+                    }
+                } else if (k2 == SKS_IF) {
+                    // A failed test walks the chain's links. An else if is
+                    // tested in turn, an else or the final } starts after
+                    // itself.
+                    if (!sks_true(sks_eval(sks_cond(line, "if")))) {
+                        int lk = load64(jump + pc * 8);
+                        while (!sks_err && load64(kind + lk * 8) == SKS_ELSEIF) {
+                            int l3 = load64(start + lk * 8);
+                            int j3 = 1;
+                            while (load8(l3 + j3) == ' ') { j3 += 1; }
+                            j3 += 4;
+                            while (load8(l3 + j3) == ' ') { j3 += 1; }
+                            if (sks_true(sks_eval(sks_cond(l3 + j3, "if")))) { break; }
+                            lk = load64(jump + lk * 8);
+                        }
+                        next = lk + 1;
+                    }
+                } else if (k2 == SKS_ELSEIF || k2 == SKS_ELSE) {
+                    // Reached by running off the end of the branch before
+                    // it, so the chain is done.
+                    next = load64(stack + pc * 8) + 1;
+                } else if (k2 == SKS_CLOSE) {
+                    if (load64(jump + pc * 8) >= 0) { next = load64(jump + pc * 8); }
+                }
+                if (sks_err) {
+                    sks_say(path, pc + 1, sks_err);
+                }
+                pc = next;
+            }
+        }
+        if (table) { kfree(table); }
+        if (args) { kfree(args); }
+    }
+    sks_err = 0;
+    sks_running -= 1;
+    sks_vars = saved_vars;
+    sks_args = saved_args;
+    sks_argc = saved_argc;
+    sks_top = saved_top;
+    kfree(text);
+    kfree(start);
+    kfree(kind);
+    kfree(jump);
+    kfree(stack);
+    return;
+}
+
+// --- the prompt -----------------------------------------------------------------
+
+// Session f's prompt variables, made on first use.
+int sks_session_table(int f) {
+    if (!sks_session_base) {
+        sks_session_base = kmalloc(KAKEL_MAX_WIN * 8);
+        if (!sks_session_base) { return 0; }
+        int i = 0;
+        for (i = 0; i < KAKEL_MAX_WIN; i += 1) { store64(sks_session_base + i * 8, 0); }
+    }
+    int t = load64(sks_session_base + f * 8);
+    if (!t) {
+        t = sks_table_new();
+        store64(sks_session_base + f * 8, t);
+    }
+    return t;
+}
+
+// What shell_run does with a typed line first. Returns 1 when the line was
+// an assignment and is done, or 0 with *out the line to run, its $ replaced.
+(int, int) sks_prompt(int f, int cmd) {
+    if (sks_running > 0) { return 0, cmd; }
+    sks_top = 0;
+    sks_err = 0;
+    sks_vars = sks_session_table(f);
+    sks_args = 0;
+    sks_argc = 0;
+    int n = 0;
+    int at = 0;
+    n, at = sks_assign_form(cmd);
+    if (n > 0) {
+        int v = sks_eval(cmd + at);
+        if (sks_err) {
+            sk_print(sks_err);
+            sk_print("\n");
+        } else {
+            sks_set(cmd, n, v);
+        }
+        sks_err = 0;
+        return 1, cmd;
+    }
+    int i = 0;
+    int has = 0;
+    while (load8(cmd + i) != 0) {
+        if (load8(cmd + i) == '$') { has = 1; }
+        i += 1;
+    }
+    if (!has) { return 0, cmd; }
+    return 0, sks_subst(cmd);
+}
