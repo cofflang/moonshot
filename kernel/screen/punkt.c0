@@ -131,28 +131,45 @@ int fb_rgb(int r, int g, int b) {
     return (r << fb_red_pos) + (g << fb_green_pos) + (b << fb_blue_pos);
 }
 
-// Identity-maps the framebuffer's real physical range into the SAME page
+// Maps the framebuffer's real physical range into the SAME page
 // tables jenna.c0's paging_init() built (must run after it, since it
-// needs pml4_phys) -- fb_addr is very likely far outside the 16MB range
-// paging_init identity-maps by default (real VBE framebuffers sit at a
-// high physical address; QEMU granted ~4GB here), so without this every
+// needs pml4_phys) -- fb_addr is very likely far outside the at most 256MB
+// that paging_init identity-maps (real VBE framebuffers sit at a
+// high physical address; QEMU grants ~4GB here), so without this every
 // pixel write would fault. Rounds the range to whole 4KB pages (fb_addr
 // itself is page-aligned in practice, but this does not assume that).
-// Reuses map_page() exactly as paging_init's own identity-map loop does --
-// an identity map (virt == phys) is the simplest correct choice for MMIO
-// that nothing else needs a different virtual address for. Deliberately
+// Reuses map_page() exactly as paging_init's own identity-map loop does,
+// at the virtual address FB_VIRT (below). Deliberately
 // NOT marked cache-disabled (a real driver would want that for MMIO, to
 // avoid the CPU caching stale framebuffer reads/delaying writes) -- QEMU's
 // emulation does not make caching visibly wrong here; a documented
 // simplification, not an oversight, revisit if it ever causes real tearing.
+//
+// The framebuffer goes at FB_VIRT rather than at its physical address, and
+// fb_addr is switched to that virtual address, so everything that draws
+// through fb_addr follows it. An identity map would fail on UEFI, where
+// firmware can put the framebuffer at 2GB (OVMF and the Lenovo IdeaPad 1i
+// both do), which is USER_VIRT_BASE. pt_create clears that 1GB slot in
+// every process's copy of PDPT 0, so the screen would vanish whenever a
+// program's address space is live, and the first SYS_BLIT would fault in
+// the kernel and loop in page_fault_handler (which maps into the kernel's
+// tables, not the process's) forever.
+// FB_VIRT (8GB, PDPT 0 slot 8) is used by nothing else; the 4GB sentinel
+// and the 5GB fault test sit in slots 4 and 5. Every process inherits it
+// through its copy of PDPT 0, since fb_map runs before any pt_create.
+// One 1GB slot holds any framebuffer up to 1GB (a 4K screen is ~33MB).
+int FB_VIRT = 0x200000000;
+int fb_phys = 0;
 void fb_map() {
-    int start = (fb_addr / 4096) * 4096;
-    int end_addr = fb_addr + fb_pitch * fb_height;
+    fb_phys = fb_addr;
+    int start = (fb_phys / 4096) * 4096;
+    int end_addr = fb_phys + fb_pitch * fb_height;
     int end = ((end_addr + 4095) / 4096) * 4096;
     int p = 0;
     for (p = start; p < end; p += 4096) {
-        map_page(pml4_phys, p, p);
+        map_page(pml4_phys, FB_VIRT + (p - start), p);
     }
+    fb_addr = FB_VIRT + (fb_phys - start);
     return;
 }
 

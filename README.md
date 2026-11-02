@@ -35,6 +35,7 @@ in front of.
 | `build.sh` | Verifies the compiler and the assembler, then builds `build/moonshot.elf`. |
 | `run_qemu.sh` | The main regression gate. Builds, boots headlessly, and asserts invariants on the serial log. |
 | `run_graphical.sh` | Boots the kernel in a real QEMU window you can type and click in. `run_graphical_mac.sh` does the same on macOS. |
+| `make_usb.sh` | Builds the kernel and writes a bootable USB stick for real hardware, UEFI or BIOS. See [Running on real hardware](#running-on-real-hardware). |
 | `sync_utsikt.sh` | Pulls a newer utsikt into `programs/utsikt/` from its own repository, or checks that the copy here matches it. See [Programs](#programs). |
 | `LICENSE` | GPL-3.0. |
 
@@ -111,6 +112,28 @@ the window.
 Without sound, `run_graphical.sh` forces QEMU's GTK window through XWayland. Under native
 Wayland, GTK delivers clicks to a relative-pointer guest but almost no motion,
 which looks exactly like a broken mouse driver and is not one.
+
+### Running on real hardware
+
+```sh
+./make_usb.sh               # build, make the image, write it to a USB stick
+./make_usb.sh --no-build    # reuse build/moonshot.elf as it is
+```
+
+The script installs `grub`, `libisoburn` and `mtools` with pacman if they are
+missing, builds the kernel and makes an image that boots on both UEFI and
+BIOS machines. It only writes to a USB disk, never to the one the running
+system is on, and erases nothing until you type the device name it shows
+(for example `/dev/sdc`). It reads the stick back to check it, then ejects it.
+
+On the machine, turn Secure Boot off in the firmware settings, since the GRUB
+on the stick is not signed, then pick the stick from the boot menu (F12 on
+Lenovo laptops). moonshot has booted to the login screen, the shell and the
+file manager on a Lenovo IdeaPad 1i. It drives a PS/2 keyboard and mouse
+(most laptops' built-in ones), the screen through the firmware's framebuffer,
+and nothing else on real hardware yet. There is no sound without a Sound
+Blaster 16 and no disk without an IDE drive, so files last until you turn the
+machine off.
 
 ## Testing
 

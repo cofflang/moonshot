@@ -723,6 +723,21 @@ cpuid_into:
     pop rbx
     ret
 
+# Zeroes rsi whole 4KB pages starting at rdi, with rep stosq, which writes
+# rcx (= pages * 512) zero quadwords from rdi upward, many per cycle on a
+# real CPU and far faster than a c0 store64 loop under QEMU's emulation.
+# smed has no string instructions, so cld (0xFC) and rep stosq
+# (0xF3 0x48 0xAB) are spelled out as bytes, like the int 48 above. rax, rcx
+# and rdi are all scratch in c0's convention.
+.global zero_pages
+zero_pages:
+    mov rcx, rsi
+    shl rcx, 9
+    xor rax, rax
+    .byte 0xFC
+    .byte 0xF3, 0x48, 0xAB
+    ret
+
 # Test-only, deliberately provoking a #8 double fault, to prove the IST stack
 # actually works (a #DF handler that runs and panics, vs. a silent triple-fault
 # reboot). Reachable only when test_doublefault.sh temporarily injects a

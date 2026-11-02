@@ -100,8 +100,8 @@ int pmm_free_count = 0;
 
 // Walks the Multiboot memory map (a variable-length list of {size, addr,
 // len, type} entries, `size` NOT counting itself -- next entry is at
-// `entry + size + 4`) and picks the first available (type 1) region that
-// can actually hold something at-or-after kernel_end, as jenna's initial
+// `entry + size + 4`) and picks the largest available (type 1) region
+// at-or-after kernel_end, clamped to the identity-map ceiling, as jenna's
 // physical-memory arena. Prints every region regardless of type/fit, so
 // the full map is visible over serial, not just whichever one got picked.
 //
@@ -138,7 +138,14 @@ void pmm_init(int mb_info) {
         serial_print_int(type);
         serial_print("\n");
 
-        if (type == 1 && !pmm_start) {
+        // The LARGEST usable region wins, not the first. Under BIOS the
+        // first region past the kernel is all of RAM, but UEFI firmware
+        // leaves its own code and data scattered through low memory, so the
+        // first one can be a few MB (7MB under OVMF), too small for pmm to
+        // get through boot, and the null pointers that follow an empty pmm
+        // fault somewhere unrelated. Only the part below the identity-map
+        // ceiling counts, since paging_init clamps pmm_limit to it anyway.
+        if (type == 1) {
             int region_start = base;
             if (region_start < _kernel_end) { region_start = _kernel_end; }
             // Round up to a 4096-byte page boundary (same no-bitwise-ops
@@ -147,10 +154,13 @@ void pmm_init(int mb_info) {
             int rem = region_start % 4096;
             int aligned = region_start;
             if (rem != 0) { aligned = region_start + (4096 - rem); }
-            if (aligned + 4096 <= base + len) {
+            int region_end = base + len;
+            if (region_end > IDMAP_MAX_PAGES * 4096) { region_end = IDMAP_MAX_PAGES * 4096; }
+            if (aligned + 4096 <= region_end
+                    && region_end - aligned > pmm_limit - pmm_start) {
                 pmm_start = aligned;
                 pmm_next = aligned;
-                pmm_limit = base + len;
+                pmm_limit = region_end;
             }
         }
 
@@ -198,6 +208,14 @@ int pmm_alloc_page() {
     }
     p = pmm_next;
     pmm_next += 4096;
+    // A never-used page holds whatever the firmware left there. QEMU's
+    // BIOS boot hands over zeroed RAM, UEFI firmware (and real machines)
+    // do not, and code all over the kernel assumes the zeros (the window
+    // tables kakel allocates with kmalloc, for one, would read back as
+    // garbage geometry and fault in fb_get_pixel). So jenna makes the zeros
+    // real, once per page, the first time it hands it out. Pages from the
+    // free list come back with their old bytes.
+    zero_page(p);
     return p;
 }
 
@@ -212,6 +230,9 @@ int pmm_alloc_run(int n) {
     }
     int p = pmm_next;
     pmm_next += n * 4096;
+    // Fresh pages, zeroed for the same reason as pmm_alloc_page's.
+    int z = zero_pages;
+    z(p, n);
     return p;
 }
 
@@ -236,16 +257,15 @@ int pmm_total_pages() {
     return (pmm_limit - pmm_start) / 4096;
 }
 
-// Fresh PMM pages hold arbitrary bytes -- jenna hands out raw physical RAM,
-// unlike the userspace alloc() builtin which relied on the kernel zeroing
-// brk pages -- so every page used as a page table MUST be zeroed first, or
-// its garbage entries would be read as present mappings to nonsense frames.
-// Writes 512 zero quads (one 4096-byte page).
+// pmm zeroes a page only the first time it hands it out; a page recycled
+// through the free list comes back with its old bytes -- unlike the
+// userspace alloc() builtin, which relies on the kernel zeroing brk pages --
+// so every page used as a page table MUST be zeroed first, or its garbage
+// entries would be read as present mappings to nonsense frames. Writes 512
+// zero quads (one 4096-byte page) with boot.s's zero_pages.
 void zero_page(int addr) {
-    int i = 0;
-    for (i = 0; i < 512; i += 1) {
-        store64(addr + i * 8, 0);
-    }
+    int z = zero_pages;
+    z(addr, 1);
     return;
 }
 

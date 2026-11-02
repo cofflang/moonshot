@@ -117,6 +117,7 @@ extern int enable_interrupts;
 extern int disable_interrupts;
 extern int flush_tlb;
 extern int cpuid_into;           // boot.s, cpuid leaf rdi into four words at rsi
+extern int zero_pages;           // boot.s, rep stosq over rsi pages at rdi
 
 include "../drivers/serial.c0";
 include "interrupts.c0";

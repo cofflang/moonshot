@@ -75,7 +75,7 @@ void vga_clear(int attr) {
 // load8/store8 like everywhere else in this codebase that is not
 // 8-byte-aligned (a text row is 160 bytes, not a multiple of 8 counted
 // from an odd starting cell in general, so store64 is not a natural fit
-// here the way it is for zero_page's whole-aligned-page loop).
+// here the way it is for zeroing whole aligned pages).
 void vga_scroll(int attr) {
     int row = 0;
     int col = 0;

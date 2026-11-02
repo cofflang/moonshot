@@ -5,6 +5,33 @@ Every release of Moonshot, newest first. The format follows
 [semantic versions](https://semver.org/), and each release also has a name.
 Each release says which coff it needs, since the two are released separately.
 
+## [0.6.1] "Busy Bertil" - 2026-11-02
+
+Needs coff v0.7.0. Fixes for real UEFI machines, first booted on a Lenovo
+IdeaPad 1i. Nothing changes under QEMU's BIOS boot.
+
+### Added
+
+- `make_usb.sh` writes a bootable USB stick for real hardware. It installs
+  what is missing, builds the kernel, makes an image that boots on UEFI and
+  BIOS and only writes to a USB disk you name, then reads it back. See
+  Running on real hardware in the README.
+
+### Fixed
+
+- jenna took the first free memory region past the kernel, which UEFI
+  firmware leaves a few MB long, so memory ran out during boot. It now takes
+  the largest one.
+- The kernel crashed during boot on UEFI machines with a general protection
+  fault (vector 13) in `fb_get_pixel`. QEMU's BIOS boot gives zeroed RAM and
+  real firmware does not, and the window tables kakel allocates were read
+  back as garbage sizes. Memory jenna hands out for the first time is now
+  zeroed.
+- The machine froze as the shell and the file manager started on UEFI
+  machines whose firmware puts the framebuffer at 2GB, where every program's
+  memory starts. The framebuffer is now mapped at its own address, 8GB, which
+  no program uses.
+
 ## [0.6.0] "Busy Bertil" - 2026-10-26
 
 Needs coff v0.7.0.
