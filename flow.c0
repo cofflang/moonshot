@@ -37,6 +37,7 @@ layout Item {
     int i_h;
     int i_scale;
     int i_color;
+    int i_grad;
     int i_bold;
     int i_bg;      // inline background, or -1
     int i_href;    // the link this run belongs to, or 0
@@ -111,6 +112,7 @@ int line_advance(int h) {
 // The text-decoration of the text node being flowed, carried into every
 // item it pushes, like flow_href.
 int flow_decor = 0;
+int flow_grad;
 int flow_href;
 
 // The bottom margin of the block that just finished, still collapsible.
@@ -226,8 +228,12 @@ void flush_line() {
                 continue;
             }
             if (it.i_bg >= 0) { fill_rect(x, y, it.i_w, it.i_h, it.i_bg); }
-            draw_text(x, y, it.i_text, it.i_len, it.i_color, it.i_scale, it.i_bold);
-            if (it.i_href != 0) {
+            if (it.i_grad > 0) {
+                draw_gradient_text(x, y, it.i_text, it.i_len, it.i_scale, it.i_bold,
+                                   it.i_grad, flow_left + dx, line_x);
+            } else { draw_text(x, y, it.i_text, it.i_len, it.i_color, it.i_scale, it.i_bold); }
+            if (it.i_href != 0) { link_box_add(x, y, it.i_w, it.i_h, it.i_href); }
+            if (it.i_href != 0 && it.i_color >= 0) {
                 // The underline is drawn from the run being part of a link,
                 // not from a CSS property, since text-decoration is not in the
                 // subset, and a link that is only a different colour is a
@@ -245,8 +251,7 @@ void flush_line() {
                     if (nxt.i_href == it.i_href) { uw = nxt.i_x - it.i_x; }
                 }
                 fill_rect(x, y + it.i_h - 1, uw, 1, it.i_color);
-                link_box_add(x, y, it.i_w, it.i_h, it.i_href);
-            } else if (it.i_decor == DECOR_UNDER || it.i_decor == DECOR_STRIKE) {
+            } else if (it.i_color >= 0 && (it.i_decor == DECOR_UNDER || it.i_decor == DECOR_STRIKE)) {
                 // text-decoration, run on across the spaces to the next
                 // item with the same decoration, for the same reason a
                 // link's underline is.
@@ -281,6 +286,7 @@ void push_item(int s, int n, int w, int scale, int color, int bold, int bg) {
     it.i_h = cell_h * scale;
     it.i_scale = scale;
     it.i_color = color;
+    it.i_grad = flow_grad;
     it.i_bold = bold;
     it.i_bg = bg;
     it.i_href = flow_href;
@@ -352,6 +358,7 @@ void move_word_down() {
         moved.i_href = it2.i_href;
         moved.i_decor = it2.i_decor;
         // An image keeps its own size, not a text cell's.
+        moved.i_grad = it2.i_grad;
         moved.i_img = it2.i_img;
         if (it2.i_img != 0) {
             moved.i_h = it2.i_h;
@@ -461,12 +468,14 @@ int enclosing_href(int node) {
 
 void flow_text(int node) {
     int p = node.n_style;
+    flow_grad = 0;
     int color = 0x000000;
     int scale = 1;
     int bold = 0;
     int bg = -1;
     if (p != 0) {
-        if (p.p_color >= 0) { color = p.p_color; }
+        if (p.p_color != -1) { color = p.p_color; }
+        if (p.p_clip == 1 && p.p_grad > 0 && p.p_color == -2) { flow_grad = p.p_grad; }
         if (p.p_scale >= 1) { scale = p.p_scale; }
         if (p.p_bold == 1) { bold = 1; }
     }

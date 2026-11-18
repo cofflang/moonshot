@@ -124,12 +124,14 @@ void scripts_run_from(int node) {
     return;
 }
 
-// Called with a page once it is parsed and styled.
+// Called with a page once it is parsed and styled. A page whose scripts may
+// not run (doc_scripts 0) gets no engine, so its onclick attributes stay text
+// as well.
 void scripts_run(int root) {
     script_root = root;
     script_page += 1;
     page_engine = 0;
-    scripts_run_from(root);
+    if (doc_scripts == 1) { scripts_run_from(root); }
     return;
 }
 
