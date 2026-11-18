@@ -46,10 +46,10 @@ int view_h;
 int cell_w;
 int cell_h;
 
-// Every glyph the font has, cached at startup, 128 characters of cell_h
+// Every glyph the font has, cached at startup, 256 slots of cell_h
 // bytes each. glyph() is a syscall, and a page is thousands of characters
 // redrawn on every scroll, so asking the kernel per character per frame
-// would put a syscall in the innermost loop of the renderer. Asking 128
+// would put a syscall in the innermost loop of the renderer. Asking 256
 // times at startup and never again puts it nowhere.
 int font_cache;
 
@@ -164,7 +164,8 @@ int img_load(int name) {
     int h = load64(buf + 8);
     int frames = load64(buf + 16);
     if (w <= 0 || h <= 0 || frames <= 0 || w > 4096 || h > 4096) { return 0; }
-    if (24 + w * h * frames * 4 > size) { return 0; }
+    int frame_bytes = w * h * 4;
+    if (frames > (size - 24) / frame_bytes) { return 0; }
     return buf;
 }
 
@@ -250,11 +251,11 @@ int font_init() {
     cell_w = d >> 16;
     cell_h = d & 65535;
     if (cell_w <= 0 || cell_h <= 0 || cell_h > 32) { return 0; }
-    font_cache = alloc(128 * cell_h);
+    font_cache = alloc(256 * cell_h);
     if (!font_cache) { return 0; }
     int c = 0;
-    for (c = 0; c < 128; c += 1) {
-        if (glyph(c, font_cache + c * cell_h) != d) { return 0; }
+    for (c = 0; c < 256; c += 1) {
+        if (glyph(slot_unicode(c), font_cache + c * cell_h) != d) { return 0; }
     }
     return 1;
 }
@@ -274,7 +275,7 @@ int font_init() {
 // an edge goes through fill_rect, which clips. Text is most of what a page
 // paints, so the difference is most of a frame.
 void draw_char(int x, int y, int ch, int color, int scale, int bold) {
-    if (ch < 0 || ch > 127) { return; }
+    if (ch < 0 || ch > 255) { return; }
     if (x >= view_w || y >= view_h) { return; }
     if (x + cell_w * scale <= 0 || y + cell_h * scale <= 0) { return; }
     int row = 0;
@@ -319,7 +320,7 @@ void draw_text(int x, int y, int s, int n, int color, int scale, int bold) {
     int i = 0;
     int px = x;
     while (i < n) {
-        draw_char(px, y, s[i], color, scale, bold);
+        if (color != -2) { draw_char(px, y, s[i], color, scale, bold); }
         px += cell_w * scale;
         i += 1;
     }
@@ -371,4 +372,73 @@ void draw_address_bar(int full_h, int name) {
 // and it is called from everywhere precisely so that it can.
 int text_width(int n, int scale) {
     return n * cell_w * scale;
+}
+
+int unicode_slot(int c) {
+    if (c >= 32 && c <= 126) { return c; }
+    if (c == 229 || c == 228 || c == 246 || c == 197 || c == 196 || c == 214 || c == 233) { return c; }
+    if (c == 8211) { return 128; }
+    if (c == 8230) { return 129; }
+    if (c == 8220) { return 130; }
+    if (c == 8221) { return 131; }
+    return '?';
+}
+int slot_unicode(int c) {
+    if (c == 128) { return 8211; }
+    if (c == 129) { return 8230; }
+    if (c == 130) { return 8220; }
+    if (c == 131) { return 8221; }
+    return c;
+}
+int gradient_mix(int a, int b, int x, int width) {
+    if (width <= 1) { return a; }
+    if (x < 0) { x = 0; }
+    if (x >= width) { x = width - 1; }
+    int out = 0;
+    int shift = 0;
+    for (shift = 0; shift <= 16; shift += 8) {
+        int av = (a >> shift) & 255;
+        int bv = (b >> shift) & 255;
+        int v = av + (bv - av) * x / (width - 1);
+        out = out | (v << shift);
+    }
+    return out;
+}
+void draw_gradient_text(int x, int y, int s, int n, int scale, int bold, int grad, int left, int width) {
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int ch = s[i];
+        int row = 0;
+        for (row = 0; row < cell_h; row += 1) {
+            int bits = font_cache + ch * cell_h + row;
+            int col = 0;
+            for (col = 0; col < cell_w; col += 1) {
+                if (((load8(bits) >> (cell_w - 1 - col)) & 1) != 0) {
+                    int dx = 0;
+                    for (dx = 0; dx < scale + bold; dx += 1) {
+                        int px = x + (i * cell_w + col) * scale + dx;
+                        int color = gradient_color(grad, px - left, width);
+                        fill_rect(px, y + row * scale, 1, scale, color);
+                    }
+                }
+            }
+        }
+    }
+    return;
+}
+
+int gradient_color(int grad, int x, int width) {
+    int at = 0;
+    if (width > 1) { at = x * 10000 / (width - 1); }
+    int count = load64(grad);
+    int k = 0;
+    if (at <= load64(grad + 16)) { return load64(grad + 8); }
+    for (k = 1; k < count; k += 1) {
+        int stop = load64(grad + 16 + k * 16);
+        if (at <= stop) {
+            int previous = load64(grad + k * 16);
+            return gradient_mix(load64(grad + 8 + (k - 1) * 16), load64(grad + 8 + k * 16), at - previous, stop - previous + 1);
+        }
+    }
+    return load64(grad + 8 + (count - 1) * 16);
 }

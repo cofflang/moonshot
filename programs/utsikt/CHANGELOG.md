@@ -7,6 +7,64 @@ utsikt has no version numbers of its own. It ships inside Moonshot, which
 carries this repository as a subtree, so each entry is named after the
 Moonshot release that carried it.
 
+## Moonshot 0.7.0 "Lucky Lillan" - 2026-11-18
+
+Needs coff v0.8.0 and the `moon.c0` that Moonshot 0.7.0 ships.
+
+### Added
+
+- Pages of another user open without their scripts. utsikt reads a page with
+  `readfile_owned`, and when the kernel says that another user owns the file,
+  the page is read the ordinary way, shown, and given no script engine, so
+  its `<script>` blocks and `onclick` attributes stay text. The rule looks at
+  the owner of the page file and at nothing else, so the folders above it and
+  the stylesheets it links are not checked. The page that opens first prints
+  a note about this before its first frame. No note is printed after the
+  first frame, since a windowed program's text would be drawn over the page.
+- `<link rel="stylesheet" href="...">`. A linked sheet is applied in document
+  order together with the `<style>` blocks, so the order a page writes them
+  in decides which rule wins. A page loads at most 16 linked sheets, each at
+  most 64 KiB, and imports are not followed. A sheet that is missing or
+  too large is skipped. `rel` is kept on every element, and any
+  of its words may be `stylesheet`.
+- Links, pictures and sheets are looked up from the folder of the page that
+  names them, so a page in `/site/notes/` finds `pic.spr` next to it. A name
+  that starts with `/` is still taken from the root.
+- `color: transparent` and `background: transparent`. A transparent
+  background clears the colour a default style gave, and a transparent text
+  colour paints nothing unless the text is clipped to a gradient.
+- `background: linear-gradient(...)` with `background-clip: text`, also
+  written `-webkit-background-clip: text`. The text is filled with a
+  gradient that runs left to right across the line. The direction is `to
+  right` or an angle up to 360 degrees, drawn left to right either way. There
+  are two to eight colour stops, each with an optional position in percent,
+  and a stop with none is placed evenly between its neighbours. Anything
+  that does not parse is left out and the text keeps its colour.
+- Swedish letters, the accented e and four punctuation marks, the en dash,
+  the ellipsis and the two curly double quotes. They are read from UTF-8 text
+  and from numeric character references, and each takes one cell of the
+  font. The font cache holds 256 glyphs instead of 128.
+
+### Changed
+
+- `margin` and `padding` take one to four lengths in pixels, and a value is
+  used only when every side is the same. `margin: 4px 8px` used to take 4 and
+  is now ignored, so a page with two different sides has to say each side on
+  its own.
+- A byte that is not valid UTF-8, and a character the font does not have,
+  paint as `?`.
+- A `<style>` block and a linked sheet keep the order they have in the
+  document.
+- `load_document`, `load_document_foreign` and `load_document_limit` are the
+  places a page's bytes enter the engine, and `img_load` is the place for
+  pictures.
+
+### Fixed
+
+- A sprite whose header named more frames than its file holds could make the
+  size check wrap and be accepted. The check is now made by division, and the
+  picture is refused.
+
 ## Moonshot 0.5.0 "Kind Goran" - 2026-10-14
 
 Needs coff v0.6.0.

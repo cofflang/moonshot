@@ -96,6 +96,7 @@ layout Node {
 // so that dom.c0 does not have to know that a stylesheet parser exists.
 layout StyleBlock {
     int sb_text;
+    int sb_href;
     int sb_next;
 }
 
@@ -294,10 +295,8 @@ int read_entity() {
         }
         if (any == 1 && p < src_len && src[p] == ';') {
             pos = p + 1;
-            // The font is 7-bit. Anything above it becomes a question mark
-            // rather than a random glyph or a silent hole.
-            if (v < 32 || v > 126) { return '?'; }
-            return v;
+            // Supported code points use one cached font slot each.
+            return unicode_slot(v);
         }
         pos = save;
     }
@@ -366,6 +365,22 @@ int read_text(int pre) {
             if (c == '&') {
                 int e = read_entity();
                 if (e >= 0) { c = e; } else { pos += 1; }
+            } else if (c >= 128) {
+                int need = 0;
+                int v = 0;
+                if (c >= 194 && c <= 223) { need = 1; v = c & 31; }
+                else if (c >= 224 && c <= 239) { need = 2; v = c & 15; }
+                else if (c >= 240 && c <= 244) { need = 3; v = c & 7; }
+                int j = 1;
+                int valid = need > 0 && pos + need < save;
+                while (valid && j <= need) {
+                    int b = src[pos + j];
+                    if (b < 128 || b > 191) { valid = 0; }
+                    else { v = v * 64 + (b & 63); }
+                    j += 1;
+                }
+                if (valid) { pos += need + 1; c = unicode_slot(v); }
+                else { pos += 1; c = '?'; }
             } else {
                 pos += 1;
             }
@@ -395,6 +410,7 @@ int read_text(int pre) {
 // smaller price than a struct nobody else would use. Read it immediately
 // after the call, since the next start tag overwrites it.
 int attr_href;
+int attr_rel;
 int attr_src;      // <img src>, raw bytes for the same reason as href
 int attr_id;       // id, raw, since a script looks it up as written
 int attr_type;     // type, lowercased
@@ -403,6 +419,7 @@ int attr_onclick;  // onclick, raw, handed to a script engine as it is
 int read_attrs() {
     int class_val = 0;
     attr_href = 0;
+    attr_rel = 0;
     attr_src = 0;
     attr_id = 0;
     attr_type = 0;
@@ -447,6 +464,7 @@ int read_attrs() {
                 }
             }
             if (str_eq(name, "class") == 1 && value != 0) { class_val = value; }
+            if (str_eq(name, "rel") == 1 && vlen > 0) { attr_rel = str_dup_lower(src, vpos, vlen); }
             if (str_eq(name, "href") == 1 && vlen > 0) {
                 attr_href = str_dup(src, vpos, vlen);
             }
@@ -508,6 +526,7 @@ void read_style_block() {
     int b = doc_alloc(sizeof(StyleBlock));
     if (!b) { return; }
     b.sb_text = text;
+    b.sb_href = 0;
     b.sb_next = 0;
     if (!style_blocks) { style_blocks = b; } else {
         int t = style_blocks_tail;
@@ -585,6 +604,7 @@ int html_parse(int text) {
             int tag = tag_id(name);
             int class_val = read_attrs();
             int href_val = attr_href;
+            int rel_val = attr_rel;
             int src_val = attr_src;
             int self_closing = 0;
             if (pos < src_len && src[pos] == '/') { self_closing = 1; pos += 1; }
@@ -625,8 +645,17 @@ int html_parse(int text) {
             e.n_onclick = attr_onclick;
             // Loaded while the document is parsed, into memory the document
             // owns, so an image is given back with the page it was on.
-            if (tag == TAG_IMG && src_val != 0) { e.n_img = img_load(src_val); }
+            if (tag == TAG_IMG && src_val != 0) { e.n_img = img_load(resource_name(src_val)); }
             node_append(open, e);
+            if (str_eq(name, "link") && rel_stylesheet(rel_val) && href_val) {
+                int sheet = doc_alloc(sizeof(StyleBlock));
+                if (sheet) {
+                    sheet.sb_href = href_val;
+                    if (style_blocks_tail) { int tail = style_blocks_tail; tail.sb_next = sheet; }
+                    else { style_blocks = sheet; }
+                    style_blocks_tail = sheet;
+                }
+            }
             if (tag == TAG_STYLE) {
                 read_style_block();
             } else if (tag == TAG_SCRIPT) {
@@ -648,4 +677,19 @@ int html_parse(int text) {
     // to do, since the tree is already built, and every unclosed element simply keeps the
     // children it collected.
     return root;
+}
+
+int rel_stylesheet(int rel) {
+    if (!rel) { return 0; }
+    int i = 0;
+    while (rel[i] != 0) {
+        while (is_space(rel[i])) { i += 1; }
+        int start = i;
+        while (rel[i] != 0 && !is_space(rel[i])) { i += 1; }
+        if (i - start == 10) {
+            int word = str_dup(rel, start, 10);
+            if (word && str_eq(word, "stylesheet")) { return 1; }
+        }
+    }
+    return 0;
 }

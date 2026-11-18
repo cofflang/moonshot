@@ -26,14 +26,21 @@ repository to use it. This is where it is developed.
   contents are raw text. Default styles for the headings `h1` to `h6`, the
   sectioning elements, `blockquote`, `pre`, `ol`, `dl`, `figure`, and inline
   ones such as `u`, `s`, `del`, `mark`, `small`, `kbd` and `abbr`. Kept
-  attributes are `class`, `href`, `src`, `id`, `type` and `onclick`.
+  attributes are `class`, `href`, `src`, `id`, `type`, `rel` and `onclick`.
 - **CSS**: type, class, `tag.class` and descendant (`div p`) selectors in
   comma-separated lists, with real specificity. `color`, `background`,
   `background-color`, `font-size`, `font-weight`, `display`, `margin`,
   `padding`, `text-align`, `text-decoration` (underline, line-through),
   `white-space` (pre) and `list-style-type` (disc, decimal, none). Colours as `#rgb`, `#rrggbb` and fifteen names.
   The default stylesheet is written in CSS and goes through the same parser
-  as a page's own.
+  as a page's own. Linked sheets and style blocks share document order.
+  Each page loads at most 16 linked sheets, each at most 64 KiB, with no imports.
+  Links, pictures and sheets resolve from the page folder, including parent paths.
+  Transparent backgrounds clear default colours. Text clipped to a linear gradient
+  uses horizontal colour stops, with up to eight stops and percentage positions.
+  Box shorthands are accepted only when all sides have the same pixel value.
+  Swedish letters, é and the supported punctuation use one font cell per character
+  when decoded from UTF-8 text or numeric character references.
 - **Layout**: block boxes, inline content broken into lines at spaces,
   collapsing vertical margins between siblings, lists with drawn markers or
   numbers,
