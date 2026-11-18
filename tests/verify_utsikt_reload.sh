@@ -47,6 +47,19 @@ if [ ! -f moonshot.iso ]; then
   exit 1
 fi
 
+# QEMU creates its monitor socket a moment after it starts, later when the
+# machine is busy. Wait for it instead of a fixed sleep, and say so if it
+# never appears.
+wait_for_socket() {
+  local i
+  for i in $(seq 1 300); do
+    [ -S "$1" ] && return 0
+    sleep 0.1
+  done
+  echo "FAIL: QEMU monitor socket $1 did not appear within 30 s"
+  return 1
+}
+
 sockfile=verify_utsikt_reload.sock
 rm -f serial.log "$sockfile"
 qemu-system-x86_64 -cdrom moonshot.iso \
@@ -56,6 +69,7 @@ qemu_pid=$!
 cleanup() { kill "$qemu_pid" 2>/dev/null; wait "$qemu_pid" 2>/dev/null; rm -f "$sockfile"; }
 trap cleanup EXIT
 
+wait_for_socket "$sockfile" || exit 1
 sleep 2
 
 python3 - "$sockfile" <<'EOF'

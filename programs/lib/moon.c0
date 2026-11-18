@@ -26,6 +26,12 @@ int sleep(int t) {
     return syscall(16, t, 0, 0, 0, 0);
 }
 
+// readfile for a file that the caller or root owns. -2 for a file of
+// another user, otherwise as readfile.
+int readfile_owned(int path, int buf, int max) {
+    return syscall(38, path, buf, max, 0, 0);
+}
+
 // The entries of a directory, from the root ("" is the root itself), as
 // 48-byte records in buf, at most max of them. +0 the type (1 file, 2
 // directory), +8 the size, +16 the name, NUL-terminated. Returns how many

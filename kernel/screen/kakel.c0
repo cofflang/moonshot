@@ -170,6 +170,8 @@ int kakel_locked = 0;
 // The window that fills the screen while the others wait behind it (Alt+M,
 // or the [+] in a tavla's title strip), or -1 for the usual layout.
 int kakel_max = -1;
+int kakel_full = -1;
+int kakel_full_saved_max = -1;
 
 // Per window, 1 when its program should be told to draw again (see
 // kakel_nudge_live and SYS_WIN_INFO).
@@ -183,6 +185,7 @@ int kakel_nudge_base = 0;
 int kakel_shown(int id) {
     if (kakel_active != 1) { return 1; }
     if (kakel_locked == 1) { return 0; }
+    if (kakel_full >= 0) { return id == kakel_full; }
     if (id == kakel_stats_win) { return 1; }
     if (kakel_max >= 0) { return id == kakel_max; }
     int r = 0;
@@ -293,7 +296,7 @@ int kakel_str_cells(int s) {
 // focus change and every reflow; never called per tick.
 void kakel_tavla_paint_title(int id) {
     if (kakel_active != 1) { return; }
-    if (kakel_is_tavla(id) == 0) { return; }
+    if (kakel_is_tavla(id) == 0 || id == kakel_full) { return; }
     if (kakel_shown(id) == 0) { return; }
     int cx = load64(kakel_cx_base + id * 8);
     int cy = load64(kakel_cy_base + id * 8);
@@ -410,6 +413,7 @@ void kakel_tavla_claim(int wid, int owner, int name) {
     // that would otherwise be presenting into this rectangle is the caller.
     kakel_clear(wid);
     kakel_paint_titles();
+    pling_trigger(0);
     return;
 }
 
@@ -565,6 +569,16 @@ int kakel_take_restored(int id) {
     return r;
 }
 
+int kakel_has_text(int id) {
+    if (id < 0 || id >= KAKEL_MAX_WIN || !kakel_grid_base) { return 0; }
+    int g = load64(kakel_grid_base + id * 8);
+    int k = 0;
+    for (k = 0; g && k < GRID_ROWS * GRID_COLS; k += 1) {
+        if ((load32(g + k * 4) & 255) != ' ') { return 1; }
+    }
+    return 0;
+}
+
 // Puts a shell window's text back after its rectangle changed. The rows
 // nearest the cursor are kept, so the prompt stays in view, and columns past
 // the new width wait in the grid for the window to be wide again.
@@ -573,12 +587,7 @@ void kakel_restore(int id) {
     if (kakel_grid_base) { g = load64(kakel_grid_base + id * 8); }
     // An empty grid is a fresh window, which gets a clear rectangle and,
     // from whoever prompts, a prompt.
-    int any = 0;
-    int k0 = 0;
-    for (k0 = 0; g && k0 < GRID_ROWS * GRID_COLS && !any; k0 += 1) {
-        if ((load32(g + k0 * 4) & 255) != ' ') { any = 1; }
-    }
-    if (!any) { kakel_clear(id); return; }
+    if (kakel_has_text(id) == 0) { kakel_clear(id); return; }
     int rows = load64(kakel_rows_base + id * 8);
     int cols = load64(kakel_cols_base + id * 8);
     int row = load64(kakel_old_row_base + id * 8);
@@ -910,6 +919,7 @@ int kakel_ring_pos(int row, int wid) {
 // the visible ones in its ring, the ring is rotated (head advanced) to
 // bring it into view. Called from keyboard_handler on Alt+Tab.
 void kakel_focus_next() {
+    if (kakel_full >= 0) { kakel_fullscreen_toggle(); }
     int old = kakel_focus;
     int row = kakel_find_row(old);
     if (row < 0) { return; }
@@ -983,6 +993,7 @@ void kakel_focus_next() {
 // back with every window where it was. The callers prompt the shells again,
 // as after any reflow.
 void kakel_maximize_toggle() {
+    if (kakel_full >= 0) { kakel_fullscreen_toggle(); return; }
     if (kakel_active != 1) { return; }
     if (kakel_max >= 0) {
         kakel_max = 0 - 1;
@@ -993,9 +1004,11 @@ void kakel_maximize_toggle() {
     }
     kakel_reflow();
     kakel_paint_titles();
+    int sl = serial_line_begin();
     serial_print("kakel maximized: win=");
     serial_print_int(kakel_max);
     serial_print("\n");
+    serial_line_end(sl);
     return;
 }
 
@@ -1005,6 +1018,7 @@ void kakel_maximize_toggle() {
 // no sign at all of whether it holds focus, and the one that just lost it
 // would keep looking active). Shared by Alt+Tab and by a mouse click.
 void kakel_focus_to(int nf) {
+    if (kakel_full >= 0 && nf != kakel_full) { kakel_fullscreen_toggle(); }
     int old = kakel_focus;
     kakel_focus = nf;
     int crow = load64(kakel_crow_base + old * 8);
@@ -1027,6 +1041,7 @@ void kakel_focus_to(int nf) {
 // out of view (which keeps its stale geometry) can never be hit.
 int kakel_win_at(int px, int py) {
     if (kakel_active != 1) { return 0 - 1; }
+    if (kakel_full >= 0) { return kakel_full; }
     if (kakel_max >= 0) {
         int mx0 = load64(kakel_cx_base + kakel_max * 8) * FONT_W;
         int my0 = load64(kakel_cy_base + kakel_max * 8) * FONT_H;
@@ -1088,9 +1103,11 @@ int kakel_click(int px, int py) {
     }
     if (wid == kakel_focus) { return 0 - 1; }
     kakel_focus_to(wid);
+    int sl = serial_line_begin();
     serial_print("kakel focus: win=");
     serial_print_int(kakel_focus);
     serial_print(" (click)\n");
+    serial_line_end(sl);
     return wid;
 }
 
@@ -1159,7 +1176,7 @@ void kakel_win_free(int id) {
 // syscalls stay correct with no change and no way for a program to paint over
 // its own title.
 void kakel_resize(int id, int cx, int cy, int cols, int rows) {
-    if (kakel_is_tavla(id) == 1 && rows > KAKEL_TAVLA_TITLE_ROWS) {
+    if (id != kakel_full && kakel_is_tavla(id) == 1 && rows > KAKEL_TAVLA_TITLE_ROWS) {
         cy += KAKEL_TAVLA_TITLE_ROWS;
         rows -= KAKEL_TAVLA_TITLE_ROWS;
     }
@@ -1189,6 +1206,11 @@ void kakel_reflow() {
     int shell_rows = all_rows - KAKEL_LOG_ROWS;
     int total_vis = 0;
 
+    if (kakel_full >= 0) {
+        kakel_resize(kakel_full, 0, 0, all_cols, all_rows);
+        kakel_shell_wins = 1;
+        return;
+    }
     if (kakel_max >= 0) {
         kakel_resize(kakel_max, 0, 0, all_cols, shell_rows);
         kakel_shell_wins = 1;
@@ -1450,11 +1472,13 @@ void kakel_tavla_kill(int wid) {
     store64(task_state_base + owner * 8, TASK_EXITED);
     store64(task_win_base + owner * 8, 0 - 1);
     store64(kakel_owner_base + wid * 8, 0 - 1);
+    int sl = serial_line_begin();
     serial_print("[tavla] closed win=");
     serial_print_int(wid);
     serial_print(" killed task=");
     serial_print_int(owner);
     serial_print("\n");
+    serial_line_end(sl);
     return;
 }
 
@@ -1479,6 +1503,23 @@ int kakel_close() {
 int kakel_close_id(int wid) {
     int row = kakel_find_row(wid);
     if (row < 0) { return 0; }
+    // Keys still queued for this window must not reach the next session
+    // that gets its id.
+    sk_queue_drop(wid);
+    int replacement_uid = -1;
+    int replacement_authed = 0;
+    if (kakel_is_tavla(wid)) {
+        replacement_uid = task_uid(load64(kakel_owner_base + wid * 8));
+        if (replacement_uid >= 0) { replacement_authed = 1; }
+    } else if (sk_uid_base && raket_authed_base) {
+        replacement_uid = sk_uid(wid);
+        replacement_authed = raket_authed(wid);
+    }
+    if (wid == kakel_full) {
+        kakel_full = 0 - 1;
+        kakel_max = kakel_full_saved_max;
+        kakel_nudge_live();
+    }
     if (wid == kakel_max) {
         kakel_max = 0 - 1;
         kakel_nudge_live();
@@ -1489,6 +1530,7 @@ int kakel_close_id(int wid) {
     // Closing a tavla is how a graphical program is meant to be shut down, so
     // the window and the program go together -- otherwise the program would
     // keep running with nowhere to draw.
+    if (kakel_is_tavla(wid)) { pling_trigger(1); }
     kakel_tavla_kill(wid);
 
     if (vis == 2) {
@@ -1541,6 +1583,10 @@ int kakel_close_id(int wid) {
         // The ring is now empty — add one fresh window.
         int nid = kakel_win_new(0, 0, 1, 1, new_bg);
         if (nid >= 0) {
+            if (replacement_authed && replacement_uid >= 0) {
+                store64(sk_uid_base + nid * 8, replacement_uid);
+                store64(raket_authed_base + nid * 8, 1);
+            }
             kakel_ring_add(0, nid, -1);
         }
         store64(kakel_ring_vis, 1);
@@ -1712,5 +1758,25 @@ void kakel_test_scroll() {
     serial_print(" cleared=");
     serial_print_int(cleared);
     serial_print("\n");
+    return;
+}
+
+// Alt+Enter gives any tavla the whole framebuffer and hides the pointer.
+void kakel_fullscreen_toggle() {
+    if (kakel_active != 1 || kakel_locked) { return; }
+    klick_hide();
+    if (kakel_full >= 0) {
+        kakel_full = 0 - 1;
+        kakel_max = kakel_full_saved_max;
+    } else {
+        if (kakel_is_tavla(kakel_focus) == 0) { klick_show(); return; }
+        kakel_full_saved_max = kakel_max;
+        kakel_full = kakel_focus;
+    }
+    kakel_reflow();
+    kakel_nudge_live();
+    kakel_paint_titles();
+    stats_last_secs = 0 - 1;
+    klick_show();
     return;
 }

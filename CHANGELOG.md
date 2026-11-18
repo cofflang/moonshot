@@ -5,6 +5,157 @@ Every release of Moonshot, newest first. The format follows
 [semantic versions](https://semver.org/), and each release also has a name.
 Each release says which coff it needs, since the two are released separately.
 
+## [0.7.0] "Lucky Lillan" - 2026-11-18
+
+Needs coff v0.8.0.
+
+### Security
+
+Users were not kept apart in 0.6.0 and 0.6.1. `login` with no password
+switched to any account, `passwd`, `own`, `mode`, `remove` and `rename` did
+not ask who was asking, a write that was refused could still change the size
+of the file, the rights of a program followed the shell window it was started
+from instead of the program, new files belonged to root, and passwords were
+typed on the command line, shown on the screen and kept in the history. If you
+rely on 0.6.0 or 0.6.1 to keep one user away from another, do not.
+
+This release fixes that. Users are kept apart only for the length of one boot,
+because users, passwords, owners and modes are not saved. Every item below
+holds within one boot and not across boots.
+
+- Users within one boot. After a reboot every file belongs to root and every
+  other user can read it, locked files included, and root has no password
+  until `passwd` is run again. Run `passwd` first thing after every boot.
+- Every program carries the user it was started as. A shell window that
+  switches to root does not give root rights to programs already running as a
+  guest. Programs and shell windows that a program starts keep its user.
+- The filesystem is told who is acting on every call. Only root or the owner
+  of a file may change it, including its mode, its name and its contents. A
+  locked file refuses reads by other users. A refused write leaves the file as
+  it was. New files belong to the user who made them.
+- `login (name)` and `passwd [user]` ask for passwords at a masked prompt. A
+  password is never part of a command line, never shown, never stored in the
+  history and never printed on the serial line. It is at most 64 bytes.
+  `passwd` needs the old password, or root. `adduser` and `own` need root. An
+  account made by `adduser` has no password until root runs `passwd` for it.
+- Command history is kept per user. Up in one user's window shows only that
+  user's commands.
+- Trusted path. A user starts programs and scripts, runs `interpret` and
+  builds with `execute` only from files that user or root owns, in folders
+  that user or root owns. Root therefore runs only root's own files. To run
+  another user's program, take it over with `own` first. Copying another
+  user's text into a file of your own, including running a selection with F5
+  or F6 in skrift, is running it. hylla says so when it refuses to start
+  another user's program.
+- Other users' files are data. Opening another user's song, model, picture,
+  text or page reads it with your rights, and another user's page opens
+  without its scripts. A file another user made can also become hylla's
+  background, through `/hylla.bg`.
+- coff and smed read only files that the user who started them or root owns,
+  in folders that the user or root owns, however they are started. A build
+  therefore never takes in another user's include file. Root has to `own`
+  another user's library before building with it.
+- utsikt runs the scripts of a page only when the page belongs to the user who
+  opened it or to root. Other users' pages open without their scripts.
+- Shared folders. In a folder where others may add files, the root folder
+  among them, nobody, root included, can overwrite or empty a file that
+  someone else made there. Remove it first. Anyone may make files in the root
+  folder and only root may make folders there. The kernel takes back
+  `tid.zone` if another user made it first.
+- Kill. Only root, or the user a task runs as, can stop it.
+- The keyboard is trusted. Anyone at the keyboard can use, type into or close
+  every open window, root's included. Lock the screen with Alt+L before
+  leaving it. A program cannot move the keyboard focus away from a window it
+  does not own.
+- A folder that goes away. When the folder a window or program is working in
+  is removed, the window goes back to `/` and says so, and a program started
+  from there is refused.
+- Saving during sync. A file that changes while `sync` runs may be saved half
+  old and half new. Other files are not affected.
+- `eval`, `eval -c` and `interpret` run inside the kernel and need root.
+  `execute` builds a program that runs in ring 3 with the identity of whoever
+  ran it.
+
+### Added
+
+- `zone` shows the local time and its offset from UTC, `14:05, UTC+1`, and
+  sets the offset. `zone +1`, `zone -3:30` and `zone 5:45` take hours from -24
+  to +24, with minutes if needed, and the offset is saved in `tid.zone`. Any
+  logged in user may set it. There is no summer time.
+- `besikta` prints the memory map, the disk, the framebuffer and the processor
+  the machine reports.
+- F12 shows the boot log on the screen and F12 again hides it, so a machine
+  that boots to a blank or odd screen can say what happened.
+- `dvala [on | off | seconds]` turns on a screen saver, a field of stars that
+  starts after the machine has been idle. It is off at boot, `dvala on` waits
+  five minutes and `dvala 90` waits ninety seconds.
+- fanfar, a short sound at sign-in, and a soft cue when a window opens and
+  closes. The `tyst` word on the kernel command line in GRUB turns the cues
+  off.
+- tapet (`start tapet.elf picture.spr 7 64 48`) writes a picture of a diagonal
+  weave from a seed, a width and a height. `write hylla.bg picture.spr` makes
+  it hylla's background. The same arguments give the same pixels.
+- The shell line takes Home and End, and Ctrl+A and Ctrl+E for the same, Ctrl+W
+  to delete the word before the cursor, Ctrl+K to delete to the end of the line
+  and Ctrl+U to delete to the start.
+- `sync create` makes a Moonshot disk out of a disk that has none, and only
+  after you have typed the confirmation it asks for.
+- `kraft`, a checker for the ACPI tables firmware leaves in memory. Given a
+  buffer that holds the tables, it checks the RSDP, the XSDT, every table
+  length and checksum, and finds the FADT, and it refuses anything that does
+  not add up. It reads only from the buffer, never from a physical address,
+  and touches no device. It is built into the kernel and nothing calls it yet,
+  so it changes nothing you can see.
+- `make_usb.sh --iso FILE` makes the same boot image, saves it as `FILE`,
+  prints its sha256 and stops without writing to any disk.
+- `build.sh` can write `build/site-disk.img`, a second disk with a folder of
+  your own pages and pictures, when `~/.config/moonshot/site-root` and
+  `site-files` name them. Without them it says it skips `/site`, builds the
+  kernel as before and leaves that disk empty. See the README.
+- utsikt draws Swedish letters and the accented e in the font's own cells, and
+  follows `rel` and linked sheets in document order, up to 16 sheets of 64 KiB
+  each. The utsikt CHANGELOG has the full list.
+
+### Changed
+
+- `sync` writes only to a disk that carries the Moonshot magic. Every disk
+  write returns a status, a timeout and an error are told apart and reported,
+  and `sync` says so when a write failed instead of saying it saved. A disk it
+  does not recognise is left untouched. The filesystem is not safe against a
+  power cut, so a failure during `sync` can leave the disk incomplete.
+- `login` and `passwd` no longer take a password on the command line, see
+  Security.
+- The kernel takes the serial line one whole log line at a time, so a timer
+  tick no longer lands in the middle of a line. Interrupts stay off for at
+  most 128 bytes at a time. What a program prints also reaches the serial
+  line as whole lines, held for each program until its newline, 256 bytes or
+  its next call, so a program such as coff that writes a message a word at a
+  time is no longer cut in two by the kernel's lines or by another program's.
+  The screen still gets every byte at once.
+- The kernel started through GRUB asks for 1024 by 768 at 32 bits and falls
+  back to any mode the firmware offers.
+- The kernel refuses to start a program with a segment that can be both
+  written and run.
+- `make_usb.sh` puts the kernel's own `kernel/core/grub.cfg` on the stick, so
+  GRUB starts Moonshot at once instead of after a three second menu, and the
+  script stops if that file loses the video settings UEFI machines need.
+- `run_qemu.sh` boots from a new disk made for each run and no longer makes
+  or reuses `disk.img`.
+
+### Fixed
+
+- When a program started from the shell split the screen before the shell
+  had printed its prompt, the shell window showed no prompt, and a plain
+  `split` always lost the prompt in the window that ran it. The shell now
+  prompts the window whose line it just finished.
+- A write that failed on the disk, or timed out, was reported as saved, and
+  some files were missing or wrong on the disk afterwards. `sync` now checks every write.
+- A request for a range of memory that wrapped around, or was negative, could
+  get past the checks of a system call, and a fault while the kernel copied a
+  program's memory could stop the kernel. A program that does this is now
+  stopped and the kernel goes on. `SYSCALL` now clears the flags a program
+  could use to single step the kernel, and the kernel has its own stacks for
+  the debug exception, the non-maskable interrupt and the machine check.
 ## [0.6.1] "Busy Bertil" - 2026-11-02
 
 Needs coff v0.7.0. Fixes for real UEFI machines, first booted on a Lenovo

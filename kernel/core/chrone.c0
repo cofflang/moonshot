@@ -148,6 +148,20 @@ int sched_tick_count = 0;
 //   task_heap_end_base[i] -- one past the last usable byte of task i's heap
 //                           region (0 alongside task_heap_next_base[i] == 0).
 //                           lager's bounds check is next+n > end.
+int task_uid_base = 0;
+
+int task_uid(int tid) {
+    if (!task_uid_base || tid < 0 || tid >= MAX_TASKS) { return -1; }
+    return load64(task_uid_base + tid * 8);
+}
+
+void task_set_uid(int tid, int uid) {
+    if (!task_uid_base || tid < 0 || tid >= MAX_TASKS) { return; }
+    if (uid < 0 || uid >= 8) { return; }
+    store64(task_uid_base + tid * 8, uid);
+    return;
+}
+
 int task_rsp_base = 0;
 int task_state_base = 0;
 int task_counter_base = 0;
@@ -157,6 +171,14 @@ int task_runs_base = 0;
 int task_cpu_base = 0;
 int task_stack_base = 0;
 int task_cr3_base = 0;
+// Per task, the address space the task is still building and has not yet
+// switched to, or 0. task_cr3_base stays on the kernel's root until the
+// build is done, since it is what a resume loads, and this slot is what the
+// reaper frees when the task is stopped part of the way through. A root with
+// bit 0 set was given up by a failed start and is freed on the next tick
+// even while its task runs on (see proc_root_begin in syscall.c0). A root is
+// in this slot or in task_cr3_base, never both.
+int task_pending_root_base = 0;
 int task_win_base = 0;
 int task_heap_next_base = 0;
 int task_heap_end_base = 0;
@@ -289,6 +311,7 @@ int sched_craft_stack(int stack_base, int entry) {
 int task_stack_pool = 0;
 
 int task_spawn(int entry) {
+    if (MAX_TASKS > 8) { return 0 - 1; }
     int id = 0;
     for (id = 0; id < MAX_TASKS; id += 1) {
         if (load64(task_state_base + id * 8) == TASK_FREE) {
@@ -302,6 +325,7 @@ int task_spawn(int entry) {
             int sp = sched_craft_stack(stack, entry);
             store64(task_rsp_base + id * 8, sp);
             store64(task_stack_base + id * 8, stack);
+            store64(task_uid_base + id * 8, -1);
             store64(task_counter_base + id * 8, 0);
             store64(task_runs_base + id * 8, 0);
             store64(task_cpu_base + id * 8, 0);
@@ -326,11 +350,13 @@ int task_spawn(int entry) {
             // stack=" line, this is what lets test_shell.sh prove a reaped
             // page is genuinely handed back out (a later spawn's stack ==
             // an earlier reaped stack, via pmm's LIFO free list).
+            int sl = serial_line_begin();
             serial_print("[sched] spawned task ");
             serial_print_int(id);
             serial_print(" stack=");
             serial_print_int(stack);
             serial_print("\n");
+            serial_line_end(sl);
             return id;
         }
     }
@@ -373,7 +399,28 @@ int sched_pick_next(int cur) {
 void sched_reap(int cur) {
     int r = 0;
     for (r = 0; r < MAX_TASKS; r += 1) {
+        // An address space a task was still building. It goes when the start
+        // gave it up, even on `cur`, which runs on the kernel's root until a
+        // build is done, and when the task was stopped, but not on `cur`,
+        // which a tick with nothing else to run goes back into. This runs in
+        // the timer interrupt, so the slot is emptied and the tree freed with
+        // interrupts off throughout, and nothing else ever walks it again.
+        int pend = 0;
+        if (task_pending_root_base) { pend = load64(task_pending_root_base + r * 8); }
+        if (pend != 0 && ((pend & 1) == 1
+                || (r != cur && load64(task_state_base + r * 8) == TASK_EXITED))) {
+            store64(task_pending_root_base + r * 8, 0);
+            int unfinished = pt_free(pend - (pend & 1));
+            serial_print("[sched] freed unfinished address space of task ");
+            serial_print_int(r);
+            serial_print(", ");
+            serial_print_int(unfinished);
+            serial_print(" pages\n");
+        }
         if (r != cur && load64(task_state_base + r * 8) == TASK_EXITED) {
+            task_hold_flush(r);
+            dvala_reaped(r);
+            user_cleanup(r);
             int sb = load64(task_stack_base + r * 8);
             if (sb != 0) {
                 // The stack goes back whole to task_stack_pool, so the
@@ -406,6 +453,7 @@ void sched_reap(int cur) {
                     serial_print("\n");
                 }
                 // Reset the slot fully to FREE so task_spawn can reuse it.
+                store64(task_uid_base + r * 8, -1);
                 store64(task_state_base + r * 8, TASK_FREE);
                 store64(task_wake_at_base + r * 8, 0);
                 if (load64(task_args_base + r * 8) != 0) { kfree(load64(task_args_base + r * 8)); }
@@ -464,9 +512,19 @@ int stats_last_disk = -1;
 int stats_last_free = -1;
 int STATS_METER_W = 78;   // plus its 2px frame, exactly 10 character cells
 
+// 1 when the status bar window exists and the per window arrays behind it are
+// allocated. Without a framebuffer kakel never starts, the window id stays -1
+// and the arrays stay null, so every access indexed by it must be skipped.
+int stats_bar_ready() {
+    if (kakel_stats_win < 0 || kakel_stats_win >= KAKEL_MAX_WIN) { return 0; }
+    if (kakel_bg_base == 0 || kakel_row_base == 0 || kakel_col_base == 0) { return 0; }
+    return 1;
+}
+
 // Draws a meter of used out of total at the bar's cursor and moves the
 // cursor past it, so text can follow.
 void stats_meter(int bar_y, int used, int total) {
+    if (stats_bar_ready() == 0) { return; }
     int col = load64(kakel_col_base + kakel_stats_win * 8);
     int mx = col * FONT_W;
     if (mx + STATS_METER_W + 2 > fb_width || total <= 0) { return; }
@@ -494,7 +552,8 @@ void stats_meter(int bar_y, int used, int total) {
 }
 
 void sched_stats_update() {
-    if (kakel_locked == 1) { return; }
+    if (stats_bar_ready() == 0) { return; }
+    if (kakel_locked == 1 || kakel_full >= 0) { return; }
     int secs = pit_ticks / 100;
     // Tenths of a megabyte, rounded up, so a single small file never reads
     // as 0.0.
@@ -613,6 +672,7 @@ void sched_tick() {
     stats_tick_count += 1;
     if (stats_tick_count >= STATS_REFRESH_PERIOD) {
         stats_tick_count = 0;
+        dvala_tick();
         sched_stats_update();
     }
 
@@ -691,12 +751,35 @@ int sched_kill_faulted(int vector, int errcode, int cr2, int rip) {
     serial_print("\n");
     int next = sched_pick_next(cur);
     if (next < 0) {
+        if (vector == 1) {
+            int land = ist_stop_landing;
+            land();
+        }
         int on = enable_interrupts;
         on();
         while (1) { halt(); }
     }
     sched_switch(cur, next);
     return 1;
+}
+
+// Stops the current task when SYSRET cannot safely return to the saved user
+// RIP/RSP. Unlike sched_kill_faulted this does not depend on an interrupted
+// ring-3 CS, because the syscall path has no such frame; it uses the same
+// exited/stopped convention and never returns to user code.
+void sched_stop_bad_sysret() {
+    int cur = sched_current;
+    task_set_end(cur, 2, 13);
+    store64(task_state_base + cur * 8, TASK_EXITED);
+    serial_print("[sched] task ");
+    serial_print_int(cur);
+    serial_print(" stopped, exception vector=13\n");
+    int on = enable_interrupts;
+    on();
+    while (1 == 1) {
+        cpu_wait();
+    }
+    return;
 }
 
 // Vector 48, raised by cpu_wait on a task with nothing to do. The CPU goes
@@ -721,9 +804,11 @@ void sched_yield(int vector, int errcode, int cr2, int rip) {
 void task_exit() {
     int me = sched_current;
     store64(task_state_base + me * 8, TASK_EXITED);
+    int sl = serial_line_begin();
     serial_print("[sched] task ");
     serial_print_int(me);
     serial_print(" exited\n");
+    serial_line_end(sl);
     while (1) {
         cpu_wait();
     }
@@ -766,6 +851,7 @@ void thread_exiter() {
 // operation; every later switch happens transparently inside the timer ISR, not
 // here. Called once from boot.s after kernel_post_init (heap already inited).
 void sched_start() {
+    task_uid_base = kmalloc(MAX_TASKS * 8);
     task_rsp_base = kmalloc(MAX_TASKS * 8);
     task_state_base = kmalloc(MAX_TASKS * 8);
     task_counter_base = kmalloc(MAX_TASKS * 8);
@@ -773,6 +859,7 @@ void sched_start() {
     task_cpu_base = kmalloc(MAX_TASKS * 8);
     task_stack_base = kmalloc(MAX_TASKS * 8);
     task_cr3_base = kmalloc(MAX_TASKS * 8);
+    task_pending_root_base = kmalloc(MAX_TASKS * 8);
     task_win_base = kmalloc(MAX_TASKS * 8);
     task_heap_next_base = kmalloc(MAX_TASKS * 8);
     task_heap_end_base = kmalloc(MAX_TASKS * 8);
@@ -787,6 +874,7 @@ void sched_start() {
     // as bogus task states.
     int i = 0;
     for (i = 0; i < MAX_TASKS; i += 1) {
+        store64(task_uid_base + i * 8, -1);
         store64(task_state_base + i * 8, TASK_FREE);
         store64(task_wake_at_base + i * 8, 0);
         store64(task_args_base + i * 8, 0);
@@ -797,6 +885,7 @@ void sched_start() {
         store64(task_cpu_base + i * 8, 0);
         store64(task_stack_base + i * 8, 0);
         store64(task_cr3_base + i * 8, pml4_phys);
+        store64(task_pending_root_base + i * 8, 0);
         store64(task_win_base + i * 8, 0 - 1);
         store64(task_heap_next_base + i * 8, 0);
         store64(task_heap_end_base + i * 8, 0);
@@ -809,10 +898,10 @@ void sched_start() {
     // plus one exiter proves a real N(>2)-task round-robin AND task exit/skip.
     // The exiter leaves first, after EXIT_AFTER_RUNS, the workers after
     // WORKER_RUNS.
-    task_spawn(thread_boot_worker);
-    task_spawn(thread_boot_worker);
-    task_spawn(thread_boot_worker);
-    task_spawn(thread_exiter);
+    task_set_uid(task_spawn(thread_boot_worker), 0);
+    task_set_uid(task_spawn(thread_boot_worker), 0);
+    task_set_uid(task_spawn(thread_boot_worker), 0);
+    task_set_uid(task_spawn(thread_exiter), 0);
 
     // Shell task (id 4). Must be spawned AFTER the demo workers so their ids
     // stay 0-3 (the automated tests check task 3's exit by id). shell_task
@@ -820,6 +909,7 @@ void sched_start() {
     // preemptive round-robin during headless test runs; the keyboard IRQ wakes
     // it via task_wake when input is available.
     shell_task_id = task_spawn(shell_task);
+    task_set_uid(shell_task_id, 0);
 
     sched_current = 0;
     sched_tick_count = 0;
@@ -841,7 +931,7 @@ void sched_start() {
 // carried on from there by the timer, 100 ticks a second, so a reading costs
 // nothing and never catches the RTC halfway through an update. clock_offset
 // is the user's own one setting, minutes added to UTC for the time shown,
-// kept in the file tid.zone in the root, a number of minutes written by hand.
+// kept in the file tid.zone in the root and set by the shell's zone command.
 
 int clock_boot_utc = 0;   // seconds since 1970 at clock_boot_ticks
 int clock_boot_ticks = 0;
@@ -913,7 +1003,7 @@ void clock_init() {
     if (fid >= 0) {
         int buf = kmalloc(16);
         if (buf) {
-            int n = jakel_read(fid, 0, buf, 15);
+            int n = jakel_read(JAKEL_SYSTEM, fid, 0, buf, 15);
             int i = 0;
             int sign = 1;
             int v = 0;
@@ -936,6 +1026,65 @@ void clock_init() {
 }
 
 int clock_utc() { return clock_boot_utc + (pit_ticks - clock_boot_ticks) / 100; }
+
+// Sets the offset the time is shown with, in minutes, from -24 to +24 hours.
+// Returns 0, or -1 when it is out of that range and nothing changed.
+int clock_offset_set(int minutes) {
+    if (minutes < 0 - 1440 || minutes > 1440) { return 0 - 1; }
+    clock_offset = minutes;
+    int sl = serial_line_begin();
+    serial_print("[clock] offset set to ");
+    serial_print_int(minutes);
+    serial_print(" min\n");
+    serial_line_end(sl);
+    return 0;
+}
+
+// Writes clock_offset to tid.zone in the root the way clock_init reads it, a
+// sign and the minutes, such as +120 or -210, and saves the disk. It writes as
+// the system, whoever asked, and only ever that one file. A file of another
+// owner squatting the name is taken back first, in the same jakel section as
+// the lookup, so no other task can swap the node in between. Returns 0 when
+// it is on disk, 1 when it is in memory only since there is no disk to save
+// to, 2 when tid.zone is a folder, 3 when the disk has no Moonshot magic and
+// was left untouched, 4 when saving to the disk failed, and 5 when there was
+// no memory, no free node or no file space for it.
+int clock_offset_save() {
+    int text = kmalloc(8);
+    if (!text) { return 5; }
+    int v = clock_offset;
+    store8(text, '+');
+    if (v < 0) { store8(text, '-'); v = 0 - v; }
+    int n = 1;
+    int div = 1000;
+    while (div > 0) {
+        int d = (v / div) % 10;
+        if (n > 1 || d != 0 || div == 1) {
+            store8(text + n, '0' + d);
+            n += 1;
+        }
+        div /= 10;
+    }
+    int held = jakel_lock();
+    int id = jakel_lookup(0, "tid.zone");
+    if (id < 0) { id = jakel_make_file(JAKEL_SYSTEM, 0, "tid.zone"); }
+    int r = 5;
+    if (id >= 0 && load64(jakel_type_base + id * 8) == JAKEL_TYPE_DIR) { r = 2; }
+    if (id >= 0 && load64(jakel_type_base + id * 8) == JAKEL_TYPE_FILE) {
+        jakel_set_owner(JAKEL_SYSTEM, id, 0);
+        jakel_set_mode(JAKEL_SYSTEM, id, JAKEL_MODE_PRIVATE);
+        if (jakel_put(JAKEL_SYSTEM, id, text, n, 0) == 0) { r = 1; }
+    }
+    jakel_unlock(held);
+    kfree(text);
+    if (r == 1 && ata_present) {
+        int s = jakel_sync();
+        if (s == JAKEL_SYNC_OK) { r = 0; }
+        if (s == JAKEL_SYNC_NO_MAGIC) { r = 3; }
+        if (s != JAKEL_SYNC_OK && s != JAKEL_SYNC_NO_MAGIC) { r = 4; }
+    }
+    return r;
+}
 
 // The local date and time as year, month, day, hour, minute, second, from
 // seconds since 1970 (Hinnant's civil_from_days).

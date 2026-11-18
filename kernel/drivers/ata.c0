@@ -37,6 +37,33 @@ int CMD_FLUSH       = 0xE7;  // FLUSH CACHE
 
 int ata_present = 0;  // 1 if a drive was detected at init
 
+// What ata_read_status, ata_write and ata_flush return.
+int ATA_OK      = 1;
+int ATA_TIMEOUT = 0 - 1;  // the drive stayed busy through every wait
+int ATA_FAILED  = 0 - 2;  // the drive set ERR, or there is no drive
+int ATA_REFUSED = 0 - 3;  // the write guard or the address check said no
+
+// LBA28 addresses stop here. Above it the drive register would take the
+// carry into its device bit and select the other drive.
+int ATA_LBA_LIMIT = 268435456;
+
+// A wait polls the status port ATA_WAIT_POLLS times, and when the drive is
+// still busy it waits again, twice as long each time, ATA_WAIT_TRIES times in
+// all. A host under heavy disk load keeps QEMU's drive busy on a flush for a
+// long time, and a real drive spinning up takes seconds.
+int ATA_WAIT_POLLS = 100000;
+int ATA_WAIT_TRIES = 7;
+
+// What ata_wait waits for.
+int ATA_UNTIL_IDLE = 0;  // BSY clear, before a command is issued
+int ATA_UNTIL_DRQ  = 1;  // BSY clear and DRQ set, the drive wants a sector
+int ATA_UNTIL_DONE = 2;  // BSY clear after a command, and ERR clear
+
+// The write guard. 1 from ata_arm, which has seen the Moonshot magic in
+// sector 0, until ata_disarm, and ata_write writes nothing while it is 0.
+// 2 lets exactly one write through, the magic sector ata_create_magic writes.
+int ata_armed = 0;
+
 // Extracts a single bit from an 8-bit status value. `bit` must be a
 // power of 2 (1, 2, 4, 8, 16, 32, 64, 128). Uses arithmetic,
 // (v/bit) - ((v/(bit*2))*2) isolates the bit.
@@ -46,27 +73,30 @@ int ata_bit(int v, int bit) {
     return (v / bit) - ((v / (bit * 2)) * 2);
 }
 
-// Poll until BSY clears (or timeout). Returns 1 on success, 0 on timeout.
-int ata_wait_not_busy() {
+// Polls the status port until the drive is in the state `until` names.
+// Returns ATA_OK, ATA_FAILED when the drive finished with ERR set, or
+// ATA_TIMEOUT when it stayed busy through every try. The four reads first
+// are the 400 ns a drive may take to raise BSY after a command.
+int ata_wait(int until) {
     int i = 0;
-    for (i = 0; i < 100000; i += 1) {
-        if (ata_bit(inb(ATA_STATUS), STAT_BSY) == 0) { return 1; }
-    }
-    return 0;
-}
-
-// Poll until the drive is ready for a data transfer. BSY must be clear
-// and DRQ must be set. Returns 0 on timeout or error, 1 on success.
-int ata_wait_drq() {
-    int i = 0;
-    for (i = 0; i < 100000; i += 1) {
-        int st = inb(ATA_STATUS);
-        if (ata_bit(st, STAT_ERR) == 1) { return 0; }
-        if (ata_bit(st, STAT_BSY) == 0) {
-            if (ata_bit(st, STAT_DRQ) == 1) { return 1; }
+    for (i = 0; i < 4; i += 1) { inb(ATA_STATUS); }
+    int polls = ATA_WAIT_POLLS;
+    int t = 0;
+    for (t = 0; t < ATA_WAIT_TRIES; t += 1) {
+        if (t > 0) { serial_print("[ata] drive still busy, waiting longer\n"); }
+        for (i = 0; i < polls; i += 1) {
+            int st = inb(ATA_STATUS);
+            if (ata_bit(st, STAT_BSY) == 0) {
+                if (until == ATA_UNTIL_IDLE) { return ATA_OK; }
+                if (ata_bit(st, STAT_ERR) == 1) { return ATA_FAILED; }
+                if (until == ATA_UNTIL_DONE) { return ATA_OK; }
+                if (ata_bit(st, STAT_DRQ) == 1) { return ATA_OK; }
+            }
         }
+        polls = polls * 2;
     }
-    return 0;
+    serial_print("[ata] drive timed out\n");
+    return ATA_TIMEOUT;
 }
 
 // Initialise the ATA driver. Detect whether a drive is present on the
@@ -93,36 +123,35 @@ int ata_init() {
     return 1;
 }
 
-// Read one 512-byte sector at 28-bit LBA address into buffer `buf`,
-// which must point to at least 512 bytes of writable memory. Safe to
-// call when ata_present == 0 (silently returns).
-void ata_read(int lba, int buf) {
-    if (!ata_present) { return; }
-    if (lba < 0) { return; }
-    if (ata_wait_not_busy() == 0) { return; }
-
+// Issues a one-sector command `cmd` for 28-bit LBA `lba` to the master drive.
+void ata_command(int lba, int cmd) {
     // Sector count = 1
     outb(ATA_NSECT, 1);
 
-    // LBA bits 7:0
-    outb(ATA_LBA_LO, lba % 256);
-
-    // LBA bits 15:8
+    // LBA bits 7:0, 15:8 and 23:16
+    outb(ATA_LBA_LO,  lba % 256);
     outb(ATA_LBA_MID, (lba / 256) - ((lba / 65536) * 256));
-
-    // LBA bits 23:16
-    outb(ATA_LBA_HI, (lba / 65536) - ((lba / 16777216) * 256));
+    outb(ATA_LBA_HI,  (lba / 65536) - ((lba / 16777216) * 256));
 
     // Drive select, master (0xE0) | LBA mode (0x40) | top nibble
     // 0xE0 already includes the LBA-mode bit, so 0xE0 + (lba >> 24 & 0x0F)
     outb(ATA_DRIVE, 0xE0 + lba / 16777216);
 
-    // Issue READ SECTORS
-    outb(ATA_COMMAND, CMD_READ);
+    outb(ATA_COMMAND, cmd);
+    return;
+}
 
-    // Wait for data
-    if (ata_wait_not_busy() == 0) { return; }
-    if (ata_wait_drq() == 0) { return; }
+// Read one 512-byte sector at 28-bit LBA address into buffer `buf`,
+// which must point to at least 512 bytes of writable memory. Returns
+// ATA_OK, or why the sector was not read.
+int ata_read_status(int lba, int buf) {
+    if (!ata_present) { return ATA_FAILED; }
+    if (lba < 0 || lba >= ATA_LBA_LIMIT) { return ATA_REFUSED; }
+    int r = ata_wait(ATA_UNTIL_IDLE);
+    if (r != ATA_OK) { return r; }
+    ata_command(lba, CMD_READ);
+    r = ata_wait(ATA_UNTIL_DRQ);
+    if (r != ATA_OK) { return r; }
 
     // Read 256 16-bit words from the data port.
     // Each 16-bit word is split into two little-endian bytes.
@@ -132,32 +161,73 @@ void ata_read(int lba, int buf) {
         store8(buf + i * 2,       w % 256);  // low byte
         store8(buf + i * 2 + 1,   w / 256);               // high byte
     }
+    return ATA_OK;
+}
+
+// ata_read_status as 1 when the sector was read and 0 when it was not. Safe
+// to call when ata_present == 0.
+int ata_read(int lba, int buf) {
+    if (ata_read_status(lba, buf) == ATA_OK) { return 1; }
+    return 0;
+}
+
+int ata_magic(int buf) {
+    int i = 0;
+    int magic = "JAKELBK";
+    for (i = 0; i < 8; i += 1) {
+        if (load8(buf + i) != load8(magic + i)) { return 0; }
+    }
+    return 1;
+}
+
+// 1 when there is a drive and its sector 0 reads back with the magic.
+int ata_writable() {
+    if (!ata_present) { return 0; }
+    if (!ata_read(0, ata_guard_buffer)) { return 0; }
+    return ata_magic(ata_guard_buffer);
+}
+
+// Reads sector 0 and lets ata_write write when it carries the Moonshot
+// magic. Returns ATA_OK, ATA_REFUSED when the magic is absent, or why
+// sector 0 could not be read. Every run of writes starts here and ends with
+// ata_disarm. In between, ata_write writes sector 0 only with the magic in
+// it, so the disk keeps the magic the whole time.
+int ata_arm() {
+    ata_armed = 0;
+    int r = ata_read_status(0, ata_guard_buffer);
+    if (r != ATA_OK) { return r; }
+    if (!ata_magic(ata_guard_buffer)) { return ATA_REFUSED; }
+    ata_armed = 1;
+    return ATA_OK;
+}
+
+void ata_disarm() {
+    ata_armed = 0;
     return;
 }
 
-// Write one 512-byte sector from buffer `buf` to 28-bit LBA address.
-// Safe to call when ata_present == 0 (silently returns).
-void ata_write(int lba, int buf) {
-    if (!ata_present) { return; }
-    if (lba < 0) { return; }
-    if (ata_wait_not_busy() == 0) { return; }
-
-    // Sector count = 1
-    outb(ATA_NSECT, 1);
-
-    // LBA bytes
-    outb(ATA_LBA_LO,  lba % 256);
-    outb(ATA_LBA_MID, (lba / 256) - ((lba / 65536) * 256));
-    outb(ATA_LBA_HI,  (lba / 65536) - ((lba / 16777216) * 256));
-
-    // Drive select
-    outb(ATA_DRIVE, 0xE0 + lba / 16777216);
-
-    // Issue WRITE SECTORS
-    outb(ATA_COMMAND, CMD_WRITE);
+// Write one 512-byte sector from buffer `buf` to 28-bit LBA address `lba`
+// and wait until the drive has taken it. ata_flush then commits it to the
+// medium. Returns ATA_OK, ATA_REFUSED when the guard turns it away,
+// ATA_TIMEOUT or ATA_FAILED.
+int ata_write(int lba, int buf) {
+    int armed = ata_armed;
+    if (armed == 2) { ata_armed = 0; }
+    if (armed == 0) {
+        serial_print("[ata] write refused, the disk was not checked for Moonshot magic\n");
+        return ATA_REFUSED;
+    }
+    if (armed == 2 && lba != 0) { return ATA_REFUSED; }
+    if (lba == 0 && !ata_magic(buf)) { return ATA_REFUSED; }
+    if (!ata_present) { return ATA_FAILED; }
+    if (lba < 0 || lba >= ATA_LBA_LIMIT) { return ATA_REFUSED; }
+    int r = ata_wait(ATA_UNTIL_IDLE);
+    if (r != ATA_OK) { return r; }
+    ata_command(lba, CMD_WRITE);
 
     // Wait for the drive to be ready to accept data
-    if (ata_wait_drq() == 0) { return; }
+    r = ata_wait(ATA_UNTIL_DRQ);
+    if (r != ATA_OK) { return r; }
 
     // Write 256 16-bit words to the data port.
     // Each 16-bit word is reconstructed from two little-endian bytes.
@@ -167,13 +237,39 @@ void ata_write(int lba, int buf) {
         int hi = load8(buf + i * 2 + 1);
         outw(ATA_DATA, lo + hi * 256);
     }
+    return ata_wait(ATA_UNTIL_DONE);
+}
 
-    // Wait for the write to complete, then flush the drive's cache so
-    // the data is committed to the medium (not just the drive's internal
-    // buffer).
-    if (ata_wait_not_busy() == 0) { return; }
+// Flushes the drive's write cache, so every sector ata_write handed it is
+// on the medium and not only in the drive's own buffer. Returns ATA_OK,
+// ATA_TIMEOUT or ATA_FAILED, and a write the cache could not commit shows
+// here as ATA_FAILED.
+int ata_flush() {
+    if (!ata_present) { return ATA_FAILED; }
+    int r = ata_wait(ATA_UNTIL_IDLE);
+    if (r != ATA_OK) { return r; }
     outb(ATA_COMMAND, CMD_FLUSH);
-    if (ata_wait_not_busy() == 0) { return; }
+    return ata_wait(ATA_UNTIL_DONE);
+}
 
-    return;
+// Writes the Moonshot magic into sector 0 of a disk that does not carry it,
+// after the shell's typed confirmation. Only a sector 0 that reads back
+// without the magic is replaced, never one that could not be read. Returns 1
+// when the disk carries the magic afterwards.
+int ata_create_magic() {
+    if (!ata_present) { return 0; }
+    if (ata_read_status(0, ata_guard_buffer) != ATA_OK) { return 0; }
+    if (ata_magic(ata_guard_buffer)) { return 0; }
+    int buf = kmalloc(512);
+    if (!buf) { return 0; }
+    int i = 0;
+    for (i = 0; i < 512; i += 1) { store8(buf + i, 0); }
+    for (i = 0; i < 8; i += 1) { store8(buf + i, load8("JAKELBK" + i)); }
+    ata_armed = 2;
+    int r = ata_write(0, buf);
+    ata_armed = 0;
+    kfree(buf);
+    if (r == ATA_OK) { r = ata_flush(); }
+    if (r != ATA_OK) { return 0; }
+    return ata_writable();
 }

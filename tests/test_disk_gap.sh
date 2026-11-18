@@ -29,10 +29,11 @@ cd "$(dirname "$0")/.."
 
 ./build.sh || exit 1
 
+mkdir -p out && cd out
+
 rm -f disk.img serial.log
 dd if=/dev/zero of=disk.img bs=512 count=20480 2>/dev/null
-
-mkdir -p out && cd out
+python3 -c 'f = open("disk.img", "r+b"); f.write(b"JAKELBK\0"); f.close()'
 
 isodir=isoroot
 rm -rf "$isodir"
@@ -46,6 +47,19 @@ qemu_pid=0
 cleanup() { [ "$qemu_pid" -ne 0 ] && kill "$qemu_pid" 2>/dev/null; wait 2>/dev/null; rm -f "$sockfile"; }
 trap cleanup EXIT
 
+# QEMU creates its monitor socket a moment after it starts, later when the
+# machine is busy. Wait for it instead of a fixed sleep, and say so if it
+# never appears.
+wait_for_socket() {
+  local i
+  for i in $(seq 1 300); do
+    [ -S "$1" ] && return 0
+    sleep 0.1
+  done
+  echo "FAIL: QEMU monitor socket $1 did not appear within 30 s"
+  return 1
+}
+
 boot() { # serial-log, then one shell command per argument
   local log=$1
   shift
@@ -55,6 +69,7 @@ boot() { # serial-log, then one shell command per argument
     -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
     -monitor unix:"$sockfile",server,nowait &
   qemu_pid=$!
+  wait_for_socket "$sockfile" || exit 1
   sleep 3
   python3 - "$sockfile" "$@" <<'EOF'
 import socket, sys, time

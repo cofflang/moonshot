@@ -78,6 +78,7 @@ extern int repl_scratch;
 extern int shell_scratch;
 extern int shell_users;
 extern int shell_mirror;
+extern int shell_mirror_out;
 extern int elf_scratch;
 extern int idt_start;
 extern int dispatch_start;
@@ -116,18 +117,37 @@ extern int isr_yield_entry;
 extern int enable_interrupts;
 extern int disable_interrupts;
 extern int flush_tlb;
+extern int user_context_records;
+extern int user_copy_read;
+extern int user_copy_read_site;
+extern int user_blit_row;
+extern int user_blit_read_site;
+extern int user_access_read;
+extern int user_access_read_end;
+extern int user_access_write;
+extern int user_access_write_end;
+extern int user_access_write_site;
+extern int user_abort_landing;
+extern int boot_fault_probe;
+extern int boot_fault_probe_site;
+extern int read_flags;           // boot.s, the flags register, for IF
+extern int read_cr3;             // boot.s, the live page-table root
 extern int cpuid_into;           // boot.s, cpuid leaf rdi into four words at rsi
-extern int zero_pages;           // boot.s, rep stosq over rsi pages at rdi
 
+extern int boot_log_data;
+extern int ata_guard_buffer;
+extern int hardware_map;
 include "../drivers/serial.c0";
 include "interrupts.c0";
 include "jenna.c0";
 include "chrone.c0";
 include "lager.c0";
+include "kraft.c0";
 include "../drivers/vga.c0";
 include "../screen/punkt.c0";
 include "../screen/kakel.c0";
 include "../shell/skalman.c0";
+include "../screen/dvala.c0";
 include "../shell/sk_script.c0";
 // The debug commands, or none. build.sh writes this file, see
 // skalman_debug.c0.
@@ -148,14 +168,17 @@ embed ticks_test_elf "../../build/ticks_test.elf";
 embed crash_test_elf "../../build/crash_test.elf";
 embed mouse_probe_elf "../../build/mouse_probe.elf";
 embed tone_elf "../../build/tone.elf";
+embed fanfar_elf "../../build/fanfar.elf";
 embed infecteria_elf "../../build/infecteria.elf";
 embed fps_probe_elf "../../build/fps_probe.elf";
 embed utsikt_elf "../../build/utsikt.elf";
 embed lira_elf "../../build/lira.elf";
 embed hylla_elf "../../build/hylla.elf";
+embed tapet_elf "../../build/tapet.elf";
 embed skrift_elf "../../build/skrift.elf";
 embed pensel_elf "../../build/pensel.elf";
 embed insyn_elf "../../build/insyn.elf";
+embed dvala_elf "../../build/dvala.elf";
 embed form_elf "../../build/form.elf";
 embed coff_elf "../../build/coff.elf";
 embed smed_elf "../../build/smed.elf";

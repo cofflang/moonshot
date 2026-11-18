@@ -1,0 +1,100 @@
+// Copyright (C) 2026 tavro
+// SPDX-License-Identifier GPL-3.0-or-later
+int sync_layout_a = -1;
+int sync_layout_c = -1;
+int sync_layout_e = -1;
+int sync_layout_d = -1;
+
+int sync_layout_fill(int uid, int id, int byte, int n) {
+    int buf = kmalloc(n);
+    int i = 0;
+    for (i = 0; i < n; i += 1) { store8(buf + i, byte); }
+    int r = jakel_put(uid, id, buf, n, 0);
+    kfree(buf);
+    return r;
+}
+
+// 1 when file id holds n bytes, the first k of them `byte` and the rest 0.
+int sync_layout_holds(int id, int n, int byte, int k) {
+    if (id < 0 || load64(jakel_size_base + id * 8) != n) { return 0; }
+    int buf = kmalloc(n);
+    if (jakel_read(JAKEL_SYSTEM, id, 0, buf, n) != n) { kfree(buf); return 0; }
+    int ok = 1;
+    int i = 0;
+    for (i = 0; i < n; i += 1) {
+        int want = 0;
+        if (i < k) { want = byte; }
+        if (load8(buf + i) != want) { ok = 0; }
+    }
+    kfree(buf);
+    return ok;
+}
+
+void sync_layout_say(int ok, int label) {
+    serial_print("[sync-test] ");
+    if (ok) { serial_print("PASS "); } else { serial_print("FAIL "); }
+    serial_print(label);
+    serial_print("\n");
+    return;
+}
+
+// Runs between jakel_sync's node table and its data pass. The earlier file
+// grows, a file is removed and a new one takes its slot, and another shrinks.
+void sync_layout_change() {
+    sync_layout_fill(1, sync_layout_a, 'G', 4096);
+    jakel_remove(JAKEL_SYSTEM, sync_layout_c);
+    sync_layout_d = jakel_make_file(JAKEL_SYSTEM, 0, "sync-d.txt");
+    sync_layout_fill(JAKEL_SYSTEM, sync_layout_d, 'D', 700);
+    sync_layout_fill(JAKEL_SYSTEM, sync_layout_e, 'e', 10);
+    sync_layout_say(sync_layout_d == sync_layout_c, "the new file took the removed file's slot");
+    return;
+}
+
+void sync_layout_probe() {
+    int b = jakel_lookup(0, "sync-b.txt");
+    if (b >= 0) {
+        int buf = kmalloc(64);
+        int i = 0;
+        for (i = 0; i < 64; i += 1) { store8(buf + i, 0); }
+        int n = jakel_read(JAKEL_SYSTEM, b, 0, buf, 63);
+        sync_layout_say(n == 13 && str_eq(buf, "rootcontent-b"),
+            "the later file is intact after the reload");
+        kfree(buf);
+        sync_layout_say(sync_layout_holds(jakel_lookup(0, "sync-a.txt"), 100, 'G', 100),
+            "the grown file keeps the recorded size and holds its own new bytes");
+        sync_layout_say(sync_layout_holds(jakel_lookup(0, "sync-c.txt"), 600, 0, 0),
+            "the removed file's sectors are zeros, not the bytes of the file in its slot");
+        sync_layout_say(jakel_lookup(0, "sync-d.txt") < 0,
+            "a file made after the node table is not on the disk");
+        sync_layout_say(sync_layout_holds(jakel_lookup(0, "sync-e.txt"), 600, 'e', 10),
+            "the shrunk file holds its new bytes and zeros after them");
+        int dup = 0;
+        int x = 0;
+        int y = 0;
+        for (x = 0; x < JAKEL_MAX_NODES; x += 1) {
+            for (y = x + 1; y < JAKEL_MAX_NODES; y += 1) {
+                if (jakel_valid(x) && jakel_valid(y) && jakel_stamp(x) == jakel_stamp(y)) { dup += 1; }
+            }
+        }
+        sync_layout_say(dup == 0, "every node loaded from the disk has a creation stamp of its own");
+        serial_print("[sync-test] DONE\n");
+        return;
+    }
+    sync_layout_a = jakel_make_file(1, 0, "sync-a.txt");
+    sync_layout_fill(1, sync_layout_a, 'a', 100);
+    b = jakel_make_file(JAKEL_SYSTEM, 0, "sync-b.txt");
+    jakel_put(JAKEL_SYSTEM, b, "rootcontent-b", 13, 0);
+    sync_layout_c = jakel_make_file(JAKEL_SYSTEM, 0, "sync-c.txt");
+    sync_layout_fill(JAKEL_SYSTEM, sync_layout_c, 'c', 600);
+    sync_layout_e = jakel_make_file(JAKEL_SYSTEM, 0, "sync-e.txt");
+    sync_layout_fill(JAKEL_SYSTEM, sync_layout_e, 'E', 600);
+    sync_layout_say(sync_layout_a >= 0 && b > sync_layout_a && sync_layout_c > b
+        && sync_layout_e > sync_layout_c, "the files lie in node order a, b, c, e");
+    sk_debug_sync_hook = sync_layout_change;
+    int r = jakel_sync();
+    sk_debug_sync_hook = 0;
+    serial_print("[sync-test] WROTE ");
+    serial_print_int(r);
+    serial_print("\n");
+    return;
+}

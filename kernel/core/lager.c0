@@ -84,10 +84,17 @@ void lager_init() {
 // the table has page tables of its own and never shares one with the
 // user's pages. Called by the ELF loader once the heap is laid out.
 void lager_place(int tid, int heap_end) {
-    int mb2 = 2097152;
     lager_reset(tid);
-    store64(task_lager_tab_base + tid * 8, ((heap_end + mb2 - 1) / mb2) * mb2 + mb2);
+    store64(task_lager_tab_base + tid * 8, lager_tab_at(heap_end));
     return;
+}
+
+// Where lager_place puts the table for a heap ending at `heap_end`. The ELF
+// loader asks the same before it loads anything, to see that the table fits
+// (elf_check), with a `heap_end` it has already held below USER_TOP.
+int lager_tab_at(int heap_end) {
+    int mb2 = 2097152;
+    return ((heap_end + mb2 - 1) / mb2) * mb2 + mb2;
 }
 
 // Forgets a task's table. Called when a slot is spawned into and when it is
@@ -128,7 +135,11 @@ int lager_room(int tid) {
         return 0;
     }
     zero_page(frame);
-    map_page(load64(task_cr3_base + tid * 8), tab + bytes, frame);
+    if (!map_page(load64(task_cr3_base + tid * 8), tab + bytes, frame)) {
+        pmm_free_page(frame);
+        serial_print("[lager] block table page could not be mapped\n");
+        return 0;
+    }
     store64(task_lager_cap_base + tid * 8, bytes + 4096);
     return tab;
 }
@@ -157,6 +168,7 @@ void lager_remove(int tab, int n, int i) {
 // Returns 1, or 0 when physical memory has run out.
 int lager_attach(int tid, int upto) {
     int mapped = load64(task_heap_mapped_base + tid * 8);
+    int prior_mapped = mapped;
     int cr3 = load64(task_cr3_base + tid * 8);
     while (mapped < upto) {
         int frame = pmm_alloc_page();
@@ -164,11 +176,42 @@ int lager_attach(int tid, int upto) {
             // Fail the allocation rather than mapping frame 0, which would
             // silently corrupt low memory.
             serial_print("[lager] out of physical pages\n");
-            store64(task_heap_mapped_base + tid * 8, mapped);
+            // Roll back the pages attached by this allocation by clearing their leaves,
+            // revoke the translations, then return the frames.
+            int v = prior_mapped;
+            while (v < mapped) {
+                int leaf = pt_leaf(cr3, v);
+                if (leaf) {
+                    int f = load64(leaf) & PTE_ADDR;
+                    store64(leaf, 0);
+                    if (f) { pmm_free_page(f); }
+                }
+                v += 4096;
+            }
+            int inv = flush_tlb;
+            inv();
+            store64(task_heap_mapped_base + tid * 8, prior_mapped);
             return 0;
         }
         zero_page(frame);
-        map_page_user_data(cr3, mapped, frame);
+        if (!map_page_user_data(cr3, mapped, frame)) {
+            pmm_free_page(frame);
+            serial_print("[lager] heap page could not be mapped\n");
+            int v2 = prior_mapped;
+            while (v2 < mapped) {
+                int leaf = pt_leaf(cr3, v2);
+                if (leaf) {
+                    int f = load64(leaf) & PTE_ADDR;
+                    store64(leaf, 0);
+                    if (f) { pmm_free_page(f); }
+                }
+                v2 += 4096;
+            }
+            int inv2 = flush_tlb;
+            inv2();
+            store64(task_heap_mapped_base + tid * 8, prior_mapped);
+            return 0;
+        }
         mapped += 4096;
     }
     store64(task_heap_mapped_base + tid * 8, mapped);
@@ -195,6 +238,7 @@ void lager_count(int tid, int n) {
 // on a bad request or when the heap or the table cannot grow.
 int lager_alloc(int tid, int n) {
     if (n <= 0) { return 0; }
+    if (n > HEAP_PAGES * 4096) { return 0; }
     n = ((n + 7) / 8) * 8;
     int top = load64(task_heap_next_base + tid * 8);
     int end = load64(task_heap_end_base + tid * 8);

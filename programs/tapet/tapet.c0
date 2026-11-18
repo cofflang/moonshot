@@ -1,0 +1,65 @@
+// Copyright (C) 2026 tavro
+// Licensed under the GNU General Public License version 3 or later.
+
+int tapet_number(int s) {
+    int n = 0;
+    int i = 0;
+    if (load8(s) == 0) { return -1; }
+    while (load8(s + i) != 0) {
+        int c = load8(s + i);
+        if (c < '0' || c > '9') { return -1; }
+        n = n * 10 + c - '0';
+        if (n > 2147483647) { return -1; }
+        i += 1;
+    }
+    return n;
+}
+
+// A seeded diagonal weave, with opaque blue, green and red channels.
+int tapet_picture(int w, int h, int seed) {
+    int buf = alloc(24 + w * h * 4);
+    if (!buf) { return 0; }
+    store64(buf, w);
+    store64(buf + 8, h);
+    store64(buf + 16, 1);
+    int y = 0;
+    int x = 0;
+    for (y = 0; y < h; y += 1) {
+        for (x = 0; x < w; x += 1) {
+            int band = ((x + y + seed) / 16) % 2;
+            int b = 48 + (x + seed) % 80;
+            int g = 40 + (y + seed) % 72;
+            int r = 24 + band * 32;
+            int p = buf + 24 + (y * w + x) * 4;
+            store8(p, b);
+            store8(p + 1, g);
+            store8(p + 2, r);
+            store8(p + 3, 0);
+        }
+    }
+    return buf;
+}
+
+int main() {
+    if (argc() != 5) {
+        print("tapet output.spr seed width height\n");
+        print("Writes one opaque woven picture. hylla tiles it at its original size.\n");
+        print("Set hylla.bg to the output path and press r in hylla.\n");
+        return 1;
+    }
+    int seed = tapet_number(argv(2));
+    int w = tapet_number(argv(3));
+    int h = tapet_number(argv(4));
+    int ceiling = win_max();
+    int mw = ceiling >> 16;
+    int mh = ceiling & 65535;
+    if (seed < 0 || w < 1 || h < 1 || w > mw || h > mh
+        || w > 2048 || h > 2048) { return 1; }
+    int size = 24 + w * h * 4;
+    if (size > 4194304) { return 1; }
+    int buf = tapet_picture(w, h, seed);
+    if (!buf) { return 2; }
+    if (writefile(argv(1), buf, size) != size) { return 3; }
+    print("tapet wrote picture\n");
+    return 0;
+}

@@ -1,0 +1,248 @@
+// Copyright (C) 2026 tavro
+int copy_test_mode = 0;
+int copy_test_ptr = 0;
+int copy_test_tid = 0 - 1;
+int copy_test_pages = 0;
+int copy_test_id = 0 - 1;
+int copy_test_data = 0;
+int copy_test_size = 0;
+int copy_test_frees = 0;
+int copy_test_expected = 0;
+int copy_test_cleaned = 0;
+int copy_test_depth = 0;
+int copy_test_fdslot = 0 - 1;
+int copy_test_offset = 0;
+int copy_test_arena = 0;
+
+void copy_test_require(int cond) {
+    if (!cond) { jenna_stop("KERNEL PANIC: copy test invariant\n"); }
+    return;
+}
+
+int copy_test_matrix(int p) {
+    int root = load64(task_cr3_base + sched_current * 8);
+    int hstart = load64(task_heap_end_base + sched_current * 8) - HEAP_PAGES * 4096;
+    copy_test_require(user_span(hstart - 8, 8, 1));
+    copy_test_require(user_span(USER_VIRT_BASE, 1, 0));
+    copy_test_require(user_span(p, 8192, 0) && user_span(p, 8192, 1));
+    copy_test_require(user_span(p + 4095, 1, 0));
+    copy_test_require(!user_span(0, 1, 0) && !user_span(USER_TOP - 1, 2, 1));
+    copy_test_require(user_span(0, 0, 0) && !user_span(p, 0 - 1, 0));
+    copy_test_require(!user_span(p, 0x7ffffffffffffff8, 1));
+    copy_test_require(!user_span(USER_VIRT_BASE - 1, 1, 0));
+    copy_test_require(!user_span(0x8000000000000000, 1, 0));
+    copy_test_require(!user_span(0xffff800000000000, 1, 0));
+    copy_test_require(!user_span(FAULT_TEST_VIRT, 1, 0));
+    int leaf = pt_leaf(root, p + 4096);
+    int saved = load64(leaf);
+    store64(leaf, saved & (0 - 2));
+    copy_test_require(!user_span(p + 4095, 2, 0));
+    store64(leaf, saved & (0 - 5));
+    copy_test_require(!user_span(p + 4095, 2, 0));
+    store64(leaf, saved & (0 - 3));
+    copy_test_require(user_span(p + 4095, 2, 0) && !user_span(p + 4095, 2, 1));
+    store64(leaf, saved);
+    int edge = root + pt_index(p, 0) * 8;
+    saved = load64(edge);
+    store64(edge, saved & (0 - 5));
+    copy_test_require(!user_span(p, 1, 0));
+    store64(edge, saved);
+    int table_walk = root;
+    int level = 0;
+    for (level = 0; level < 3; level += 1) {
+        int link = table_walk + pt_index(p, level) * 8;
+        int link_saved = load64(link);
+        if (level > 0) {
+            store64(link, link_saved | 128);
+            copy_test_require(!user_span(p, 1, 0));
+            store64(link, link_saved);
+        }
+        table_walk = link_saved & PTE_ADDR;
+    }
+    if (!user_bounce) { user_bounce = kmalloc(USER_BOUNCE); }
+    copy_test_require(user_bounce != 0);
+    int padding = 0;
+    for (padding = 0; padding < 48; padding += 1) { store8(user_bounce + padding, 90); }
+    copy_test_require(user_copy_out(p + 128, "test", 5));
+    copy_test_require(sys_dispatch(19, p + 128, p, 1, 0, 0, 0) == 1);
+    padding = 16;
+    while (padding < 48 && load8(p + padding)) { padding += 1; }
+    copy_test_require(padding < 48);
+    for (padding = padding + 1; padding < 48; padding += 1) { copy_test_require(load8(p + padding) == 0); }
+    copy_test_sound(p);
+    int mapped = load64(task_heap_mapped_base + sched_current * 8);
+    copy_test_require(!user_span(mapped, 1, 0));
+    int tab = load64(task_lager_tab_base + sched_current * 8);
+    copy_test_require(!user_span(tab, 1, 0));
+    int table = load64(task_argv_user_base + sched_current * 8);
+    copy_test_require(table != 0);
+    int old_arg = load64(table);
+    store64(table, 0x900000000);
+    copy_test_require(sys_dispatch(18, 0, 0, 0, 0, 0, 0) == 0x900000000);
+    store64(table, old_arg);
+    leaf = pt_leaf(root, table);
+    saved = load64(leaf);
+    store64(leaf, saved & (0 - 3));
+    copy_test_require(sys_dispatch(18, 0, 0, 0, 0, 0, 0) == old_arg);
+    store64(leaf, saved);
+    copy_test_graphics(p);
+    int reserved = 0;
+    int i = 0;
+    for (i = 0; i < 4; i += 1) {
+        int slot = user_reserve(1);
+        copy_test_require(slot != 0);
+        store64(slot + 8, kmalloc(16));
+        copy_test_require(load64(slot + 8) != 0);
+        reserved += 1;
+    }
+    copy_test_require(user_temp_alloc(16) == 0);
+    user_cleanup(sched_current);
+    user_cleanup(sched_current);
+    for (i = 0; i < 4; i += 1) { copy_test_require(load64(user_context(sched_current) + 64 + i * 16) == 0); }
+    serial_print("[copytest] matrix pass\n");
+    return 77;
+}
+
+int copy_test_arm(int mode, int p, int fd) {
+    copy_test_depth = klick_lift_depth;
+    copy_test_arena = jakel_used_bytes();
+    int i = 0;
+    for (i = 0; i < 3; i += 1) { copy_test_require(user_temp_alloc(16) != 0); }
+    copy_test_mode = mode;
+    copy_test_ptr = p;
+    copy_test_tid = sched_current;
+    if (mode == 3 || mode == 7) {
+        if (mode == 7) {
+            copy_test_fdslot = fd_slot(fd);
+            copy_test_offset = load64(fd_off_base + copy_test_fdslot * 8);
+        }
+        copy_test_id = jakel_open(0, "test/ucgrow");
+        copy_test_require(copy_test_id >= 0);
+        copy_test_data = load64(jakel_data_base + copy_test_id * 8);
+        copy_test_size = load64(jakel_size_base + copy_test_id * 8);
+    }
+    return 77;
+}
+
+void copy_test_begin(int c, int p) {
+    if (sched_current != copy_test_tid || p != copy_test_ptr || !copy_test_mode) { return; }
+    copy_test_frees = 0;
+    int i = 0;
+    for (i = 0; i < 4; i += 1) {
+        if (load64(c + 64 + i * 16 + 8)) { copy_test_expected += 1; }
+    }
+    copy_test_pages = pmm_available_pages();
+    if (copy_test_mode == 1 || copy_test_mode == 3 || copy_test_mode == 5 || copy_test_mode == 6 || copy_test_mode == 7) {
+        int addr = p;
+        if (copy_test_mode == 3 || copy_test_mode == 7) { addr += 4096; }
+        int leaf = pt_leaf(load64(c + 8), addr);
+        store64(leaf, load64(leaf) & (0 - 2));
+        int inv = flush_tlb;
+        inv();
+    }
+    return;
+}
+
+int copy_test_address(int p) {
+    if (sched_current == copy_test_tid && p == copy_test_ptr && copy_test_mode == 2) {
+        return 0x8000000000000000;
+    }
+    return p;
+}
+
+void copy_test_abort() {
+    copy_test_require(pmm_available_pages() == copy_test_pages);
+    if (copy_test_mode == 3 || copy_test_mode == 7) {
+        if (copy_test_mode == 7) { copy_test_require(load64(fd_off_base + copy_test_fdslot * 8) == copy_test_offset); }
+        copy_test_require(load64(jakel_data_base + copy_test_id * 8) == copy_test_data);
+        copy_test_require(load64(jakel_size_base + copy_test_id * 8) == copy_test_size);
+        copy_test_require(load8(copy_test_data) == 65);
+    }
+    serial_print("[copytest] accounting metadata pass\n");
+    return;
+}
+
+void copy_test_cleanup(int tid) {
+    if (tid != copy_test_tid || copy_test_mode == 0) { return; }
+    copy_test_require(copy_test_frees == copy_test_expected);
+    copy_test_require(klick_lift_depth == copy_test_depth);
+    copy_test_require(jakel_used_bytes() == copy_test_arena);
+    if (copy_test_cleaned == 0) {
+        copy_test_cleaned = 1;
+        serial_print("[copytest] cleanup pass\n");
+    } else {
+        copy_test_require(copy_test_cleaned == 1);
+        serial_print("[copytest] reaper empty pass\n");
+        copy_test_mode = 0;
+    }
+    return;
+}
+
+void copy_test_graphics(int p) {
+    int wid = load64(task_win_base + sched_current * 8);
+    int ww = load64(kakel_cols_base + wid * 8) * FONT_W;
+    int wh = load64(kakel_rows_base + wid * 8) * FONT_H;
+    int x = load64(kakel_cx_base + wid * 8) * FONT_W;
+    int y = load64(kakel_cy_base + wid * 8) * FONT_H;
+    int snapshot_slot = user_reserve(2);
+    copy_test_require(snapshot_slot != 0);
+    int saved_pixels = jakel_dalloc(ww * wh * 4);
+    store64(snapshot_slot + 8, saved_pixels);
+    copy_test_require(saved_pixels != 0);
+    int row = 0;
+    for (row = 0; row < wh; row += 1) {
+        mem_copy(saved_pixels + row * ww * 4, fb_addr + (y + row) * fb_pitch + x * 4, ww * 4);
+    }
+    int depth = klick_lift_depth;
+    copy_test_require(sys_dispatch(5, 0x900000000, 0, 0, 8, 8, 0) == 0 - 1);
+    copy_test_require(sys_dispatch(5, p, 1 << 63, 1 << 63, 1 << 40, 1 << 40, 0) == 0);
+    copy_test_require(sys_dispatch(5, p, 0, 0, USER_TOP, 8, 0) == 0 - 1);
+    copy_test_require(sys_dispatch(5, p, 0, 0, 8, 0 - 1, 0) == 0 - 1);
+    copy_test_require(sys_dispatch(5, p, 0, 0 - (USER_TOP / 4) + 2, 8, USER_TOP / 4, 0) == 0 - 1);
+    copy_test_require(sys_dispatch(5, p + 8192, 0, 0, 8, 8, 0) == 0);
+    int frame = lager_alloc(sched_current, ww * wh * 4);
+    copy_test_require(frame != 0);
+    int root = load64(task_cr3_base + sched_current * 8);
+    int leaf = pt_leaf(root, frame + ww * wh * 4 - 1);
+    int saved = load64(leaf);
+    store64(leaf, saved & (0 - 5));
+    int reported = load64(task_win_reported_base + sched_current * 8);
+    store64(task_win_reported_base + sched_current * 8, (ww << 16) | wh);
+    copy_test_require(sys_dispatch(9, frame, 0, 0, 0, 0, 0) == 0 - 1);
+    store64(leaf, saved);
+    store64(task_win_reported_base + sched_current * 8, reported);
+    lager_free(sched_current, frame);
+    copy_test_require(klick_lift_depth == depth);
+    int col = 0;
+    for (row = 0; row < wh; row += 1) {
+        for (col = 0; col < ww * 4; col += 1) {
+            copy_test_require(load8(saved_pixels + row * ww * 4 + col)
+                == load8(fb_addr + (y + row) * fb_pitch + x * 4 + col));
+        }
+    }
+    user_temp_free(saved_pixels);
+    serial_print("[copytest] framebuffer bytes and cursor pass\n");
+    return;
+}
+
+void copy_test_sound(int p) {
+    int active = oljud_active;
+    oljud_active = 0;
+    copy_test_require(oljud_submit(0, 0 - 1) == 0 - 1);
+    oljud_active = active;
+    if (!active) { return; }
+    int tid = sched_current;
+    int format = load64(oljud_fmt_base + tid * 8);
+    copy_test_require(oljud_submit(p, 128) == 128);
+    int count = load64(oljud_qcount_base + tid * 8);
+    copy_test_require(oljud_submit(0, 0) == count);
+    copy_test_require(oljud_submit(0, 0 - 1) == count);
+    copy_test_require(load64(oljud_qcount_base + tid * 8) == 0);
+    copy_test_require(load64(oljud_qhead_base + tid * 8) == 0);
+    copy_test_require(load64(oljud_fmt_base + tid * 8) == format);
+    copy_test_require(oljud_submit(p, 0 - 1) == 0 - 1);
+    int i = 0;
+    for (i = 0; i < 8 * OLJUD_HALF; i += 8) { copy_test_require(load64(oljud_dma + i) == 0); }
+    serial_print("[copytest] sound controls pass\n");
+    return;
+}

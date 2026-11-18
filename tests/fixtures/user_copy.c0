@@ -1,0 +1,60 @@
+// Copyright (C) 2026 tavro
+// expect: 0
+include "moon.c0";
+
+int main() {
+    if (argc() < 2) { return 0; }
+    int mode = load8(argv(1)) - '0';
+    int b = alloc(24576);
+    if (!b) { return 1; }
+    int p = (b + 4095) & (0 - 4096);
+    store8(p, 65);
+    store8(p + 4096, 66);
+    if (mode == 0) {
+        int ok = syscall(32752, p, 0, 0, 0, 0);
+        if (ok != 77) { print("[copytest] matrix FAIL\n"); return 2; }
+        int fd = syscall(23, "test/uceof", 1, 0, 0, 0);
+        if (fd < 3) { return 3; }
+        if (syscall(25, fd, p, 1, 0, 0) != 1) { return 4; }
+        syscall(26, fd, 0, 0, 0, 0);
+        fd = syscall(23, "test/uceof", 0, 0, 0, 0);
+        if (syscall(24, fd, p, 1, 0, 0) != 1) { return 5; }
+        if (syscall(24, fd, 0x900000000, 0x7ffffffffffffff8, 0, 0) != 0) { return 6; }
+        if (syscall(24, fd, 0, 1, 0, 0) != 0 - 1) { return 7; }
+        syscall(26, fd, 0, 0, 0, 0);
+        int sound_before = syscall(14, 0, 0, 0, 0, 0);
+        if (sound_before >= 0) {
+            int queued = syscall(14, p, 128, 0, 0, 0);
+            if (queued < 0) { return 8; }
+            int dropped = syscall(14, 0, 0 - 1, 0, 0, 0);
+            if (dropped < 0 || syscall(14, 0, 0, 0, 0, 0) != 0) { return 9; }
+        }
+        print("[copytest] semantics pass\n");
+        return 77;
+    }
+    if (mode == 6) {
+        int dims = syscall(2, 0, 0, 0, 0, 0);
+        p = alloc((dims >> 16) * (dims & 65535) * 4);
+        if (!p) { return 13; }
+    }
+    int fd = 0;
+    if (mode == 7) {
+        fd = syscall(23, "test/ucgrow", 1, 0, 0, 0);
+        if (fd < 3 || syscall(25, fd, p, 1, 0, 0) != 1) { return 14; }
+    }
+    if (mode == 3) {
+        if (syscall(15, "test/ucgrow", p, 1, 0, 0) != 1) { return 10; }
+    }
+    int target = p;
+    if (mode == 1) { store8(p + 1, 0); }
+    if (syscall(32753, mode, target, fd, 0, 0) != 77) { return 11; }
+    if (mode == 1) { syscall(8, target, 0, 0, 0, 0); }
+    if (mode == 2) { syscall(12, 65, target, 0, 0, 0); }
+    if (mode == 3) { syscall(15, "test/ucgrow", target, 8192, 0, 0); }
+    if (mode == 4) { syscall(1, target, 1, 0, 0, 0); }
+    if (mode == 5) { syscall(5, target, 0, 0, 8, 8); }
+    if (mode == 6) { syscall(9, target, 0, 0, 0, 0); }
+    if (mode == 7) { syscall(25, fd, target, 8192, 0, 0); }
+    print("[copytest] unexpectedly returned\n");
+    return 12;
+}

@@ -11,7 +11,8 @@
 #
 # The clock's offset survives a reboot. The first boot writes tid.zone, as a person
 # would, and syncs it to disk. The second boot, from the same disk, reads it
-# and says so before anyone logs in.
+# and says so before anyone logs in. The first boot also reads the RTC, which
+# QEMU starts at 10:00:30 UTC, as that time.
 set -u
 cd "$(dirname "$0")/.."
 ./build.sh || exit 1
@@ -28,11 +29,13 @@ grub-mkrescue -o moonshot.iso "$isodir" >grub-mkrescue.log 2>&1
 disk=time_zone.img
 rm -f "$disk"
 dd if=/dev/zero of="$disk" bs=512 count=20480 2>/dev/null
+python3 -c 'f = open("time_zone.img", "r+b"); f.write(b"JAKELBK\0"); f.close()'
 boot() { # serial log, then keys typed one line at a time
   local log=$1
   shift
   rm -f "$log" time_zone.sock
   qemu-system-x86_64 -cdrom moonshot.iso -serial file:"$log" -display none -no-reboot -m 128 \
+    -rtc base=2026-10-15T10:00:30 \
     -drive file="$disk",format=raw,if=ide,index=0,media=disk \
     -monitor unix:time_zone.sock,server,nowait &
   local pid=$!
@@ -59,11 +62,19 @@ if grep -aq '^\[clock\] utc=[0-9]* offset=0 min$' first.log; then
 else
   echo "  FAIL the first boot did not start at offset 0"; ok=0
 fi
+want=$(python3 -c 'import calendar; print(calendar.timegm((2026, 10, 15, 10, 0, 30)))')
+# Read during boot, a second or few after QEMU started the RTC at 10:00:30.
+got=$(grep -ao '^\[clock\] utc=[0-9]*' first.log | head -1 | sed 's/.*=//')
+if [ -n "$got" ] && [ "$got" -ge "$want" ] && [ "$got" -le $((want + 5)) ]; then
+  echo "  ok   the kernel read the RTC as 10:00:30 UTC, $((got - want)) s into boot"
+else
+  echo "  FAIL the kernel read the RTC as ${got:-nothing}, expected $want to $((want + 5))"; ok=0
+fi
 if grep -aq '^\[jakel\] synced' first.log; then echo "  ok   tid.zone synced"; else echo "  FAIL nothing was synced"; ok=0; fi
 if grep -aq '^\[clock\] utc=[0-9]* offset=120 min$' second.log; then
   echo "  ok   the second boot read the offset back"
 else
   echo "  FAIL the second boot says: $(grep -a '^\[clock\]' second.log)"; ok=0
 fi
-if [ "$ok" -eq 1 ]; then echo "PASS: tid.zone survives a reboot"; exit 0; fi
+if [ "$ok" -eq 1 ]; then echo "PASS: the RTC is read as UTC and tid.zone survives a reboot"; exit 0; fi
 exit 1

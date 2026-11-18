@@ -123,6 +123,24 @@ df_stack_bottom:
     .skip 4096
 df_stack_top:
 
+# Dedicated 4 KB IST stacks for #DB, NMI and #MC. Each is supervisor-only and
+# 16-byte aligned, and is selected by its own TSS IST entry so a fault on one
+# of these vectors never runs on the interrupted (possibly corrupt) stack.
+.balign 16
+db_stack_bottom:
+    .skip 4096
+db_stack_top:
+
+.balign 16
+nmi_stack_bottom:
+    .skip 4096
+nmi_stack_top:
+
+.balign 16
+mc_stack_bottom:
+    .skip 4096
+mc_stack_top:
+
 .section .text
 .code32
 .global _boot_start
@@ -195,6 +213,21 @@ long_mode_start:
     lea rax, [df_stack_top]
     mov [tss64 + 0x24], rax
 
+    # IST2 -> #DB, IST3 -> NMI, IST4 -> #MC. Each dedicated stack keeps a
+    # fault on that vector from running on the interrupted task's stack.
+    lea rax, [db_stack_top]
+    mov [tss64 + 0x2c], rax
+    lea rax, [nmi_stack_top]
+    mov [tss64 + 0x34], rax
+    lea rax, [mc_stack_top]
+    mov [tss64 + 0x3c], rax
+
+    # I/O map base at 0x66. A base of 0 would make the TSS's own bytes a
+    # permission bitmap that opens most ports below 832 to ring 3. 104 lies
+    # past the limit 0x67, so no bitmap exists and with IOPL 0 every IN and
+    # OUT from ring 3 is a #GP.
+    mov word ptr [tss64 + 0x66], 104
+
     lea rax, [tss64]
     mov word ptr [gdt64_tss], 0x67
     mov [gdt64_tss + 2], ax
@@ -244,7 +277,7 @@ long_mode_start:
     wrmsr
 
     mov ecx, 0xC0000084
-    mov eax, 1 << 9
+    mov eax, 0x47700
     xor edx, edx
     wrmsr
 
@@ -506,15 +539,9 @@ isr_simdfp_entry: # #19, no error code
 # stack_top, still 16-aligned. The CPU's 3-qword push (24 bytes) plus the
 # per-vector stub's 2-qword push (16 bytes, vector + padding) plus this
 # stub's 15-register push (120 bytes) = 160 bytes, a multiple of 16, so
-# RSP is correctly 16-aligned right before `call int_dispatch`, satisfying
-# the SysV ABI's "16-aligned at the point of CALL" requirement. (The
-# padding qword only exists to keep this a multiple of 16 -- without it,
-# the vector-number push alone would leave it 8 bytes short.) This is a
-# known simplification, not a general solution, and it holds because nothing
-# currently running before interrupts are enabled ever leaves RSP
-# misaligned, not because this stub defensively re-aligns it. Revisit
-# (e.g. a dedicated interrupt stack via the IST mechanism, or defensive
-# `and rsp, -16`) if that stops being true.
+# The saved frame keeps the scheduler layout below. Dispatch uses separate
+# aligned scratch storage for its frame pointer, so a kernel fault at either
+# stack alignment enters c0 with the required call alignment.
 isr_common:
     push rax
     push rbx
@@ -564,12 +591,21 @@ isr_common:
     # layout (and the `add rsp, 16` cleanup below) is identical. CR2 holds
     # the faulting linear address, meaningful only for #PF -- read here and
     # handed to every handler; the ones that do not need it ignore it.
+    # NMI never enters shared dispatch or scheduler state.
+    cmp qword ptr [rsp + 120], 2
+    je isr_epilogue
+
     mov rdi, [rsp + 120]   # vector
     mov rsi, [rsp + 128]   # error code (real for #PF, dummy 0 for IRQs)
     mov rdx, cr2           # faulting address (CR2)
     mov rcx, [rsp + 136]   # faulting RIP (from CPU-pushed frame)
     mov r8, [rsp + 144]    # CS, whose low two bits are the ring that was running
+    mov r9, rsp
+    and rsp, -16
+    sub rsp, 16
+    mov [rsp], r9
     call int_dispatch
+    mov rsp, [rsp]
 
     # Preemptive switch check. The timer handler
     # (int_dispatch -> timer_tick -> sched_tick, vector 32 only) may have
@@ -591,8 +627,12 @@ isr_common:
     cmp rax, 0
     je .Lno_switch
     mov qword ptr [0x100090], 0
+    # A stopped user debug frame is private emergency state.
+    cmp qword ptr [rsp + 120], 1
+    je .Ldiscard_ist
     mov rax, [0x100080]
     mov [rax], rsp
+.Ldiscard_ist:
     mov rsp, [0x100088]
 
     # Reload CR3 from the incoming task's saved page-table root
@@ -706,6 +746,23 @@ flush_tlb:
     mov cr3, rax
     ret
 
+# The flags register in rax, so the syscall code can check that interrupts
+# are off (bit 9, IF) before it touches a program's memory. pushfq is
+# written as its byte since smed has no pushfq.
+.global read_flags
+read_flags:
+    .byte 0x9C
+    pop rax
+    ret
+
+# CR3 in rax, the root of the address space the CPU is walking, which the
+# syscall code compares with the calling task's own before it checks a
+# program's pointer against that root.
+.global read_cr3
+read_cr3:
+    mov rax, cr3
+    ret
+
 # cpuid with the leaf in rdi (subleaf 0), its four answers stored at rsi as
 # four 8-byte words, eax, ebx, ecx, edx. cpuid clears the upper halves of the
 # registers it writes, so the 64-bit stores carry just the 32-bit answers.
@@ -721,21 +778,6 @@ cpuid_into:
     mov [rsi + 16], rcx
     mov [rsi + 24], rdx
     pop rbx
-    ret
-
-# Zeroes rsi whole 4KB pages starting at rdi, with rep stosq, which writes
-# rcx (= pages * 512) zero quadwords from rdi upward, many per cycle on a
-# real CPU and far faster than a c0 store64 loop under QEMU's emulation.
-# smed has no string instructions, so cld (0xFC) and rep stosq
-# (0xF3 0x48 0xAB) are spelled out as bytes, like the int 48 above. rax, rcx
-# and rdi are all scratch in c0's convention.
-.global zero_pages
-zero_pages:
-    mov rcx, rsi
-    shl rcx, 9
-    xor rax, rax
-    .byte 0xFC
-    .byte 0xF3, 0x48, 0xAB
     ret
 
 # Test-only, deliberately provoking a #8 double fault, to prove the IST stack
@@ -771,3 +813,95 @@ gdt64_end:
 gdt64_pointer:
     .word gdt64_end - gdt64 - 1
     .long gdt64
+
+.section .bss
+.balign 16
+.global user_context_records
+user_context_records:
+    .skip 1536
+
+.section .text
+.global user_access_read
+.global user_access_read_end
+user_access_read:
+    movzx rax, byte ptr [rdi]
+user_access_read_end:
+    ret
+
+# The caller supplies a checked span and an active read descriptor.
+.global user_copy_read
+user_copy_read:
+    mov rcx, rdx
+    # Clear direction before the guarded REP MOVSB instruction.
+    .byte 0xFC
+.global user_copy_read_site
+user_copy_read_site:
+    .byte 0xF3, 0xA4
+    ret
+
+.global user_blit_row
+user_blit_row:
+    test rdx, rdx
+    jz user_blit_row_done
+.global user_blit_read_site
+user_blit_read_site:
+    mov eax, dword ptr [rdi]
+    add rdi, 4
+    mov qword ptr [rcx + 16], rdi
+    test eax, eax
+    jz user_blit_row_skip
+    mov dword ptr [rsi], eax
+user_blit_row_skip:
+    add rsi, 4
+    dec rdx
+    jnz user_blit_read_site
+user_blit_row_done:
+    ret
+
+.global user_access_write
+.global user_access_write_end
+user_access_write:
+    mov rax, rsi
+.global user_access_write_site
+user_access_write_site:
+    mov byte ptr [rdi], al
+user_access_write_end:
+    ret
+
+.global user_abort_landing
+user_abort_landing:
+    cli
+    and rsp, -16
+    call user_abort_stack
+    mov rsp, rax
+    call user_abort_finish
+    .byte 0x0F, 0x0B
+
+.global boot_fault_probe
+.global boot_fault_probe_site
+boot_fault_probe:
+    movabs rax, 0x140000000
+boot_fault_probe_site:
+    mov rax, [rax]
+    ret
+
+.section .text
+.global ist_stop_landing
+ist_stop_landing:
+    mov rsp, [tss64 + 4]
+    sti
+.List_stop_wait:
+    hlt
+    jmp .List_stop_wait
+
+.section .bss
+.balign 16
+.global boot_log_data
+boot_log_data:
+    .skip 8192
+.global ata_guard_buffer
+ata_guard_buffer:
+    .skip 512
+.global hardware_map
+hardware_map:
+    .skip 3072

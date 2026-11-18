@@ -82,10 +82,34 @@ syscall_entry:
     pop r12
     pop rbx
     pop rbp
-    pop rcx
-    pop r11
-    pop rsp            # restore the user's own rsp before returning to it
+    pop rcx            # saved user RIP (RCX on SYSCALL entry)
+    pop r11            # saved user RFLAGS
+    pop r10            # saved user RSP
+
+    # RCX and RSP must be canonical lower-half values before SYSRET. A
+    # non-canonical RCX makes SYSRET fault in ring 0 with the user's RSP
+    # already live; a non-canonical RSP is no safer. Stop the task instead
+    # of returning.
+    mov rdx, 0x80000000
+    cmp rcx, rdx
+    jb .Lbad_sysret
+    cmp r10, rdx
+    jb .Lbad_sysret
+    mov rdx, 0x7ffffffff000
+    cmp rcx, rdx
+    jae .Lbad_sysret
+    cmp r10, rdx
+    ja .Lbad_sysret
+    and r11, 0x40dd5
+    or r11, 0x202
+
+    mov rsp, r10
     sysretq
+
+.Lbad_sysret:
+    mov rsp, [tss64 + 4]
+    call sched_stop_bad_sysret
+    jmp .Lbad_sysret
 
 # enter_ring3(entry_rip, user_rsp, kernel_rsp, cr3) — enter ring 3 for the
 # first time. Called from c0 by name (`extern int enter_ring3;`).

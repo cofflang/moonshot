@@ -88,9 +88,11 @@ void jit_init() {
     if (!jit_break_patches) {
         jit_break_patches = kmalloc(32 * 8); // 32 break placeholders
     }
+    int sl2 = serial_line_begin();
     serial_print("[jit] code page at ");
     serial_print_int(jit_page);
     serial_print("\n");
+    serial_line_end(sl2);
     return;
 }
 
@@ -108,8 +110,10 @@ int jit_print_helper(int v) {
 // The string pointer is passed in rdi. Returns the string pointer so the
 // JIT REPL prints it as the expression result.
 int jit_print_str_helper(int str) {
-    serial_print(str);
+    int sl = serial_line_begin();
+    serial_print_in(sl, str);
     serial_print("\n");
+    serial_line_end(sl);
     sk_print(str);
     sk_print("\n");
     return str;
@@ -628,24 +632,28 @@ int jit_compile_node(int nd, int pos) {
         int name_len = nd.extra;
         int idx = repl_lookup(name_ptr, name_len);
         if (idx < 0) {
+            int sl2 = serial_line_begin();
             serial_print("[jit] unknown variable '");
             // Print the variable name character by character.
             int ci = 0;
             for (ci = 0; ci < name_len; ci += 1) {
-                serial_putc(load64(name_ptr + ci));
+                serial_putc(load8(name_ptr + ci)); serial_line_room(sl2);
             }
             serial_print("'\n");
+            serial_line_end(sl2);
             return -1;
         }
         int val = load64(repl_var_values + idx * 8);
+        int sl3 = serial_line_begin();
         serial_print("[jit] var ");
         int ci = 0;
         for (ci = 0; ci < name_len; ci += 1) {
-            serial_putc(load64(name_ptr + ci));
+            serial_putc(load8(name_ptr + ci)); serial_line_room(sl3);
         }
         serial_print(" = ");
         serial_print_int(val);
         serial_print("\n");
+        serial_line_end(sl3);
         return jit_mov_eax_imm(pos, val);
     }
 
@@ -853,9 +861,11 @@ int jit_compile_node(int nd, int pos) {
     }
 
     // --- unsupported node kind ---
+    int sl9 = serial_line_begin();
     serial_print("[jit] unsupported node kind ");
     serial_print_int(kind);
     serial_print("\n");
+    serial_line_end(sl9);
     return -1;
 }
 
@@ -887,9 +897,11 @@ int jit_compile_and_run(int nd) {
     }
     pos = jit_pop_rbx(pos);
     pos = jit_ret(pos);
+    int sl3 = serial_line_begin();
     serial_print("[jit] compiled ");
     serial_print_int(pos);
     serial_print(" bytes\n");
+    serial_line_end(sl3);
     jit_set_writable(0);       // remove W bit before execution
     int result = jit_exec();
     jit_set_writable(1);       // restore W bit for next compilation

@@ -26,3 +26,7 @@ et25 25_form_moved.c0 0
 et26 26_broken_elf.c0 1
 et27 27_form_tools.c0 0
 et28 28_form_copy.c0 0
+et29 29_hostile_syscalls.c0 0
+et30 31_elf_corpus.c0 49
+et31 32_lisp.c0 0
+et32 33_task_uid.c0 0

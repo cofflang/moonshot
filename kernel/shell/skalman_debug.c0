@@ -12,9 +12,36 @@
 // this file, an ordinary build includes skalman_nodebug.c0 instead, and then
 // none of this code is in the kernel at all.
 
+// A test sets this to a function that changes files while jakel_sync is
+// between its node table and its data pass. Only a debug build has it, so an
+// ordinary kernel has no writable function pointer on the sync path.
+int sk_debug_sync_hook = 0;
+
+void sk_debug_sync_pause() {
+    if (sk_debug_sync_hook) { int hook = sk_debug_sync_hook; hook(); }
+    return;
+}
+
+// Set by mirrorinject. The next mirror line takes another writer's line at
+// its byte 64, as a program writing to the console at a room point would.
+int sk_debug_mirror_inject = 0;
+
+void sk_debug_mirror_point(int i) {
+    if (!sk_debug_mirror_inject || i != 64) { return; }
+    sk_debug_mirror_inject = 0;
+    int text = "injected";
+    int k = 0;
+    while (load8(text + k) != 0) { sk_mirror_putc(load8(text + k)); k += 1; }
+    sk_mirror_putc(10);
+    return;
+}
+
 void sk_debug_cmds() {
     sk_cmd("chars", "", "print every printable ascii glyph, to check the font", 1);
     sk_cmd("mouse", "", "print the pointer position, buttons and packet count", 1);
+    sk_cmd("serialmax", "", "print the most bytes one task wrote to serial with interrupts off", 1);
+    sk_cmd("mirrorlong", "", "print a 200 character line, longer than the serial bound", 1);
+    sk_cmd("mirrorinject", "", "print a long line that another writer joins at its byte 64", 1);
     sk_cmd("run3", "[program]", "run a program (or a built-in test) in this shell's own task, the shell does not come back", 1);
     return;
 }
@@ -22,6 +49,24 @@ void sk_debug_cmds() {
 // Runs `cmd` when it is a debug command and returns 1, otherwise returns 0
 // and the shell carries on looking.
 int sk_debug_run(int f, int cmd) {
+    // serialmax, the longest interrupts-off serial section a task has had,
+    // which serial_line_room keeps near SERIAL_OFF_BYTES.
+    if (str_eq(cmd, "mirrorlong") == 1 || str_eq(cmd, "mirrorinject") == 1) {
+        if (str_eq(cmd, "mirrorinject") == 1) { sk_debug_mirror_inject = 1; }
+        int k = 0;
+        for (k = 0; k < 200; k += 1) { sk_putc('m'); }
+        sk_putc(10);
+        return 1;
+    }
+    if (str_eq(cmd, "serialmax") == 1) {
+        int n = serial_off_longest;
+        sk_print("serialmax ");
+        sk_print_int(n);
+        sk_print(" bytes, bound ");
+        sk_print_int(SERIAL_OFF_BYTES);
+        sk_print("\n");
+        return 1;
+    }
     // chars — print a grid of all 95 printable ASCII glyphs (32-126) so the
     // user can visually verify every font glyph in one screenful. Six rows of
     // 16 characters each (the last row has only 15).
@@ -46,6 +91,7 @@ int sk_debug_run(int f, int cmd) {
     // is marked EXITED and the shell is lost. start is the everyday way.
     if (str_eq(cmd, "run3") == 1) {
         sk_print("running ring-3 test in current task...\n");
+        task_set_uid(sched_current, sk_uid(f));
         run_ring3_test();
         return 1;
     }
@@ -60,26 +106,26 @@ int sk_debug_run(int f, int cmd) {
             return 1;
         }
         int cwd = 0;
-        if (kakel_active == 1) { cwd = load64(sk_cwd_base + f * 8); }
-        int fid = jakel_open(cwd, name);
-        if (fid < 0) {
-            sk_print("run3: file not found: "); sk_print(name); sk_print("\n");
-            return 1;
-        }
-        if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) {
-            sk_print("run3: not a file\n");
-            return 1;
-        }
+        if (kakel_active == 1) { cwd = sk_cwd(f); }
+        int held = jakel_lock();
+        int fid = sk_trusted_file(f, cwd, name, "run3: ", "not started");
+        if (fid < 0) { jakel_unlock(held); return 1; }
         int fsize = load64(jakel_size_base + fid * 8);
         if (fsize == 0 || fsize > ELF_MAX_BYTES) {
+            jakel_unlock(held);
             sk_print("run3: file empty or too large (max ");
             sk_print_int(ELF_MAX_BYTES);
             sk_print(" bytes)\n");
             return 1;
         }
         int buf = kmalloc(fsize);
-        jakel_read(fid, 0, buf, fsize);
+        if (!buf) { jakel_unlock(held); return 1; }
+        if (!jakel_can_read(sk_uid(f), fid) || jakel_read(sk_uid(f), fid, 0, buf, fsize) != fsize) {
+            jakel_unlock(held); kfree(buf); sk_print("run3: permission denied\n"); return 1;
+        }
+        jakel_unlock(held);
         sk_print("running ELF image in current task...\n");
+        task_set_uid(sched_current, sk_uid(f));
         run_elf_binary(buf, fsize, 0);
         return 1;
     }

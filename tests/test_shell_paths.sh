@@ -32,10 +32,10 @@ cd "$(dirname "$0")/.."
 
 ./build.sh || exit 1
 
+mkdir -p out && cd out
+
 rm -f disk.img serial.log
 dd if=/dev/zero of=disk.img bs=512 count=20480 2>/dev/null
-
-mkdir -p out && cd out
 
 isodir=isoroot
 rm -rf "$isodir"

@@ -15,13 +15,14 @@
 #   ./make_usb.sh              build, make the ISO, pick the stick, write it
 #   ./make_usb.sh --no-build   reuse build/moonshot.elf as it is
 #   ./make_usb.sh /dev/sdX     write to this device (still asks to confirm)
+#   ./make_usb.sh --iso FILE   make the ISO, save it as FILE, print its
+#                              sha256 and stop without touching any device
 #
-# Why not kernel/core/grub.cfg as it is. A UEFI machine has no VGA text
-# mode, so the kernel must use the framebuffer it asks for in boot.s
-# (MB_FLAGS bit 2). GRUB's EFI build only hands one over when its video
-# drivers are loaded, hence `insmod all_video` and `gfxpayload=keep` in
-# the config this script writes into the ISO. `gfxpayload=text` gives
-# "WARNING: no console will be available to OS" and a blank screen.
+# The ISO carries kernel/core/grub.cfg, the same config QEMU boots with.
+# A UEFI machine has no VGA text mode, so the kernel uses the framebuffer it
+# asks for in boot.s (MB_FLAGS bit 2), and GRUB's EFI build only hands one
+# over when its video drivers are loaded. The config therefore has to keep
+# `insmod all_video` and `gfxpayload=keep`, which this script checks.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -29,14 +30,18 @@ die() { echo "make_usb.sh: $*" >&2; exit 1; }
 
 BUILD=1
 DEV=""
-for arg in "$@"; do
-  case "$arg" in
+ISO_OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --no-build) BUILD=0 ;;
-    /dev/*) DEV="$arg" ;;
+    --iso) [ $# -ge 2 ] || die "--iso needs a file name"; ISO_OUT="$2"; shift ;;
+    /dev/*) DEV="$1" ;;
     -h|--help) sed -n 12,17p "$0"; exit 0 ;;
-    *) die "unknown argument: $arg" ;;
+    *) die "unknown argument: $1" ;;
   esac
+  shift
 done
+[ -z "$ISO_OUT" ] || [ -z "$DEV" ] || die "--iso never writes a device; give one or the other"
 
 # --- 1. Host packages -------------------------------------------------------
 # grub gives grub-mkrescue and the i386-pc and x86_64-efi images it puts in the
@@ -46,6 +51,7 @@ command -v grub-mkrescue >/dev/null && [ -d /usr/lib/grub/x86_64-efi ] || need_p
 command -v xorriso >/dev/null || need_pkgs+=(libisoburn)
 command -v mformat >/dev/null || need_pkgs+=(mtools)
 if [ ${#need_pkgs[@]} -gt 0 ]; then
+  [ -z "$ISO_OUT" ] || die "missing ${need_pkgs[*]}; install them first (--iso never installs anything)"
   command -v pacman >/dev/null || die "missing ${need_pkgs[*]}; install them with your package manager"
   echo "==> Installing missing packages: ${need_pkgs[*]}"
   sudo pacman -S --needed "${need_pkgs[@]}"
@@ -59,6 +65,9 @@ if [ "$BUILD" = 1 ]; then
   echo "==> Building the kernel (build.sh)"
   ./build.sh
 fi
+grep -Eq '^insmod all_video' kernel/core/grub.cfg &&
+  grep -Eq '^set gfxpayload=keep' kernel/core/grub.cfg ||
+  die "kernel/core/grub.cfg lacks insmod all_video or gfxpayload=keep; UEFI would show a blank screen"
 [ -f build/moonshot.elf ] || die "build/moonshot.elf not found; run without --no-build"
 
 # --- 3. ISO -----------------------------------------------------------------
@@ -66,19 +75,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/iso/boot/grub"
 cp build/moonshot.elf "$work/iso/boot/"
-cat >"$work/iso/boot/grub/grub.cfg" <<'EOF'
-set timeout=3
-set default=0
-insmod all_video
-insmod gfxterm
-set gfxmode=1024x768x32,1024x768,auto
-set gfxpayload=keep
-
-menuentry "Moonshot" {
-    multiboot /boot/moonshot.elf
-    boot
-}
-EOF
+cp kernel/core/grub.cfg "$work/iso/boot/grub/grub.cfg"
 
 iso="$work/moonshot-usb.iso"
 echo "==> Making the ISO"
@@ -87,6 +84,14 @@ grub-mkrescue -o "$iso" "$work/iso" >"$work/mkrescue.log" 2>&1 ||
 xorriso -indev "$iso" -report_el_torito plain 2>/dev/null | grep -qi 'efi' ||
   die "the ISO has no EFI boot entry; check that /usr/lib/grub/x86_64-efi exists"
 echo "    $(du -h "$iso" | cut -f1), boots on UEFI and BIOS"
+echo "    sha256 $(sha256sum "$iso" | cut -d' ' -f1)"
+
+if [ -n "$ISO_OUT" ]; then
+  cp "$iso" "$ISO_OUT"
+  echo "==> Saved $ISO_OUT"
+  echo "    sha256 $(sha256sum "$ISO_OUT" | cut -d' ' -f1)"
+  exit 0
+fi
 
 # --- 4. Pick the USB stick --------------------------------------------------
 usb_disks() { lsblk -dnpo NAME,TRAN,TYPE | awk '$2=="usb" && $3=="disk" {print $1}'; }
@@ -155,5 +160,5 @@ On the IdeaPad:
      F10 to save. Moonshot's GRUB is not signed, so Secure Boot blocks it.
   2. Plug the stick in, power on and press F12 (or Fn+F12) for the boot
      menu, then pick the USB stick (the EFI entry).
-  3. GRUB shows "Moonshot" for 3 seconds and boots it.
+  3. GRUB boots Moonshot at once.
 EOF

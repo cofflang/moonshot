@@ -189,6 +189,7 @@ SECTIONS
         shell_scratch = .;      . = . + 1040;  /* skalman.c0 -- digits, names, completion, echo --file */
         shell_users = .;        . = . + 128;   /* skalman.c0 -- the user table (persistent) */
         shell_mirror = .;       . = . + 256;   /* skalman.c0 -- the line being mirrored to serial */
+        shell_mirror_out = .;   . = . + 256;   /* skalman.c0 -- the copy of that line being written out */
         elf_scratch = .;        . = . + 256;   /* syscall.c0 -- built-in test binaries */
     }
 

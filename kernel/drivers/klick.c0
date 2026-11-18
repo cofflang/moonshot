@@ -237,7 +237,7 @@ void klick_hide() {
 // sample what is underneath. A program's shape is drawn the same way, a
 // light fill inside a dark edge.
 void klick_show() {
-    if (klick_active != 1) { return; }
+    if (klick_active != 1 || (kakel_full >= 0 && !kakel_locked)) { return; }
     if (klick_saved_at >= 0) { return; }
     int shape = klick_shape_here();
     int n = KLICK_SIZE;
@@ -506,6 +506,21 @@ void klick_handler() {
         }
 
         // The mouse's y axis points up, the framebuffer's points down.
+        int held = klick_left + klick_right * 2 + klick_middle * 4;
+        int released_spent = dvala_mouse_mask != 0;
+        dvala_mouse_mask = dvala_mouse_mask & held;
+        int spent = 0;
+        if (dx != 0 || dy != 0 || dz != 0 || held != dvala_mouse_physical) {
+            spent = dvala_activity();
+        }
+        dvala_mouse_physical = held;
+        if (spent) { dvala_mouse_mask = dvala_mouse_mask | held; }
+        if (spent || released_spent) {
+            klick_drain_left = 0; klick_focus_click = 0;
+            klick_left = 0; klick_middle = 0; klick_right = 0;
+            outb(0xA0, 0x20); outb(0x20, 0x20);
+            return;
+        }
         klick_move_to(klick_x + dx, klick_y - dy);
         if (dz != 0) { klick_wheel_add(dz); }
 

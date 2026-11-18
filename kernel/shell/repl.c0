@@ -131,9 +131,11 @@ int repl_assign(int name, int len, int value) {
     if (repl_var_count >= REPL_MAX_VARS) {
         // The value is still the expression's result, but the variable is
         // not created, so the next use of it fails. Say so now.
+        int sl = serial_line_begin();
         serial_print("[repl] all ");
         serial_print_int(REPL_MAX_VARS);
         serial_print(" variables in use, assignment not stored\n");
+        serial_line_end(sl);
         sk_print("repl: no room for another variable, not stored\n");
         return value;
     }
@@ -813,10 +815,12 @@ int repl_eval_node(int nd) {
             store64(repl_eval_node(addr_arg), repl_eval_node(val_arg));
             return 0;
         }
+        int sl = serial_line_begin();
         serial_print("[repl] unknown function '");
         int ci = 0;
-        for (ci = 0; ci < flen; ci += 1) { serial_putc(load8(fname + ci)); }
+        for (ci = 0; ci < flen; ci += 1) { serial_putc(load8(fname + ci)); serial_line_room(sl); }
         serial_print("'\n");
+        serial_line_end(sl);
         return 0;
     }
     if (kind == ND_VAR) {
@@ -824,11 +828,13 @@ int repl_eval_node(int nd) {
         int len = nd.extra;
         int idx = repl_lookup(name, len);
         if (idx < 0) {
+            int sl2 = serial_line_begin();
             serial_print("[repl] unknown variable '");
             // Print the variable name to serial byte by byte.
             int j = 0;
-            for (j = 0; j < len; j += 1) { serial_putc(load8(name + j)); }
+            for (j = 0; j < len; j += 1) { serial_putc(load8(name + j)); serial_line_room(sl2); }
             serial_print("'\n");
+            serial_line_end(sl2);
             return 0;
         }
         return load64(repl_var_values + idx * 8);
@@ -885,16 +891,20 @@ int repl_eval_node(int nd) {
         if (left != 0 && left.kind == ND_STR) {
             // String argument — print it directly.
             int str = left.child1;
+            int sl4 = serial_line_begin();
             serial_print("[repl] ");
-            serial_print(str);
+            serial_print_in(sl4, str);
             serial_print("\n");
+            serial_line_end(sl4);
             sk_print(str);
             sk_print("\n");
         } else {
             int val = repl_eval_node(left);
+            int sl5 = serial_line_begin();
             serial_print("[repl] ");
             serial_print_int(val);
             serial_print("\n");
+            serial_line_end(sl5);
             sk_print_int(val);
             sk_print("\n");
         }
@@ -1084,9 +1094,11 @@ void repl_eval(int src) {
     }
     if (top_kind != ND_PRINT && top_kind != ND_IF && top_kind != ND_WHILE && top_kind != ND_FOR
         && top_kind != ND_BREAK && top_kind != ND_CONTINUE) {
+        int sl3 = serial_line_begin();
         serial_print("[repl] ");
         serial_print_int(result);
         serial_print("\n");
+        serial_line_end(sl3);
         sk_color(fb_rgb(100, 255, 100));  // soft green
         if (!result) {
             sk_print("0\n");
@@ -1162,9 +1174,11 @@ void repl_eval_jit(int src) {
     // compile correctly. Single-expression unwrapping is handled inside
     // jit_compile_node via ND_EXPR_STMT.
     int result = jit_compile_and_run(ast);
+    int sl3 = serial_line_begin();
     serial_print("[jit] ");
     serial_print_int(result);
     serial_print("\n");
+    serial_line_end(sl3);
     sk_color(fb_rgb(100, 200, 255));  // soft cyan
     sk_print_int(result);
     sk_print("\n");

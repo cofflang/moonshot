@@ -67,6 +67,19 @@ fi
 rm -f disk.img
 dd if=/dev/zero of=disk.img bs=512 count=20480 2>/dev/null
 
+# QEMU creates its monitor socket a moment after it starts, later when the
+# machine is busy. Wait for it instead of a fixed sleep, and say so if it
+# never appears.
+wait_for_socket() {
+  local i
+  for i in $(seq 1 300); do
+    [ -S "$1" ] && return 0
+    sleep 0.1
+  done
+  echo "FAIL: QEMU monitor socket $1 did not appear within 30 s"
+  return 1
+}
+
 sockfile=verify_elf_backend.sock
 rm -f serial.log "$sockfile"
 qemu-system-x86_64 -cdrom moonshot.iso \
@@ -78,6 +91,7 @@ qemu_pid=$!
 cleanup() { kill "$qemu_pid" 2>/dev/null; wait "$qemu_pid" 2>/dev/null; rm -f "$sockfile"; }
 trap cleanup EXIT
 
+wait_for_socket "$sockfile" || exit 1
 sleep 3
 
 names=$(awk '{print $1}' "$manifest")
@@ -173,6 +187,10 @@ fail=0
 echo "--- exit codes seen ---"
 grep '\[syscall\] exit code=' serial.log || true
 echo
+if ! grep -q '\[syscall\] exit code=' serial.log; then
+  echo "FAIL: no program ran (monitor or boot failed)"
+  exit 1
+fi
 
 # Exit codes appear in spawn order, so walk both lists together rather than
 # grepping for each value, since two tests could legitimately share a code, and a

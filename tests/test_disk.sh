@@ -27,10 +27,24 @@ trap cleanup EXIT
 ./build.sh || exit 1
 
 # ------ Phase 1, write boot ------
-rm -f disk.img serial.log
-dd if=/dev/zero of=disk.img bs=512 count=20480 2>/dev/null
+# QEMU creates its monitor socket a moment after it starts, later when the
+# machine is busy. Wait for it instead of a fixed sleep, and say so if it
+# never appears.
+wait_for_socket() {
+  local i
+  for i in $(seq 1 300); do
+    [ -S "$1" ] && return 0
+    sleep 0.1
+  done
+  echo "FAIL: QEMU monitor socket $1 did not appear within 30 s"
+  return 1
+}
 
 mkdir -p out && cd out
+
+rm -f disk.img serial.log
+dd if=/dev/zero of=disk.img bs=512 count=20480 2>/dev/null
+python3 -c 'f = open("disk.img", "r+b"); f.write(b"JAKELBK\0"); f.close()'
 
 isodir=isoroot
 rm -rf "$isodir"
@@ -47,6 +61,7 @@ qemu-system-x86_64 -cdrom moonshot.iso \
   -monitor unix:disk_test.sock,server,nowait &
 
 QEMU_PID=$!
+wait_for_socket disk_test.sock || exit 1
 sleep 2
 
 # Wait for the shell prompt to appear (boot sequence is fast).
@@ -127,6 +142,7 @@ qemu-system-x86_64 -cdrom moonshot.iso \
   -monitor unix:disk_test.sock,server,nowait &
 
 QEMU_PID=$!
+wait_for_socket disk_test.sock || exit 1
 sleep 2
 
 # Log in as root again (a fresh boot, raket's login gate is back too).

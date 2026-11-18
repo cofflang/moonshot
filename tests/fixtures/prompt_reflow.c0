@@ -1,0 +1,41 @@
+    if (boot_test == 1 && kakel_active == 1) {
+        int pf = kakel_focus;
+        int plocked = kakel_locked;
+        kakel_locked = 0;
+        int pc = 0;
+        for (pc = 0; pc < 3; pc += 1) {
+            store64(raket_authed_base + pf * 8, pc / 2);
+            store64(raket_stage_base + pf * 8, pc % 2);
+            int want = "moonshot login: ";
+            if (pc == 1) { want = "password: "; }
+            if (pc == 2) { want = "root> "; }
+            kakel_clear(pf);
+            kakel_reflow();
+            shell_reprompt_after_spawn(0 - 1);
+            shell_reprompt_after_spawn(0 - 1);
+            int pg = kakel_grid(pf);
+            int pi = 0;
+            int bad = 0;
+            while (load8(want + pi) != 0) {
+                if ((load32(pg + pi * 4) & 255) != load8(want + pi)) { bad += 1; }
+                pi += 1;
+            }
+            if (load64(kakel_col_base + pf * 8) != pi) { bad += 1; }
+            if (load64(kakel_row_base + pf * 8) != 0) { bad += 1; }
+            while (pi < GRID_ROWS * GRID_COLS) {
+                if ((load32(pg + pi * 4) & 255) != ' ') { bad += 1; }
+                pi += 1;
+            }
+            serial_print("[prompt-test] case=");
+            serial_print_int(pc);
+            serial_print(" bad=");
+            serial_print_int(bad);
+            serial_print("\n");
+        }
+        store64(raket_authed_base + pf * 8, 0);
+        store64(raket_stage_base + pf * 8, RAKET_STAGE_USER);
+        kakel_clear(pf);
+        raket_prompt(pf);
+        kakel_locked = plocked;
+        raket_lock_draw();
+    }

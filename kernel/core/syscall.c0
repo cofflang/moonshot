@@ -45,9 +45,318 @@ int SYS_INFO        = 34;
 int SYS_KILL        = 35;
 int SYS_POINTER     = 36;
 int SYS_WHEEL       = 37;
+int SYS_READFILE_OWNED = 38;
+
+// --- a program's memory ------------------------------------------------------
+//
+// Every pointer a program passes is checked here, once, before the kernel
+// reads or writes through it. A span of a program's memory is good when it
+// lies wholly in [USER_VIRT_BASE, USER_TOP), outside what the process shares
+// with the kernel's root, and every page of it is present with U set at
+// every level of the caller's own tables, and W too for a span the kernel
+// writes. That takes in the ELF segments, the stack and the heap up to
+// task_heap_mapped_base, and leaves out lager's block table, which is
+// supervisor-only, the reserved heap not yet mapped, and every kernel page.
+// The sums are taken as differences, so no length wraps the check.
+//
+// What makes a span that passed still good when it is copied is that
+// interrupts are off from the SYSCALL instruction to SYSRET, and this kernel
+// runs on one CPU, so nothing can change the program's tables or its bytes
+// in between. That is asserted, at sys_dispatch's entry and in every check,
+// and a handler that waits with interrupts on (SYS_SLEEP, SYS_WAIT) touches
+// no program memory while it waits.
+
+// Stops the kernel when interrupts are on where they must be off. The
+// assertion above, a kernel bug and never a program's.
+void user_assert_irq_off(int where) {
+    int fl = read_flags;
+    if ((fl() & 512) == 0) { return; }
+    int off = disable_interrupts;
+    off();
+    serial_print("KERNEL PANIC: interrupts on in ");
+    serial_print(where);
+    serial_print("\n");
+    while (1) { halt(); }
+    return;
+}
+
+// 1 when the page at `va` is present, not a large page and user-accessible
+// at every level under `root`, and writable at every level too when `write`
+// is 1.
+int user_page(int root, int va, int write) {
+    int need = 5;
+    if (write) { need = 7; }
+    int t = root;
+    int level = 0;
+    for (level = 0; level < 4; level += 1) {
+        int e = load64(t + pt_index(va, level) * 8);
+        if ((e & need) != need) { return 0; }
+        if (level > 0 && level < 3 && (e & 128) != 0) { return 0; }
+        t = e & PTE_ADDR;
+    }
+    return 1;
+}
+
+// 1 when the n bytes at p are the calling program's own, readable by the
+// kernel for `write` 0 and writable for `write` 1, as the comment above
+// describes. A zero length is good and is never looked at, a negative one
+// never is.
+int user_span(int p, int n, int write) {
+    user_assert_irq_off("user_span");
+    if (n < 0) { return 0; }
+    if (n == 0) { return 1; }
+    if (p < USER_VIRT_BASE || p >= USER_TOP || n > USER_TOP - p) { return 0; }
+    int root = load64(task_cr3_base + sched_current * 8);
+    int cr3 = read_cr3;
+    if (root == pml4_phys || (cr3() & PTE_ADDR) != root) { return 0; }
+    if (!pt_private_range(root, p - (p & 4095), p + n)) { return 0; }
+    int va = p - (p & 4095);
+    while (va < p + n) {
+        if (!user_page(root, va, write)) { return 0; }
+        va += 4096;
+    }
+    return 1;
+}
+
+// Fixed task records exist before task creation and require no fault-time allocation.
+// Four slots hold kind and pointer pairs, followed by the draw restoration flag.
+int user_context(int tid) {
+    if (tid < 0 || tid >= MAX_TASKS || MAX_TASKS > 8) {
+        jenna_stop("KERNEL PANIC: user context index\n");
+    }
+    return user_context_records + tid * 192;
+}
+
+int user_reserve(int kind) {
+    user_assert_irq_off("user_reserve");
+    int c = user_context(sched_current);
+    int i = 0;
+    for (i = 3; i >= 0; i -= 1) {
+        int slot = c + 64 + i * 16;
+        if (!load64(slot)) {
+            store64(slot, kind);
+            store64(slot + 8, 0);
+            return slot;
+        }
+    }
+    return 0;
+}
+
+void user_release_slot(int slot) {
+    int kind = load64(slot);
+    int ptr = load64(slot + 8);
+    store64(slot, 0);
+    store64(slot + 8, 0);
+    if (ptr) {
+        if (kind == 1) { kfree(ptr); }
+        else if (kind == 2) { jakel_dfree(ptr); }
+        else { jenna_stop("KERNEL PANIC: user cleanup kind\n"); }
+    }
+    return;
+}
+
+int user_temp_alloc(int n) {
+    int slot = user_reserve(1);
+    if (!slot) { return 0; }
+    int ptr = kmalloc(n);
+    if (!ptr) { user_release_slot(slot); return 0; }
+    store64(slot + 8, ptr);
+    return ptr;
+}
+
+void user_temp_free(int ptr) {
+    user_assert_irq_off("user_temp_free");
+    int c = user_context(sched_current);
+    int i = 0;
+    for (i = 0; i < 4; i += 1) {
+        int slot = c + 64 + i * 16;
+        if (load64(slot) && load64(slot + 8) == ptr) {
+            user_release_slot(slot);
+            return;
+        }
+    }
+    jenna_stop("KERNEL PANIC: unowned user temporary\n");
+    return;
+}
+
+void user_cleanup(int tid) {
+    user_assert_irq_off("user_cleanup");
+    int c = user_context(tid);
+    store64(c, 0);
+    int i = 0;
+    for (i = 0; i < 4; i += 1) { user_release_slot(c + 64 + i * 16); }
+    if (load64(c + 128)) {
+        store64(c + 128, 0);
+        klick_drop();
+    }
+    return;
+}
+
+// The descriptor exists only for this nonblocking transfer and its exact span.
+int user_begin(int p, int n, int write) {
+    if (!user_span(p, n, write)) { return 0; }
+    int c = user_context(sched_current);
+    if (load64(c)) { jenna_stop("KERNEL PANIC: nested user transfer\n"); }
+    store64(c + 8, load64(task_cr3_base + sched_current * 8));
+    store64(c + 16, p);
+    store64(c + 24, p + n);
+    store64(c + 32, write);
+    store64(c, 1);
+    return c;
+}
+
+int user_fault(int vector, int errcode, int cr2, int rip, int frame) {
+    if (vector != 13 && vector != 14) { return 0; }
+    if ((load64(frame + 144) & 3) != 0) { return 0; }
+    int c = user_context(sched_current);
+    int rd = user_access_read;
+    int re = user_access_read_end;
+    int wr = user_access_write_site;
+    int we = user_access_write_end;
+    int write = load64(c + 32);
+    if (write == 0) { if ((rip < rd || rip >= re) && rip != user_blit_read_site && rip != user_copy_read_site) { return 0; } }
+    else { if (rip < wr || rip >= we) { return 0; } }
+    int cr = read_cr3;
+    int root = load64(task_cr3_base + sched_current * 8);
+    int fl = read_flags;
+    if (load64(c) != 1 || load64(c + 8) != root || (cr() & PTE_ADDR) != root
+            || root == pml4_phys || (fl() & 512) != 0) { return 0; }
+    if (vector == 14 && (cr2 < load64(c + 16) || cr2 >= load64(c + 24))) { return 0; }
+    int sb = load64(task_stack_base + sched_current * 8);
+    if (frame < sb || frame > sb + TASK_STACK_SIZE - 176) { return 0; }
+    int sp = load64(frame + 160);
+    if (sp < sb || sp > sb + TASK_STACK_SIZE) { return 0; }
+    store64(c, 2);
+    store64(c + 48, vector);
+    store64(c + 56, rip);
+    store64(frame + 136, user_abort_landing);
+    return 1;
+}
+
+int user_abort_stack() {
+    return load64(task_stack_base + sched_current * 8) + TASK_STACK_SIZE;
+}
+
+void user_abort_finish() {
+    user_assert_irq_off("user_abort_finish");
+    int me = sched_current;
+    int c = user_context(me);
+    if (load64(c) != 2) { jenna_stop("KERNEL PANIC: user abort state\n"); }
+    int vector = load64(c + 48);
+    user_cleanup(me);
+    task_set_end(me, 2, vector);
+    store64(task_state_base + me * 8, TASK_EXITED);
+    int sl = serial_line_begin();
+    serial_print("[usercopy] stopped task ");
+    serial_print_int(me);
+    serial_print(" vector=");
+    serial_print_int(vector);
+    serial_print("\n");
+    serial_line_end(sl);
+    int on = enable_interrupts;
+    on();
+    while (1) { cpu_wait(); }
+    return;
+}
+
+int user_read_byte(int p) {
+    int c = user_begin(p, 1, 0);
+    if (!c) { jenna_stop("KERNEL PANIC: invalid internal user read\n"); }
+    int access = user_access_read;
+    int v = access(p);
+    store64(c, 0);
+    return v;
+}
+
+void user_write_byte(int p, int v) {
+    int c = user_begin(p, 1, 1);
+    if (!c) { jenna_stop("KERNEL PANIC: invalid internal user write\n"); }
+    int access = user_access_write;
+    access(p, v);
+    store64(c, 0);
+    return;
+}
+
+void user_write_word(int p, int v, int n) {
+    int c = user_begin(p, n, 1);
+    if (!c) { jenna_stop("KERNEL PANIC: invalid internal user word\n"); }
+    int access = user_access_write;
+    int i = 0;
+    for (i = 0; i < n; i += 1) { access(p + i, v & 255); v = v >> 8; }
+    store64(c + 16, p + n);
+    store64(c, 0);
+    return;
+}
+
+int user_read_next(int c, int n) {
+    user_assert_irq_off("user_read_next");
+    int cr = read_cr3;
+    if (c != user_context(sched_current) || load64(c) != 1 || load64(c + 32) != 0
+            || load64(c + 8) != (cr() & PTE_ADDR)
+            || load64(c + 8) != load64(task_cr3_base + sched_current * 8) || n < 0 || n > 8
+            || n > load64(c + 24) - load64(c + 16)) {
+        jenna_stop("KERNEL PANIC: invalid user descriptor\n");
+    }
+    int p = load64(c + 16);
+    int access = user_access_read;
+    int v = 0;
+    int i = 0;
+    for (i = 0; i < n; i += 1) { v |= access(p + i) << (i * 8); }
+    store64(c + 16, p + n);
+    return v;
+}
+
+// Copies n bytes of the program's memory at p into the kernel's dst. 1, or
+// 0 with nothing read when the span is not the caller's to read.
+int user_copy_in(int dst, int p, int n) {
+    int c = user_begin(p, n, 0);
+    if (!c) { return 0; }
+    int access = user_copy_read;
+    access(dst, p, n);
+    store64(c + 16, p + n);
+    store64(c, 0);
+    return 1;
+}
+
+// Copies n bytes of the kernel's src into the program's memory at p. 1, or
+// 0 with nothing written when the span is not the caller's to write.
+int user_copy_out(int p, int src, int n) {
+    int c = user_begin(p, n, 1);
+    if (!c) { return 0; }
+    int access = user_access_write;
+    int i = 0;
+    for (i = 0; i < n; i += 1) { access(p + i, load8(src + i)); }
+    store64(c + 16, p + n);
+    store64(c, 0);
+    return 1;
+}
+
+// Copies the string at the program's p into the kernel's dst, which holds
+// cap bytes, stopping after its NUL or at cap - 1 bytes, and ends it with a
+// NUL. Each byte is read once, and a page is checked as the string reaches
+// it, so a short string at the end of the program's memory is good and a
+// page past its NUL is never looked at. Returns the length, or -1 when a
+// byte before the NUL is not the caller's.
+int user_copy_text(int dst, int p, int cap) {
+    user_assert_irq_off("user_copy_text");
+    if (cap <= 0) { return 0 - 1; }
+    if (p < USER_VIRT_BASE || p >= USER_TOP) { return 0 - 1; }
+    int i = 0;
+    for (i = 0; i < cap - 1; i += 1) {
+        if (i == 0 || ((p + i) & 4095) == 0) {
+            if (p + i >= USER_TOP || !user_span(p + i, 1, 0)) { return 0 - 1; }
+        }
+        int c = user_read_byte(p + i);
+        store8(dst + i, c);
+        if (!c) { return i; }
+    }
+    store8(dst + i, 0);
+    return i;
+}
 
 // Copies a path out of user memory into a fresh kmalloc'd buffer, bounded by
-// what jakel allows, and returns it (the caller kfrees it), or 0.
+// what jakel allows, and returns it (the caller releases its slot), or 0, for a
+// path that is not the caller's to read too.
 //
 // Its own buffer, never jakel's name scratch, which is where jakel_open
 // builds each component. A path copied there would have its '/' overwritten
@@ -55,17 +364,19 @@ int SYS_WHEEL       = 37;
 // directory "test".
 int sys_copy_path(int src) {
     int max = JAKEL_NAME_LEN * 4;
-    int buf = kmalloc(max);
+    int buf = user_temp_alloc(max);
     if (!buf) { return 0; }
-    int i = 0;
-    for (i = 0; i < max - 1; i += 1) {
-        int c = load8(src + i);
-        store8(buf + i, c);
-        if (!c) { return buf; }
+    if (user_copy_text(buf, src, max) < 0) {
+        user_temp_free(buf);
+        return 0;
     }
-    store8(buf + i, 0);
     return buf;
 }
+
+// The kernel's bounce buffer for console output, which is copied out of the
+// program a piece at a time and printed from here. Taken on first use.
+int USER_BOUNCE = 256;
+int user_bounce = 0;
 
 
 // A ring-3 process's open files, FD_SLOTS of them per task. Slot i is fd
@@ -99,9 +410,116 @@ void task_set_quiet(int tid, int q) {
     return;
 }
 
+// Per task, the line it is printing, held back from the serial line until it
+// ends. A program often prints one line in several writes (coff writes its
+// message a word at a time), and between two of them the timer can switch
+// tasks, so a kernel line or another task's would land in its middle. The
+// line goes out whole at its newline, when the hold is full, and before the
+// task does anything other than print, so it still comes before what that
+// call logs. What is left when the task ends goes out when it exits or is
+// reaped. The screen gets every byte at once as before.
+int SERIAL_HOLD = 256;
+int task_hold_base = 0;
+int task_hold_len_base = 0;
+
+void task_hold_flush(int tid) {
+    if (!task_hold_len_base || tid < 0 || tid >= MAX_TASKS) { return; }
+    int n = load64(task_hold_len_base + tid * 8);
+    if (n == 0) { return; }
+    store64(task_hold_len_base + tid * 8, 0);
+    int at = task_hold_base + tid * SERIAL_HOLD;
+    int sl = serial_line_begin();
+    int i = 0;
+    for (i = 0; i < n; i += 1) { serial_putc(load8(at + i)); }
+    serial_line_end(sl);
+    return;
+}
+
+void task_hold_putc(int tid, int ch) {
+    // Both tables are zeroed before they are published. Without them the
+    // byte goes straight out, as it would with no hold at all.
+    if (!task_hold_base) {
+        int hb = kmalloc(MAX_TASKS * SERIAL_HOLD);
+        int lb = kmalloc(MAX_TASKS * 8);
+        if (hb && lb) {
+            int i = 0;
+            for (i = 0; i < MAX_TASKS; i += 1) { store64(lb + i * 8, 0); }
+            task_hold_len_base = lb;
+            task_hold_base = hb;
+        } else {
+            if (hb) { kfree(hb); }
+            if (lb) { kfree(lb); }
+        }
+    }
+    if (!task_hold_base || tid < 0 || tid >= MAX_TASKS) {
+        serial_putc(ch);
+        return;
+    }
+    int n = load64(task_hold_len_base + tid * 8);
+    store8(task_hold_base + tid * SERIAL_HOLD + n, ch);
+    store64(task_hold_len_base + tid * 8, n + 1);
+    if (ch == '\n' || n + 1 == SERIAL_HOLD) { task_hold_flush(tid); }
+    return;
+}
+
+// Per task, 1 while the task runs the kernel's coff or smed, whoever started
+// it. A build reads only files that its uid or root owns, along the whole
+// folder chain (sys_build_may_read), so a file another user made can never
+// become part of a program this user builds. What it writes is not limited
+// by this. spawn_program_owned allocates the table before any program
+// starts, and fails the spawn when it cannot.
+int task_build_base = 0;
+
+void task_set_build(int tid, int b) {
+    if (!task_build_base || tid < 0 || tid >= MAX_TASKS) { return; }
+    store64(task_build_base + tid * 8, b);
+    return;
+}
+
+int task_build(int tid) {
+    if (!task_build_base || tid < 0 || tid >= MAX_TASKS) { return 0; }
+    return load64(task_build_base + tid * 8);
+}
+
+// 1 when the calling task may read node id, 0 when it is a build and id or
+// a folder above it belongs to another user, which it then says on serial.
+int sys_build_may_read(int id) {
+    if (!task_build(sched_current)) { return 1; }
+    if (jakel_trusted_chain(task_uid(sched_current), id)) { return 1; }
+    serial_print("[syscall] build refused a file another user owns\n");
+    return 0;
+}
+
+// Per task, the creation stamp of the directory in task_cwd_base.
+int task_cwd_stamp_base = 0;
+
+// The creation stamp kept with task tid's directory. Read in the same jakel
+// section as task_cwd(tid), or with interrupts off as a syscall is.
+int task_cwd_stamp(int tid) {
+    if (!task_cwd_stamp_base || tid < 0 || tid >= MAX_TASKS) { return 0; }
+    return load64(task_cwd_stamp_base + tid * 8);
+}
+
+// Task tid's directory. A directory removed since the task started, whose
+// slot may hold a file or another directory by now, is never used. The task
+// goes back to the root, and the serial line says so.
 int task_cwd(int tid) {
-    if (!task_cwd_base) { return 0; }
-    return load64(task_cwd_base + tid * 8);
+    if (!task_cwd_base || !task_cwd_stamp_base || tid < 0 || tid >= MAX_TASKS) { return 0; }
+    int held = jakel_lock();
+    int d = load64(task_cwd_base + tid * 8);
+    int ok = d == 0 || (jakel_is_dir(d) && jakel_stamp(d) == load64(task_cwd_stamp_base + tid * 8));
+    if (!ok) {
+        store64(task_cwd_base + tid * 8, 0);
+        store64(task_cwd_stamp_base + tid * 8, 0);
+    }
+    jakel_unlock(held);
+    if (ok) { return d; }
+    int sl = serial_line_begin();
+    serial_print("[syscall] task ");
+    serial_print_int(tid);
+    serial_print(" folder is gone, back in /\n");
+    serial_line_end(sl);
+    return 0;
 }
 
 // Per task, how the program in it ended. 1 when it called exit, with the
@@ -124,6 +542,10 @@ void task_set_end(int tid, int how, int code) {
 int fd_file_base = 0;
 int fd_off_base = 0;
 int fd_wr_base = 0;
+// Per slot, the creation stamp of the file, so a file removed while it is
+// open, whose node slot may hold another file by now, is never read or
+// written through the old fd (fd_live).
+int fd_stamp_base = 0;
 
 void fd_reset(int tid) {
     int i = 0;
@@ -131,10 +553,19 @@ void fd_reset(int tid) {
         fd_file_base = kmalloc(MAX_TASKS * FD_SLOTS * 8);
         fd_off_base = kmalloc(MAX_TASKS * FD_SLOTS * 8);
         fd_wr_base = kmalloc(MAX_TASKS * FD_SLOTS * 8);
+        fd_stamp_base = kmalloc(MAX_TASKS * FD_SLOTS * 8);
         for (i = 0; i < MAX_TASKS * FD_SLOTS; i += 1) { store64(fd_file_base + i * 8, 0); }
     }
     for (i = 0; i < FD_SLOTS; i += 1) { store64(fd_file_base + (tid * FD_SLOTS + i) * 8, 0); }
     return;
+}
+
+// 1 when table slot k still names the file it was opened on, a live file
+// with the same creation stamp.
+int fd_live(int k) {
+    int id = load64(fd_file_base + k * 8) - 1;
+    if (!jakel_valid(id) || load64(jakel_type_base + id * 8) != JAKEL_TYPE_FILE) { return 0; }
+    return jakel_stamp(id) == load64(fd_stamp_base + k * 8);
 }
 
 // The table index of the current task's fd, or -1 for one that is not open.
@@ -146,14 +577,25 @@ int fd_slot(int fd) {
 }
 
 // Writes len bytes at s to the console, the serial port and the process's
-// window, or the focused one when it has none.
+// window, or the focused one when it has none. Returns len, or -1 with
+// nothing printed when the bytes are not the caller's to read.
 int sys_console_write(int s, int len) {
+    if (len < 0 || !user_span(s, len, 0)) { return 0 - 1; }
+    if (len == 0) { return 0; }
+    if (!user_bounce) { user_bounce = kmalloc(USER_BOUNCE); }
+    if (!user_bounce) { return 0 - 1; }
     int wid = load64(task_win_base + sched_current * 8);
     int quiet = task_quiet(sched_current);
     int i = 0;
     for (i = 0; i < len; i += 1) {
-        int ch = load8(s + i);
-        serial_putc(ch);
+        int k = i % USER_BOUNCE;
+        if (k == 0) {
+            int piece = len - i;
+            if (piece > USER_BOUNCE) { piece = USER_BOUNCE; }
+            if (!user_copy_in(user_bounce, s + i, piece)) { return 0 - 1; }
+        }
+        int ch = load8(user_bounce + k);
+        task_hold_putc(sched_current, ch);
         if (quiet == 1) {
             // Started by another program to work in the background (see
             // SYS_SPAWN's flags), so nothing reaches the screen.
@@ -208,6 +650,12 @@ void task_info_reset(int tid) {
     }
     store64(task_presents_base + tid * 8, 0);
     store64(task_parent_base + tid * 8, 0 - 1);
+    // A task started by the slot's previous occupant is no child of the
+    // next one, so every link to the slot goes with it.
+    int c = 0;
+    for (c = 0; c < MAX_TASKS; c += 1) {
+        if (load64(task_parent_base + c * 8) == tid) { store64(task_parent_base + c * 8, 0 - 1); }
+    }
     int nm = load64(task_name_base + tid * 8);
     if (nm) { kfree(nm); }
     store64(task_name_base + tid * 8, 0);
@@ -227,8 +675,8 @@ void info_str(int dst, int s, int n) {
 
 int INFO_TASK_BYTES = 96;
 
-// SYS_INFO's three views, written into buf (kernel-checked to be the
-// caller's own), at most max bytes. Returns the bytes written, or -1.
+// SYS_INFO's three views, staged in kernel storage before transfer to the
+// caller, at most max bytes. Returns the bytes written, or -1.
 int sys_info(int what, int buf, int max) {
     if (what == 0) {
         // The machine, sixteen numbers, or seventeen.
@@ -330,7 +778,11 @@ int sys_info(int what, int buf, int max) {
 }
 
 int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
+    // SYSCALL cleared IF on the way in (SFMASK, boot.s), and every check of
+    // a program's pointer below relies on that. See user_span.
+    user_assert_irq_off("sys_dispatch");
     sys_calls += 1;
+    if (num != 1 && !(num == 25 && (a1 == 1 || a1 == 2))) { task_hold_flush(sched_current); }
     // A program closed with alt+w or its [x] is ended from an interrupt,
     // and when that interrupt came while the program itself was running,
     // the CPU goes back to it and it runs on until the next tick. Its next
@@ -342,6 +794,14 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         int on0 = enable_interrupts;
         on0();
         while (1) { cpu_wait(); }
+    }
+    // SYS_READFILE_OWNED is SYS_READFILE for a file the caller's uid or root
+    // owns, a number of its own rather than a fourth argument, since the
+    // readfile builtin leaves that register unset.
+    int owned_read = 0;
+    if (num == SYS_READFILE_OWNED) {
+        num = 8;
+        owned_read = 1;
     }
     // SYS_EXIT_CLOSE(code) -- SYS_EXIT for a program whose window means
     // nothing once it is gone, like an editor that was quit. A plain exit
@@ -442,7 +902,27 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         int wy5 = load64(kakel_cy_base + wid5 * 8) * FONT_H;
         int ww5 = load64(kakel_cols_base + wid5 * 8) * FONT_W;
         int wh5 = load64(kakel_rows_base + wid5 * 8) * FONT_H;
-        fb_blit(a1, a2, a3, a4, a5, wx5, wy5, ww5, wh5);
+        // Only the rows and columns that land in the window are read, each
+        // visible row checked before the first pixel is drawn, so a huge
+        // height costs at most the window's rows and a bad source draws
+        // nothing. The source pitch a4 * 4 and the offset of the last row
+        // read must both fit below USER_TOP before either is multiplied.
+        if (a4 < 0 || a5 < 0) { return 0 - 1; }
+        if (a4 > USER_TOP / 4) { return 0 - 1; }
+        fb_clip(a2, a4, ww5);
+        int c05 = clip_lo;
+        int c15 = clip_hi;
+        fb_clip(a3, a5, wh5);
+        int r05 = clip_lo;
+        int r15 = clip_hi;
+        if (c05 >= c15 || r05 >= r15) { return 0; }
+        if (r15 - 1 > (USER_TOP / 4 - c15) / a4) { return 0 - 1; }
+        if (a1 < USER_VIRT_BASE || a1 >= USER_TOP) { return 0 - 1; }
+        int row5 = 0;
+        for (row5 = r05; row5 < r15; row5 += 1) {
+            if (!user_span(a1 + (row5 * a4 + c05) * 4, (c15 - c05) * 4, 0)) { return 0 - 1; }
+        }
+        fb_blit_user_rows(a1, a4, a2, a3, r05, r15, c05, c15, wx5, wy5);
         return 0;
     }
     if (num == 6) {
@@ -473,7 +953,11 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
     if (num == 8) {
         // SYS_READFILE(name, buf, max) — read a file from jakel into the
         // process's own memory. Returns the number of bytes copied, or -1 if
-        // the path does not resolve to a file.
+        // the path does not resolve to a file. As SYS_READFILE_OWNED it reads
+        // only a file that the caller's uid or root owns and returns -2 for
+        // any other, so a program learns, in the same call that reads them,
+        // whether the bytes come from a file it may trust as code. utsikt
+        // reads pages that way and runs a page's scripts only then.
         //
         // With buf == 0 it returns the file's SIZE and copies nothing, so a
         // program can size its alloc() before the real read. That is why
@@ -484,23 +968,25 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // to be baked into the ELF by a host script and changing one pixel would
         // mean a recompile -- see pensel, which draws sprites on Moonshot itself.
         //
-        // Pointers arrive as the process's own virtual addresses and are used
-        // directly, since SYSCALL does not switch CR3, so the process's address
-        // space is still live here, the same way SYS_DEBUG_PRINT already
-        // reads its string and SYS_BLIT its pixel buffer.
-        //
-        // `buf` IS bounds-checked against USER_VIRT_BASE though, unlike those
-        // two. They only READ through a user pointer; this one writes through
-        // it, so a bad value would have the kernel scribble file contents
-        // into its own memory. Not a security model -- ring 3 has none here
-        // yet -- just refusing the one operation that can corrupt the kernel.
+        // Pointers arrive as the process's own virtual addresses, since
+        // SYSCALL does not switch CR3, so the process's address space is
+        // still live here. The path and the bytes the read fills are both
+        // checked to be the caller's own first (user_span), the buffer for
+        // writing, since a bad one would have the kernel scribble file
+        // contents into its own memory.
         if (!a1) { return -1; }
         int nbuf = sys_copy_path(a1);
         if (!nbuf) { return -1; }
         int fid = jakel_open(0, nbuf);
-        kfree(nbuf);
+        user_temp_free(nbuf);
         if (fid < 0) { return -1; }
         if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) { return -1; }
+        if (!jakel_can_read(task_uid(sched_current), fid)) { return -1; }
+        if (!sys_build_may_read(fid)) { return -1; }
+        if (owned_read) {
+            int own8 = load64(jakel_uid_base + fid * 8);
+            if (own8 != task_uid(sched_current) && own8 != 0) { return 0 - 2; }
+        }
         int fsz = load64(jakel_size_base + fid * 8);
         if (!a2) { return fsz; }
         if (a2 < USER_VIRT_BASE) {
@@ -509,8 +995,10 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         }
         int n = fsz;
         if (a3 < n) { n = a3; }
-        if (n <= 0) { return 0; }
-        jakel_read(fid, 0, a2, n);
+        if (n < 0) { return 0 - 1; }
+        if (n == 0) { return 0; }
+        if (!user_span(a2, n, 1)) { return -1; }
+        if (jakel_read_user(task_uid(sched_current), fid, 0, a2, n) != n) { return -1; }
         return n;
     }
     if (num == 9) {
@@ -587,17 +1075,25 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // Buffers outside the heap (a static array in the program's data
         // segment) sit far below it, leaving this bound enormous and inert.
         int hnext9 = load64(task_heap_next_base + sched_current * 8);
-        if (a1 < hnext9) {
+        if (a1 >= USER_VIRT_BASE && a1 < hnext9) {
             int max_rows = (hnext9 - a1) / srcbytes;
             if (rows9 > max_rows) { rows9 = max_rows; }
         }
+        if (rows9 <= 0) { return 0; }
+        // That bound only trims a frame, it proves nothing about the source.
+        // Every byte the rows below read is checked to be the caller's
+        // before the first one is copied. Both factors are window sizes
+        // under 65536, so the product cannot overflow.
+        if (!user_span(a1, (rows9 - 1) * srcbytes + copybytes, 0)) { return 0 - 1; }
+        store64(user_context(sched_current) + 128, 1);
         klick_lift_rect(wx9, wy9, copybytes / 4, rows9);
         int r9 = 0;
         for (r9 = 0; r9 < rows9; r9 += 1) {
-            mem_copy(fb_addr + (wy9 + r9) * fb_pitch + wx9 * 4,
+            user_copy_in(fb_addr + (wy9 + r9) * fb_pitch + wx9 * 4,
                      a1 + r9 * srcbytes, copybytes);
         }
         klick_drop();
+        store64(user_context(sched_current) + 128, 0);
         return 0;
     }
     if (num == 11) {
@@ -665,12 +1161,12 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // allocate for the worst case once and render a sub-rectangle of it.
         //
         // The ceiling is one window filling every row the layout can give out,
-        // the full framebuffer minus the status bar. Deliberately NOT reduced
+        // the full framebuffer. Deliberately NOT reduced
         // by a tavla's title strip -- that inset makes a window smaller, and a
         // program that budgeted for the un-inset size is still correct.
         if (!kakel_active) { return 0; }
         int mw = (fb_width / FONT_W) * FONT_W;
-        int mh = (fb_height / FONT_H - KAKEL_LOG_ROWS) * FONT_H;
+        int mh = (fb_height / FONT_H) * FONT_H;
         return (mw << 16) | mh;
     }
     if (num == 12) {
@@ -701,12 +1197,13 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // (including space) come back all-zero, which is what font_hi/font_lo
         // already return for them.
         if (!a2) { return (FONT_W << 16) | FONT_H; }
-        // Written through, like SYS_READFILE's buffer and unlike the pointers
-        // the kernel only reads -- so it gets the same refusal.
+        // Written through, like SYS_READFILE's buffer, so all FONT_H bytes
+        // are checked to be the caller's to write first.
         if (a2 < USER_VIRT_BASE) {
             serial_print("[syscall] glyph: refusing non-user buffer\n");
             return -1;
         }
+        if (!user_span(a2, FONT_H, 1)) { return -1; }
         int ghi12 = font_hi(a1);
         int gv12 = font_lo(a1);
         // Same peel-from-the-low-end sweep as fb_draw_char. font_lo's lowest
@@ -715,7 +1212,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         int gr12 = 7;
         for (gr12 = 7; gr12 >= 0; gr12 -= 1) {
             if (gr12 == 3) { gv12 = ghi12; }
-            store8(a2 + gr12, gv12 % 256);
+            user_write_byte(a2 + gr12, gv12 % 256);
             gv12 /= 256;
         }
         return (FONT_W << 16) | FONT_H;
@@ -728,28 +1225,27 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // save. Like pensel's save it changes jakel in memory only; the
         // shell's `sync` puts it on disk.
         //
-        // buf is checked like SYS_READFILE's, since the kernel only reads through
-        // it here, but a file holding kernel memory would be a leak.
+        // buf is checked like SYS_READFILE's, for reading, since a file
+        // holding kernel memory would be a leak. It is checked before the
+        // file is made, so a bad buffer creates nothing.
         if (a1 == 0 || a3 < 0) { return -1; }
         if (a2 < USER_VIRT_BASE) {
             serial_print("[syscall] writefile: refusing non-user buffer\n");
             return -1;
         }
+        if (!user_span(a2, a3, 0)) { return -1; }
         int wpath = sys_copy_path(a1);
         if (!wpath) { return -1; }
         int wid = jakel_open(0, wpath);
-        if (wid < 0) { wid = jakel_create_at(0, wpath); }
-        kfree(wpath);
+        if (wid < 0) { wid = jakel_create_at(task_uid(sched_current), 0, wpath); }
+        user_temp_free(wpath);
         if (wid < 0) { return -1; }
         if (load64(jakel_type_base + wid * 8) != JAKEL_TYPE_FILE) { return -1; }
         // Checked here and not left to jakel_write, since a zero-length write it
         // refused would still return 0 == len, and the truncation below
         // would then empty a file the caller may not touch.
-        if (jakel_can_write(jakel_current_uid, wid) == 0) { return -1; }
-        if (jakel_write(wid, 0, a2, a3) != a3) { return -1; }
-        // A write never shrinks a file, so a shorter save would keep the old
-        // tail. The size is set to what was written, as pensel does.
-        store64(jakel_size_base + wid * 8, a3);
+        if (jakel_can_replace(task_uid(sched_current), wid) == 0) { return -1; }
+        if (jakel_put(task_uid(sched_current), wid, a2, a3, 1) != 0) { return -1; }
         return a3;
     }
     if (num == 16) {
@@ -812,22 +1308,28 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
             }
             u = lager_alloc(me18, count * 8 + bytes);
             if (!u) { return 0; }
+            // The table lives in the program's heap, which it can change,
+            // so it is written and read like any other program memory.
+            if (!user_span(u, count * 8 + bytes, 1)) { return 0; }
             int dst = u + count * 8;
             sp = ab18 + 8;
             k = 0;
             for (k = 0; k < count; k += 1) {
-                store64(u + k * 8, dst);
+                user_write_word(u + k * 8, dst, 8);
                 int c = 1;
                 while (c != 0) {
                     c = load8(sp);
-                    store8(dst, c);
+                    user_write_byte(dst, c);
                     sp += 1;
                     dst += 1;
                 }
             }
             store64(task_argv_user_base + me18 * 8, u);
         }
-        return load64(u + a1 * 8);
+        // The pointer is the program's own, handed back and never followed.
+        if (!user_bounce) { user_bounce = kmalloc(USER_BOUNCE); }
+        if (!user_bounce || !user_copy_in(user_bounce, u + a1 * 8, 8)) { return 0; }
+        return load64(user_bounce);
     }
     if (num == 19) {
         // SYS_LISTDIR(path, buf, max) -- the entries of a directory, one
@@ -843,7 +1345,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         if (!lp) { return 0 - 1; }
         int did = 0;
         if (load8(lp) != 0) { did = jakel_open(0, lp); }
-        kfree(lp);
+        user_temp_free(lp);
         if (did < 0 || load64(jakel_type_base + did * 8) != JAKEL_TYPE_DIR) { return 0 - 1; }
         int n19 = load64(jakel_size_base + did * 8) / 8;
         if (!a2) { return n19; }
@@ -851,12 +1353,20 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
             serial_print("[syscall] listdir: refusing non-user buffer\n");
             return 0 - 1;
         }
+        if (a3 < 0) { return 0 - 1; }
         if (a3 < n19) { n19 = a3; }
+        // At most the entries there are, so the product is small, and all of
+        // the records are checked before the first is written.
+        if (n19 > USER_TOP / 48 || !user_span(a2, n19 * 48, 1)) { return 0 - 1; }
         int kids = load64(jakel_data_base + did * 8);
         int r19 = 0;
         for (r19 = 0; r19 < n19; r19 += 1) {
             int cid = load64(kids + r19 * 8);
-            int rec = a2 + r19 * 48;
+            if (!user_bounce) { user_bounce = kmalloc(USER_BOUNCE); }
+            if (!user_bounce) { return 0 - 1; }
+            int rec = user_bounce;
+            int clear19 = 0;
+            for (clear19 = 0; clear19 < 48; clear19 += 1) { store8(rec + clear19, 0); }
             store64(rec, load64(jakel_type_base + cid * 8));
             store64(rec + 8, load64(jakel_size_base + cid * 8));
             int cname = load64(jakel_name_base + cid * 8);
@@ -865,6 +1375,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
                 store8(rec + 16 + k19, load8(cname + k19));
             }
             store8(rec + 16 + k19, 0);
+            if (!user_copy_out(a2 + r19 * 48, rec, 48)) { return 0 - 1; }
         }
         return n19;
     }
@@ -878,23 +1389,22 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // runs another one and waits for it (SYS_WAIT), as skrift runs coff.
         // Flag 2 finds names from the caller's own folder.
         if (!a1 || a2 < 0 || a2 > 3) { return 0 - 1; }
-        int sl = kmalloc(256);
+        int sl = user_temp_alloc(256);
         if (!sl) { return 0 - 1; }
-        int k20 = 0;
-        for (k20 = 0; k20 < 255 && load8(a1 + k20) != 0; k20 += 1) {
-            store8(sl + k20, load8(a1 + k20));
+        if (user_copy_text(sl, a1, 256) < 0) {
+            user_temp_free(sl);
+            return 0 - 1;
         }
-        store8(sl + k20, 0);
         int cwd20 = 0;
-        if ((a2 & 2) != 0) { cwd20 = task_cwd(sched_current); }
-        if ((a2 & 1) != 0) {
-            spawn_next_windowed = 0;
-            spawn_next_quiet = 1;
+        int cst20 = 0;
+        if ((a2 & 2) != 0) {
+            cwd20 = task_cwd(sched_current);
+            cst20 = task_cwd_stamp(sched_current);
         }
-        int t20 = spawn_program(cwd20, sl);
-        spawn_next_windowed = 1;
-        spawn_next_quiet = 0;
-        kfree(sl);
+        int mode20 = SPAWN_WINDOWED;
+        if ((a2 & 1) != 0) { mode20 = SPAWN_QUIET; }
+        int t20 = spawn_program_mode(task_uid(sched_current), cwd20, cst20, sl, mode20);
+        user_temp_free(sl);
         return t20;
     }
     if (num == 21) {
@@ -908,10 +1418,16 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         if ((a1 & 4095) != 0 || a2 <= 0 || a2 > 256 || a3 < 0 || a3 > 1) { return 0 - 1; }
         int hend = load64(task_heap_end_base + sched_current * 8);
         int hmapped = load64(task_heap_mapped_base + sched_current * 8);
-        if (!hend || a1 < hend - HEAP_PAGES * 4096 || a1 + a2 * 4096 > hmapped) {
+        // The range is compared by difference, so no a1 near the top of the
+        // signed range wraps past the heap's end.
+        if (!hend || a1 < hend - HEAP_PAGES * 4096 || a1 < USER_VIRT_BASE
+            || a1 >= hmapped || a2 > (hmapped - a1) / 4096) {
             serial_print("[syscall] protect: refusing pages outside the heap\n");
             return 0 - 1;
         }
+        // Every page present and the program's own, U set at every level,
+        // before any leaf changes.
+        if (!user_span(a1, a2 * 4096, 0)) { return 0 - 1; }
         int cr21 = load64(task_cr3_base + sched_current * 8);
         int p21 = 0;
         for (p21 = 0; p21 < a2; p21 += 1) {
@@ -932,8 +1448,9 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
     }
     if (num == 22) {
         // SYS_EDIT(path) -- opens a file in its editor, a picture (.spr) in
-        // pensel and anything else in skrift, in a new window that takes the
-        // focus, so hylla can open what it cannot draw itself. Names are found
+        // pensel and anything else in skrift, in a new window, so hylla can
+        // open what it cannot draw itself. The window takes the focus only
+        // from the caller's own window (sys_holds_focus). Names are found
         // from the root. Returns the editor's task id, or -1.
         if (!a1 || a1 < USER_VIRT_BASE || kakel_active != 1) { return 0 - 1; }
         int path22 = sys_copy_path(a1);
@@ -945,42 +1462,44 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
             && load8(path22 + n22 - 2) == 'p' && load8(path22 + n22 - 1) == 'r') {
             prog22 = "/pensel.elf ";
         }
-        int t22 = editor_open(0, prog22, path22);
+        int t22 = editor_open_focus(task_uid(sched_current), 0, 0, prog22, path22, sys_holds_focus());
         serial_print("[syscall] edit ");
         serial_print(path22);
         serial_print(" in task ");
         serial_print_int(t22);
         serial_print("\n");
-        kfree(path22);
+        user_temp_free(path22);
         if (t22 < 0) { return 0 - 1; }
         return t22;
     }
     if (num == SYS_SHELL) {
         // SYS_SHELL(line) -- opens a new shell window, in the caller's
-        // folder, as the user who is logged in, takes the focus there and
-        // types the line into it, so it runs exactly as if typed, and stays
+        // folder, as the caller's user, takes the focus there when the
+        // caller's own window has it (sys_holds_focus), and types the line
+        // into it, so it runs exactly as if typed, and stays
         // on screen with whatever it printed. skrift's F5 runs `execute` this
         // way. Returns the window's id, -1 for a bad line, -3 when there is
         // no room for another window. A program can do nothing here that the
         // logged-in user could not type, the same as SYS_EDIT's shell window.
         if (!a1 || a1 < USER_VIRT_BASE || kakel_active != 1) { return 0 - 1; }
-        int sh_line = kmalloc(256);
+        int sh_line = user_temp_alloc(256);
         if (!sh_line) { return 0 - 1; }
+        // Copied once, then looked at in the kernel's copy.
+        if (user_copy_text(sh_line, a1, 256) < 0) { user_temp_free(sh_line); return 0 - 1; }
         int k28 = 0;
-        for (k28 = 0; k28 < 255 && load8(a1 + k28) != 0; k28 += 1) {
-            int c28 = load8(a1 + k28);
+        for (k28 = 0; load8(sh_line + k28) != 0; k28 += 1) {
             // One line, so a newline inside it would run a second command.
-            if (c28 < 32) { kfree(sh_line); return 0 - 1; }
-            store8(sh_line + k28, c28);
+            if (load8(sh_line + k28) < 32) { user_temp_free(sh_line); return 0 - 1; }
         }
-        store8(sh_line + k28, 0);
+        if (task_uid(sched_current) < 0) { user_temp_free(sh_line); return -1; }
         int w28 = kakel_split();
-        if (w28 < 0) { kfree(sh_line); return 0 - 3; }
+        if (w28 < 0) { user_temp_free(sh_line); return 0 - 3; }
         store64(raket_authed_base + w28 * 8, 1);
-        store64(sk_uid_base + w28 * 8, jakel_current_uid);
-        store64(sk_cwd_base + w28 * 8, task_cwd(sched_current));
+        store64(sk_uid_base + w28 * 8, task_uid(sched_current));
+        int cwd28 = task_cwd(sched_current);
+        sk_set_cwd_stamped(w28, cwd28, task_cwd_stamp(sched_current));
         shell_reprompt_others(w28);
-        kakel_focus_to(w28);
+        if (sys_holds_focus()) { kakel_focus_to(w28); }
         shell_prompt_session(w28);
         serial_print("[syscall] shell ");
         serial_print(sh_line);
@@ -991,7 +1510,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
             shell_enqueue(w28, load8(sh_line + k28));
         }
         shell_enqueue(w28, '\n');
-        kfree(sh_line);
+        user_temp_free(sh_line);
         return w28;
     }
     if (num == SYS_WAIT) {
@@ -1026,10 +1545,15 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
     if (num == SYS_KILL) {
         // SYS_KILL(tid) -- stops a task the caller started itself (SYS_SPAWN),
         // as the shell's kill does. A program can stop what it began, a
-        // build it gave up waiting for, and nothing else. Returns 0, or -1
-        // for any other task or one that is not running.
+        // build it gave up waiting for, and nothing else. The shell's rule
+        // for users holds too, so a root task is stopped only by root and
+        // another task only by one of its own uid. Returns 0, or -1 for any
+        // other task or one that is not running.
         if (a1 < 0 || a1 >= MAX_TASKS || !task_parent_base) { return 0 - 1; }
         if (load64(task_parent_base + a1 * 8) != sched_current) { return 0 - 1; }
+        int kuid35 = task_uid(sched_current);
+        if (kuid35 < 0) { return 0 - 1; }
+        if (kuid35 != 0 && task_uid(a1) != kuid35) { return 0 - 1; }
         int st35 = load64(task_state_base + a1 * 8);
         if (st35 != TASK_RUNNABLE && st35 != TASK_BLOCKED) { return 0 - 1; }
         store64(task_state_base + a1 * 8, TASK_EXITED);
@@ -1057,9 +1581,23 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // insyn, the debug panel. 0 the machine's counters, 1 every task
         // slot, 2 the hardware. See sys_info for the layouts. buf must lie
         // wholly in the caller's own heap, since the kernel writes it.
+        // The range is compared by difference against the heap's mapped part,
+        // so no length wraps it, and the bytes sys_info can write at most
+        // are checked to be the caller's before it writes any.
         int hmap = load64(task_heap_mapped_base + sched_current * 8);
-        if (a2 < USER_VIRT_BASE || a3 <= 0 || a2 + a3 > hmap) { return 0 - 1; }
-        return sys_info(a1, a2, a3);
+        int hend34 = load64(task_heap_end_base + sched_current * 8);
+        if (!hend34 || a2 < hend34 - HEAP_PAGES * 4096 || a2 < USER_VIRT_BASE) { return 0 - 1; }
+        if (a3 <= 0 || a2 >= hmap || a3 > hmap - a2) { return 0 - 1; }
+        int most34 = MAX_TASKS * INFO_TASK_BYTES;
+        if (most34 < 136) { most34 = 136; }
+        if (most34 > a3) { most34 = a3; }
+        if (!user_span(a2, most34, 1)) { return 0 - 1; }
+        int info_buf = user_temp_alloc(most34);
+        if (!info_buf) { return 0 - 1; }
+        int info_n = sys_info(a1, info_buf, most34);
+        if (info_n > 0 && !user_copy_out(a2, info_buf, info_n)) { info_n = 0 - 1; }
+        user_temp_free(info_buf);
+        return info_n;
     }
     if (num == SYS_CLOCK) {
         // SYS_CLOCK(what, value) -- the wall clock. what 0 gives seconds since
@@ -1070,13 +1608,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         if (a1 == 0) { return clock_utc(); }
         if (a1 == 1) { return pit_ticks * 10; }
         if (a1 == 2) { return clock_offset; }
-        if (a1 == 3 && a2 >= 0 - 1440 && a2 <= 1440) {
-            clock_offset = a2;
-            serial_print("[clock] offset set to ");
-            serial_print_int(a2);
-            serial_print(" min\n");
-            return 0;
-        }
+        if (a1 == 3) { return clock_offset_set(a2); }
         return 0 - 1;
     }
     if (num == SYS_CLOSE_KEY) {
@@ -1101,11 +1633,11 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         int rpath = sys_copy_path(a1);
         if (!rpath) { return 0 - 1; }
         int rfid = jakel_open(task_cwd(sched_current), rpath);
-        kfree(rpath);
+        user_temp_free(rpath);
         if (rfid < 0) { return 0 - 1; }
         if (load64(jakel_type_base + rfid * 8) != JAKEL_TYPE_FILE) { return 0 - 1; }
-        if (jakel_can_write(jakel_current_uid, rfid) == 0) { return 0 - 1; }
-        if (jakel_remove(rfid) != 0) { return 0 - 1; }
+        if (jakel_can_write(task_uid(sched_current), rfid) == 0) { return 0 - 1; }
+        if (jakel_remove(task_uid(sched_current), rfid) != 0) { return 0 - 1; }
         return 0;
     }
     if (num == 23) {
@@ -1122,14 +1654,15 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         if (!opath) { return 0 - 1; }
         int ocwd = task_cwd(sched_current);
         int ofid = jakel_open(ocwd, opath);
-        if (ofid < 0 && a2 == 1) { ofid = jakel_create_at(ocwd, opath); }
-        kfree(opath);
+        if (ofid < 0 && a2 == 1) { ofid = jakel_create_at(task_uid(sched_current), ocwd, opath); }
+        user_temp_free(opath);
         if (ofid < 0) { return 0 - 1; }
         if (load64(jakel_type_base + ofid * 8) != JAKEL_TYPE_FILE) { return 0 - 1; }
-        if (a2 == 0 && jakel_can_read(jakel_current_uid, ofid) == 0) { return 0 - 1; }
+        if (a2 == 0 && jakel_can_read(task_uid(sched_current), ofid) == 0) { return 0 - 1; }
+        if (a2 == 0 && !sys_build_may_read(ofid)) { return 0 - 1; }
         if (a2 == 1) {
-            if (jakel_can_write(jakel_current_uid, ofid) == 0) { return 0 - 1; }
-            store64(jakel_size_base + ofid * 8, 0);
+            if (jakel_can_replace(task_uid(sched_current), ofid) == 0) { return 0 - 1; }
+            if (jakel_set_size(task_uid(sched_current), ofid, 0) != 0) { return -1; }
         }
         if (!fd_file_base) { fd_reset(sched_current); }
         int oi = 0;
@@ -1137,6 +1670,7 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
             int ok = sched_current * FD_SLOTS + oi;
             if (!load64(fd_file_base + ok * 8)) {
                 store64(fd_file_base + ok * 8, ofid + 1);
+                store64(fd_stamp_base + ok * 8, jakel_stamp(ofid));
                 store64(fd_off_base + ok * 8, 0);
                 store64(fd_wr_base + ok * 8, a2);
                 return oi + 3;
@@ -1148,13 +1682,20 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // SYS_READ(fd, buf, n) -- reads up to n bytes from where the last read
         // ended. Returns how many, 0 at the end of the file, -1 for a bad fd.
         int rk = fd_slot(a1);
-        if (rk < 0 || a3 < 0) { return 0 - 1; }
+        if (rk < 0 || a3 < 0 || !fd_live(rk)) { return 0 - 1; }
         if (a2 < USER_VIRT_BASE) {
             serial_print("[syscall] read: refusing non-user buffer\n");
             return 0 - 1;
         }
         int roff = load64(fd_off_base + rk * 8);
-        int rn = jakel_read(load64(fd_file_base + rk * 8) - 1, roff, a2, a3);
+        // Only the bytes the file still has from roff are checked, so a huge
+        // n near the end of a file asks nothing of the buffer past them.
+        int rid = load64(fd_file_base + rk * 8) - 1;
+        int reff = load64(jakel_size_base + rid * 8) - roff;
+        if (reff < 0) { reff = 0; }
+        if (a3 < reff) { reff = a3; }
+        if (!user_span(a2, reff, 1)) { return 0 - 1; }
+        int rn = jakel_read_user(task_uid(sched_current), rid, roff, a2, reff);
         store64(fd_off_base + rk * 8, roff + rn);
         return rn;
     }
@@ -1165,14 +1706,15 @@ int sys_dispatch(int num, int a1, int a2, int a3, int a4, int a5, int a6) {
         // SYS_WRITEFILE it changes jakel in memory only, `sync` saves it.
         if (a1 == 1 || a1 == 2) { return sys_console_write(a2, a3); }
         int wk = fd_slot(a1);
-        if (wk < 0 || a3 < 0 || load64(fd_wr_base + wk * 8) != 1) { return 0 - 1; }
+        if (wk < 0 || a3 < 0 || load64(fd_wr_base + wk * 8) != 1 || !fd_live(wk)) { return 0 - 1; }
         if (a2 < USER_VIRT_BASE) {
             serial_print("[syscall] write: refusing non-user buffer\n");
             return 0 - 1;
         }
         if (a3 == 0) { return 0; }
+        if (!user_span(a2, a3, 0)) { return 0 - 1; }
         int woff = load64(fd_off_base + wk * 8);
-        if (jakel_write(load64(fd_file_base + wk * 8) - 1, woff, a2, a3) != a3) { return 0 - 1; }
+        if (jakel_write_user(task_uid(sched_current), load64(fd_file_base + wk * 8) - 1, woff, a2, a3) != a3) { return 0 - 1; }
         store64(fd_off_base + wk * 8, woff + a3);
         return a3;
     }
@@ -1247,47 +1789,85 @@ void run_ring3_binary(int code, int code_len, int windowed) {
         serial_print("[ring3] binary too large\n");
         return;
     }
-    int code_page = pmm_alloc_page();
-    if (!code_page) { serial_print("[ring3] no code page\n"); return; }
-    int stack_page = pmm_alloc_page();
-    if (!stack_page) { serial_print("[ring3] no stack page\n"); return; }
+    if (code_len < 0) { return; }
 
+    int sl2 = serial_line_begin();
     serial_print("[ring3] loading ");
     serial_print_int(code_len);
     serial_print(" bytes\n");
+    serial_line_end(sl2);
 
-    // Copy the code into the physical page. This runs in kernel context
-    // (CR3 still the kernel's own pml4_phys, which identity-maps all
-    // physical RAM), so code_page works directly as a virtual address here
-    // -- it is only once the process is actually running in ring 3 that its
-    // code lives at USER_VIRT_BASE instead.
-    int i = 0;
-    for (i = 0; i < code_len; i += 1) {
-        store8(code_page + i, load8(code + i));
+    // The address space is the reaper's until it is committed, the same
+    // way run_elf_binary builds one, so nothing of it is lost on a failure
+    // or when the task is stopped part of the way through.
+    int proc_pml4 = proc_root_begin();
+    if (!proc_pml4) {
+        serial_print("[ring3] no pages for the address space\n");
+        return;
     }
 
-    // Patch the string address immediate if this is the built-in test binary.
-    // The test binary has a mov edi, imm32 at offset 5; the immediate (4
-    // bytes at offset 6) must be the VIRTUAL address the string will be read
-    // at once running -- USER_VIRT_BASE + MSG_OFFSET, not the physical
-    // code_page, since the ring-3 binary only ever sees USER_VIRT_BASE.
-    if (code_len == RING3_TEST_LEN && load8(code) == 0xB8 && load8(code + 1) == 1) {
-        int str_addr = USER_VIRT_BASE + RING3_TEST_MSG_OFF;
-        int off = RING3_TEST_STRADDR_OFF;
-        store32(code_page + off, str_addr);
+    // The code page is taken, filled and put in the tree with interrupts
+    // off, so it is in the tree or back with jenna before a task switch.
+    // This runs in kernel context (CR3 still the kernel's own pml4_phys,
+    // which identity-maps all physical RAM), so code_page works directly as
+    // a virtual address here -- it is only once the process is actually
+    // running in ring 3 that its code lives at USER_VIRT_BASE instead.
+    proc_irq_off();
+    int code_page = pmm_alloc_page();
+    int code_mapped = 0;
+    if (code_page) {
+        zero_page(code_page);
+        int i = 0;
+        for (i = 0; i < code_len; i += 1) {
+            store8(code_page + i, load8(code + i));
+        }
+        // Patch the string address immediate if this is the built-in test
+        // binary. The test binary has a mov edi, imm32 at offset 5; the
+        // immediate (4 bytes at offset 6) must be the VIRTUAL address the
+        // string will be read at once running -- USER_VIRT_BASE +
+        // MSG_OFFSET, not the physical code_page, since the ring-3 binary
+        // only ever sees USER_VIRT_BASE.
+        if (code_len == RING3_TEST_LEN && load8(code) == 0xB8 && load8(code + 1) == 1) {
+            int str_addr = USER_VIRT_BASE + RING3_TEST_MSG_OFF;
+            int off = RING3_TEST_STRADDR_OFF;
+            store32(code_page + off, str_addr);
+        }
+        code_mapped = map_page_user(proc_pml4, USER_VIRT_BASE, code_page);
+        if (!code_mapped) { pmm_free_page(code_page); }
+    }
+    proc_irq_on();
+    if (!code_mapped) {
+        proc_root_abandon(proc_pml4);
+        if (!code_page) { serial_print("[ring3] no code page\n"); }
+        else { serial_print("[ring3] code page could not be mapped\n"); }
+        return;
     }
 
-    int proc_pml4 = pt_create();
-    map_page_user(proc_pml4, USER_VIRT_BASE, code_page);
-    map_page_user_data(proc_pml4, USER_VIRT_BASE + 4096, stack_page);
+    proc_irq_off();
+    int stack_page = pmm_alloc_page();
+    int stack_mapped = 0;
+    if (stack_page) {
+        zero_page(stack_page);
+        stack_mapped = map_page_user_data(proc_pml4, USER_VIRT_BASE + 4096, stack_page);
+        if (!stack_mapped) { pmm_free_page(stack_page); }
+    }
+    proc_irq_on();
+    if (!stack_mapped) {
+        proc_root_abandon(proc_pml4);
+        if (!stack_page) { serial_print("[ring3] no stack page\n"); }
+        else { serial_print("[ring3] stack page could not be mapped\n"); }
+        return;
+    }
+    int sl8 = serial_line_begin();
     serial_print("[ring3] private pml4=");
     serial_print_int(proc_pml4);
     serial_print("\n");
+    serial_line_end(sl8);
 
     // Record this task's page-table root so a future preemption resumes it
     // on its own address space (see chrone.c0's task_cr3_base/sched_tick).
     int tid = sched_current;
-    store64(task_cr3_base + tid * 8, proc_pml4);
+    proc_root_commit(proc_pml4);
 
     // When this is a windowed spawn, create a dedicated kakel window for the
     // process's output before dropping to ring 3. If kakel is not active
@@ -1295,16 +1875,21 @@ void run_ring3_binary(int code, int code_len, int windowed) {
     // fall back to the existing behaviour (output goes wherever sk_putc
     // routes it -- the shell's focus or the full-screen framebuffer).
     if (windowed == 1 && kakel_active == 1) {
-        int wid = kakel_split();
+        int wid = 0 - 1;
+        // The saver covers the layout without joining either tile ring.
+        if (tid == dvala_tid) { wid = kakel_win_new(0, 0, 1, 1, 0); }
+        else { wid = kakel_split(); }
         store64(task_win_base + tid * 8, wid);
         if (wid >= 0) {
             kakel_tavla_claim(wid, tid, ring3_title_take("ring3"));
             // kakel_tavla_claim reflows, which clears every visible window --
             // including the prompts in the ones this spawn did not touch.
-            shell_reprompt_after_spawn(wid);
+            if (tid != dvala_tid) { shell_reprompt_after_spawn(wid); }
+            int sl9 = serial_line_begin();
             serial_print("[ring3] windowed spawn wid=");
             serial_print_int(wid);
             serial_print("\n");
+            serial_line_end(sl9);
         }
     }
     ring3_title_clear();
@@ -1395,58 +1980,216 @@ int elf_validate(int buf, int len) {
     if (load8(buf + 3) != 'F') { return 0; }
     if (load8(buf + 4) != 2) { return 0; } // EI_CLASS is ELFCLASS64
     if (load8(buf + 5) != 1) { return 0; } // EI_DATA is ELFDATA2LSB
+    if (load8(buf + 6) != 1) { return 0; } // EI_VERSION is EV_CURRENT
     int e_type = load8(buf + 16) + load8(buf + 17) * 256;
     if (e_type != 2) { return 0; } // ET_EXEC
     int e_machine = load8(buf + 18) + load8(buf + 19) * 256;
     if (e_machine != 62) { return 0; } // EM_X86_64
+    if (load32(buf + 20) != 1) { return 0; } // e_version is EV_CURRENT
+    int e_ehsize = load8(buf + 52) + load8(buf + 53) * 256;
+    if (e_ehsize != 64) { return 0; }
     return 1;
 }
 
-// Set by elf_load to the first unused page-aligned virtual address right
-// after the highest PT_LOAD segment it mapped -- run_elf_binary places the
-// process's stack there, so it can never collide with the program's own
-// code/data regardless of how many segments or how large they are.
-int elf_next_free_virt = 0;
+// The size of an ELF64 program header, the least e_phentsize can be.
+int ELF_PHDR_LEN = 56;
 
-// Maps every PT_LOAD segment of a validated ELF64 image already resident in
-// kernel memory at `buf` (length `len`) into `pml4`'s private address
-// space, page by page. Each page gets a fresh physical frame, zeroed (so
-// any part of the page beyond p_filesz -- a real .bss -- reads as zero
-// exactly like a real loader's demand-zero pages), then whatever slice of
-// [p_offset, p_offset+p_filesz) falls within that page is copied in before
-// the page is mapped user-accessible. Returns the entry point (e_entry) on
-// success, 0 if the image fails validation.
-int elf_load(int pml4, int buf, int len) {
+// Everything a process gets above its highest segment, in bytes. One page
+// left unmapped as a guard, the stack, then the heap's reservation.
+int elf_run_bytes() {
+    return 4096 + USER_STACK_PAGES * 4096 + HEAP_PAGES * 4096;
+}
+
+// Checks the whole of the ELF64 image at `buf` (`len` bytes) against the
+// address space `pml4` it is to be loaded into, before a single page of it
+// is mapped. Returns the page-rounded end of its highest PT_LOAD segment,
+// where the guard page under the stack starts, or 0 to refuse the image.
+//
+// The image is the kernel's own copy, so it cannot change under the check.
+// Every value that comes from it is a signed 64-bit number, and one with its
+// top bit set is negative and refused before it is used. Each bound is a
+// comparison against what is left below the limit (`n <= limit - p`), never
+// a sum tested after it is made, so nothing here can wrap.
+//
+// Refused are a header elf_validate refuses, an image shorter than a header
+// or longer than ELF_MAX_BYTES, no program headers, a stride below 56, a
+// program header table that does not lie inside the image, and for each
+// PT_LOAD
+//   - p_flags with both PF_W and PF_X, even when p_memsz is 0
+//   - a negative offset, address or size, or p_filesz over p_memsz
+//   - file bytes [p_offset, p_offset + p_filesz) not inside the image, even
+//     when p_filesz is 0
+//   - memory [p_vaddr, p_vaddr + p_memsz) not inside the user range
+//     [USER_VIRT_BASE, USER_TOP), or lying under a table the process shares
+//     with the kernel (pt_private_range)
+//   - pages, rounded out, that overlap another segment's
+// A PT_LOAD of no memory maps nothing and is held to the file bounds only.
+// The entry point must lie within the bytes, not the rounded pages, of a
+// PT_LOAD of some memory that is executable. And the stack, heap and lager
+// block table run_elf_binary places above the image must fit below USER_TOP
+// and clear of the kernel's tables as well.
+//
+// Every pair of segments is compared, which the image cap and the 56-byte
+// stride bound at about 4700 headers.
+int elf_check(int pml4, int buf, int len) {
+    if (len < 64 || len > ELF_MAX_BYTES) { return 0; }
     if (elf_validate(buf, len) == 0) { return 0; }
     int e_entry = load64(buf + 24);
     int e_phoff = load64(buf + 32);
     int e_phentsize = load8(buf + 54) + load8(buf + 55) * 256;
     int e_phnum = load8(buf + 56) + load8(buf + 57) * 256;
+    if (e_phnum == 0 || e_phentsize < ELF_PHDR_LEN) { return 0; }
+    if (e_phoff < 0 || e_phoff > len) { return 0; }
+    if (e_phnum > (len - e_phoff) / e_phentsize) { return 0; }
 
-    elf_next_free_virt = 0;
+    int top = 0;
+    int entry_ok = 0;
     int i = 0;
     for (i = 0; i < e_phnum; i += 1) {
         int ph = buf + e_phoff + i * e_phentsize;
-        int p_type = load32(ph);
-        if (p_type == 1) { // PT_LOAD
+        if (load32(ph) == 1) { // PT_LOAD
+            // W^X, no segment may be both writable (PF_W) and executable (PF_X).
+            if ((load32(ph + 4) & 3) == 3) { return 0; }
             int p_offset = load64(ph + 8);
             int p_vaddr  = load64(ph + 16);
             int p_filesz = load64(ph + 32);
             int p_memsz  = load64(ph + 40);
-            // What the segment may do. Code that may not be written, data
-            // that may not be run, and an image of one segment that is both
-            // is mapped as both.
-            int p_flags  = load32(ph + 4);
-            int run_it = (p_flags & 1) == 1;
-            int write_it = (p_flags & 2) == 2;
+            if (p_offset < 0 || p_vaddr < 0 || p_filesz < 0 || p_memsz < 0) { return 0; }
+            if (p_filesz > p_memsz) { return 0; }
+            if (p_offset > len || p_filesz > len - p_offset) { return 0; }
+            if (p_memsz > 0) {
+                if (p_vaddr < USER_VIRT_BASE || p_vaddr >= USER_TOP) { return 0; }
+                if (p_memsz > USER_TOP - p_vaddr) { return 0; }
+                // USER_TOP is page-aligned and the end is at most USER_TOP,
+                // so rounding it up stays at most USER_TOP too.
+                int lo = (p_vaddr / 4096) * 4096;
+                int hi = ((p_vaddr + p_memsz + 4095) / 4096) * 4096;
+                if (!pt_private_range(pml4, lo, hi)) { return 0; }
+                // Every earlier PT_LOAD has passed these checks already.
+                int j = 0;
+                for (j = 0; j < i; j += 1) {
+                    int qh = buf + e_phoff + j * e_phentsize;
+                    int q_vaddr = load64(qh + 16);
+                    int q_memsz = load64(qh + 40);
+                    if (load32(qh) == 1 && q_memsz > 0) {
+                        int q_lo = (q_vaddr / 4096) * 4096;
+                        int q_hi = ((q_vaddr + q_memsz + 4095) / 4096) * 4096;
+                        if (lo < q_hi && q_lo < hi) { return 0; }
+                    }
+                }
+                if (hi > top) { top = hi; }
+                if ((load32(ph + 4) & 1) == 1 && e_entry >= p_vaddr
+                    && e_entry - p_vaddr < p_memsz) {
+                    entry_ok = 1;
+                }
+            }
+        }
+    }
+    if (!entry_ok) { return 0; }
+
+    // What run_elf_binary and lager_place put above the image.
+    if (top > USER_TOP - elf_run_bytes()) { return 0; }
+    int tab = lager_tab_at(top + elf_run_bytes());
+    if (tab > USER_TOP - LAGER_TAB_PAGES * 4096) { return 0; }
+    if (!pt_private_range(pml4, top, tab + LAGER_TAB_PAGES * 4096)) { return 0; }
+    return top;
+}
+
+// Interrupts off and on around the few steps of building an address space
+// that a task switch must not come between, the allocation of a frame and
+// the moment the tree or the reaper's slot holds it. The loaders run in
+// ordinary task context, where interrupts are on.
+void proc_irq_off() {
+    int off = disable_interrupts;
+    off();
+    return;
+}
+
+void proc_irq_on() {
+    int on = enable_interrupts;
+    on();
+    return;
+}
+
+// Makes a new address space for the current task and hands it to the reaper
+// in the same step (task_pending_root_base, chrone.c0), so a task stopped
+// at any point of its start leaves nothing behind. The task keeps running
+// on the kernel's root. Returns the root, or 0 when there are no pages for
+// one. A root an earlier failed start of this task gave up is waited out
+// first, which takes until the next tick.
+int proc_root_begin() {
+    int me = sched_current;
+    while (load64(task_pending_root_base + me * 8) != 0) { cpu_wait(); }
+    proc_irq_off();
+    int root = pt_create();
+    if (root) { store64(task_pending_root_base + me * 8, root); }
+    proc_irq_on();
+    return root;
+}
+
+// The start failed. The root goes to the reaper, which frees it on the next
+// tick. The caller does not touch it again.
+void proc_root_abandon(int root) {
+    store64(task_pending_root_base + sched_current * 8, root + 1);
+    return;
+}
+
+// The address space is built. It becomes the task's own, the one a resume
+// loads and the reaper frees when the task ends, in one step.
+void proc_root_commit(int root) {
+    int me = sched_current;
+    proc_irq_off();
+    store64(task_cr3_base + me * 8, root);
+    store64(task_pending_root_base + me * 8, 0);
+    proc_irq_on();
+    return;
+}
+
+// Maps every PT_LOAD segment of the ELF64 image at `buf` (length `len`),
+// resident in kernel memory, into `pml4`'s private address space, page by
+// page, once elf_check has accepted all of it. Each page gets a fresh
+// physical frame, zeroed (so any part of the page beyond p_filesz -- a real
+// .bss -- reads as zero exactly like a real loader's demand-zero pages),
+// then whatever slice of [p_offset, p_offset+p_filesz) falls within that
+// page is copied in before the page is mapped user-accessible. Returns the
+// entry point (e_entry) on success, 0 if elf_check refuses the image, a page
+// cannot be had, or map_page_user refuses a page. A frame is taken and put
+// in the tree with interrupts off, so it is either in `pml4` or back with
+// jenna by the time a task switch can come. The ones mapped belong to
+// `pml4`, which the caller has given the reaper (proc_root_begin).
+int elf_load(int pml4, int buf, int len) {
+    if (!elf_check(pml4, buf, len)) { return 0; }
+    int e_entry = load64(buf + 24);
+    int e_phoff = load64(buf + 32);
+    int e_phentsize = load8(buf + 54) + load8(buf + 55) * 256;
+    int e_phnum = load8(buf + 56) + load8(buf + 57) * 256;
+
+    int i = 0;
+    for (i = 0; i < e_phnum; i += 1) {
+        int ph = buf + e_phoff + i * e_phentsize;
+        int p_type = load32(ph);
+        int p_memsz = load64(ph + 40);
+        if (p_type == 1 && p_memsz > 0) { // PT_LOAD
+            int p_offset = load64(ph + 8);
+            int p_vaddr  = load64(ph + 16);
+            int p_filesz = load64(ph + 32);
+            // What the segment may do. Code that may not be written, and
+            // data that may not be run. elf_check has refused a segment that
+            // asks for both.
+            int run_it = (load32(ph + 4) & 1) == 1;
 
             int seg_start = (p_vaddr / 4096) * 4096;
             int seg_end = ((p_vaddr + p_memsz + 4095) / 4096) * 4096;
-            if (seg_end > elf_next_free_virt) { elf_next_free_virt = seg_end; }
 
             int page = 0;
             for (page = seg_start; page < seg_end; page += 4096) {
+                proc_irq_off();
                 int frame = pmm_alloc_page();
+                if (!frame) {
+                    proc_irq_on();
+                    serial_print("[elf] out of physical pages\n");
+                    return 0;
+                }
                 zero_page(frame);
                 // The part of this page the file supplies, the rest stays zero.
                 int lo = page;
@@ -1456,15 +2199,17 @@ int elf_load(int pml4, int buf, int len) {
                 if (hi > lo) {
                     mem_copy(frame + (lo - page), buf + p_offset + (lo - p_vaddr), hi - lo);
                 }
-                if (run_it && write_it) {
-                    map_page_user(pml4, page, frame);
-                } else if (run_it) {
-                    map_page_user(pml4, page, frame);
+                int mapped = 0;
+                if (run_it) {
+                    mapped = map_page_user(pml4, page, frame);
                     int leaf = pt_leaf(pml4, page);
-                    if (leaf) { store64(leaf, frame | 5); }
+                    if (mapped && leaf) { store64(leaf, frame | 5); }
                 } else {
-                    map_page_user_data(pml4, page, frame);
+                    mapped = map_page_user_data(pml4, page, frame);
                 }
+                if (!mapped) { pmm_free_page(frame); }
+                proc_irq_on();
+                if (!mapped) { return 0; }
             }
         }
     }
@@ -1474,8 +2219,8 @@ int elf_load(int pml4, int buf, int len) {
 // Parses and runs a real ELF64 executable in ring 3, the same per-process-
 // isolated way run_ring3_binary runs the hand-crafted flat binary, with its own
 // pt_create()'d address space, its own task_cr3_base entry, its own kernel
-// stack. The stack page is placed at elf_next_free_virt (set by elf_load),
-// guaranteed clear of every loaded segment. Right after the stack, every
+// stack. The stack is placed one guard page above the end of the highest
+// segment (elf_check), clear of every loaded segment. Right after the stack, every
 // process also gets a fixed-size, eagerly-mapped heap region (HEAP_PAGES
 // pages) for SYS_ALLOC to bump-allocate from -- eager rather than demand-
 // paged, matching this codebase's general preference for the simpler
@@ -1525,24 +2270,50 @@ void run_elf_binary(int code, int code_len, int windowed) {
         kfree(code);
         return;
     }
-    int proc_pml4 = pt_create();
+    // The new address space is the reaper's to free from the moment it
+    // exists until it is committed below, so a start that fails, or a task
+    // stopped while it starts, leaves no page of it behind.
+    int proc_pml4 = proc_root_begin();
+    if (!proc_pml4) {
+        spawn_image_release(code);
+        kfree(code);
+        serial_print("[elf] no pages for the address space\n");
+        return;
+    }
     int entry = elf_load(proc_pml4, code, code_len);
+    // Where the image ends, the same answer elf_load had from elf_check,
+    // kept here rather than in a global another starting task could change.
+    int image_top = 0;
+    if (entry) { image_top = elf_check(proc_pml4, code, code_len); }
     spawn_image_release(code);
     kfree(code);
-    if (!entry) {
+    if (!entry || !image_top) {
+        proc_root_abandon(proc_pml4);
         serial_print("[elf] invalid ELF64 image\n");
         return;
     }
 
     // One page above the image stays unmapped, so a stack that runs off its
-    // bottom touches nothing of the program's own.
-    int stack_virt = elf_next_free_virt + 4096;
+    // bottom touches nothing of the program's own. elf_check has seen that
+    // the stack, heap and block table fit.
+    int stack_virt = image_top + 4096;
     int sp_i = 0;
     for (sp_i = 0; sp_i < USER_STACK_PAGES; sp_i += 1) {
+        proc_irq_off();
         int stack_page = pmm_alloc_page();
-        if (!stack_page) { serial_print("[elf] no stack page\n"); return; }
-        zero_page(stack_page);
-        map_page_user_data(proc_pml4, stack_virt + sp_i * 4096, stack_page);
+        int stack_mapped = 0;
+        if (stack_page) {
+            zero_page(stack_page);
+            stack_mapped = map_page_user_data(proc_pml4, stack_virt + sp_i * 4096, stack_page);
+            if (!stack_mapped) { pmm_free_page(stack_page); }
+        }
+        proc_irq_on();
+        if (!stack_mapped) {
+            proc_root_abandon(proc_pml4);
+            if (!stack_page) { serial_print("[elf] no stack page\n"); }
+            else { serial_print("[elf] stack page could not be mapped\n"); }
+            return;
+        }
     }
     int stack_top = stack_virt + USER_STACK_PAGES * 4096;
 
@@ -1556,6 +2327,7 @@ void run_elf_binary(int code, int code_len, int windowed) {
     // processes in a boot would run off the end of it. Programs that allocate
     // nothing cost nothing, and HEAP_PAGES is a ceiling rather than a price.
 
+    int sl6 = serial_line_begin();
     serial_print("[elf] loaded, entry=");
     serial_print_int(entry);
     serial_print(" stack=");
@@ -1565,38 +2337,44 @@ void run_elf_binary(int code, int code_len, int windowed) {
     serial_print(" pml4=");
     serial_print_int(proc_pml4);
     serial_print("\n");
+    serial_line_end(sl6);
 
     int tid = sched_current;
-    store64(task_cr3_base + tid * 8, proc_pml4);
+    proc_root_commit(proc_pml4);
     store64(task_heap_next_base + tid * 8, heap_virt);
     store64(task_heap_mapped_base + tid * 8, heap_virt);
     store64(task_heap_end_base + tid * 8, heap_virt + HEAP_PAGES * 4096);
     lager_place(tid, heap_virt + HEAP_PAGES * 4096);
     fd_reset(tid);
+    task_hold_flush(tid);
 
     if (windowed >= 1 && kakel_active == 1) {
-        // kakel_split refuses (returns -1) when the visible layout is full,
-        // and the process then runs unwindowed with its output going to
-        // whichever window has focus. Say so, rather than leaving the user to
-        // wonder why the fourth game did not get a tile of its own -- and see
-        // the note in kakel_split about slots being consumed even when the
-        // layout cannot show them.
-        int wid = kakel_split();
+        if (tid == dvala_tid) { proc_irq_off(); }
+        // Ordinary programs need a visible tile from kakel_split.
+        int wid = 0 - 1;
+        // The saver covers the layout without joining either tile ring.
+        if (tid == dvala_tid) { wid = kakel_win_new(0, 0, 1, 1, 0); }
+        else { wid = kakel_split(); }
         store64(task_win_base + tid * 8, wid);
         if (wid < 0) {
             int lost = ring3_title_take(0);
             if (lost) { kfree(lost); }
+            if (tid == dvala_tid) { proc_irq_on(); task_exit(); }
             serial_print("[elf] no window available, running unwindowed\n");
             sk_print("start: no free window, close one first\n");
         }
         if (wid >= 0) {
             kakel_tavla_claim(wid, tid, ring3_title_take("elf"));
             if (windowed == 2) { kakel_focus_to(wid); }
-            shell_reprompt_after_spawn(wid);
+            dvala_ready(tid, wid);
+            if (tid != dvala_tid) { shell_reprompt_after_spawn(wid); }
+            int sl8 = serial_line_begin();
             serial_print("[elf] windowed spawn wid=");
             serial_print_int(wid);
             serial_print("\n");
+            serial_line_end(sl8);
         }
+        if (tid == dvala_tid) { proc_irq_on(); }
     }
     ring3_title_clear();
 
@@ -1612,9 +2390,10 @@ void run_elf_binary(int code, int code_len, int windowed) {
 // in the task's slot of spawn_rec_base, the task's entry point taking no
 // arguments. The ELF image, its length, the arguments block (see chrone.c0),
 // the directory relative paths start from, windowed (0 the focused window, 1
-// one of its own), focus, and the window's title. Per task, since a kernel
-// task calling spawn_program twice in a row can be preempted before the
-// first task has read what it was given.
+// one of its own), focus, the window's title, the uid, the creation stamp of
+// that directory (see task_cwd), and whether it is a build (task_build).
+// Per task, since a kernel task calling spawn_program twice in a row can be
+// preempted before the first task has read what it was given.
 //
 // The record stays in the slot, owning the image, until run_elf_binary is
 // done with it, and the arguments and the title leave it as they are moved
@@ -1622,7 +2401,7 @@ void run_elf_binary(int code, int code_len, int windowed) {
 // starting leaves the reaper (spawn_slot_drop) whatever it still had. Each
 // field is emptied before it is stored elsewhere, so a stop between the two
 // loses it rather than freeing it twice.
-int SPAWN_REC = 56;
+int SPAWN_REC = 80;
 int spawn_rec_base = 0;
 
 // run_elf_binary has copied `code` into the program's pages and is about to
@@ -1637,22 +2416,35 @@ void spawn_image_release(int code) {
     kfree(rec);
     return;
 }
-// 0 when the next spawn_program should run its program in the window that
-// has the focus instead of one of its own. Read once, then back to 1.
-int spawn_next_windowed = 1;
-// 1 when the next spawn_program's window should take the focus, as an
-// editor opened from the shell or hylla does. start leaves the focus where
-// it is. Read once, then back to 0.
-int spawn_next_focus = 0;
-// 1 when the next spawn_program's program should print to the serial line
-// only (task_quiet). Read once, then back to 0.
-int spawn_next_quiet = 0;
+// How a spawn places its program, passed with each spawn so no other task
+// can take the choice in between. SPAWN_WINDOWED gives the program a window
+// of its own instead of the one with the focus, SPAWN_FOCUS makes that
+// window take the focus, as an editor opened from the shell or hylla does,
+// and SPAWN_QUIET sends what it prints to the serial line only (task_quiet).
+int SPAWN_WINDOWED = 1;
+int SPAWN_FOCUS    = 2;
+int SPAWN_QUIET    = 4;
 
 // Opens `args` in the editor program `prog` (its path and a space, such as
 // "/skrift.elf "), in a window of its own that takes the focus. `cwd` is
 // where a relative path starts from. Returns the editor's task id, or
 // spawn_program's negative answer.
-int editor_open(int cwd, int prog, int args) {
+int editor_open(int uid, int cwd, int cwd_stamp, int prog, int args) {
+    return editor_open_focus(uid, cwd, cwd_stamp, prog, args, 1);
+}
+
+// 1 when the focused window is a tavla of the calling task. A program may
+// move the focus from its own window to one it opens, and never from a
+// window it does not own, so a program in the background cannot pull the
+// keys someone is typing into a window it made.
+int sys_holds_focus() {
+    if (kakel_active != 1 || kakel_focus < 0) { return 0; }
+    if (!kakel_is_tavla(kakel_focus)) { return 0; }
+    return load64(kakel_owner_base + kakel_focus * 8) == sched_current;
+}
+
+// editor_open, with focus 0 for a window that opens without the focus.
+int editor_open_focus(int uid, int cwd, int cwd_stamp, int prog, int args, int focus) {
     int np = 0;
     while (load8(prog + np) != 0) { np += 1; }
     int n = 0;
@@ -1662,9 +2454,9 @@ int editor_open(int cwd, int prog, int args) {
     int i = 0;
     for (i = 0; i < np; i += 1) { store8(line + i, load8(prog + i)); }
     for (i = 0; i <= n; i += 1) { store8(line + np + i, load8(args + i)); }
-    spawn_next_focus = 1;
-    int tid = spawn_program(cwd, line);
-    spawn_next_focus = 0;
+    int mode = SPAWN_WINDOWED;
+    if (focus) { mode = SPAWN_WINDOWED | SPAWN_FOCUS; }
+    int tid = spawn_system_program(uid, cwd, cwd_stamp, line, mode);
     kfree(line);
     return tid;
 }
@@ -1698,19 +2490,78 @@ int elf_title(int path) {
     return t;
 }
 
-int spawn_program(int cwd, int line) {
-    int args = sk_args_block(line);
+int spawn_program(int uid, int cwd, int cwd_stamp, int line) {
+    return spawn_program_mode(uid, cwd, cwd_stamp, line, SPAWN_WINDOWED);
+}
+
+int spawn_program_mode(int uid, int cwd, int cwd_stamp, int line, int mode) {
+    return spawn_program_owned(uid, cwd, cwd_stamp, sk_args_block(line), 0 - 1, mode);
+}
+
+
+// The programs the kernel starts by a fixed path, coff, smed, the editors,
+// hylla, fanfar and dvala, start only from a file root owns, so a file a
+// user put in place of one never runs as whoever asked for it. Returns -8
+// for a file of another owner, else as spawn_program.
+int spawn_system_program(int uid, int cwd, int cwd_stamp, int line, int mode) {
+    return spawn_program_owned(uid, cwd, cwd_stamp, sk_args_block(line), 0, mode);
+}
+
+int spawn_system_quoted(int uid, int cwd, int cwd_stamp, int line, int mode) {
+    return spawn_program_owned(uid, cwd, cwd_stamp, sk_args_block_quoted(line), 0, mode);
+}
+
+// Starts the program of a quoted line from a file that must belong to
+// `owner`, such as the program execute has just built as that user. Returns
+// -8 when it does not.
+int spawn_owned_quoted(int uid, int cwd, int cwd_stamp, int line, int owner) {
+    return spawn_program_owned(uid, cwd, cwd_stamp, sk_args_block_quoted(line), owner, SPAWN_WINDOWED);
+}
+
+// The one place a program file is found, checked and read, all in one jakel
+// section, so the file read is the file checked. The file must belong to
+// `owner`. With owner -1 it must belong to uid or to root, so a user starts
+// only programs that user or root put in place, and root only root's own.
+// cwd comes with the creation stamp the caller kept with it (sk_cwd_stamp,
+// task_cwd_stamp), and a cwd other than the root that no longer has it
+// counts as gone, so the program is never looked for in a folder that took
+// the old one's slot. Returns -8 for a file of another owner, else as
+// spawn_program.
+int spawn_program_owned(int uid, int cwd, int cwd_stamp, int args, int owner, int mode) {
+    if (uid < 0 || uid >= 8) { if (args) { kfree(args); } return -1; }
     if (!args) { return 0 - 1; }
     int name = args + 8;    // the first word, NUL-terminated
+    int held = jakel_lock();
+    if (cwd != 0 && (!jakel_is_dir(cwd) || jakel_stamp(cwd) != cwd_stamp)) {
+        jakel_unlock(held); kfree(args); return 0 - 2;
+    }
+    if (cwd == 0) { cwd_stamp = 0; }
     int fid = jakel_open(cwd, name);
-    if (fid < 0) { kfree(args); return 0 - 2; }
-    if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) { kfree(args); return 0 - 3; }
+    if (fid < 0) { jakel_unlock(held); kfree(args); return 0 - 2; }
+    if (load64(jakel_type_base + fid * 8) != JAKEL_TYPE_FILE) {
+        jakel_unlock(held); kfree(args); return 0 - 3;
+    }
+    int fown = load64(jakel_uid_base + fid * 8);
+    if ((owner >= 0 && fown != owner) || (owner < 0 && fown != uid && fown != 0)) {
+        jakel_unlock(held); kfree(args); return 0 - 8;
+    }
+    // The kernel's own coff and smed, the root-owned /coff.elf and /smed.elf,
+    // run as builds however they are started (task_build).
+    int build = 0;
+    if (fown == 0 && load64(jakel_parent_base + fid * 8) == 0
+        && (jakel_str_eq(load64(jakel_name_base + fid * 8), "coff.elf")
+            || jakel_str_eq(load64(jakel_name_base + fid * 8), "smed.elf"))) {
+        build = 1;
+    }
     int fsize = load64(jakel_size_base + fid * 8);
-    if (fsize == 0 || fsize > ELF_MAX_BYTES) { kfree(args); return 0 - 4; }
+    if (fsize == 0 || fsize > ELF_MAX_BYTES) { jakel_unlock(held); kfree(args); return 0 - 4; }
     int buf = kmalloc(fsize);
-    if (!buf) { kfree(args); return 0 - 4; }
+    if (!buf) { jakel_unlock(held); kfree(args); return 0 - 4; }
     int task_nm = 0;
-    jakel_read(fid, 0, buf, fsize);
+    if (!jakel_can_read(uid, fid) || jakel_read(uid, fid, 0, buf, fsize) != fsize) {
+        jakel_unlock(held); kfree(buf); kfree(args); return -7;
+    }
+    jakel_unlock(held);
     if (fsize < 4 || load8(buf) != 0x7F || load8(buf + 1) != 'E'
         || load8(buf + 2) != 'L' || load8(buf + 3) != 'F') {
         kfree(buf);
@@ -1729,24 +2580,33 @@ int spawn_program(int cwd, int line) {
         ring3_title_base = tb;
         spawn_rec_base = rb;
     }
+    // Zeroed before it is published, since a task can be switched to while
+    // this runs.
+    if (!task_build_base) {
+        int bb = kmalloc(MAX_TASKS * 8);
+        if (!bb) { kfree(buf); kfree(args); return 0 - 5; }
+        int bi = 0;
+        for (bi = 0; bi < MAX_TASKS; bi += 1) { store64(bb + bi * 8, 0); }
+        task_build_base = bb;
+    }
     int rec = kmalloc(SPAWN_REC);
     if (!rec) { kfree(buf); kfree(args); return 0 - 4; }
     store64(rec, buf);
     store64(rec + 8, fsize);
     store64(rec + 16, args);
     store64(rec + 24, cwd);
-    store64(rec + 32, spawn_next_windowed);
-    spawn_next_windowed = 1;
-    store64(rec + 40, spawn_next_focus);
-    spawn_next_focus = 0;
-    int quiet = spawn_next_quiet;
-    spawn_next_quiet = 0;
+    store64(rec + 64, cwd_stamp);
+    store64(rec + 72, build);
+    store64(rec + 32, (mode & SPAWN_WINDOWED) != 0);
+    store64(rec + 40, (mode & SPAWN_FOCUS) != 0);
+    int quiet = (mode & SPAWN_QUIET) != 0;
     // Name the tavla after the file. An owned copy, not `name` itself, since
     // the caller's line is gone long before the spawned task reaches
     // kakel_tavla_claim.
     if (load8(name) == '/') { task_nm = sk_strdup(name + 1); }
     else { task_nm = sk_strdup(name); }
     store64(rec + 48, elf_title(name));
+    store64(rec + 56, uid);
     int tid = task_spawn(spawn_elf_entry);
     // The task waits for this before it does anything.
     if (tid >= 0) { store64(spawn_rec_base + tid * 8, rec); }
@@ -1798,6 +2658,7 @@ void spawn_elf_entry() {
     int me = sched_current;
     while (load64(spawn_rec_base + me * 8) == 0) { cpu_wait(); }
     int rec = load64(spawn_rec_base + me * 8);
+    task_set_uid(me, load64(rec + 56));
     int code = load64(rec);
     int len  = load64(rec + 8);
     int win  = load64(rec + 32);
@@ -1811,10 +2672,20 @@ void spawn_elf_entry() {
     store64(ring3_title_base + me * 8, title);
     if (!task_cwd_base) {
         task_cwd_base = kmalloc(MAX_TASKS * 8);
+        task_cwd_stamp_base = kmalloc(MAX_TASKS * 8);
         int ci = 0;
-        for (ci = 0; ci < MAX_TASKS; ci += 1) { store64(task_cwd_base + ci * 8, 0); }
+        for (ci = 0; ci < MAX_TASKS; ci += 1) {
+            store64(task_cwd_base + ci * 8, 0);
+            store64(task_cwd_stamp_base + ci * 8, 0);
+        }
     }
     store64(task_cwd_base + me * 8, cwd);
+    store64(task_cwd_stamp_base + me * 8, load64(rec + 64));
+    int build = load64(rec + 72);
+    task_set_build(me, build);
+    // A build whose flag did not hold would read like any program, so it
+    // does not run at all.
+    if (build && !task_build(me)) { task_exit(); }
     task_set_end(me, 3, 0);
     if (focus == 1 && win == 1) { win = 2; }
     run_elf_binary(code, len, win);

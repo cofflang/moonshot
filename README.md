@@ -17,25 +17,26 @@ language whose compiler, coff, is a separate project in the same stack.
 The end goal is an OS with a real graphical interface and its own windowing
 system, not a serial-only kernel. Every test runs headless in QEMU and reads
 the serial log or the framebuffer; there is also a graphical mode you can sit
-in front of.
+in front of. Users are kept apart only for the length of one boot, see
+[Users](#users).
 
 ## What is in the repository
 
 | Path | What it is |
 |------|------------|
-| `kernel/core/` | `kmain.c0`, the kernel entry point, which `include`s every other subsystem so coff compiles one flat translation unit, and the core: knekt (boot and interrupts), jenna (memory and paging), chrone (the scheduler and the clock), lager (the ring-3 allocator), syscall (ring-3 system calls and the ELF loader), interrupts. Also `boot.s`, the hand-written Multiboot entry stub that gets the CPU into 64-bit long mode, `ring3_handlers.s`, the ring-3 entry and exit trampolines, `linker.ld`, which places the kernel at 1 MiB, and the GRUB menus, `grub.cfg` and `grub_test.cfg` for the test boot. |
+| `kernel/core/` | `kmain.c0`, the kernel entry point, which `include`s every other subsystem so coff compiles one flat translation unit, and the core: knekt (boot and interrupts), jenna (memory and paging), chrone (the scheduler and the clock), lager (the ring-3 allocator), syscall (ring-3 system calls and the ELF loader), interrupts, and kraft (a checker for the ACPI tables firmware leaves in memory). Also `boot.s`, the hand-written Multiboot entry stub that gets the CPU into 64-bit long mode, `ring3_handlers.s`, the ring-3 entry and exit trampolines, `linker.ld`, which places the kernel at 1 MiB, and the GRUB menus, `grub.cfg` and `grub_test.cfg` for the test boot. |
 | `kernel/drivers/` | ata (disk), keyboard, klick (mouse), oljud (Sound Blaster 16), serial, vga (the text-mode fallback). |
-| `kernel/screen/` | punkt (the framebuffer and font) and kakel (windowing). |
-| `kernel/files/` | jakel (the filesystem) and `index_html.c0`, the pages utsikt opens and the test pages its scripts and elements are checked on, put on the filesystem at boot like the programs are. |
+| `kernel/screen/` | punkt (the framebuffer and font), kakel (windowing) and dvala (the screen saver). |
+| `kernel/files/` | jakel (the filesystem) and `index_html.c0`, the pages utsikt opens and the test pages its scripts and elements are checked on, put on the filesystem at boot like the programs are. `LOCKING.md` lists what touches jakel's tables without its lock. |
 | `kernel/shell/` | raket (init and the login screen), skalman (the shell) and its scripts, repl (the REPL) and jit (its compiler). |
-| `programs/` | The sources of the ring-3 programs the kernel carries. skrift (the text editor), pensel (the pixel editor), form (the 3D modeller), hylla (the file manager), lira (the piano roll) and insyn (a look inside the machine) each have a folder. Infecteria, the game, and djup, the 3D form draws with, come from Gnista. The browser engine is in `programs/utsikt/`, beside a frame-rate probe and the small programs the tests run. `programs/lib/` holds `moon.c0`, the ring-3 library they all include, and lira's noter song format and synth, which Infecteria plays its music with too. See [Programs](#programs). |
-| `tests/` | The test scripts, sixty-six of them besides `run_qemu.sh`, and `run_suite.sh`, which runs them all against a snapshot of the tree, several at a time. See [Testing](#testing). |
-| `tests/elf/` | Twenty-eight small c0 programs compiled with `coff --elf` and run inside the OS, by `verify_elf_backend.sh` and by the scripts that need a program to drive, so ring-3 code is checked end to end. |
-| `tools/` | `gen_programs.sh` and `gen_elf_tests.sh` compile the ring-3 programs and the tests/elf programs into `build/` for the kernel to embed, and `bake.c0` packs the latter into one file. `build.sh` runs them. `screenshot.sh` boots headlessly and saves the screen to `screenshots/` as a PNG. |
+| `programs/` | The sources of the ring-3 programs the kernel carries. skrift (the text editor), pensel (the pixel editor), form (the 3D modeller), hylla (the file manager), lira (the piano roll) and insyn (a look inside the machine) each have a folder, and tapet (a picture of a diagonal weave from a seed) has one too. dvala is the screen saver's field of stars and fanfar is the sign-in sound. `lisp.c0`, from Gnista, is a small Lisp the tests run. Infecteria, the game, and djup, the 3D form draws with, come from Gnista. The browser engine is in `programs/utsikt/`, beside a frame-rate probe and the small programs the tests run. `programs/lib/` holds `moon.c0`, the ring-3 library they all include, and lira's noter song format and synth, which Infecteria plays its music with too. See [Programs](#programs). |
+| `tests/` | The test scripts, a hundred and three of them besides `run_qemu.sh`, with Python helpers for the QEMU monitor beside them, and `run_suite.sh`, which runs them all against a snapshot of the tree, several at a time. See [Testing](#testing). |
+| `tests/elf/` | Thirty-two small c0 programs compiled with `coff --elf` and run inside the OS, by `verify_elf_backend.sh` and by the scripts that need a program to drive, so ring-3 code is checked end to end. |
+| `tools/` | `gen_programs.sh` and `gen_elf_tests.sh` compile the ring-3 programs and the tests/elf programs into `build/` for the kernel to embed, and `bake.c0` packs the latter into one file. `build.sh` runs them. `screenshot.sh` boots headlessly and saves the screen to `screenshots/` as a PNG. `site_copy.c0` and `site_images.c0` are the host tools behind the optional site disk, see [A disk of your own pages](#a-disk-of-your-own-pages-optional). |
 | `build.sh` | Verifies the compiler and the assembler, then builds `build/moonshot.elf`. |
 | `run_qemu.sh` | The main regression gate. Builds, boots headlessly, and asserts invariants on the serial log. |
 | `run_graphical.sh` | Boots the kernel in a real QEMU window you can type and click in. `run_graphical_mac.sh` does the same on macOS. |
-| `make_usb.sh` | Builds the kernel and writes a bootable USB stick for real hardware, UEFI or BIOS. See [Running on real hardware](#running-on-real-hardware). |
+| `make_usb.sh` | Builds the kernel and writes a bootable USB stick for real hardware, UEFI or BIOS. `--iso FILE` saves the image and writes no device. See [Running on real hardware](#running-on-real-hardware). |
 | `sync_utsikt.sh` | Pulls a newer utsikt into `programs/utsikt/` from its own repository, or checks that the copy here matches it. See [Programs](#programs). |
 | `LICENSE` | GPL-3.0. |
 
@@ -56,9 +57,10 @@ You need Linux on x86_64, and these packages on Arch (`apt` names vary):
 The kernel is compiled by `coff1`, the self-hosted c0 compiler. That compiler
 lives in its own repository, and this one expects to find it at `../c0-coff/`
 next to the moonshot directory, together with smed, coff's own assembler and
-linker. This release needs coff v0.7.0 or later, the first whose file
-builtins work under `--elf`, which coff and smed need to run inside
-moonshot, and whose smed writes code and data as separate segments.
+linker. This release needs coff v0.8.0 or later, the first with the compound
+operators `&=`, `|=`, `^=`, `<<=` and `>>=`, which the kernel's system call
+code uses. It keeps what v0.7.0 brought, file builtins that work under
+`--elf` and a smed that writes code and data as separate segments.
 No pre-built image is needed.
 
 ```sh
@@ -78,6 +80,31 @@ already bootstrapped coff by hand following its README, `build.sh` runs that
 audit once and records the result. Either way the first build takes a few
 minutes and every build after it is seconds.
 
+### A disk of your own pages, optional
+
+`build.sh` can also write a second disk image that holds a folder of your own
+pages and pictures. It does this only when two files exist in
+`~/.config/moonshot/`. `site-root` holds one line, the absolute path of the
+folder to take files from. `site-files` lists the files to copy, one name
+relative to that folder per line. A build with no `site-root`, no
+folder or no list says `skipping /site` and goes on. It still writes
+`build/site-disk.img`, and that disk is empty.
+
+`build.sh` refuses, and stops, when the folder path is relative or holds
+anything outside letters, digits and `_ . / -`, when the folder or any part of a
+listed path is a symbolic link, when a listed file is missing, is not a regular
+file or has a hard link, when a name is absolute, hidden or leaves the folder,
+or when the list changes between the check and the copy. Pictures ending in
+`.jpg`, `.png` or `.gif` are converted to sprites, and every other file is
+copied as it is. The disk image is exactly 10 MiB, holds at most 40 nodes counting the root folder and takes at most 1 MiB of
+file data.
+
+The disk is written to `build/site-disk.img`, and its path to
+`build/site-disk.path`. It is a build product, like the kernel in `build/`, and
+nothing attaches it for you. `run_qemu.sh`, `run_graphical.sh` and the kernel
+do not read it, and only `tests/verify_site_build.py` does. To see the pages,
+add it to QEMU by hand as a second disk. They are under `/site`.
+
 ## Running
 
 ```sh
@@ -85,8 +112,10 @@ minutes and every build after it is seconds.
 ./run_graphical.sh   # a real QEMU window (needs qemu-ui-gtk and qemu-ui-sdl on Arch)
 ```
 
-Both create `disk.img` if it does not exist. Log in as `root` with an empty
-password; `help` lists the shell commands, `help (command)` explains one.
+`run_graphical.sh` creates `disk.img` if it does not exist. `run_qemu.sh` boots
+from a new disk made for each run and removes it afterwards. Log in as `root`
+with an empty password and run `passwd` first, since users, passwords and owners
+are not saved and every boot starts the same way; `help` lists the shell commands, `help (command)` explains one.
 Some things to try: `start hylla.elf` for the file manager, `start
 infecteria.elf` for a game in its own window, `start utsikt.elf` for the
 browser (click a link, Backspace goes back), `start lira.elf` for the piano
@@ -118,6 +147,7 @@ which looks exactly like a broken mouse driver and is not one.
 ```sh
 ./make_usb.sh               # build, make the image, write it to a USB stick
 ./make_usb.sh --no-build    # reuse build/moonshot.elf as it is
+./make_usb.sh --iso moonshot.iso   # make the image, keep it, write nothing
 ```
 
 The script installs `grub`, `libisoburn` and `mtools` with pacman if they are
@@ -131,9 +161,30 @@ on the stick is not signed, then pick the stick from the boot menu (F12 on
 Lenovo laptops). moonshot has booted to the login screen, the shell and the
 file manager on a Lenovo IdeaPad 1i. It drives a PS/2 keyboard and mouse
 (most laptops' built-in ones), the screen through the firmware's framebuffer,
-and nothing else on real hardware yet. There is no sound without a Sound
+and nothing else on real hardware yet. GRUB starts moonshot at once. F12
+shows the boot log on the screen and F12 again hides it, so a machine that
+boots to a blank screen can say why. `besikta` prints the memory map, the
+disk, the framebuffer and the processor the machine reports. `sync` writes
+only to a disk that carries the moonshot magic, and `sync create` makes one
+after you type the confirmation it asks for. `tyst` on the kernel line in
+GRUB turns off the sign-in sound and the window cues. There is no sound without a Sound
 Blaster 16 and no disk without an IDE drive, so files last until you turn the
 machine off.
+
+## Users
+
+Users are kept apart only for the length of one boot. Users, passwords, owners
+and modes are not saved, so after a reboot every file belongs to root, every
+other user can read it, locked files included, and root has no password until
+`passwd` is run. Run it first, every boot. `login (name)` and `passwd [user]`
+ask for passwords at a masked prompt, and a password is never part of a command
+line or of the history, which is kept per user. `adduser` makes an account with
+no password, so root runs `passwd` for it at once. A user starts programs and
+builds only from files that user or root owns, in folders that user or root
+owns, and `own (path) (user)` takes a file over. Another user's page opens in
+utsikt without its scripts. Anyone at the keyboard can use every open window,
+root's included, so lock the screen with Alt+L before leaving it. 0.6.0 and
+0.6.1 did not keep users apart. CHANGELOG.md has the full list.
 
 ## Testing
 
@@ -205,10 +256,21 @@ tests/verify_utsikt_reload.sh       # reloading a page gives its memory back
 tests/verify_utsikt_elements.sh     # pre, ol, u and s, h4, mark, a raw script
 tests/verify_utsikt_script.sh       # the scripting interface and its test engine
 tests/verify_glimt.sh               # glimt, utsikt's scripting language
+tests/verify_edit_keys.sh           # the shell's editing keys
+tests/verify_zone.sh                # the zone command and its offset
+tests/verify_start_prompt.sh        # the prompt after start and split
+tests/verify_sync_while_typing.sh   # sync puts every file on the disk or says it did not
+tests/verify_hostile_syscalls.sh    # every syscall called with hostile arguments
+tests/verify_elf_corpus.sh          # malformed ELF files are refused
+tests/verify_ports.sh               # ring 3 reaches no I/O port
+tests/verify_tf_syscall.sh          # SYSCALL with the trap flag set
+tests/verify_prompt_reflow.sh       # prompt glyphs across window events
 ```
 
+This list is the core of them. `tests/run_suite.sh` runs every script.
+
 `tests/run_suite.sh` runs all of them against a snapshot of the tree, three
-at a time, in about twelve minutes, so the tree can be edited while it runs.
+at a time, in about twenty-five minutes, so the tree can be edited while it runs.
 `tests/run_suite.sh verify_form.sh test_shell.sh` runs only the ones named.
 
 Every script boots the kernel in QEMU and passes or fails on what the serial

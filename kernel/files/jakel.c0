@@ -66,9 +66,11 @@ int jakel_used_bytes() {
 int jakel_dalloc(int n) {
     int p = arena_alloc(jakel_arena_start, jakel_arena_end, n);
     if (p == 0 && n > 0) {
+        int sl = serial_line_begin();
         serial_print("[jakel] out of file space for ");
         serial_print_int(n);
         serial_print(" bytes\n");
+        serial_line_end(sl);
     }
     return p;
 }
@@ -77,25 +79,182 @@ void jakel_dfree(int p) {
     arena_free(jakel_arena_start, jakel_arena_end, p, "[jakel] dfree");
     return;
 }
-int jakel_created_base = 0;   // creation counter (in-memory only)
-int jakel_creation_counter = 0;
+int jakel_created_base = 0;   // creation stamp (in-memory only)
+// The next creation stamp. It starts at 1, since 0 is the stamp of the root
+// folder made at boot, and every node made or loaded takes the next one.
+int jakel_creation_counter = 1;
 int jakel_uid_base = 0;       // owner uid (in-memory only)
 int jakel_mode_base = 0;      // permission level (in-memory only)
 
-// Current user id. Root (uid 0) bypasses all permission checks.
-int jakel_current_uid = 0;
+// Kernel housekeeping passes explicit system authority, the same uid as root.
+int JAKEL_SYSTEM = 0;
+
+// The shell task runs with interrupts on and the timer preempts it, while a
+// file system call from ring 3 runs with interrupts off. Every public jakel
+// call that reads or changes the node tables, a folder's entry list or a
+// file's data runs with interrupts off too, through these two, so the two
+// sides never interleave. Each name_held function is the body and expects
+// the caller to hold this. Nested use keeps interrupts off until the
+// outermost unlock. jakel_sync is the one exception. Its drive writes are
+// slow port I/O that would stop the clock, input and sound for the whole
+// save, so it takes the lock only to copy the node table and then once for
+// each sector's bytes, and never keeps a pointer into jakel past an unlock.
+// LOCKING.md next to this file lists everything that touches the tables
+// without the lock, and every node id kept outside jakel.
+int jakel_lock() {
+    int rf = read_flags;
+    int saved = rf();
+    int off = disable_interrupts;
+    off();
+    return saved;
+}
+
+void jakel_unlock(int saved) {
+    if ((saved & 512) != 0) { int on = enable_interrupts; on(); }
+    return;
+}
 
 // --- permission checks --------------------------------------------------------
+int jakel_valid(int id) {
+    if (id < 0 || id >= JAKEL_MAX_NODES || !jakel_type_base) { return 0; }
+    return load64(jakel_type_base + id * 8) != JAKEL_TYPE_FREE;
+}
+
+// 1 when id names a live folder. Every call that takes a folder id checks
+// this first, since a folder id kept outside jakel, such as a working
+// folder, can outlive the folder, and its slot can hold a file by then.
+int jakel_is_dir(int id) {
+    if (!jakel_valid(id)) { return 0; }
+    return load64(jakel_type_base + id * 8) == JAKEL_TYPE_DIR;
+}
+
+// The creation stamp of node id, or -1 when id names no node. A stamp is
+// never given to two nodes in one boot, so an id kept together with its
+// stamp tells a node apart from a later one in the same slot.
+int jakel_stamp(int id) {
+    if (!jakel_valid(id)) { return 0 - 1; }
+    return load64(jakel_created_base + id * 8);
+}
+
 int jakel_can_read(int uid, int id) {
+    if (uid < 0 || uid >= 8 || !jakel_valid(id)) { return 0; }
     if (!uid) { return 1; }
     if (uid == load64(jakel_uid_base + id * 8)) { return 1; }
     if (load64(jakel_mode_base + id * 8) == JAKEL_MODE_LOCKED) { return 0; }
     return 1;
 }
 int jakel_can_write(int uid, int id) {
+    if (uid < 0 || uid >= 8 || !jakel_valid(id)) { return 0; }
     if (!uid) { return 1; }
     if (uid == load64(jakel_uid_base + id * 8)) { return 1; }
     return 0;
+}
+
+// A public directory accepts entries from other users. Removing entries
+// also requires ownership of the entry itself.
+int jakel_can_add(int uid, int dir) {
+    if (uid < 0 || uid >= 8 || !jakel_valid(dir)) { return 0; }
+    if (load64(jakel_type_base + dir * 8) != JAKEL_TYPE_DIR) { return 0; }
+    if (jakel_can_write(uid, dir)) { return 1; }
+    return load64(jakel_mode_base + dir * 8) == JAKEL_MODE_PUBLIC;
+}
+
+// 1 when uid may put a node of this type into dir, by making it there or by
+// moving or renaming it there. The root folder holds the names the kernel
+// writes, such as tid.zone and every seeded program. Anyone may put a file
+// there, and the kernel takes back a file squatting one of its names. Only
+// root may put a folder there, since a folder with entries in it cannot be
+// taken back.
+int jakel_can_place(int uid, int dir, int type) {
+    if (!jakel_can_add(uid, dir)) { return 0; }
+    if (dir == 0 && type == JAKEL_TYPE_DIR && uid != 0) { return 0; }
+    return 1;
+}
+
+// 1 when uid may write over or empty file id as a whole, the create or
+// replace kind of write. Beyond jakel_can_write, a file in a public folder
+// that belongs to neither the writer nor the folder's owner is refused, root
+// included, so a name one user made first in a shared folder never receives
+// another user's content or build. Root removes such a file first.
+int jakel_can_replace(int uid, int id) {
+    if (!jakel_can_write(uid, id)) { return 0; }
+    int parent = load64(jakel_parent_base + id * 8);
+    if (!jakel_valid(parent)) { return 0; }
+    if (load64(jakel_mode_base + parent * 8) != JAKEL_MODE_PUBLIC) { return 1; }
+    int owner = load64(jakel_uid_base + id * 8);
+    if (owner == uid || owner == load64(jakel_uid_base + parent * 8)) { return 1; }
+    return 0;
+}
+
+// 1 when uid may trust what node id holds, as code or as input to a build,
+// because id and every folder above it belong to uid or to root. No other
+// user can then have written the file, or put another file or folder on its
+// path.
+int jakel_trusted_chain(int uid, int id) {
+    if (uid < 0 || uid >= 8) { return 0; }
+    int i = 0;
+    for (i = 0; i < JAKEL_MAX_NODES && jakel_valid(id); i += 1) {
+        int owner = load64(jakel_uid_base + id * 8);
+        if (owner != uid && owner != 0) { return 0; }
+        if (id == 0) { return 1; }
+        id = load64(jakel_parent_base + id * 8);
+    }
+    return 0;
+}
+
+int jakel_set_owner_held(int uid, int id, int owner) {
+    if (uid != 0 || !jakel_valid(id) || owner < 0 || owner >= 8) { return -1; }
+    store64(jakel_uid_base + id * 8, owner);
+    return 0;
+}
+
+int jakel_set_owner(int uid, int id, int owner) {
+    int held = jakel_lock();
+    int r = jakel_set_owner_held(uid, id, owner);
+    jakel_unlock(held);
+    return r;
+}
+
+int jakel_set_mode_held(int uid, int id, int mode) {
+    if (!jakel_can_write(uid, id) || mode < 0 || mode > 2) { return -1; }
+    store64(jakel_mode_base + id * 8, mode);
+    return 0;
+}
+
+int jakel_set_mode(int uid, int id, int mode) {
+    int held = jakel_lock();
+    int r = jakel_set_mode_held(uid, id, mode);
+    jakel_unlock(held);
+    return r;
+}
+
+int jakel_set_size_held(int uid, int id, int n) {
+    if (!jakel_can_write(uid, id) || n < 0) { return -1; }
+    if (load64(jakel_type_base + id * 8) != JAKEL_TYPE_FILE) { return -1; }
+    if (n > load64(jakel_size_base + id * 8)) { return -1; }
+    store64(jakel_size_base + id * 8, n);
+    return 0;
+}
+
+int jakel_set_size(int uid, int id, int n) {
+    int held = jakel_lock();
+    int r = jakel_set_size_held(uid, id, n);
+    jakel_unlock(held);
+    return r;
+}
+
+int jakel_put_held(int uid, int id, int buf, int n, int from_user) {
+    if (!jakel_can_replace(uid, id) || n < 0) { return -1; }
+    if (load64(jakel_type_base + id * 8) != JAKEL_TYPE_FILE) { return -1; }
+    if (jakel_write_transfer(uid, id, 0, buf, n, from_user) != n) { return -1; }
+    return jakel_set_size(uid, id, n);
+}
+
+int jakel_put(int uid, int id, int buf, int n, int from_user) {
+    int held = jakel_lock();
+    int r = jakel_put_held(uid, id, buf, n, from_user);
+    jakel_unlock(held);
+    return r;
 }
 
 int jakel_copy_name(int src) {
@@ -109,9 +268,11 @@ int jakel_copy_name(int src) {
     }
     if (i == JAKEL_NAME_LEN - 1 && load8(src + i) != 0) {
         // The node will be found by its first 31 characters only.
+        int sl = serial_line_begin();
         serial_print("[jakel] name longer than 31 characters, cut: ");
-        serial_print(src);
+        serial_print_in(sl, src);
         serial_print("\n");
+        serial_line_end(sl);
     }
     store8(buf + i, 0);
     return buf;
@@ -131,17 +292,20 @@ int jakel_str_len(int s) {
     while (load8(s + i) != 0) { i += 1; }
     return i;
 }
-int jakel_alloc_node(int type, int parent, int name_str) {
+int jakel_alloc_node(int uid, int type, int parent, int name_str) {
+    if (uid < 0 || uid >= 8) { return -1; }
     int id = 0;
     for (id = 0; id < JAKEL_MAX_NODES; id += 1) {
         if (load64(jakel_type_base + id * 8) == JAKEL_TYPE_FREE) {
+            int name = jakel_copy_name(name_str);
+            if (!name) { return -1; }
             store64(jakel_type_base + id * 8, type);
-            store64(jakel_name_base + id * 8, jakel_copy_name(name_str));
+            store64(jakel_name_base + id * 8, name);
             store64(jakel_parent_base + id * 8, parent);
             store64(jakel_size_base + id * 8, 0);
             store64(jakel_data_base + id * 8, 0);
             store64(jakel_created_base + id * 8, jakel_creation_counter);
-            store64(jakel_uid_base + id * 8, 0);
+            store64(jakel_uid_base + id * 8, uid);
             store64(jakel_mode_base + id * 8, JAKEL_MODE_PRIVATE);
             jakel_creation_counter += 1;
             return id;
@@ -168,14 +332,14 @@ void jakel_free_node(int id) {
     store64(jakel_mode_base + id * 8, 0);
     return;
 }
-void jakel_add_child(int dir_id, int child_id) {
+int jakel_add_child(int dir_id, int child_id) {
     int old_size = load64(jakel_size_base + dir_id * 8);
     int old_data = load64(jakel_data_base + dir_id * 8);
     int new_size = old_size + 8;
     int new_data = jakel_dalloc(new_size);
     // Out of space, so the child is not linked in. It still exists, unreachable
     // from this directory, which beats writing its id through a null pointer.
-    if (!new_data) { return; }
+    if (!new_data) { return -1; }
     int i = 0;
     for (i = 0; i < old_size; i += 8) {
         store64(new_data + i, load64(old_data + i));
@@ -184,35 +348,26 @@ void jakel_add_child(int dir_id, int child_id) {
     if (old_data != 0) { jakel_dfree(old_data); }
     store64(jakel_data_base + dir_id * 8, new_data);
     store64(jakel_size_base + dir_id * 8, new_size);
-    return;
+    return 0;
 }
 
-void jakel_remove_child(int dir_id, int child_id) {
-    int old_size = load64(jakel_size_base + dir_id * 8);
-    int old_data = load64(jakel_data_base + dir_id * 8);
-    int new_size = old_size - 8;
-    int new_data = 0;
-    if (new_size > 0) {
-        new_data = jakel_dalloc(new_size);
-        if (!new_data) { return; }
+// Compact in place so unlink never needs a fresh allocation.
+int jakel_remove_child(int dir_id, int child_id) {
+    int size = load64(jakel_size_base + dir_id * 8);
+    int data = load64(jakel_data_base + dir_id * 8);
+    int pos = 0;
+    while (pos < size && load64(data + pos) != child_id) { pos += 8; }
+    if (pos == size) { return -1; }
+    while (pos + 8 < size) {
+        store64(data + pos, load64(data + pos + 8)); pos += 8;
     }
-    int i = 0;
-    int w = 0;
-    while (i < old_size) {
-        int cid = load64(old_data + i);
-        if (cid != child_id) {
-            store64(new_data + w, cid);
-            w += 8;
-        }
-        i += 8;
-    }
-    jakel_dfree(old_data);
-    store64(jakel_data_base + dir_id * 8, new_data);
-    store64(jakel_size_base + dir_id * 8, new_size);
-    return;
+    store64(jakel_size_base + dir_id * 8, size - 8);
+    if (size == 8) { jakel_dfree(data); store64(jakel_data_base + dir_id * 8, 0); }
+    return 0;
 }
 
-int jakel_lookup(int dir_id, int name_str) {
+int jakel_lookup_held(int dir_id, int name_str) {
+    if (!jakel_is_dir(dir_id)) { return -1; }
     int sz = load64(jakel_size_base + dir_id * 8);
     int data = load64(jakel_data_base + dir_id * 8);
     int i = 0;
@@ -223,27 +378,50 @@ int jakel_lookup(int dir_id, int name_str) {
     }
     return -1;
 }
-int jakel_mkdir(int parent, int name_str) {
+
+int jakel_lookup(int dir_id, int name_str) {
+    int held = jakel_lock();
+    int r = jakel_lookup_held(dir_id, name_str);
+    jakel_unlock(held);
+    return r;
+}
+int jakel_mkdir_held(int uid, int parent, int name_str) {
+    if (!jakel_can_place(uid, parent, JAKEL_TYPE_DIR)) { return -1; }
     if (jakel_lookup(parent, name_str) >= 0) { return -1; }
-    int id = jakel_alloc_node(JAKEL_TYPE_DIR, parent, name_str);
+    int id = jakel_alloc_node(uid, JAKEL_TYPE_DIR, parent, name_str);
     if (id < 0) { return -1; }
-    jakel_add_child(parent, id);
+    if (jakel_add_child(parent, id) != 0) { jakel_free_node(id); return -1; }
     return id;
 }
 
-int jakel_make_file(int parent, int name_str) {
+int jakel_mkdir(int uid, int parent, int name_str) {
+    int held = jakel_lock();
+    int r = jakel_mkdir_held(uid, parent, name_str);
+    jakel_unlock(held);
+    return r;
+}
+
+int jakel_make_file_held(int uid, int parent, int name_str) {
+    if (!jakel_can_place(uid, parent, JAKEL_TYPE_FILE)) { return -1; }
     if (jakel_lookup(parent, name_str) >= 0) { return -1; }
-    int id = jakel_alloc_node(JAKEL_TYPE_FILE, parent, name_str);
+    int id = jakel_alloc_node(uid, JAKEL_TYPE_FILE, parent, name_str);
     if (id < 0) { return -1; }
-    jakel_add_child(parent, id);
+    if (jakel_add_child(parent, id) != 0) { jakel_free_node(id); return -1; }
     return id;
+}
+
+int jakel_make_file(int uid, int parent, int name_str) {
+    int held = jakel_lock();
+    int r = jakel_make_file_held(uid, parent, name_str);
+    jakel_unlock(held);
+    return r;
 }
 
 // Creates the file a path names, relative to directory `dir`, inside a
 // directory that must already exist. Returns its id, or -1. Modifies `path`
 // (cuts it at the last '/'), so it must not be jakel_name_scratch, which
 // jakel_open builds each component in.
-int jakel_create_at(int dir, int path) {
+int jakel_create_at_held(int uid, int dir, int path) {
     int slash = -1;
     int i = 0;
     for (i = 0; load8(path + i) != 0; i += 1) {
@@ -266,10 +444,81 @@ int jakel_create_at(int dir, int path) {
     // never be found again by the full one.
     int n = jakel_str_len(leaf);
     if (n == 0 || n > JAKEL_NAME_LEN - 1) { return -1; }
-    return jakel_make_file(dir, leaf);
+    return jakel_make_file(uid, dir, leaf);
 }
 
-int jakel_remove(int id) {
+int jakel_create_at(int uid, int dir, int path) {
+    int held = jakel_lock();
+    int r = jakel_create_at_held(uid, dir, path);
+    jakel_unlock(held);
+    return r;
+}
+
+// Rename commits only after every allocation and permission check succeeds.
+int jakel_rename_held(int uid, int id, int dir, int leaf) {
+    if (!id || !jakel_can_write(uid, id)) { return -1; }
+    if (!jakel_can_place(uid, dir, load64(jakel_type_base + id * 8))) { return -1; }
+    int parent = load64(jakel_parent_base + id * 8);
+    if (!jakel_can_add(uid, parent)) { return -1; }
+    int n = jakel_str_len(leaf);
+    if (!n || n >= JAKEL_NAME_LEN || jakel_lookup(dir, leaf) >= 0) { return -1; }
+    int i = 0;
+    for (i = 0; i < n; i += 1) { if (load8(leaf + i) == '/') { return -1; } }
+    int ancestor = dir;
+    for (i = 0; i < JAKEL_MAX_NODES; i += 1) {
+        if (ancestor == id || !jakel_valid(ancestor)) { return -1; }
+        if (ancestor == 0) { break; }
+        ancestor = load64(jakel_parent_base + ancestor * 8);
+    }
+    if (i == JAKEL_MAX_NODES) { return -1; }
+    int name = jakel_copy_name(leaf);
+    if (!name) { return -1; }
+    int children = 0;
+    int size = load64(jakel_size_base + dir * 8);
+    if (dir != parent) {
+        children = jakel_dalloc(size + 8);
+        if (!children) { kfree(name); return -1; }
+        mem_copy(children, load64(jakel_data_base + dir * 8), size);
+        store64(children + size, id);
+    }
+    int old_name = load64(jakel_name_base + id * 8);
+    if (dir != parent) {
+        if (jakel_remove_child(parent, id) != 0) {
+            jakel_dfree(children); kfree(name); return -1;
+        }
+        int old_children = load64(jakel_data_base + dir * 8);
+        store64(jakel_data_base + dir * 8, children);
+        store64(jakel_size_base + dir * 8, size + 8);
+        store64(jakel_parent_base + id * 8, dir);
+        if (old_children) { jakel_dfree(old_children); }
+    }
+    store64(jakel_name_base + id * 8, name);
+    if (old_name) { kfree(old_name); }
+    return 0;
+}
+
+int jakel_rename(int uid, int id, int dir, int leaf) {
+    int held = jakel_lock();
+    int r = jakel_rename_held(uid, id, dir, leaf);
+    jakel_unlock(held);
+    return r;
+}
+
+// Removes what `path` names from `dir`, found and removed in one section,
+// so the node removed is the node the name led to. Returns -4 when nothing
+// has that name, else as jakel_remove.
+int jakel_remove_at(int uid, int dir, int path) {
+    int held = jakel_lock();
+    int id = jakel_open(dir, path);
+    int r = 0 - 4;
+    if (id >= 0) { r = jakel_remove(uid, id); }
+    jakel_unlock(held);
+    return r;
+}
+
+int jakel_remove_held(int uid, int id) {
+    if (!jakel_can_write(uid, id)) { return -3; }
+    if (!jakel_can_add(uid, load64(jakel_parent_base + id * 8))) { return -3; }
     if (!id) { return -2; }
     int type = load64(jakel_type_base + id * 8);
     if (type == JAKEL_TYPE_DIR) {
@@ -277,9 +526,16 @@ int jakel_remove(int id) {
         if (sz != 0) { return -1; }
     }
     int parent = load64(jakel_parent_base + id * 8);
-    jakel_remove_child(parent, id);
+    if (jakel_remove_child(parent, id) != 0) { return -3; }
     jakel_free_node(id);
     return 0;
+}
+
+int jakel_remove(int uid, int id) {
+    int held = jakel_lock();
+    int r = jakel_remove_held(uid, id);
+    jakel_unlock(held);
+    return r;
 }
 
 int jakel_path_next(int s, int offset) {
@@ -290,7 +546,7 @@ int jakel_path_next(int s, int offset) {
     }
     return i;
 }
-int jakel_open(int parent, int path_str) {
+int jakel_open_held(int parent, int path_str) {
     int cur = parent;
     int pos = 0;
     if (load8(path_str) == '/') {
@@ -298,6 +554,7 @@ int jakel_open(int parent, int path_str) {
         pos = 1;
     }
     while (1) {
+        if (!jakel_is_dir(cur)) { return -1; }
         int end = jakel_path_next(path_str, pos);
         if (end < 0) { break; }
         if (end == pos) { break; }
@@ -339,19 +596,29 @@ int jakel_open(int parent, int path_str) {
     return cur;
 }
 
+int jakel_open(int parent, int path_str) {
+    int held = jakel_lock();
+    int r = jakel_open_held(parent, path_str);
+    jakel_unlock(held);
+    return r;
+}
+
 // The file at `path_str` from `parent`, made when it does not exist yet, in
 // the folder the path names (the folder itself must exist). What an editor
 // saves through, since its name can be a path like "ed/hello.c0" and
-// jakel_lookup only looks in one folder. Returns the id, or -1.
-int jakel_open_or_make(int parent, int path_str) {
+// jakel_lookup only looks in one folder. Returns the id, or -1, also for an
+// existing file uid may not replace (jakel_can_replace).
+int jakel_open_or_make_held(int uid, int parent, int path_str) {
     int id = jakel_open(parent, path_str);
+    if (id >= 0 && load64(jakel_type_base + id * 8) == JAKEL_TYPE_FILE
+        && !jakel_can_replace(uid, id)) { return -1; }
     if (id >= 0) { return id; }
     int last = -1;
     int i = 0;
     for (i = 0; load8(path_str + i) != 0; i += 1) {
         if (load8(path_str + i) == '/') { last = i; }
     }
-    if (last < 0) { return jakel_make_file(parent, path_str); }
+    if (last < 0) { return jakel_make_file(uid, parent, path_str); }
     int dir = parent;
     if (last == 0) {
         dir = 0;
@@ -366,20 +633,65 @@ int jakel_open_or_make(int parent, int path_str) {
         kfree(folder);
     }
     if (dir < 0 || load64(jakel_type_base + dir * 8) != JAKEL_TYPE_DIR) { return -1; }
-    return jakel_make_file(dir, path_str + last + 1);
+    return jakel_make_file(uid, dir, path_str + last + 1);
 }
-int jakel_read(int id, int offset, int buf, int len) {
-    if (jakel_can_read(jakel_current_uid, id) == 0) { return 0; }
+
+int jakel_open_or_make(int uid, int parent, int path_str) {
+    int held = jakel_lock();
+    int r = jakel_open_or_make_held(uid, parent, path_str);
+    jakel_unlock(held);
+    return r;
+}
+int jakel_read_held(int uid, int id, int offset, int buf, int len) {
+    if (jakel_can_read(uid, id) == 0) { return 0; }
     int type = load64(jakel_type_base + id * 8);
     if (type != JAKEL_TYPE_FILE) { return 0; }
+    if (len < 0) { return 0; }
+    if (offset < 0) { return 0; }
+    int capacity = jakel_arena_end - jakel_arena_start;
+    if (offset > capacity - len) { return 0; }
     int sz = load64(jakel_size_base + id * 8);
     if (offset >= sz) { return 0; }
     int data = load64(jakel_data_base + id * 8);
+    if (!data || sz > (data - sizeof(HeapBlock)).size) { return 0; }
     int avail = sz - offset;
     int n = len;
     if (n > avail) { n = avail; }
     mem_copy(buf, data + offset, n);
     return n;
+}
+
+int jakel_read(int uid, int id, int offset, int buf, int len) {
+    int held = jakel_lock();
+    int r = jakel_read_held(uid, id, offset, buf, len);
+    jakel_unlock(held);
+    return r;
+}
+
+int jakel_read_user_held(int uid, int id, int offset, int buf, int len) {
+    if (jakel_can_read(uid, id) == 0) { return 0; }
+    int type = load64(jakel_type_base + id * 8);
+    if (type != JAKEL_TYPE_FILE) { return 0; }
+    if (len < 0) { return 0; }
+    if (offset < 0) { return 0; }
+    int capacity = jakel_arena_end - jakel_arena_start;
+    if (offset > capacity - len) { return 0; }
+    int sz = load64(jakel_size_base + id * 8);
+    if (offset >= sz) { return 0; }
+    int data = load64(jakel_data_base + id * 8);
+    if (!data || sz > (data - sizeof(HeapBlock)).size) { return 0; }
+    int avail = sz - offset;
+    int n = len;
+    if (n > avail) { n = avail; }
+    if (!user_copy_out(buf, data + offset, n)) { return 0; }
+    return n;
+}
+
+int jakel_read_user(int uid, int id, int offset, int buf, int len) {
+    int held = jakel_lock();
+    int r = jakel_read_user_held(uid, id, offset, buf, len);
+    jakel_unlock(held);
+    return r;
 }
 
 // Zeroes n bytes from addr. The gap a write past the end of a file leaves
@@ -391,12 +703,27 @@ void jakel_zero(int addr, int n) {
     return;
 }
 
-int jakel_write(int id, int offset, int buf, int len) {
-    if (jakel_can_write(jakel_current_uid, id) == 0) { return 0; }
+int jakel_write(int uid, int id, int offset, int buf, int len) {
+    return jakel_write_transfer(uid, id, offset, buf, len, 0);
+}
+
+int jakel_write_user(int uid, int id, int offset, int buf, int len) {
+    if (!user_span(buf, len, 0)) { return 0; }
+    return jakel_write_transfer(uid, id, offset, buf, len, 1);
+}
+
+int jakel_write_transfer_held(int uid, int id, int offset, int buf, int len, int from_user) {
+    if (jakel_can_write(uid, id) == 0) { return 0; }
     int type = load64(jakel_type_base + id * 8);
     if (type != JAKEL_TYPE_FILE) { return 0; }
+    if (len < 0) { return 0; }
+    if (offset < 0) { return 0; }
+    int capacity = jakel_arena_end - jakel_arena_start;
+    if (offset > capacity - len) { return 0; }
     int old_sz = load64(jakel_size_base + id * 8);
     int old_data = load64(jakel_data_base + id * 8);
+    if (old_sz < 0 || old_sz > capacity) { return 0; }
+    if (old_sz > 0 && (!old_data || old_sz > (old_data - sizeof(HeapBlock)).size)) { return 0; }
     int new_end = offset + len;
     int new_sz = old_sz;
     if (new_end > old_sz) { new_sz = new_end; }
@@ -404,45 +731,69 @@ int jakel_write(int id, int offset, int buf, int len) {
     // A write inside the file's current size goes straight into it. Copying
     // on every write would make filling a large file in pieces cost the whole
     // file per piece.
-    if (old_data != 0 && new_sz == old_sz) {
-        mem_copy(old_data + offset, buf, len);
+    if (old_data != 0 && new_sz == old_sz && new_sz <= (old_data - sizeof(HeapBlock)).size) {
+        if (from_user) {
+            if (!user_copy_in(old_data + offset, buf, len)) { return 0; }
+        } else { mem_copy(old_data + offset, buf, len); }
         return len;
     }
     // So does a file that grows into room its block already has.
     if (old_data != 0 && new_sz <= (old_data - sizeof(HeapBlock)).size) {
         if (offset > old_sz) { jakel_zero(old_data + old_sz, offset - old_sz); }
-        mem_copy(old_data + offset, buf, len);
+        if (from_user) {
+            if (!user_copy_in(old_data + offset, buf, len)) { return 0; }
+        } else { mem_copy(old_data + offset, buf, len); }
         store64(jakel_size_base + id * 8, new_sz);
         return len;
     }
+    int slot = 0;
     if (new_sz > 0) {
+        if (from_user) { slot = user_reserve(2); if (!slot) { return 0; } }
         // A file appended to gets half again the room it needs, so that
         // growing one piece at a time copies it a handful of times rather
         // than once per piece. Anything else gets exactly its size, since
         // most files are written whole once and never grow.
         int room = new_sz;
-        if (old_sz > 0 && offset >= old_sz) { room = new_sz + new_sz / 2; }
+        if (old_sz > 0 && offset >= old_sz) {
+            int extra = new_sz / 2;
+            if (extra <= capacity - new_sz) { room = new_sz + extra; }
+        }
         new_data = arena_alloc(jakel_arena_start, jakel_arena_end, room);
         if (!new_data) { new_data = jakel_dalloc(new_sz); }
         // Out of file space, so nothing is written and the file keeps what it
         // had, rather than writing the file through address 0 into low memory.
-        if (!new_data) { return 0; }
+        if (!new_data) {
+            if (slot) { user_release_slot(slot); }
+            return 0;
+        }
+        if (slot) { store64(slot + 8, new_data); }
         int head = offset;
         if (head > old_sz) { head = old_sz; }
         if (head > 0) { mem_copy(new_data, old_data, head); }
         if (offset > old_sz) { jakel_zero(new_data + old_sz, offset - old_sz); }
-        mem_copy(new_data + offset, buf, len);
+        if (from_user) {
+            if (!user_copy_in(new_data + offset, buf, len)) { user_release_slot(slot); return 0; }
+        } else { mem_copy(new_data + offset, buf, len); }
         if (new_end < old_sz) {
             mem_copy(new_data + new_end, old_data + new_end, old_sz - new_end);
         }
     }
+    if (slot) { store64(slot, 0); store64(slot + 8, 0); }
     if (old_data != 0 && old_data != new_data) { jakel_dfree(old_data); }
     store64(jakel_data_base + id * 8, new_data);
     store64(jakel_size_base + id * 8, new_sz);
     return len;
 }
 
-void jakel_list(int id) {
+int jakel_write_transfer(int uid, int id, int offset, int buf, int len, int from_user) {
+    int held = jakel_lock();
+    int r = jakel_write_transfer_held(uid, id, offset, buf, len, from_user);
+    jakel_unlock(held);
+    return r;
+}
+
+void jakel_list_held(int id) {
+    if (!jakel_is_dir(id)) { return; }
     int sz = load64(jakel_size_base + id * 8);
     int data = load64(jakel_data_base + id * 8);
     int i = 0;
@@ -488,14 +839,22 @@ void jakel_list(int id) {
     return;
 }
 
+void jakel_list(int id) {
+    int held = jakel_lock();
+    jakel_list_held(id);
+    jakel_unlock(held);
+    return;
+}
+
 // Prints the full path of a node by walking its parent chain. Names are
 // collected bottom-up in jakel_path_scratch then printed in reverse (root
 // first). A path deeper than the buffer is cut at the root end.
-void jakel_where(int id) {
+void jakel_where_held(int id) {
     int buf = jakel_path_scratch;
     int pos = 0;
     int cur = id;
     while (cur != 0 && pos < 1024 - JAKEL_NAME_LEN - 1) {
+        if (!jakel_valid(cur)) { break; }
         int name = load64(jakel_name_base + cur * 8);
         int nl = jakel_str_len(name);
         int i = 0;
@@ -515,6 +874,13 @@ void jakel_where(int id) {
             sk_putc(load8(buf + pos));
         }
     }
+    return;
+}
+
+void jakel_where(int id) {
+    int held = jakel_lock();
+    jakel_where_held(id);
+    jakel_unlock(held);
     return;
 }
 
@@ -626,7 +992,8 @@ void jakel_load() {
         store64(jakel_type_base    + id * 8, type);
         store64(jakel_parent_base  + id * 8, parent);
         store64(jakel_name_base    + id * 8, name_buf);
-        store64(jakel_created_base + id * 8, 0);
+        store64(jakel_created_base + id * 8, jakel_creation_counter);
+        jakel_creation_counter += 1;
         store64(jakel_uid_base + id * 8, 0);
         store64(jakel_mode_base + id * 8, JAKEL_MODE_PRIVATE);
         int data_buf = 0;
@@ -680,25 +1047,105 @@ void jakel_load() {
             }
         }
     }
+    if (jakel_valid(0)) { store64(jakel_mode_base, JAKEL_MODE_PUBLIC); }
     serial_print("[jakel] loaded ");
     serial_print_int(loaded);
     serial_print(" nodes from disk\n");
     return;
 }
 
+// What jakel_sync returns.
+int JAKEL_SYNC_OK        = 0;
+int JAKEL_SYNC_NO_DISK   = 1;  // no drive, nothing written
+int JAKEL_SYNC_NO_MAGIC  = 2;  // sector 0 lacks the magic, disk left untouched
+int JAKEL_SYNC_TIMEOUT   = 3;  // the drive timed out partway, the disk may be incomplete
+int JAKEL_SYNC_FAILED    = 4;  // the drive reported an error, the disk may be incomplete
+int JAKEL_SYNC_NO_MEMORY = 5;  // no buffers, nothing written
+
+// Copies sector k of node i's data into secbuf, as the node is now, under
+// the lock. The disk has room for exactly the size the table recorded, so
+// the caller asks only for sectors inside it. Bytes the node no longer has,
+// because it shrank, went away, changed type or is a new node in a reused
+// slot (stamp differs), are zeros, so a file changed during the save never
+// spills into the next file's sectors.
+void jakel_sync_sector(int i, int stamp, int k, int secbuf) {
+    int held = jakel_lock();
+    int j = 0;
+    int pos = k * 512;
+    int sz = 0;
+    if (load64(jakel_type_base + i * 8) == JAKEL_TYPE_FILE
+        && load64(jakel_created_base + i * 8) == stamp
+        && load64(jakel_data_base + i * 8) != 0) {
+        sz = load64(jakel_size_base + i * 8);
+    }
+    if (pos < sz) {
+        j = sz - pos;
+        if (j > 512) { j = 512; }
+        mem_copy(secbuf, load64(jakel_data_base + i * 8) + pos, j);
+    }
+    jakel_unlock(held);
+    while (j < 512) { store8(secbuf + j, 0); j += 1; }
+    return;
+}
+
+// Writes the superblock `sb`, the node table `nt` and every file's data,
+// through the 512-byte buffer `secbuf`. Each file gets exactly the sectors
+// its size in `nt` needs, whatever the file holds by now, and `stamps` holds
+// each node's creation stamp from when `nt` was made. Stops at the first
+// sector the drive did not take and returns its ata status, or ATA_OK.
+int jakel_sync_write(int sb, int nt, int table_secs, int secbuf, int stamps) {
+    int r = ata_write(0, sb);
+    if (r != ATA_OK) { return r; }
+    int sec = 1;
+    for (sec = 1; sec < 1 + table_secs; sec += 1) {
+        r = ata_write(sec, nt + (sec - 1) * 512);
+        if (r != ATA_OK) { return r; }
+    }
+    int ds = 1 + table_secs;
+    int i = 0;
+    for (i = 0; i < JAKEL_MAX_NODES; i += 1) {
+        int off = i * 64;
+        int sz = (nt + off).fsize;
+        if ((nt + off).type == JAKEL_TYPE_FILE && sz > 0) {
+            int k = 0;
+            for (k = 0; k < (sz + 511) / 512; k += 1) {
+                jakel_sync_sector(i, load64(stamps + i * 8), k, secbuf);
+                r = ata_write(ds, secbuf);
+                if (r != ATA_OK) { return r; }
+                ds += 1;
+            }
+        }
+    }
+    return ATA_OK;
+}
+
 // Persist the entire in-memory filesystem state to disk.
 // Writes a superblock (sector 0), the node table (sectors 1-16 for 128
 // nodes), and all file data after it. Directory child-ID arrays are NOT
 // serialised -- they are rebuilt from parent pointers on load.
-// Allocates temporary heap buffers for sector-sized writes and frees
-// them before returning.
-void jakel_sync() {
+// The disk is checked for the Moonshot magic once, before the first write,
+// and the drive's cache is flushed once, after the last. Returns
+// JAKEL_SYNC_OK only when every sector is on the disk, and prints
+// "[jakel] synced" only then.
+int jakel_sync() {
     if (!ata_present) {
         serial_print("[jakel] no disk, sync skipped\n");
-        return;
+        return JAKEL_SYNC_NO_DISK;
+    }
+    int table_secs = JAKEL_MAX_NODES * 64 / 512;
+    int sb = kmalloc(512);
+    int nt = kmalloc(table_secs * 512);
+    int secbuf = kmalloc(512);
+    int stamps = kmalloc(JAKEL_MAX_NODES * 8);
+    if (!sb || !nt || !secbuf || !stamps) {
+        if (sb) { kfree(sb); }
+        if (nt) { kfree(nt); }
+        if (secbuf) { kfree(secbuf); }
+        if (stamps) { kfree(stamps); }
+        serial_print("[jakel] sync failed, out of memory, disk left untouched\n");
+        return JAKEL_SYNC_NO_MEMORY;
     }
     // --- Build superblock (sector 0) ---
-    int sb = kmalloc(512);
     int i = 0;
     for (i = 0; i < 512; i += 1) { store8(sb + i, 0); }
     store8(sb + 0, 0x4A); store8(sb + 1, 0x41); store8(sb + 2, 0x4B);
@@ -707,16 +1154,18 @@ void jakel_sync() {
     sb.version = 1;
     sb.node_count = JAKEL_MAX_NODES;
     sb.name_max = JAKEL_NAME_LEN;
-    int table_secs = JAKEL_MAX_NODES * 64 / 512;
     sb.first_data_sector = 1 + table_secs;
     // total_data_sectors filled below
     // --- Build node table (64 bytes a node, from sector 1) ---
-    int nt = kmalloc(table_secs * 512);
+    // One consistent copy of every node, taken under the lock. The data pass
+    // below writes exactly the sizes recorded here.
     for (i = 0; i < table_secs * 512; i += 1) { store8(nt + i, 0); }
     int node_count = 0;
     int data_secs = 0;
+    int held = jakel_lock();
     i = 0;
     for (i = 0; i < JAKEL_MAX_NODES; i += 1) {
+        store64(stamps + i * 8, load64(jakel_created_base + i * 8));
         int type = load64(jakel_type_base + i * 8);
         int off = i * 64;
         (nt + off).type = type;
@@ -736,81 +1185,72 @@ void jakel_sync() {
         }
         node_count += 1;
     }
+    jakel_unlock(held);
     sb.total_data_sectors = data_secs;
-    // Write superblock
-    ata_write(0, sb);
-    kfree(sb);
-    // Write the node table
-    int sec = 1;
-    int ntoff = 0;
-    while (sec < 1 + table_secs) {
-        int secbuf = kmalloc(512);
-        int j = 0;
-        for (j = 0; j < 512; j += 1) {
-            store8(secbuf + j, load8(nt + ntoff + j));
-        }
-        ata_write(sec, secbuf);
+    // Nothing in an ordinary build. A debug build lets a test change files
+    // here, between the node table and the data pass (skalman_debug.c0).
+    sk_debug_sync_pause();
+    int r = ata_arm();
+    if (r == ATA_REFUSED) {
+        kfree(sb);
+        kfree(nt);
         kfree(secbuf);
-        ntoff += 512;
-        sec += 1;
+        kfree(stamps);
+        serial_print("[jakel] disk left untouched, Moonshot magic absent\n");
+        return JAKEL_SYNC_NO_MAGIC;
     }
+    if (r == ATA_OK) { r = jakel_sync_write(sb, nt, table_secs, secbuf, stamps); }
+    if (r == ATA_OK) { r = ata_flush(); }
+    ata_disarm();
+    kfree(sb);
     kfree(nt);
-    // --- Write file data ---
-    int ds = 1 + table_secs;
-    i = 0;
-    for (i = 0; i < JAKEL_MAX_NODES; i += 1) {
-        int type = load64(jakel_type_base + i * 8);
-        if (type == JAKEL_TYPE_FILE) {
-            int sz = load64(jakel_size_base + i * 8);
-            if (sz > 0) {
-                int data = load64(jakel_data_base + i * 8);
-                int nsec = (sz + 511) / 512;
-                int pos = 0;
-                int si = 0;
-                for (si = 0; si < nsec; si += 1) {
-                    int secbuf = kmalloc(512);
-                    int j = sz - pos;
-                    if (j > 512) { j = 512; }
-                    mem_copy(secbuf, data + pos, j);
-                    while (j < 512) {
-                        store8(secbuf + j, 0);
-                        j += 1;
-                    }
-                    ata_write(ds, secbuf);
-                    kfree(secbuf);
-                    pos += 512;
-                    ds += 1;
-                }
-            }
-        }
+    kfree(secbuf);
+    kfree(stamps);
+    if (r == ATA_TIMEOUT) {
+        serial_print("[jakel] sync failed, the disk timed out\n");
+        return JAKEL_SYNC_TIMEOUT;
     }
+    if (r != ATA_OK) {
+        serial_print("[jakel] sync failed, the disk reported an error\n");
+        return JAKEL_SYNC_FAILED;
+    }
+    int sl6 = serial_line_begin();
     serial_print("[jakel] synced ");
     serial_print_int(node_count);
     serial_print(" nodes, ");
     serial_print_int(data_secs);
     serial_print(" data sectors\n");
-    return;
+    serial_line_end(sl6);
+    return JAKEL_SYNC_OK;
 }
-
 
 // Writes `size` bytes at `data` to directory `dir` as `name`, replacing
 // whatever was there. For the programs kmain.c0 embeds, the bytes are already
 // in memory, so they go straight into the file with no copy in between.
-void jakel_seed_file(int dir, int name, int data, int size) {
+void jakel_seed_file_held(int dir, int name, int data, int size) {
     int stale = jakel_lookup(dir, name);
-    if (stale >= 0) { jakel_remove(stale); }
-    int f = jakel_make_file(dir, name);
+    if (stale >= 0) { jakel_remove(JAKEL_SYSTEM, stale); }
+    int f = jakel_make_file(JAKEL_SYSTEM, dir, name);
     if (f < 0) {
         serial_print("[jakel] no node for ");
         serial_print(name);
         serial_print("\n");
         return;
     }
-    if (jakel_write(f, 0, data, size) != size) {
+    if (jakel_write(JAKEL_SYSTEM, f, 0, data, size) != size) {
         serial_print("[jakel] no file space for ");
         serial_print(name);
         serial_print("\n");
     }
+    return;
+}
+
+// jakel_seed_file as one jakel section, so no other task can take the name between
+// the removal of the old file and the making of the new one.
+void jakel_seed_file(int dir, int name, int data, int size) {
+    int held = jakel_lock();
+    jakel_seed_file_held(dir, name, data, size);
+    jakel_unlock(held);
     return;
 }
 
@@ -852,20 +1292,51 @@ int main() {
 ";
 }
 
-void jakel_seed_page(int dir, int name, int text) {
+void jakel_seed_page_held(int dir, int name, int text) {
     int stale = jakel_lookup(dir, name);
-    if (stale >= 0) { jakel_remove(stale); }
-    int f = jakel_make_file(dir, name);
+    if (stale >= 0) { jakel_remove(JAKEL_SYSTEM, stale); }
+    int f = jakel_make_file(JAKEL_SYSTEM, dir, name);
     if (f < 0) { return; }
     int n = 0;
     while (load8(text + n) != 0) { n += 1; }
-    jakel_write(f, 0, text, n);
+    jakel_write(JAKEL_SYSTEM, f, 0, text, n);
+    return;
+}
+
+// jakel_seed_page as one jakel section, so no other task can take the name between
+// the removal of the old file and the making of the new one.
+void jakel_seed_page(int dir, int name, int text) {
+    int held = jakel_lock();
+    jakel_seed_page_held(dir, name, text);
+    jakel_unlock(held);
     return;
 }
 
 // Removes from /test (`dir`) every file a test boot puts there, and /test
 // itself when nothing else is left in it.
+void jakel_drop_site_leaf(int dir, int name) {
+    int id = jakel_lookup(dir, name);
+    if (id >= 0 && load64(jakel_type_base + id * 8) == JAKEL_TYPE_FILE) { jakel_remove(JAKEL_SYSTEM, id); }
+    return;
+}
+void jakel_drop_site_folder(int dir, int name, int file) {
+    int child = jakel_lookup(dir, name);
+    if (child < 0 || load64(jakel_type_base + child * 8) != JAKEL_TYPE_DIR) { return; }
+    jakel_drop_site_leaf(child, file);
+    if (load64(jakel_size_base + child * 8) == 0) { jakel_remove(JAKEL_SYSTEM, child); }
+    return;
+}
 void jakel_drop_fixtures(int dir) {
+    int site = jakel_lookup(dir, "site");
+    if (site >= 0 && load64(jakel_type_base + site * 8) == JAKEL_TYPE_DIR) {
+        jakel_drop_site_folder(site, "css", "site.css");
+        jakel_drop_site_folder(site, "now", "index.html");
+        jakel_drop_site_folder(site, "explore", "index.html");
+        jakel_drop_site_leaf(site, "index.html");
+        jakel_drop_site_leaf(site, "resume.html");
+        jakel_drop_site_leaf(site, "blog.html");
+        if (load64(jakel_size_base + site * 8) == 0) { jakel_remove(JAKEL_SYSTEM, site); }
+    }
     int i = load64(jakel_size_base + dir * 8);
     while (i > 0) {
         i -= 8;
@@ -884,9 +1355,9 @@ void jakel_drop_fixtures(int dir) {
                 fixture = 1;
             }
         }
-        if (fixture) { jakel_remove(cid); }
+        if (fixture) { jakel_remove(JAKEL_SYSTEM, cid); }
     }
-    if (load64(jakel_size_base + dir * 8) == 0) { jakel_remove(dir); }
+    if (load64(jakel_size_base + dir * 8) == 0) { jakel_remove(JAKEL_SYSTEM, dir); }
     return;
 }
 
@@ -929,7 +1400,7 @@ void jakel_init() {
         // Seed a demo c0 file for REPL testing on first boot only.
         // Built byte-by-byte because c0 has no string-literal syntax.
         // No // comments -- the REPL tokenizer treats / as division.
-        int demo = jakel_make_file(0, "demo.c0");
+        int demo = jakel_make_file(JAKEL_SYSTEM, 0, "demo.c0");
         if (demo >= 0) {
             int b = kmalloc(256);
             int p = 0;
@@ -954,7 +1425,7 @@ void jakel_init() {
             store8(b+p, '9'); p=p+1; store8(b+p, '9'); p=p+1;
             store8(b+p, '9'); p=p+1; store8(b+p, ')'); p=p+1;
             store8(b+p, ';'); p=p+1; store8(b+p, '\n'); p=p+1;
-            if (b != 0) { jakel_write(demo, 0, b, p); kfree(b); }
+            if (b != 0) { jakel_write(JAKEL_SYSTEM, demo, 0, b, p); kfree(b); }
             store64(jakel_size_base + demo * 8, p);
         }
     }
@@ -992,7 +1463,7 @@ void jakel_init() {
         if (tdir >= 0) { jakel_drop_fixtures(tdir); }
         tdir = 0 - 1;
     } else if (tdir < 0) {
-        tdir = jakel_mkdir(0, "test");
+        tdir = jakel_mkdir(JAKEL_SYSTEM, 0, "test");
     }
     {
 
@@ -1006,12 +1477,12 @@ void jakel_init() {
         int hello_elf = 0 - 1;
         if (tdir >= 0) {
             int stale_hello = jakel_lookup(tdir, "hello.elf");
-            if (stale_hello >= 0) { jakel_remove(stale_hello); }
-            hello_elf = jakel_make_file(tdir, "hello.elf");
+            if (stale_hello >= 0) { jakel_remove(JAKEL_SYSTEM, stale_hello); }
+            hello_elf = jakel_make_file(JAKEL_SYSTEM, tdir, "hello.elf");
         }
         if (hello_elf >= 0) {
             int eb = elf_test_code();
-            jakel_write(hello_elf, 0, eb, ELF_TEST_LEN);
+            jakel_write(JAKEL_SYSTEM, hello_elf, 0, eb, ELF_TEST_LEN);
             store64(jakel_size_base + hello_elf * 8, ELF_TEST_LEN);
         }
 
@@ -1027,8 +1498,8 @@ void jakel_init() {
         int coff_hello = 0 - 1;
         if (tdir >= 0) {
             int stale_coff_hello = jakel_lookup(tdir, "coff_hello.elf");
-            if (stale_coff_hello >= 0) { jakel_remove(stale_coff_hello); }
-            coff_hello = jakel_make_file(tdir, "coff_hello.elf");
+            if (stale_coff_hello >= 0) { jakel_remove(JAKEL_SYSTEM, stale_coff_hello); }
+            coff_hello = jakel_make_file(JAKEL_SYSTEM, tdir, "coff_hello.elf");
         }
         if (coff_hello >= 0) {
             int eb = kmalloc(1024);
@@ -1062,7 +1533,7 @@ void jakel_init() {
             store64(eb + eb_p, 0xe900000000000000); eb_p += 8;
             store64(eb + eb_p, 0x5dec894800000000); eb_p += 8;
             store8(eb + eb_p, 195); eb_p += 1;
-            if (eb != 0) { jakel_write(coff_hello, 0, eb, eb_p); kfree(eb); }
+            if (eb != 0) { jakel_write(JAKEL_SYSTEM, coff_hello, 0, eb, eb_p); kfree(eb); }
             store64(jakel_size_base + coff_hello * 8, eb_p);
         }
 
@@ -1082,7 +1553,7 @@ void jakel_init() {
         // gnista.elf is not a program this kernel carries, and a disk.img
         // may still hold one.
         int stale_gnista = jakel_lookup(0, "gnista.elf");
-        if (stale_gnista >= 0) { jakel_remove(stale_gnista); }
+        if (stale_gnista >= 0) { jakel_remove(JAKEL_SYSTEM, stale_gnista); }
         // Infecteria, utsikt and lira in the root directory, not /test.
         // they are things to use, not scaffolding.
         jakel_seed_file(0, "infecteria.elf", infecteria_elf, infecteria_elf_size);
@@ -1100,6 +1571,22 @@ void jakel_init() {
         // different bytes rather than re-rendering the same ones.
         jakel_seed_page(0, "about.html", utsikt_about_html());
         if (tdir >= 0) {
+            int site = jakel_lookup(tdir, "site");
+            if (site < 0) { site = jakel_mkdir(JAKEL_SYSTEM, tdir, "site"); }
+            if (site >= 0) {
+                int cssdir = jakel_lookup(site, "css");
+                if (cssdir < 0) { cssdir = jakel_mkdir(JAKEL_SYSTEM, site, "css"); }
+                int nowdir = jakel_lookup(site, "now");
+                if (nowdir < 0) { nowdir = jakel_mkdir(JAKEL_SYSTEM, site, "now"); }
+                int exploredir = jakel_lookup(site, "explore");
+                if (exploredir < 0) { exploredir = jakel_mkdir(JAKEL_SYSTEM, site, "explore"); }
+                jakel_seed_page(site, "index.html", utsikt_site_index());
+                jakel_seed_page(site, "resume.html", utsikt_site_flat());
+                jakel_seed_page(site, "blog.html", utsikt_site_flat());
+                if (cssdir >= 0) { jakel_seed_page(cssdir, "site.css", utsikt_site_css()); }
+                if (nowdir >= 0) { jakel_seed_page(nowdir, "index.html", utsikt_site_next()); }
+                if (exploredir >= 0) { jakel_seed_page(exploredir, "index.html", utsikt_site_next()); }
+            }
             jakel_seed_page(tdir, "elements.html", utsikt_elements_html());
             jakel_seed_page(tdir, "script.html", utsikt_script_html());
             jakel_seed_page(tdir, "glimt.html", utsikt_glimt_html());
@@ -1107,10 +1594,13 @@ void jakel_init() {
         // The picture about.html shows. See jakel_seed_moon.
         jakel_seed_moon();
         jakel_seed_file(0, "lira.elf", lira_elf, lira_elf_size);
+        jakel_seed_file(0, "fanfar.elf", fanfar_elf, fanfar_elf_size);
         jakel_seed_file(0, "hylla.elf", hylla_elf, hylla_elf_size);
+        jakel_seed_file(0, "tapet.elf", tapet_elf, tapet_elf_size);
         jakel_seed_file(0, "skrift.elf", skrift_elf, skrift_elf_size);
         jakel_seed_file(0, "pensel.elf", pensel_elf, pensel_elf_size);
         jakel_seed_file(0, "insyn.elf", insyn_elf, insyn_elf_size);
+        jakel_seed_file(0, "dvala.elf", dvala_elf, dvala_elf_size);
         jakel_seed_file(0, "form.elf", form_elf, form_elf_size);
         // The compiler and the assembler, and a program to try them on.
         jakel_seed_file(0, "coff.elf", coff_elf, coff_elf_size);
@@ -1148,7 +1638,7 @@ void jakel_big_file_test() {
     int big = 2097152;
     int chunk = 4096;
     int buf = kmalloc(chunk);
-    int id = jakel_make_file(0, "jakel_selftest");
+    int id = jakel_make_file(JAKEL_SYSTEM, 0, "jakel_selftest");
     if (buf == 0 || id < 0) {
         serial_print("[jakel] 2MB self-test: could not start\n");
         return;
@@ -1160,17 +1650,17 @@ void jakel_big_file_test() {
         for (i = 0; i < chunk; i += 8) {
             store64(buf + i, jakel_test_word(off + i));
         }
-        if (jakel_write(id, off, buf, chunk) != chunk) { ok = 0; }
+        if (jakel_write(JAKEL_SYSTEM, id, off, buf, chunk) != chunk) { ok = 0; }
     }
     if (load64(jakel_size_base + id * 8) != big) { ok = 0; }
     for (off = 0; off < big && ok == 1; off += chunk) {
-        jakel_read(id, off, buf, chunk);
+        jakel_read(JAKEL_SYSTEM, id, off, buf, chunk);
         int i = 0;
         for (i = 0; i < chunk; i += 8) {
             if (load64(buf + i) != jakel_test_word(off + i)) { ok = 0; }
         }
     }
-    jakel_remove(id);
+    jakel_remove(JAKEL_SYSTEM, id);
     int again = jakel_dalloc(big);
     if (!again) { ok = 0; }
     jakel_dfree(again);
@@ -1193,7 +1683,7 @@ void jakel_append_test() {
     int chunk = 4096;
     int total = 262144;
     int buf = kmalloc(chunk);
-    int id = jakel_make_file(0, "jakel_appendtest");
+    int id = jakel_make_file(JAKEL_SYSTEM, 0, "jakel_appendtest");
     if (buf == 0 || id < 0) {
         serial_print("[jakel] append self-test: could not start\n");
         return;
@@ -1204,37 +1694,37 @@ void jakel_append_test() {
     int i = 0;
     for (off = 0; off < total; off += chunk) {
         for (i = 0; i < chunk; i += 8) { store64(buf + i, jakel_test_word(off + i)); }
-        if (jakel_write(id, off, buf, chunk) != chunk) { ok = 0; }
+        if (jakel_write(JAKEL_SYSTEM, id, off, buf, chunk) != chunk) { ok = 0; }
     }
     // Past the end, with a 4KB gap before it.
     for (i = 0; i < chunk; i += 8) { store64(buf + i, jakel_test_word(total + chunk + i)); }
-    if (jakel_write(id, total + chunk, buf, chunk) != chunk) { ok = 0; }
+    if (jakel_write(JAKEL_SYSTEM, id, total + chunk, buf, chunk) != chunk) { ok = 0; }
     if (load64(jakel_size_base + id * 8) != total + 2 * chunk) { ok = 0; }
     for (off = 0; off < total + 2 * chunk && ok == 1; off += chunk) {
-        jakel_read(id, off, buf, chunk);
+        jakel_read(JAKEL_SYSTEM, id, off, buf, chunk);
         for (i = 0; i < chunk; i += 8) {
             int want = jakel_test_word(off + i);
             if (off == total) { want = 0; }
             if (load64(buf + i) != want) { ok = 0; }
         }
     }
-    jakel_remove(id);
+    jakel_remove(JAKEL_SYSTEM, id);
     // A second file, 4KB written whole and then a piece at 16KB. Its block
     // has no room to spare, so this write moves the file to a new block, in
     // memory the 2MB test left full of its pattern, and the 12KB gap there
     // must still read back as zeroes.
-    id = jakel_make_file(0, "jakel_appendtest");
+    id = jakel_make_file(JAKEL_SYSTEM, 0, "jakel_appendtest");
     if (id < 0) { ok = 0; }
     for (i = 0; i < chunk && ok == 1; i += 8) { store64(buf + i, jakel_test_word(i)); }
-    if (ok == 1 && jakel_write(id, 0, buf, chunk) != chunk) { ok = 0; }
-    if (ok == 1 && jakel_write(id, 4 * chunk, buf, chunk) != chunk) { ok = 0; }
+    if (ok == 1 && jakel_write(JAKEL_SYSTEM, id, 0, buf, chunk) != chunk) { ok = 0; }
+    if (ok == 1 && jakel_write(JAKEL_SYSTEM, id, 4 * chunk, buf, chunk) != chunk) { ok = 0; }
     for (off = chunk; off < 4 * chunk && ok == 1; off += chunk) {
-        jakel_read(id, off, buf, chunk);
+        jakel_read(JAKEL_SYSTEM, id, off, buf, chunk);
         for (i = 0; i < chunk; i += 8) {
             if (load64(buf + i) != 0) { ok = 0; }
         }
     }
-    if (id >= 0) { jakel_remove(id); }
+    if (id >= 0) { jakel_remove(JAKEL_SYSTEM, id); }
     if (ok == 1) {
         serial_print("[jakel] append self-test: ok\n");
     } else {
@@ -1286,9 +1776,9 @@ void jakel_seed_moon() {
         }
     }
     int stale = jakel_lookup(0, "moon.spr");
-    if (stale >= 0) { jakel_remove(stale); }
-    int f = jakel_make_file(0, "moon.spr");
-    if (f >= 0) { jakel_write(f, 0, buf, size); }
+    if (stale >= 0) { jakel_remove(JAKEL_SYSTEM, stale); }
+    int f = jakel_make_file(JAKEL_SYSTEM, 0, "moon.spr");
+    if (f >= 0) { jakel_write(JAKEL_SYSTEM, f, 0, buf, size); }
     kfree(buf);
     return;
 }
@@ -1349,9 +1839,9 @@ void jakel_seed_demo_song() {
     i = demo_note(buf, i, 48, 48, 8, 90);
     i = demo_note(buf, i, 48, 60, 8, 110);
     int stale = jakel_lookup(0, "demo.not");
-    if (stale >= 0) { jakel_remove(stale); }
-    int f = jakel_make_file(0, "demo.not");
-    if (f >= 0) { jakel_write(f, 0, buf, size); }
+    if (stale >= 0) { jakel_remove(JAKEL_SYSTEM, stale); }
+    int f = jakel_make_file(JAKEL_SYSTEM, 0, "demo.not");
+    if (f >= 0) { jakel_write(JAKEL_SYSTEM, f, 0, buf, size); }
     kfree(buf);
     return;
 }
@@ -1458,8 +1948,106 @@ void jakel_seed_infecteria_song() {
         }
         mem_copy(buf + 72 + b * 48, tmp, 48);
     }
-    int f = jakel_make_file(0, "infecteria.not");
-    if (f >= 0) { jakel_write(f, 0, buf, size); }
+    int f = jakel_make_file(JAKEL_SYSTEM, 0, "infecteria.not");
+    if (f >= 0) { jakel_write(JAKEL_SYSTEM, f, 0, buf, size); }
     kfree(buf);
     return;
+}
+
+// The largest free block in the file arena, in bytes.
+int jakel_largest_free() {
+    int best = 0;
+    int b = jakel_arena_start;
+    while (b < jakel_arena_end) {
+        if (b.free == 1 && b.size > best) { best = b.size; }
+        b += sizeof(HeapBlock) + b.size;
+    }
+    return best;
+}
+
+void jakel_bounds_test() {
+    int id = jakel_make_file(JAKEL_SYSTEM, 0, "jakel_bounds_test");
+    int buf = kmalloc(16);
+    int ok = 1;
+    if (id < 0 || buf == 0) {
+        serial_print("[jakel] bounds FAILED setup\n");
+        return;
+    }
+    store64(buf, 0x12345678);
+    if (jakel_write(JAKEL_SYSTEM, id, 0, buf, 8) != 8) { ok = 0; }
+    int data = load64(jakel_data_base + id * 8);
+    int capacity = jakel_arena_end - jakel_arena_start;
+    int n = 0;
+    for (n = 0; n < 6; n += 1) {
+        int offset = 0;
+        int len = 1;
+        if (n == 0) { offset = -1; }
+        if (n == 1) { len = -1; }
+        if (n == 2) { offset = capacity; }
+        if (n == 3) { len = capacity + 1; }
+        if (n == 4) { offset = 1; len = 9223372036854775807; }
+        if (n == 5) { offset = 9223372036854775807; }
+        if (jakel_read(JAKEL_SYSTEM, id, offset, buf + 8, len) != 0) { ok = 0; }
+        serial_print("[jakel] bounds write "); serial_print("probe"); serial_print("\n");
+        if (jakel_write(JAKEL_SYSTEM, id, offset, buf, len) != 0) { ok = 0; }
+        if (load64(jakel_size_base + id * 8) != 8) { ok = 0; }
+        if (load64(jakel_data_base + id * 8) != data) { ok = 0; }
+        if (load64(data) != 0x12345678) { ok = 0; }
+    }
+    if (jakel_write(JAKEL_SYSTEM, id, 8, buf, 8) != 8) { ok = 0; }
+    if (jakel_read(JAKEL_SYSTEM, id, 8, buf + 8, 8) != 8) { ok = 0; }
+    if (load64(buf + 8) != 0x12345678) { ok = 0; }
+    // An append to a size above two thirds of the arena, where half again
+    // that size does not fit in the arena at all. It must take a block of
+    // exactly its size when one is free, and otherwise be refused with the
+    // file as it was. The source is the arena itself, since no other kernel
+    // buffer is that large, and only the file's own new block is written.
+    int old_sz = load64(jakel_size_base + id * 8);
+    int old_data = load64(jakel_data_base + id * 8);
+    int new_sz = ((capacity - capacity / 3) / 8 + 8) * 8;
+    if (new_sz / 2 <= capacity - new_sz) { ok = 0; }
+    int largest = jakel_largest_free();
+    int fits = largest >= new_sz;
+    serial_print("[jakel] bounds headroom probe size ");
+    serial_print_int(new_sz);
+    serial_print(" largest free ");
+    serial_print_int(largest);
+    serial_print("\n");
+    int got = jakel_write(JAKEL_SYSTEM, id, old_sz, jakel_arena_start, new_sz - old_sz);
+    int now_data = load64(jakel_data_base + id * 8);
+    if (fits) {
+        serial_print("[jakel] bounds headroom probe grew\n");
+        if (got != new_sz - old_sz) { ok = 0; }
+        if (load64(jakel_size_base + id * 8) != new_sz) { ok = 0; }
+        if (now_data == 0) { ok = 0; }
+        else {
+            // Exactly its size, or that plus a tail too small to split off.
+            int block = (now_data - sizeof(HeapBlock)).size;
+            if (block < new_sz || block >= new_sz + sizeof(HeapBlock) + 8) { ok = 0; }
+        }
+    } else {
+        serial_print("[jakel] bounds headroom probe refused\n");
+        if (got != 0) { ok = 0; }
+        if (load64(jakel_size_base + id * 8) != old_sz) { ok = 0; }
+        if (now_data != old_data) { ok = 0; }
+    }
+    if (now_data == 0 || load64(now_data) != 0x12345678 || load64(now_data + 8) != 0x12345678) { ok = 0; }
+    jakel_remove(JAKEL_SYSTEM, id);
+    kfree(buf);
+    if (ok) { serial_print("[jakel] bounds PASS\n"); }
+    else { serial_print("[jakel] bounds FAILED\n"); }
+}
+
+void boot_log_persist() {
+    if (!ata_writable()) { return; }
+    int buf = kmalloc(boot_log_count + 1);
+    if (!buf) { return; }
+    int start = (boot_log_next - boot_log_count + 8192) % 8192;
+    int i = 0;
+    for (i = 0; i < boot_log_count; i += 1) {
+        store8(buf + i, load8(boot_log_data + (start + i) % 8192));
+    }
+    jakel_seed_file(0, "boot.log", buf, boot_log_count);
+    kfree(buf);
+    jakel_sync();
 }

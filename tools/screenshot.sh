@@ -18,6 +18,8 @@
 #     time, not a description of one -- same "run the actual thing"
 #     discipline as every other test script here)
 #
+# SCREENSHOT_TEST=1 selects the test boot with source-defined fixtures.
+# SCREENSHOT_SETTLE waits after the keys, before the capture.
 # Usage: ./screenshot.sh [label] [wait-seconds] [sendkey ...]
 #   label         optional; becomes part of the filename (default: "boot")
 #   wait-seconds  optional; how long to let it boot before capturing
@@ -38,7 +40,7 @@ shift $(( $# < 2 ? $# : 2 )) || true
 keys=("$@")
 
 mkdir -p screenshots
-outfile="screenshots/$(date +%Y-%m-%d)_${label}.png"
+outfile="${SCREENSHOT_OUTPUT:-screenshots/$(date +%Y-%m-%d)_${label}.png}"
 
 ./build.sh
 
@@ -46,7 +48,11 @@ isodir=isoroot
 rm -rf "$isodir" moonshot.iso
 mkdir -p "$isodir/boot/grub"
 cp build/moonshot.elf "$isodir/boot/moonshot.elf"
-cp kernel/core/grub.cfg "$isodir/boot/grub/grub.cfg"
+if [ "${SCREENSHOT_TEST:-0}" = 1 ]; then
+  cp kernel/core/grub_test.cfg "$isodir/boot/grub/grub.cfg"
+else
+  cp kernel/core/grub.cfg "$isodir/boot/grub/grub.cfg"
+fi
 grub-mkrescue -o moonshot.iso "$isodir" >grub-mkrescue.log 2>&1
 if [ ! -f moonshot.iso ]; then
   echo "FAIL: grub-mkrescue did not produce moonshot.iso"
@@ -55,7 +61,7 @@ if [ ! -f moonshot.iso ]; then
 fi
 
 sockfile="screenshot.sock"
-ppmfile="screenshot.ppm"
+ppmfile=$(mktemp "${TMPDIR:-/tmp}/moonshot-screen.XXXXXXXX.ppm")
 rm -f "$sockfile" "$ppmfile" serial.log
 
 # The budget is the initial wait + 0.3s per sendkey (they are sent one at a time,
@@ -64,9 +70,10 @@ rm -f "$sockfile" "$ppmfile" serial.log
 # kills QEMU mid-key-send once there are more than a couple of keys, which
 # surfaces as a confusing BrokenPipeError from Python rather than an
 # obviously-a-timeout error.
-budget=$((wait_seconds + (${#keys[@]} * 1) + 5))
+budget=$((wait_seconds + (${#keys[@]} * 1) + ${SCREENSHOT_SETTLE:-0} + 5))
 timeout "$budget" qemu-system-x86_64 -cdrom moonshot.iso \
   -serial file:serial.log -display none -no-reboot -m 128 \
+  ${SCREENSHOT_DISK:+-drive "file=$SCREENSHOT_DISK,format=raw,if=ide,index=0,media=disk"} \
   -monitor "unix:$sockfile,server,nowait" &
 qemu_pid=$!
 cleanup() { kill "$qemu_pid" 2>/dev/null; wait "$qemu_pid" 2>/dev/null || true; rm -f "$sockfile" "$ppmfile"; }
@@ -75,7 +82,7 @@ trap cleanup EXIT
 sleep "$wait_seconds"
 
 python3 - "$sockfile" "$ppmfile" "${keys[@]}" <<'PY'
-import socket, sys, time
+import os, socket, sys, time
 sockfile, ppmfile = sys.argv[1], sys.argv[2]
 keys = sys.argv[3:]
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -86,6 +93,7 @@ for k in keys:
     s.sendall(("sendkey %s\n" % k).encode())
     time.sleep(0.3)
     s.recv(4096)
+time.sleep(int(os.environ.get("SCREENSHOT_SETTLE", "0")))
 s.sendall(("screendump %s\n" % ppmfile).encode())
 time.sleep(0.5)
 s.recv(4096)
@@ -104,7 +112,7 @@ elif command -v convert >/dev/null 2>&1; then
   convert "$ppmfile" "$outfile"
 else
   echo "no ImageMagick (magick/convert) found -- keeping the raw PPM instead"
-  outfile="screenshots/$(date +%Y-%m-%d)_${label}.ppm"
+  outfile="${outfile%.*}.ppm"
   mv "$ppmfile" "$outfile"
 fi
 

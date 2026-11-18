@@ -102,8 +102,7 @@ sleep 0.5
 #   "kakel typed: win=0 char=97 row=R col=C1"  -- scancode 30 decoded to 'a'
 #       (97) via scancode_init's table and DREW into window 0 (the boot-time
 #       focus). This is the real point, a keypress visibly changes the
-#       screen, not just that IRQ1 fired (the "key scancode" lines already
-#       prove delivery).
+#       screen through the keyboard IRQ and the shell input queue.
 #   "kakel typed: win=0 char=65 row=R col=C2"  -- the SECOND 'a', typed with
 #       CapsLock on and no Shift, decodes to 'A' (65) not 'a': proof CapsLock
 #       inverts a letter's case on its own. Must be the SAME row R and
@@ -122,7 +121,7 @@ sleep 0.5
 #       focus back around to window 0.
 #
 # (If GRUB did not grant a framebuffer, kakel never activates and
-# keyboard_handler falls back to VGA text mode; not separately checked --
+# shell input echo falls back to VGA text mode; not separately checked --
 # every real run gets the framebuffer.)
 a_line=$(grep -oE "^kakel typed: win=0 char=97 row=[0-9]+ col=[0-9]+$" serial.log | head -1)
 A_line=$(grep -oE "^kakel typed: win=0 char=65 row=[0-9]+ col=[0-9]+$" serial.log | head -1)
@@ -133,7 +132,6 @@ parse_row() { echo "$1" | sed -E 's/.* row=([0-9]+) col=[0-9]+/\1/'; }
 parse_col() { echo "$1" | sed -E 's/.* row=[0-9]+ col=([0-9]+)/\1/'; }
 
 ok=1
-if ! grep -q "key scancode" serial.log; then ok=0; fi
 if [ -z "$a_line" ] || [ -z "$A_line" ] || [ -z "$tab_line" ] || [ -z "$b_line" ]; then ok=0; fi
 # Focus must switch to a different window (any non-zero id)
 if ! grep -q "^kakel focus: win=0$" serial.log; then ok=0; fi

@@ -317,3 +317,16 @@ if (eq(attr(by_id(\"keep\"), \"id\"), \"keep\") && len(\"abc\") == 3) {
 </html>
 ";
 }
+
+int utsikt_site_index() {
+    return "<html><head><link rel='icon' href='missing.css'><link rel='stylesheet' href='css/site.css'><link rel='stylesheet' href='missing.css'></head><body><h1>workbench</h1><nav><a href='resume.html'>resume</a> <a href='blog.html'>blog</a> <a href='now/index.html'>now</a> <a href='explore/index.html'>explore</a></nav><main><p>a small page kept on disk, with a shared sheet beside it.</p><mark><a href='now/index.html'>read the next page</a></mark><p>å ä ö Å Ä Ö é – … “text”</p></main></body></html>";
+}
+int utsikt_site_next() {
+    return "<html><head><link rel='stylesheet' href='../css/site.css'></head><body><h1>another page</h1><p>the sheet lives in the parent folder, the return link does too.</p><mark><a href='../index.html'>back to workbench</a></mark><p>å ä ö Å Ä Ö é – … “text”</p></body></html>";
+}
+int utsikt_site_flat() {
+    return "<html><head><link rel='stylesheet' href='css/site.css'></head><body><h1>notes</h1><p>a second page using the same sheet.</p><a href='index.html'>back to workbench</a></body></html>";
+}
+int utsikt_site_css() {
+    return "body{background:#111;color:white;padding:8px} h1{background:linear-gradient(120deg,#20880c 0,#6fcf6f 37.5%,#20880c 100%);background-clip:text;color:transparent} nav a{color:#aaa} main{padding:96px 0} mark{background:transparent} mark a{color:white}";
+}

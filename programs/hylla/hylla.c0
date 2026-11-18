@@ -762,8 +762,12 @@ void go_up() {
 void start(int program, int file) {
     int line = file;
     if (program != 0) { line = join(program, " ", file); }
-    if (spawn(line) >= 0) {
+    int t = spawn(line);
+    if (t >= 0) {
         message = join("opened", " ", line);
+    } else if (t == 0 - 8) {
+        // The kernel starts a program only from a file its user or root owns.
+        message = join("not started, another user owns", " ", line);
     } else {
         message = join("could not open", " ", line);
     }

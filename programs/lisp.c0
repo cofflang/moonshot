@@ -1,0 +1,433 @@
+// Copyright (C) 2026 tavro
+// Distributed under the GNU General Public License version 3 or later.
+// A small Lisp for gnista programs. tmp_lisp is a placeholder prefix.
+// Values are checked arena handles. Zero is nil and the only false value.
+layout TmpLisp {
+    int cells; int cap; int roots; int nr; int syms; int globals; int ns;
+    int error; int text; int pos; int len; int line; int column;
+    int fuel; int budget; int depth; int stress; int result; int collections;
+}
+layout TmpLispCell { int tag; int a; int b; int mark; }
+
+int tmp_lisp_fail(int v, int e) { if (!v.error) { v.error = e; } return 0; }
+int tmp_lisp_cell(int v, int x) {
+    if (x < 1 || x > v.cap) { return tmp_lisp_fail(v, 1); }
+    return v.cells + (x - 1) * sizeof(TmpLispCell);
+}
+int tmp_lisp_tag(int v, int x) {
+    if (!x) { return 0; }
+    int c = tmp_lisp_cell(v, x);
+    if (!c) { return 0; }
+    if (!c.tag) { tmp_lisp_fail(v, 1); }
+    return c.tag;
+}
+int tmp_lisp_a(int v, int x) {
+    int c = tmp_lisp_cell(v, x); if (!c) { return 0; } return c.a;
+}
+int tmp_lisp_b(int v, int x) {
+    int c = tmp_lisp_cell(v, x); if (!c) { return 0; } return c.b;
+}
+int tmp_lisp_root(int v, int x) {
+    if (v.nr >= 2048) { return tmp_lisp_fail(v, 2); }
+    store64(v.roots + v.nr * 8, x); v.nr += 1; return x;
+}
+int tmp_lisp_mark(int v, int x) {
+    if (!x) { return 0; }
+    int c = tmp_lisp_cell(v, x);
+    if (!c || !c.tag || c.mark) { return 0; }
+    c.mark = 1; return 1;
+}
+int tmp_lisp_collect(int v) {
+    int i = 0;
+    for (i = 1; i <= v.cap; i += 1) { int c = tmp_lisp_cell(v, i); c.mark = 0; }
+    for (i = 0; i < v.nr; i += 1) { tmp_lisp_mark(v, load64(v.roots + i * 8)); }
+    for (i = 0; i < v.ns; i += 1) {
+        tmp_lisp_mark(v, load64(v.syms + i * 72));
+        tmp_lisp_mark(v, load64(v.globals + i * 8));
+    }
+    tmp_lisp_mark(v, v.result);
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (i = 1; i <= v.cap; i += 1) {
+            int c = tmp_lisp_cell(v, i);
+            if (c.mark && (c.tag == 3 || c.tag == 4)) {
+                changed += tmp_lisp_mark(v, c.a); changed += tmp_lisp_mark(v, c.b);
+            }
+        }
+    }
+    int freed = 0;
+    for (i = 1; i <= v.cap; i += 1) {
+        int c = tmp_lisp_cell(v, i);
+        if (c.tag && !c.mark) { c.tag = 0; freed += 1; }
+    }
+    v.collections += 1; return freed;
+}
+// Every allocating caller roots all live handles before crossing this boundary.
+int tmp_lisp_make(int v, int tag, int a, int b) {
+    if (v.error) { return 0; }
+    if (v.stress) { tmp_lisp_collect(v); }
+    int pass = 0;
+    for (pass = 0; pass < 2; pass += 1) {
+        int i = 0;
+        for (i = 1; i <= v.cap; i += 1) {
+            int c = tmp_lisp_cell(v, i);
+            if (!c.tag) { c.tag = tag; c.a = a; c.b = b; c.mark = 0; return i; }
+        }
+        if (!pass) { tmp_lisp_collect(v); }
+    }
+    return tmp_lisp_fail(v, 3);
+}
+int tmp_lisp_cons(int v, int a, int b) {
+    int n = v.nr; tmp_lisp_root(v, a); tmp_lisp_root(v, b);
+    int r = tmp_lisp_make(v, 3, a, b); v.nr = n; return r;
+}
+int tmp_lisp_number(int v, int n) { return tmp_lisp_make(v, 1, n, 0); }
+int tmp_lisp_integer(int v, int x) {
+    if (tmp_lisp_tag(v, x) != 1) { return tmp_lisp_fail(v, 4); }
+    return tmp_lisp_a(v, x);
+}
+int tmp_lisp_equal_text(int a, int b, int len) {
+    int i = 0;
+    for (i = 0; i < len; i += 1) { if (load8(a + i) != load8(b + i)) { return 0; } }
+    return load8(a + len) == 0;
+}
+int tmp_lisp_symbol(int v, int text, int len) {
+    if (len < 1 || len > 63) { return tmp_lisp_fail(v, 5); }
+    int i = 0;
+    for (i = 0; i < v.ns; i += 1) {
+        int s = v.syms + i * 72;
+        if (tmp_lisp_equal_text(s + 8, text, len)) { return load64(s); }
+    }
+    if (v.ns == 128) { return tmp_lisp_fail(v, 5); }
+    int x = tmp_lisp_make(v, 2, v.ns, 0);
+    if (!x) { return 0; }
+    int s = v.syms + v.ns * 72;
+    store64(s, x);
+    for (i = 0; i < len; i += 1) { store8(s + 8 + i, load8(text + i)); }
+    store8(s + 8 + len, 0); v.ns += 1; return x;
+}
+int tmp_lisp_length(int v, int xs) {
+    int n = 0;
+    while (xs && !v.error) {
+        if (tmp_lisp_tag(v, xs) != 3 || n >= v.cap) { tmp_lisp_fail(v, 4); return 0; }
+        n += 1; xs = tmp_lisp_b(v, xs);
+    }
+    return n;
+}
+int tmp_lisp_named(int v, int x, int name) {
+    if (tmp_lisp_tag(v, x) != 2) { return 0; }
+    int id = tmp_lisp_a(v, x); int i = 0;
+    while (load8(name + i)) { i += 1; }
+    return tmp_lisp_equal_text(v.syms + id * 72 + 8, name, i);
+}
+int tmp_lisp_advance(int v) {
+    int c = load8(v.text + v.pos); v.pos += 1;
+    if (c == 10) { v.line += 1; v.column = 1; } else { v.column += 1; }
+    return c;
+}
+int tmp_lisp_space(int v) {
+    while (v.pos < v.len) {
+        int c = load8(v.text + v.pos);
+        if (c == ';') {
+            while (v.pos < v.len && load8(v.text + v.pos) != 10) { tmp_lisp_advance(v); }
+        } else {
+            if (c != 32 && c != 9 && c != 10 && c != 13) { return 0; }
+            tmp_lisp_advance(v);
+        }
+    }
+    return 0;
+}
+int tmp_lisp_read(int v) {
+    if (v.error) { return 0; }
+    if (v.depth >= 48) { return tmp_lisp_fail(v, 6); }
+    v.depth += 1; int roots = v.nr; int r = 0;
+    tmp_lisp_space(v);
+    if (v.pos >= v.len) { tmp_lisp_fail(v, 7); }
+    else {
+        int c = tmp_lisp_advance(v);
+        if (c == '(') {
+            int head = 0; int tail = 0;
+            int slot = v.nr; tmp_lisp_root(v, 0);
+            tmp_lisp_space(v);
+            while (v.pos < v.len && load8(v.text + v.pos) != ')' && !v.error) {
+                int x = tmp_lisp_read(v);
+                int pair = tmp_lisp_cons(v, x, 0);
+                if (!head) { head = pair; store64(v.roots + slot * 8, head); }
+                else { int tc = tmp_lisp_cell(v, tail); tc.b = pair; }
+                tail = pair; tmp_lisp_space(v);
+            }
+            if (v.pos >= v.len) { tmp_lisp_fail(v, 7); }
+            else { tmp_lisp_advance(v); }
+            r = head;
+        } else {
+            if (c == 39) {
+                int x = tmp_lisp_read(v); tmp_lisp_root(v, x);
+                int q = tmp_lisp_symbol(v, "quote", 5); tmp_lisp_root(v, q);
+                int args = tmp_lisp_cons(v, x, 0);
+                r = tmp_lisp_cons(v, q, args);
+            } else {
+                if (c == ')') { tmp_lisp_fail(v, 7); }
+                else {
+                    int start = v.pos - 1;
+                    while (v.pos < v.len) {
+                        int d = load8(v.text + v.pos);
+                        if (d <= 32 || d == '(' || d == ')' || d == 39 || d == ';') { break; }
+                        tmp_lisp_advance(v);
+                    }
+                    int len = v.pos - start; int off = 0; int neg = 0;
+                    if (c == '-' && len > 1) { neg = 1; off = 1; }
+                    int digit = load8(v.text + start + off);
+                    if (digit >= '0' && digit <= '9') {
+                        int n = 0;
+                        for (off = off; off < len && !v.error; off += 1) {
+                            int d = load8(v.text + start + off) - '0';
+                            if (d < 0 || d > 9) { tmp_lisp_fail(v, 7); }
+                            else {
+                                // Accumulate negatively to include the signed minimum.
+                                int last = 7; if (neg) { last = 8; }
+                                if (n < -922337203685477580 || (n == -922337203685477580 && d > last)) { tmp_lisp_fail(v, 8); }
+                                else { n = n * 10 - d; }
+                            }
+                        }
+                        if (!neg) { n = 0 - n; }
+                        r = tmp_lisp_number(v, n);
+                    } else { r = tmp_lisp_symbol(v, v.text + start, len); }
+                }
+            }
+        }
+    }
+    v.nr = roots; v.depth -= 1; if (v.error) { return 0; } return r;
+}
+int tmp_lisp_lookup(int v, int sym, int env) {
+    while (env && !v.error) {
+        int binding = tmp_lisp_a(v, env);
+        if (tmp_lisp_a(v, binding) == sym) { return tmp_lisp_b(v, binding); }
+        env = tmp_lisp_b(v, env);
+    }
+    int value = load64(v.globals + tmp_lisp_a(v, sym) * 8);
+    // A separate symbol bit records definitions whose value is nil.
+    int c = tmp_lisp_cell(v, sym);
+    if (!c.b) { return tmp_lisp_fail(v, 9); }
+    return value;
+}
+int tmp_lisp_set(int v, int sym, int value) {
+    if (tmp_lisp_tag(v, sym) != 2) { return tmp_lisp_fail(v, 4); }
+    store64(v.globals + tmp_lisp_a(v, sym) * 8, value);
+    int c = tmp_lisp_cell(v, sym); c.b = 1; return value;
+}
+int tmp_lisp_builtin(int v, int op, int args) {
+    int count = tmp_lisp_length(v, args);
+    if (count != 2 && op <= 9) { return tmp_lisp_fail(v, 10); }
+    if (count != 1 && op >= 10 && op <= 12) { return tmp_lisp_fail(v, 10); }
+    if (count != 2 && op == 13) { return tmp_lisp_fail(v, 10); }
+    int x = tmp_lisp_a(v, args);
+    if (op == 10 || op == 11) {
+        if (tmp_lisp_tag(v, x) != 3) { return tmp_lisp_fail(v, 4); }
+        if (op == 10) { return tmp_lisp_a(v, x); } return tmp_lisp_b(v, x);
+    }
+    if (op == 12) { if (!x) { return tmp_lisp_number(v, 1); } return 0; }
+    int y = tmp_lisp_a(v, tmp_lisp_b(v, args));
+    if (op == 13) { return tmp_lisp_cons(v, x, y); }
+    int a = tmp_lisp_integer(v, x); int b = tmp_lisp_integer(v, y); int n = 0;
+    if (v.error) { return 0; }
+    // Arithmetic wraps at 64 bits except division overflow and zero divisors.
+    if (op == 1) { n = a + b; }
+    if (op == 2) { n = a - b; }
+    if (op == 3) { n = a * b; }
+    if (op == 4 || op == 5) {
+        if (!b || (a == 0 - 9223372036854775807 - 1 && b == -1)) { return tmp_lisp_fail(v, 11); }
+        if (op == 4) { n = a / b; } else { n = a % b; }
+    }
+    if (op == 6) { if (a == b) { return tmp_lisp_number(v, 1); } return 0; }
+    if (op == 7) { if (a < b) { return tmp_lisp_number(v, 1); } return 0; }
+    if (op == 8) { if (a > b) { return tmp_lisp_number(v, 1); } return 0; }
+    return tmp_lisp_number(v, n);
+}
+int tmp_lisp_apply(int v, int fn, int args) {
+    int roots = v.nr; tmp_lisp_root(v, fn); tmp_lisp_root(v, args);
+    int tag = tmp_lisp_tag(v, fn); int r = 0;
+    if (tag == 6) { r = tmp_lisp_builtin(v, tmp_lisp_a(v, fn), args); }
+    else {
+        if (tag == 5) {
+            if (tmp_lisp_length(v, args) != tmp_lisp_b(v, fn)) { tmp_lisp_fail(v, 10); }
+            else { int host = tmp_lisp_a(v, fn); r = host(v, args); }
+        } else {
+            if (tag != 4) { tmp_lisp_fail(v, 4); }
+            else {
+                int params = tmp_lisp_a(v, fn); int env = 0;
+                int slot = v.nr; tmp_lisp_root(v, 0);
+                while (params && args && !v.error) {
+                    int pair = tmp_lisp_cons(v, tmp_lisp_a(v, params), tmp_lisp_a(v, args));
+                    env = tmp_lisp_cons(v, pair, env); store64(v.roots + slot * 8, env);
+                    params = tmp_lisp_b(v, params); args = tmp_lisp_b(v, args);
+                }
+                if (params || args) { tmp_lisp_fail(v, 10); }
+                else { r = tmp_lisp_eval_node(v, tmp_lisp_b(v, fn), env); }
+            }
+        }
+    }
+    v.nr = roots; if (v.error) { return 0; } return r;
+}
+int tmp_lisp_lambda(int v, int params, int body) {
+    int p = params;
+    while (p && !v.error) {
+        if (tmp_lisp_tag(v, p) != 3 || tmp_lisp_tag(v, tmp_lisp_a(v, p)) != 2) { return tmp_lisp_fail(v, 4); }
+        int q = tmp_lisp_b(v, p);
+        while (q) {
+            if (tmp_lisp_tag(v, q) != 3) { return tmp_lisp_fail(v, 4); }
+            if (tmp_lisp_a(v, p) == tmp_lisp_a(v, q)) { return tmp_lisp_fail(v, 4); }
+            q = tmp_lisp_b(v, q);
+        }
+        p = tmp_lisp_b(v, p);
+    }
+    return tmp_lisp_make(v, 4, params, body);
+}
+int tmp_lisp_eval_inner(int v, int x, int env) {
+    int tag = tmp_lisp_tag(v, x);
+    if (tag == 2) { return tmp_lisp_lookup(v, x, env); }
+    if (tag != 3) { return x; }
+    int op = tmp_lisp_a(v, x); int args = tmp_lisp_b(v, x);
+    int count = tmp_lisp_length(v, args);
+    if (tmp_lisp_named(v, op, "quote")) {
+        if (count != 1) { return tmp_lisp_fail(v, 10); } return tmp_lisp_a(v, args);
+    }
+    if (tmp_lisp_named(v, op, "if")) {
+        if (count != 3) { return tmp_lisp_fail(v, 10); }
+        int cond = tmp_lisp_eval_node(v, tmp_lisp_a(v, args), env);
+        args = tmp_lisp_b(v, args);
+        if (!cond) { args = tmp_lisp_b(v, args); }
+        return tmp_lisp_eval_node(v, tmp_lisp_a(v, args), env);
+    }
+    if (tmp_lisp_named(v, op, "lambda") || tmp_lisp_named(v, op, "define")) {
+        if (count != 2) { return tmp_lisp_fail(v, 10); }
+        int target = tmp_lisp_a(v, args);
+        int body = tmp_lisp_a(v, tmp_lisp_b(v, args));
+        if (tmp_lisp_named(v, op, "lambda")) { return tmp_lisp_lambda(v, target, body); }
+        int value = 0;
+        if (tmp_lisp_tag(v, target) == 3) {
+            value = tmp_lisp_lambda(v, tmp_lisp_b(v, target), body);
+            target = tmp_lisp_a(v, target);
+        } else { value = tmp_lisp_eval_node(v, body, env); }
+        if (v.error) { return 0; } return tmp_lisp_set(v, target, value);
+    }
+    int roots = v.nr;
+    int fn = tmp_lisp_eval_node(v, op, env); tmp_lisp_root(v, fn);
+    int head = 0; int tail = 0; int slot = v.nr; tmp_lisp_root(v, 0);
+    while (args && !v.error) {
+        int value = tmp_lisp_eval_node(v, tmp_lisp_a(v, args), env);
+        int pair = tmp_lisp_cons(v, value, 0);
+        if (!head) { head = pair; store64(v.roots + slot * 8, head); }
+        else { int c = tmp_lisp_cell(v, tail); c.b = pair; }
+        tail = pair; args = tmp_lisp_b(v, args);
+    }
+    int r = 0; if (!v.error) { r = tmp_lisp_apply(v, fn, head); }
+    v.nr = roots; return r;
+}
+int tmp_lisp_eval_node(int v, int x, int env) {
+    if (v.error) { return 0; }
+    if (v.fuel <= 0) { return tmp_lisp_fail(v, 12); }
+    if (v.depth >= 48) { return tmp_lisp_fail(v, 6); }
+    v.fuel -= 1; v.depth += 1;
+    int roots = v.nr; tmp_lisp_root(v, x); tmp_lisp_root(v, env);
+    int r = tmp_lisp_eval_inner(v, x, env);
+    v.nr = roots; v.depth -= 1; if (v.error) { return 0; } return r;
+}
+int tmp_lisp_bind(int v, int name, int fn, int argc) {
+    if (!fn || argc < 0 || argc > 16) { return tmp_lisp_fail(v, 10); }
+    int len = 0; while (len <= 63 && load8(name + len)) { len += 1; }
+    int sym = tmp_lisp_symbol(v, name, len);
+    int value = tmp_lisp_make(v, 5, fn, argc);
+    if (v.error) { return 0; } tmp_lisp_set(v, sym, value); return 1;
+}
+int tmp_lisp_new(int cells, int fuel) {
+    if (cells < 64 || cells > 65536 || fuel < 1 || fuel > 1000000) { return 0; }
+    int v = alloc(sizeof(TmpLisp)); if (!v) { return 0; }
+    int i = 0; for (i = 0; i < sizeof(TmpLisp); i += 8) { store64(v + i, 0); }
+    v.cells = alloc(cells * sizeof(TmpLispCell)); v.roots = alloc(2048 * 8);
+    v.syms = alloc(128 * 72); v.globals = alloc(128 * 8);
+    if (!v.cells || !v.roots || !v.syms || !v.globals) {
+        if (v.cells) { dealloc(v.cells); } if (v.roots) { dealloc(v.roots); }
+        if (v.syms) { dealloc(v.syms); } if (v.globals) { dealloc(v.globals); } dealloc(v); return 0;
+    }
+    v.cap = cells; v.budget = fuel;
+    for (i = 0; i < cells * sizeof(TmpLispCell); i += 8) { store64(v.cells + i, 0); }
+    for (i = 0; i < 128 * 8; i += 8) { store64(v.globals + i, 0); }
+    int names = "+-*/%=<>";
+    for (i = 0; i < 8; i += 1) {
+        int sym = tmp_lisp_symbol(v, names + i, 1);
+        int value = tmp_lisp_make(v, 6, i + 1, 0); tmp_lisp_set(v, sym, value);
+    }
+    int sym = tmp_lisp_symbol(v, "car", 3); tmp_lisp_set(v, sym, tmp_lisp_make(v, 6, 10, 0));
+    sym = tmp_lisp_symbol(v, "cdr", 3); tmp_lisp_set(v, sym, tmp_lisp_make(v, 6, 11, 0));
+    sym = tmp_lisp_symbol(v, "null?", 5); tmp_lisp_set(v, sym, tmp_lisp_make(v, 6, 12, 0));
+    sym = tmp_lisp_symbol(v, "cons", 4); tmp_lisp_set(v, sym, tmp_lisp_make(v, 6, 13, 0));
+    return v;
+}
+int tmp_lisp_free(int v) {
+    if (!v) { return 0; }
+    dealloc(v.cells); dealloc(v.roots); dealloc(v.syms); dealloc(v.globals); dealloc(v); return 0;
+}
+int tmp_lisp_begin(int v) {
+    v.error = 0; v.nr = 0; v.depth = 0; v.result = 0;
+    v.fuel = v.budget; v.pos = 0; v.line = 1; v.column = 1; return 0;
+}
+int tmp_lisp_eval_text(int v, int text, int len) {
+    tmp_lisp_begin(v);
+    if (len < 0 || len > 16384) { return tmp_lisp_fail(v, 13); }
+    v.text = text; v.len = len; int i = 0;
+    for (i = 0; i < len; i += 1) {
+        int c = load8(text + i);
+        if ((c < 32 && c != 9 && c != 10 && c != 13) || c > 126) { return tmp_lisp_fail(v, 7); }
+    }
+    tmp_lisp_space(v);
+    while (v.pos < v.len && !v.error) {
+        int form = tmp_lisp_read(v);
+        v.result = tmp_lisp_eval_node(v, form, 0);
+        tmp_lisp_space(v);
+    }
+    return v.result;
+}
+// Returned handles remain rooted until the next entry call. Retain values in globals.
+int tmp_lisp_eval(int v, int text) {
+    int n = 0; while (n <= 16384 && load8(text + n)) { n += 1; }
+    return tmp_lisp_eval_text(v, text, n);
+}
+// Scripts are plain ASCII text without a binary header or embedded NUL bytes.
+int tmp_lisp_load(int v, int filename) {
+    tmp_lisp_begin(v);
+    int size = readfile(filename, 0, 0);
+    if (size < 0 || size > 16384) { tmp_lisp_fail(v, 13); return v.error; }
+    int buf = alloc(size + 1); if (!buf) { tmp_lisp_fail(v, 3); return v.error; }
+    if (readfile(filename, buf, size) != size) { tmp_lisp_fail(v, 13); }
+    else { tmp_lisp_eval_text(v, buf, size); }
+    dealloc(buf); return v.error;
+}
+int tmp_lisp_call(int v, int name, int a, int b, int c) {
+    tmp_lisp_begin(v);
+    int len = 0; while (len <= 63 && load8(name + len)) { len += 1; }
+    int sym = tmp_lisp_symbol(v, name, len);
+    if (v.error) { return 0; }
+    int fn = tmp_lisp_lookup(v, sym, 0); tmp_lisp_root(v, fn);
+    int args = 0; int slot = v.nr; tmp_lisp_root(v, 0);
+    int val = tmp_lisp_number(v, c); args = tmp_lisp_cons(v, val, args); store64(v.roots + slot * 8, args);
+    val = tmp_lisp_number(v, b); args = tmp_lisp_cons(v, val, args); store64(v.roots + slot * 8, args);
+    val = tmp_lisp_number(v, a); args = tmp_lisp_cons(v, val, args); store64(v.roots + slot * 8, args);
+    v.result = tmp_lisp_apply(v, fn, args); v.nr = 0; return v.result;
+}
+int tmp_lisp_error(int v) {
+    if (!v.error) { return ""; }
+    if (v.error == 1) { return "invalid cell handle"; }
+    if (v.error == 2) { return "root stack limit"; }
+    if (v.error == 3) { return "arena exhausted"; }
+    if (v.error == 4) { return "invalid value type"; }
+    if (v.error == 5) { return "symbol limit"; }
+    if (v.error == 6) { return "depth limit"; }
+    if (v.error == 7) { return "malformed text"; }
+    if (v.error == 8) { return "integer overflow"; }
+    if (v.error == 9) { return "unbound symbol"; }
+    if (v.error == 10) { return "invalid arity"; }
+    if (v.error == 11) { return "invalid division"; }
+    if (v.error == 12) { return "fuel exhausted"; }
+    return "script size or read failure";
+}

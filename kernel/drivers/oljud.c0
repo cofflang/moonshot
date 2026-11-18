@@ -72,6 +72,50 @@ int oljud_irqs = 0;        // halves finished, which also says which half is nex
 int oljud_played = 0;      // queue bytes mixed into the DMA ring, ever
 int oljud_dsp_version = 0; // major * 256 + minor once the card answered
 
+// One bounded cue voice, independent of every program queue.
+int pling_muted = 0;
+int pling_samples = 0;
+int pling_ready = 0;
+int pling_current = 0;
+int pling_position = 0;
+int PLING_FRAMES = 4410;
+
+void pling_init() {
+    int started = pit_ticks;
+    if (!pling_samples) { return; }
+    int event = 0;
+    int i = 0;
+    for (event = 0; event < 2; event += 1) {
+        int phase = 0;
+        for (i = 0; i < PLING_FRAMES; i += 1) {
+            int note = i / 2205;
+            int frequency = 440 + note * 220;
+            if (event == 1) { frequency = 660 - note * 220; }
+            phase = (phase + frequency) % OLJUD_RATE;
+            int amplitude = 12 * (PLING_FRAMES - i) / PLING_FRAMES;
+            if (i < 220) { amplitude = amplitude * i / 220; }
+            int sample = amplitude;
+            if (phase < OLJUD_RATE / 2) { sample = 0 - sample; }
+            store8(pling_samples + event * PLING_FRAMES + i, 128 + sample);
+        }
+    }
+    pling_ready = 1;
+    int sl = serial_line_begin();
+    serial_print("[pling] generator ticks=");
+    serial_print_int(pit_ticks - started);
+    serial_print("\n");
+    serial_line_end(sl);
+    return;
+}
+
+void pling_trigger(int event) {
+    if (pling_muted || !oljud_active || !pling_ready) { return; }
+    if (event < 0 || event > 1) { return; }
+    pling_current = pling_samples + event * PLING_FRAMES;
+    pling_position = 0;
+    return;
+}
+
 // Takes the DMA ring and the queues. Runs early in main, right after jakel's
 // arena, and takes contiguous runs from the top of pmm. It is done whether
 // or not there is a card (that is not known yet), and costs about half a
@@ -92,6 +136,7 @@ void oljud_mem_init() {
         oljud_q = 0;
         return;
     }
+    pling_samples = kmalloc(PLING_FRAMES * 2);
     int t = 0;
     for (t = 0; t < MAX_TASKS; t += 1) { oljud_task_reset(t); }
     return;
@@ -183,6 +228,16 @@ void oljud_fill(int half) {
             store64(oljud_qcount_base + t * 8, count - n * fbytes);
             oljud_played += n * fbytes;
         }
+    }
+    if (!pling_muted && pling_current) {
+        for (i = 0; i < OLJUD_HALF && pling_position < PLING_FRAMES; i += 1) {
+            int cue = (load8(pling_current + pling_position) - 128) * 256;
+            int mix = oljud_mix + i * 16;
+            store64(mix, load64(mix) + cue);
+            store64(mix + 8, load64(mix + 8) + cue);
+            pling_position += 1;
+        }
+        if (pling_position == PLING_FRAMES) { pling_current = 0; }
     }
     int dst = oljud_dma + half * OLJUD_HALF * 4;
     for (i = 0; i < OLJUD_HALF; i += 1) {
@@ -348,13 +403,15 @@ int oljud_submit(int buf, int len) {
     if (len < n) { n = len; }
     // Whole frames only, so a frame never wraps half queued.
     n -= n % oljud_frame_bytes(load64(oljud_fmt_base + tid * 8));
+    // Only the bytes that fit are read, and all of them are checked to be
+    // the caller's first, so a length far past its buffer queues nothing.
+    if (!user_span(buf, n, 0)) { return 0 - 1; }
     int q = oljud_q + tid * OLJUD_QSIZE;
     int tail = (load64(oljud_qhead_base + tid * 8) + count) & (OLJUD_QSIZE - 1);
-    int i = 0;
-    for (i = 0; i < n; i += 1) {
-        store8(q + tail, load8(buf + i));
-        tail = (tail + 1) & (OLJUD_QSIZE - 1);
-    }
+    int first = OLJUD_QSIZE - tail;
+    if (first > n) { first = n; }
+    if (!user_copy_in(q + tail, buf, first)) { return 0 - 1; }
+    if (n > first && !user_copy_in(q, buf + first, n - first)) { return 0 - 1; }
     store64(oljud_qcount_base + tid * 8, count + n);
     return n;
 }

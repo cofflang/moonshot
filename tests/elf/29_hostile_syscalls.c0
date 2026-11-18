@@ -1,0 +1,859 @@
+// 29_hostile_syscalls.c0 — part of the moonshot operating system.
+//
+// Copyright (C) 2026 tavro
+//
+// This file is part of moonshot, an operating system built from scratch.
+// moonshot is free software, distributed under the GNU General Public
+// License version 3 or (at your option) any later version, WITHOUT ANY
+// WARRANTY; see the LICENSE file for the full text.
+//
+// expect: 0
+// Calls every syscall with arguments a hostile program would choose, for
+// verify_hostile_syscalls.sh. Null, kernel half, non-canonical and unmapped
+// pointers, pointers whose end wraps, negative and huge lengths, bad
+// handles and bad task ids.
+//
+// With the argument all it runs every case below 100, one after the other,
+// while a second copy of itself keeps a canary in memory and in a file and
+// checks it throughout. Each case that holds adds one, and so does the
+// canary. With a number it runs that one case alone, and exits 77 when it
+// holds or the number of the check that did not. With anything else, as
+// when the elf backend test starts every program, it exits 0 at once, since
+// that test reads one exit code per program and this one starts others.
+// Cases from 100 on each expose a known open finding, they are listed in
+// the script and are never run without a number, since some of them take
+// the kernel down.
+include "moon.c0";
+
+int WIRED_LAST = 59;
+
+// The pointers a hostile program passes. A buffer of its own is the one case
+// the kernel has to accept.
+int p_null() { return 0; }
+int p_low() { return 0x100000; }
+int p_high() { return (0 - 1) << 47; }
+int p_noncanon() { return 1 << 63; }
+int p_unmapped() { return 1 << 42; }
+int p_sentinel() { return 1 << 32; }
+int huge() { return (1 << 62) - 1 + (1 << 62); }
+
+// A result line is built whole and printed with one call, since the kernel
+// can print between two calls and split the line.
+int lbuf = 0;
+int llen = 0;
+
+void lput(int s) {
+    int i = 0;
+    while (load8(s + i) != 0) { store8(lbuf + llen, load8(s + i)); llen += 1; i += 1; }
+    store8(lbuf + llen, 0);
+}
+
+void lnum(int n) {
+    if (n < 0) { lput("-"); n = 0 - n; }
+    if (n == 0) { lput("0"); return; }
+    int top = 1;
+    while (top <= n / 10) { top = top * 10; }
+    while (top > 0) {
+        store8(lbuf + llen, '0' + n / top % 10);
+        llen += 1;
+        top = top / 10;
+    }
+    store8(lbuf + llen, 0);
+}
+
+int same(int a, int b) {
+    int i = 0;
+    while (load8(a + i) != 0 || load8(b + i) != 0) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i += 1;
+    }
+    return 1;
+}
+
+int bad(int r) { return r != 0 - 1; }
+
+// Syscall 0 and 27 end the program, so their cases run in a child.
+int child_exit(int arg) {
+    int t = spawn_with(arg, 1);
+    if (t < 0) { return 1; }
+    return wait_for(t, 500);
+}
+
+int c_exit_huge_code() {
+    if (child_exit("test/et29.elf x0") != (1 << 40) + 5) { return 1; }
+    return 0;
+}
+
+int c_exit_close_huge_code() {
+    if (child_exit("test/et29.elf x27") != (1 << 40) + 6) { return 1; }
+    return 0;
+}
+
+int c_unknown_numbers() {
+    if (bad(syscall(39, 0, 0, 0, 0, 0))) { return 1; }
+    if (bad(syscall(0 - 1, 0, 0, 0, 0, 0))) { return 2; }
+    if (bad(syscall(1 << 62, 1, 2, 3, 4, 5))) { return 3; }
+    if (bad(syscall(1 << 63, 1, 2, 3, 4, 5))) { return 4; }
+    if (bad(syscall(0x100000000 + 6, 1, 2, 3, 4, 5))) { return 5; }
+    return 0;
+}
+
+int c_debug_print_lengths() {
+    int b = alloc(64);
+    if (syscall(1, b, 0 - 1, 0, 0, 0) > 0) { return 1; }
+    if (syscall(1, b, 1 << 63, 0, 0, 0) > 0) { return 2; }
+    if (syscall(1, p_high(), 0, 0, 0, 0) != 0) { return 3; }
+    if (syscall(1, p_null(), 0, 0, 0, 0) != 0) { return 4; }
+    return 0;
+}
+
+int c_no_argument_calls() {
+    int h = huge();
+    int before = ticks();
+    syscall(2, h, h, h, h, h);
+    syscall(4, h, h, h, h, h);
+    syscall(10, h, h, h, h, h);
+    syscall(11, h, h, h, h, h);
+    syscall(17, h, 0 - 1, h, h, h);
+    syscall(37, h, h, h, h, h);
+    if (syscall(7, h, h, h, h, h) < before) { return 1; }
+    return 0;
+}
+
+int c_fill_geometry() {
+    int h = huge();
+    int m = 1 << 63;
+    syscall(3, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0xff00ff);
+    syscall(3, m, m, m, m, 0xff00ff);
+    syscall(3, h, h, h, h, 0xff00ff);
+    syscall(3, 0 - 100, 0 - 100, 1 << 40, 1 << 40, 0xff00ff);
+    syscall(3, 5, 5, 0 - 3, 4, 0xff00ff);
+    syscall(3, h - 3, h - 3, 16, 16, 0xff00ff);
+    return 0;
+}
+
+int c_blit_empty_and_offscreen() {
+    int b = alloc(256);
+    int h = huge();
+    int m = 1 << 63;
+    syscall(5, b, 0, 0, 0, 0);
+    syscall(5, b, 0, 0, 0 - 1, 0 - 1);
+    syscall(5, b, 0, 0, 0 - 1, 4);
+    syscall(5, b, 0, 0, 4, 0 - 1);
+    syscall(5, b, h, h, 4, 4);
+    syscall(5, b, m, m, 4, 4);
+    syscall(5, b, 0 - 100000, 0 - 100000, 4, 4);
+    return 0;
+}
+
+int c_alloc_sizes() {
+    if (syscall(6, 0, 0, 0, 0, 0) != 0) { return 1; }
+    if (syscall(6, 0 - 1, 0, 0, 0, 0) != 0) { return 2; }
+    if (syscall(6, 1 << 63, 0, 0, 0, 0) != 0) { return 3; }
+    if (syscall(6, 1 << 62, 0, 0, 0, 0) != 0) { return 4; }
+    if (syscall(6, 1 << 40, 0, 0, 0, 0) != 0) { return 5; }
+    int p = alloc(16);
+    if (!p) { return 6; }
+    store64(p, 7);
+    if (load64(p) != 7) { return 7; }
+    if (dealloc(p) != 0) { return 8; }
+    return 0;
+}
+
+int c_dealloc_handles() {
+    int p = alloc(32);
+    if (bad(syscall(13, 1, 0, 0, 0, 0))) { return 1; }
+    if (bad(syscall(13, p_low(), 0, 0, 0, 0))) { return 2; }
+    if (bad(syscall(13, p_high(), 0, 0, 0, 0))) { return 3; }
+    if (bad(syscall(13, p_noncanon(), 0, 0, 0, 0))) { return 4; }
+    if (bad(syscall(13, p_unmapped(), 0, 0, 0, 0))) { return 5; }
+    if (bad(syscall(13, p + 8, 0, 0, 0, 0))) { return 6; }
+    if (dealloc(p) != 0) { return 7; }
+    if (bad(syscall(13, p, 0, 0, 0, 0))) { return 8; }
+    return 0;
+}
+
+int c_sleep_lengths() {
+    int t0 = ticks();
+    sleep(0 - 1);
+    sleep(1 << 63);
+    sleep(0);
+    if (ticks() - t0 > 100) { return 1; }
+    return 0;
+}
+
+int c_argv_indices() {
+    if (argv(0 - 1) != 0) { return 1; }
+    if (argv(1 << 62) != 0) { return 2; }
+    if (argv(1 << 63) != 0) { return 3; }
+    if (argv(0x100000000) != 0) { return 4; }
+    if (argv(argc()) != 0) { return 5; }
+    return 0;
+}
+
+int c_readfile_pointers() {
+    int b = alloc(64);
+    if (bad(syscall(8, 0, b, 64, 0, 0))) { return 1; }
+    if (bad(syscall(8, "no/such/file", b, 64, 0, 0))) { return 2; }
+    if (bad(syscall(8, "test", b, 64, 0, 0))) { return 3; }
+    if (bad(syscall(8, "test/et29.can", 8, 64, 0, 0))) { return 4; }
+    if (bad(syscall(8, "test/et29.can", p_low(), 64, 0, 0))) { return 5; }
+    if (bad(syscall(8, "test/et29.can", p_high(), 64, 0, 0))) { return 6; }
+    if (bad(syscall(8, "test/et29.can", p_noncanon(), 64, 0, 0))) { return 7; }
+    // 38 is readfile for a file the caller or root owns, the same checks.
+    if (bad(syscall(38, 0, b, 64, 0, 0))) { return 8; }
+    if (bad(syscall(38, "no/such/file", b, 64, 0, 0))) { return 9; }
+    if (bad(syscall(38, "test", b, 64, 0, 0))) { return 10; }
+    if (bad(syscall(38, "test/et29.can", 8, 64, 0, 0))) { return 11; }
+    if (bad(syscall(38, "test/et29.can", p_low(), 64, 0, 0))) { return 12; }
+    if (bad(syscall(38, "test/et29.can", p_high(), 64, 0, 0))) { return 13; }
+    if (bad(syscall(38, "test/et29.can", p_noncanon(), 64, 0, 0))) { return 14; }
+    return 0;
+}
+
+int c_readfile_lengths() {
+    int b = alloc(64);
+    store64(b, 99);
+    if (syscall(8, "test/et29.can", b, 0 - 1, 0, 0) != 0 - 1) { return 1; }
+    if (syscall(8, "test/et29.can", b, 1 << 63, 0, 0) != 0 - 1) { return 2; }
+    if (load64(b) != 99) { return 3; }
+    int n = syscall(8, "test/et29.can", 0, 0, 0, 0);
+    if (n != 256) { return 4; }
+    int big = alloc(512);
+    if (syscall(8, "test/et29.can", big, huge(), 0, 0) != 256) { return 5; }
+    if (syscall(38, "test/et29.can", b, 0 - 1, 0, 0) != 0 - 1) { return 6; }
+    if (syscall(38, "test/et29.can", b, 1 << 63, 0, 0) != 0 - 1) { return 7; }
+    if (load64(b) != 99) { return 8; }
+    if (syscall(38, "test/et29.can", 0, 0, 0, 0) != 256) { return 9; }
+    if (syscall(38, "test/et29.can", big, huge(), 0, 0) != 256) { return 10; }
+    return 0;
+}
+
+int c_writefile_arguments() {
+    int b = alloc(64);
+    if (bad(syscall(15, 0, b, 8, 0, 0))) { return 1; }
+    if (bad(syscall(15, "test/et29.tmp", b, 0 - 1, 0, 0))) { return 2; }
+    if (bad(syscall(15, "test/et29.tmp", b, 1 << 63, 0, 0))) { return 3; }
+    if (bad(syscall(15, "test/et29.tmp", p_null() + 8, 8, 0, 0))) { return 4; }
+    if (bad(syscall(15, "test/et29.tmp", p_low(), 8, 0, 0))) { return 5; }
+    if (bad(syscall(15, "test/et29.tmp", p_high(), 8, 0, 0))) { return 6; }
+    if (bad(syscall(15, "test/et29.tmp", p_noncanon(), 8, 0, 0))) { return 7; }
+    if (bad(syscall(15, "test", b, 8, 0, 0))) { return 8; }
+    if (bad(syscall(15, "no/such/dir/x", b, 8, 0, 0))) { return 9; }
+    return 0;
+}
+
+int c_listdir_arguments() {
+    int b = alloc(512);
+    if (bad(syscall(19, 0, b, 4, 0, 0))) { return 1; }
+    if (bad(syscall(19, "test/et29.can", b, 4, 0, 0))) { return 2; }
+    if (bad(syscall(19, "no/such/dir", b, 4, 0, 0))) { return 3; }
+    if (bad(syscall(19, "test", p_null() + 8, 4, 0, 0))) { return 4; }
+    if (bad(syscall(19, "test", p_low(), 4, 0, 0))) { return 5; }
+    if (bad(syscall(19, "test", p_high(), 4, 0, 0))) { return 6; }
+    if (bad(syscall(19, "test", p_noncanon(), 4, 0, 0))) { return 7; }
+    if (syscall(19, "test", b, 0 - 1, 0, 0) > 0) { return 8; }
+    if (syscall(19, "test", b, 1 << 63, 0, 0) > 0) { return 9; }
+    if (syscall(19, "test", b, 0, 0, 0) != 0) { return 10; }
+    return 0;
+}
+
+int c_spawn_arguments() {
+    if (bad(syscall(20, 0, 0, 0, 0, 0))) { return 1; }
+    if (bad(syscall(20, "test/et29.elf x0", 0 - 1, 0, 0, 0))) { return 2; }
+    if (bad(syscall(20, "test/et29.elf x0", 4, 0, 0, 0))) { return 3; }
+    if (bad(syscall(20, "test/et29.elf x0", 1 << 62, 0, 0, 0))) { return 4; }
+    if (bad(syscall(20, "test/et29.elf x0", 1 << 63, 0, 0, 0))) { return 5; }
+    if (syscall(20, "", 1, 0, 0, 0) >= 0) { return 6; }
+    if (syscall(20, "no/such.elf", 1, 0, 0, 0) >= 0) { return 7; }
+    if (syscall(20, "test", 1, 0, 0, 0) >= 0) { return 8; }
+    int n = 300;
+    int b = alloc(n);
+    int i = 0;
+    for (i = 0; i < n - 1; i += 1) { store8(b + i, 'a'); }
+    if (syscall(20, b, 1, 0, 0, 0) >= 0) { return 9; }
+    return 0;
+}
+
+int c_protect_arguments() {
+    int b = alloc(8192);
+    int page = (b + 4095) / 4096 * 4096;
+    if (bad(syscall(21, 0, 1, 0, 0, 0))) { return 1; }
+    if (bad(syscall(21, page + 1, 1, 0, 0, 0))) { return 2; }
+    if (bad(syscall(21, page, 0, 0, 0, 0))) { return 3; }
+    if (bad(syscall(21, page, 0 - 1, 0, 0, 0))) { return 4; }
+    if (bad(syscall(21, page, 257, 0, 0, 0))) { return 5; }
+    if (bad(syscall(21, page, 1, 2, 0, 0))) { return 6; }
+    if (bad(syscall(21, page, 1, 0 - 1, 0, 0))) { return 7; }
+    if (bad(syscall(21, p_high() & (0 - 4096), 1, 0, 0, 0))) { return 8; }
+    if (bad(syscall(21, huge() & (0 - 4096), 256, 0, 0, 0))) { return 9; }
+    if (bad(syscall(21, (1 << 63) + (1 << 62), 256, 0, 0, 0))) { return 10; }
+    if (bad(syscall(21, p_unmapped(), 1, 0, 0, 0))) { return 11; }
+    if (bad(syscall(21, p_sentinel(), 1, 0, 0, 0))) { return 12; }
+    return 0;
+}
+
+int c_edit_pointers() {
+    if (bad(syscall(22, 0, 0, 0, 0, 0))) { return 1; }
+    if (bad(syscall(22, p_low(), 0, 0, 0, 0))) { return 2; }
+    if (bad(syscall(22, p_high(), 0, 0, 0, 0))) { return 3; }
+    if (bad(syscall(22, p_noncanon(), 0, 0, 0, 0))) { return 4; }
+    return 0;
+}
+
+int c_open_arguments() {
+    if (bad(syscall(23, 0, 0, 0, 0, 0))) { return 1; }
+    if (bad(syscall(23, "test/et29.can", 2, 0, 0, 0))) { return 2; }
+    if (bad(syscall(23, "test/et29.can", 0 - 1, 0, 0, 0))) { return 3; }
+    if (bad(syscall(23, "test/et29.can", 1 << 62, 0, 0, 0))) { return 4; }
+    if (bad(syscall(23, "no/such/file", 0, 0, 0, 0))) { return 5; }
+    if (bad(syscall(23, "no/such/dir/x", 1, 0, 0, 0))) { return 6; }
+    if (bad(syscall(23, "test", 0, 0, 0, 0))) { return 7; }
+    if (bad(syscall(23, "", 0, 0, 0, 0))) { return 8; }
+    return 0;
+}
+
+int c_open_exhaust() {
+    int fds = alloc(16 * 8);
+    int i = 0;
+    int opened = 0;
+    for (i = 0; i < 16; i += 1) {
+        int fd = syscall(23, "test/et29.can", 0, 0, 0, 0);
+        store64(fds + i * 8, fd);
+        if (fd >= 0) { opened += 1; }
+    }
+    int refused = bad(syscall(23, "test/et29.can", 0, 0, 0, 0)) == 0;
+    for (i = 0; i < 16; i += 1) {
+        if (load64(fds + i * 8) >= 0) { syscall(26, load64(fds + i * 8), 0, 0, 0, 0); }
+    }
+    if (opened != 8) { return 1; }
+    if (refused != 1) { return 2; }
+    int fd = syscall(23, "test/et29.can", 0, 0, 0, 0);
+    if (fd < 3) { return 3; }
+    syscall(26, fd, 0, 0, 0, 0);
+    return 0;
+}
+
+int c_bad_handles() {
+    int b = alloc(64);
+    int fd = syscall(23, "test/et29.can", 0, 0, 0, 0);
+    int bads = alloc(11 * 8);
+    store64(bads, 0 - 1);
+    store64(bads + 8, 0);
+    store64(bads + 16, 11);
+    store64(bads + 24, 1 << 62);
+    store64(bads + 32, 1 << 63);
+    store64(bads + 40, fd + 1);
+    store64(bads + 48, 3 + (1 << 32));
+    store64(bads + 56, fd + (1 << 32));
+    store64(bads + 64, fd + (1 << 63));
+    store64(bads + 72, 3 + 8);
+    store64(bads + 80, 2 + (1 << 40));
+    int i = 0;
+    for (i = 0; i < 11; i += 1) {
+        int h = load64(bads + i * 8);
+        if (bad(syscall(24, h, b, 16, 0, 0))) { return 1 + i; }
+        if (bad(syscall(26, h, 0, 0, 0, 0))) { return 20 + i; }
+    }
+    if (bad(syscall(25, 0 - 1, b, 1, 0, 0))) { return 40; }
+    if (bad(syscall(25, 0, b, 1, 0, 0))) { return 41; }
+    if (bad(syscall(25, 11, b, 1, 0, 0))) { return 42; }
+    if (bad(syscall(25, 1 << 62, b, 1, 0, 0))) { return 43; }
+    if (bad(syscall(25, fd + (1 << 63), b, 1, 0, 0))) { return 44; }
+    if (bad(syscall(25, fd, b, 1, 0, 0))) { return 45; }
+    if (syscall(26, fd, 0, 0, 0, 0) != 0) { return 46; }
+    if (bad(syscall(26, fd, 0, 0, 0, 0))) { return 47; }
+    return 0;
+}
+
+int c_read_buffers_and_lengths() {
+    int b = alloc(512);
+    int fd = syscall(23, "test/et29.can", 0, 0, 0, 0);
+    int r = 0;
+    if (bad(syscall(24, fd, p_null() + 8, 16, 0, 0))) { r = 1; }
+    if (r == 0 && bad(syscall(24, fd, p_low(), 16, 0, 0))) { r = 2; }
+    if (r == 0 && bad(syscall(24, fd, p_high(), 16, 0, 0))) { r = 3; }
+    if (r == 0 && bad(syscall(24, fd, p_noncanon(), 16, 0, 0))) { r = 4; }
+    if (r == 0 && bad(syscall(24, fd, b, 0 - 1, 0, 0))) { r = 5; }
+    if (r == 0 && bad(syscall(24, fd, b, 1 << 63, 0, 0))) { r = 6; }
+    if (r == 0 && syscall(24, fd, b, huge(), 0, 0) != 256) { r = 7; }
+    if (r == 0 && syscall(24, fd, b, huge(), 0, 0) != 0) { r = 8; }
+    syscall(26, fd, 0, 0, 0, 0);
+    return r;
+}
+
+int c_write_buffers_and_lengths() {
+    int b = alloc(64);
+    int fd = syscall(23, "test/et29.tmp", 1, 0, 0, 0);
+    int r = 0;
+    if (fd < 3) { return 1; }
+    if (bad(syscall(25, fd, p_null() + 8, 8, 0, 0))) { r = 2; }
+    if (r == 0 && bad(syscall(25, fd, p_low(), 8, 0, 0))) { r = 3; }
+    if (r == 0 && bad(syscall(25, fd, p_high(), 8, 0, 0))) { r = 4; }
+    if (r == 0 && bad(syscall(25, fd, p_noncanon(), 8, 0, 0))) { r = 5; }
+    if (r == 0 && bad(syscall(25, fd, b, 0 - 1, 0, 0))) { r = 6; }
+    if (r == 0 && bad(syscall(25, fd, b, 1 << 63, 0, 0))) { r = 7; }
+    if (r == 0 && syscall(25, fd, b, 0, 0, 0) != 0) { r = 8; }
+    if (r == 0 && syscall(25, fd, b, 8, 0, 0) != 8) { r = 9; }
+    syscall(26, fd, 0, 0, 0, 0);
+    syscall(30, "test/et29.tmp", 0, 0, 0, 0);
+    return r;
+}
+
+int c_remove_arguments() {
+    if (bad(syscall(30, 0, 0, 0, 0, 0))) { return 1; }
+    if (bad(syscall(30, p_low(), 0, 0, 0, 0))) { return 2; }
+    if (bad(syscall(30, p_high(), 0, 0, 0, 0))) { return 3; }
+    if (bad(syscall(30, p_noncanon(), 0, 0, 0, 0))) { return 4; }
+    if (bad(syscall(30, "", 0, 0, 0, 0))) { return 5; }
+    if (bad(syscall(30, "/", 0, 0, 0, 0))) { return 6; }
+    if (bad(syscall(30, "test", 0, 0, 0, 0))) { return 7; }
+    if (bad(syscall(30, "no/such/file", 0, 0, 0, 0))) { return 8; }
+    return 0;
+}
+
+int c_shell_arguments() {
+    if (bad(syscall(28, 0, 0, 0, 0, 0))) { return 1; }
+    if (bad(syscall(28, p_low(), 0, 0, 0, 0))) { return 2; }
+    if (bad(syscall(28, p_high(), 0, 0, 0, 0))) { return 3; }
+    if (bad(syscall(28, p_noncanon(), 0, 0, 0, 0))) { return 4; }
+    if (bad(syscall(28, "echo a\necho b", 0, 0, 0, 0))) { return 5; }
+    return 0;
+}
+
+int c_wait_ids() {
+    if (syscall(29, 0 - 1, 0, 0, 0, 0) != 0 - 1001) { return 1; }
+    if (syscall(29, 8, 1, 0, 0, 0) != 0 - 1001) { return 2; }
+    if (syscall(29, 1 << 62, 1, 0, 0, 0) != 0 - 1001) { return 3; }
+    if (syscall(29, 1 << 63, 1, 0, 0, 0) != 0 - 1001) { return 4; }
+    if (syscall(29, 1 << 32, 1, 0, 0, 0) != 0 - 1001) { return 5; }
+    return 0;
+}
+
+int c_sound_format_values() {
+    if (bad(syscall(31, 3, 0, 0, 0, 0))) { return 1; }
+    if (bad(syscall(31, 0 - 1, 0, 0, 0, 0))) { return 2; }
+    if (bad(syscall(31, 1 << 62, 0, 0, 0, 0))) { return 3; }
+    if (bad(syscall(31, 1 << 63, 0, 0, 0, 0))) { return 4; }
+    if (bad(syscall(31, 1 << 32, 0, 0, 0, 0))) { return 5; }
+    return 0;
+}
+
+int c_close_key_values() {
+    syscall(32, 7, 0, 0, 0, 0);
+    syscall(32, 0 - 1, 0, 0, 0, 0);
+    syscall(32, 1 << 63, 0, 0, 0, 0);
+    syscall(32, 0, 0, 0, 0, 0);
+    return 0;
+}
+
+int c_clock_values() {
+    int off = syscall(33, 2, 0, 0, 0, 0);
+    if (bad(syscall(33, 0 - 1, 0, 0, 0, 0))) { return 1; }
+    if (bad(syscall(33, 4, 0, 0, 0, 0))) { return 2; }
+    if (bad(syscall(33, 1 << 62, 0, 0, 0, 0))) { return 3; }
+    if (bad(syscall(33, 1 << 63, 0, 0, 0, 0))) { return 4; }
+    if (bad(syscall(33, 3, 1441, 0, 0, 0))) { return 5; }
+    if (bad(syscall(33, 3, 0 - 1441, 0, 0, 0))) { return 6; }
+    if (bad(syscall(33, 3, 1 << 62, 0, 0, 0))) { return 7; }
+    if (bad(syscall(33, 3, 1 << 63, 0, 0, 0))) { return 8; }
+    if (syscall(33, 2, 0, 0, 0, 0) != off) { return 9; }
+    return 0;
+}
+
+int c_info_arguments() {
+    int b = alloc(4096);
+    if (bad(syscall(34, 7, b, 128, 0, 0))) { return 1; }
+    if (bad(syscall(34, 0 - 1, b, 128, 0, 0))) { return 2; }
+    if (bad(syscall(34, 1 << 62, b, 128, 0, 0))) { return 3; }
+    if (bad(syscall(34, 1 << 63, b, 128, 0, 0))) { return 4; }
+    if (bad(syscall(34, 0, 0, 128, 0, 0))) { return 5; }
+    if (bad(syscall(34, 0, p_low(), 128, 0, 0))) { return 6; }
+    if (bad(syscall(34, 0, p_high(), 128, 0, 0))) { return 7; }
+    if (bad(syscall(34, 0, p_noncanon(), 128, 0, 0))) { return 8; }
+    if (bad(syscall(34, 0, b, 0, 0, 0))) { return 9; }
+    if (bad(syscall(34, 0, b, 0 - 1, 0, 0))) { return 10; }
+    if (bad(syscall(34, 0, b, 1 << 40, 0, 0))) { return 11; }
+    if (bad(syscall(34, 0, b, 1 << 63, 0, 0))) { return 12; }
+    if (syscall(34, 0, b, 128, 0, 0) != 128) { return 13; }
+    return 0;
+}
+
+int c_kill_ids() {
+    if (bad(syscall(35, 0 - 1, 0, 0, 0, 0))) { return 1; }
+    if (bad(syscall(35, 8, 0, 0, 0, 0))) { return 2; }
+    if (bad(syscall(35, 1 << 62, 0, 0, 0, 0))) { return 3; }
+    if (bad(syscall(35, 1 << 63, 0, 0, 0, 0))) { return 4; }
+    if (bad(syscall(35, 1 << 32, 0, 0, 0, 0))) { return 5; }
+    return 0;
+}
+
+int c_pointer_shapes() {
+    if (bad(syscall(36, 3, 0, 0, 0, 0))) { return 1; }
+    if (bad(syscall(36, 0 - 1, 0, 0, 0, 0))) { return 2; }
+    if (bad(syscall(36, 1 << 62, 0, 0, 0, 0))) { return 3; }
+    if (bad(syscall(36, 1 << 63, 0, 0, 0, 0))) { return 4; }
+    if (bad(syscall(36, 1 << 32, 0, 0, 0, 0))) { return 5; }
+    syscall(36, 0, 0, 0, 0, 0);
+    return 0;
+}
+
+int c_present_arguments() {
+    int r = syscall(9, 0, 0, 0, 0, 0);
+    if (r != 0 && r != 0 - 1) { return 1; }
+    return 0;
+}
+
+int c_glyph_arguments() {
+    int b = alloc(64);
+    int cell = syscall(12, 'A', 0, 0, 0, 0);
+    if (cell != (8 << 16) + 8) { return 1; }
+    if (syscall(12, 'A', b, 0, 0, 0) != cell) { return 2; }
+    if (bad(syscall(12, 'A', 8, 0, 0, 0))) { return 3; }
+    if (bad(syscall(12, 'A', p_low(), 0, 0, 0))) { return 4; }
+    if (bad(syscall(12, 'A', p_high(), 0, 0, 0))) { return 5; }
+    if (bad(syscall(12, 'A', p_noncanon(), 0, 0, 0))) { return 6; }
+    if (syscall(12, 0 - 1, b, 0, 0, 0) != cell) { return 7; }
+    if (syscall(12, 1 << 63, b, 0, 0, 0) != cell) { return 8; }
+    if (syscall(12, huge(), 0, 0, 0, 0) != cell) { return 9; }
+    return 0;
+}
+
+int c_sound_arguments() {
+    int b = alloc(64);
+    syscall(14, 0, 0, 0, 0, 0);
+    syscall(14, 0, 0 - 1, 0, 0, 0);
+    if (syscall(14, b, 0, 0, 0, 0) > 0) { return 1; }
+    if (syscall(14, b, 0 - 1, 0, 0, 0) > 0) { return 2; }
+    if (syscall(14, b, 1 << 63, 0, 0, 0) > 0) { return 3; }
+    if (bad(syscall(14, 8, 16, 0, 0, 0))) { return 4; }
+    if (bad(syscall(14, p_low(), 16, 0, 0, 0))) { return 5; }
+    if (bad(syscall(14, p_high(), 16, 0, 0, 0))) { return 6; }
+    if (bad(syscall(14, p_noncanon(), 16, 0, 0, 0))) { return 7; }
+    syscall(14, 0, 0 - 1, 0, 0, 0);
+    return 0;
+}
+
+int c_sound_length_past_buffer() {
+    int b = alloc(64);
+    syscall(14, b, huge(), 0, 0, 0);
+    syscall(14, 0, 0 - 1, 0, 0, 0);
+    return 0;
+}
+
+// A path or line that is a pointer the program does not own, which the call
+// must refuse. The second argument is what the call needs there to get as
+// far as reading the path, 0 - 1 for a buffer of its own.
+int path_pointer(int num, int ptr, int arg2) {
+    if (arg2 == 0 - 1) { arg2 = alloc(64); }
+    int r = syscall(num, ptr, arg2, 8, 0, 0);
+    if (r >= 0) { return 1; }
+    return 0;
+}
+
+int c_readfile_unmapped_path() {
+    if (path_pointer(8, p_unmapped(), 0 - 1)) { return 1; }
+    if (path_pointer(38, p_unmapped(), 0 - 1)) { return 2; }
+    return 0;
+}
+
+int c_writefile_sentinel_buffer() {
+    int r = syscall(15, "test/et29.tmp", p_sentinel(), 8, 0, 0);
+    syscall(30, "test/et29.tmp", 0, 0, 0, 0);
+    if (r != 0 - 1) { return 1; }
+    return 0;
+}
+
+int c_readfile_sentinel_buffer() {
+    if (syscall(8, "test/et29.can", p_sentinel(), 8, 0, 0) != 0 - 1) { return 1; }
+    if (syscall(38, "test/et29.can", p_sentinel(), 8, 0, 0) != 0 - 1) { return 2; }
+    return 0;
+}
+
+int c_glyph_sentinel_buffer() {
+    if (syscall(12, 'A', p_sentinel(), 0, 0, 0) != 0 - 1) { return 1; }
+    return 0;
+}
+
+int c_sound_sentinel_buffer() {
+    if (syscall(14, p_sentinel(), 16, 0, 0, 0) > 0) { return 1; }
+    return 0;
+}
+
+int c_debug_print_kernel_heap() {
+    if (syscall(1, p_low(), 16, 0, 0, 0) != 0 - 1) { return 1; }
+    return 0;
+}
+
+int c_debug_print_bit63() {
+    if (syscall(1, p_noncanon(), 16, 0, 0, 0) != 0 - 1) { return 1; }
+    return 0;
+}
+
+int c_debug_print_kernel_half() {
+    if (syscall(1, p_high(), 16, 0, 0, 0) != 0 - 1) { return 1; }
+    return 0;
+}
+
+int c_debug_print_unmapped() {
+    if (syscall(1, p_unmapped(), 16, 0, 0, 0) != 0 - 1) { return 1; }
+    return 0;
+}
+
+int c_blit_huge_rows() {
+    int b = alloc(256);
+    syscall(5, b, 0, 0, 4, 1 << 40);
+    return 0;
+}
+
+int c_blit_unmapped_source() {
+    if (syscall(5, p_unmapped(), 0, 0, 4, 4) != 0 - 1) { return 1; }
+    return 0;
+}
+
+int c_present_unmapped_source() {
+    if (syscall(9, p_unmapped(), 0, 0, 0, 0) != 0 - 1) { return 1; }
+    return 0;
+}
+
+int c_write_offset_wrap() {
+    int b = alloc(64);
+    store8(b, 65);
+    int fd = syscall(23, "test/et29.tmp", 1, 0, 0, 0);
+    if (fd < 3) { return 1; }
+    if (syscall(25, fd, b, 1, 0, 0) != 1) { return 2; }
+    int r = syscall(25, fd, b, 0x7fffffffffffffff, 0, 0);
+    int rd = open_read("test/et29.tmp");
+    if (read(rd, b + 8, 8) != 1 || load8(b + 8) != 65) { return 3; }
+    close(rd);
+    store8(b, 66);
+    if (syscall(25, fd, b, 1, 0, 0) != 1) { return 4; }
+    syscall(26, fd, 0, 0, 0, 0);
+    rd = open_read("test/et29.tmp");
+    if (read(rd, b + 8, 8) != 2) { return 5; }
+    if (load8(b + 8) != 65 || load8(b + 9) != 66) { return 6; }
+    close(rd);
+    syscall(30, "test/et29.tmp", 0, 0, 0, 0);
+    if (r != 0 - 1) { return 7; }
+    return 0;
+}
+
+int c_alloc_rounding_wrap() {
+    int first = alloc(16);
+    int p = syscall(6, 0x7ffffffffffffff9, 0, 0, 0, 0);
+    int next = alloc(16);
+    if (p != 0) { return 1; }
+    if (next <= first) { return 2; }
+    return 0;
+}
+
+int c_info_wrapping_length() {
+    int b = alloc(4096);
+    if (syscall(34, 0, b, 0x7ffffffffffffff0, 0, 0) != 0 - 1) { return 1; }
+    if (syscall(34, 0, b, 0x7ffffffffffffff8, 0, 0) != 0 - 1) { return 2; }
+    return 0;
+}
+
+// Pages whose end wraps past the top of the signed range, the first of them
+// the last page below it.
+int c_protect_wrapped_range() {
+    if (bad(syscall(21, 0x7ffffffffffff000, 2, 1, 0, 0))) { return 1; }
+    if (bad(syscall(21, 0x7fffffffffff0000, 256, 0, 0, 0))) { return 2; }
+    return 0;
+}
+
+int c_wait_not_a_child() {
+    if (syscall(29, 0, 1, 0, 0, 0) != 0 - 1001) { return 1; }
+    if (syscall(29, 1, 1, 0, 0, 0) != 0 - 1001) { return 2; }
+    return 0;
+}
+
+int run_case(int n) {
+    if (n == 54) { print("debug_print_bit63"); return c_debug_print_bit63(); }
+    if (n == 55) { print("debug_print_kernel_half"); return c_debug_print_kernel_half(); }
+    if (n == 56) { print("debug_print_unmapped"); return c_debug_print_unmapped(); }
+    if (n == 57) { print("blit_huge_rows"); return c_blit_huge_rows(); }
+    if (n == 58) { print("write_offset_wrap"); return c_write_offset_wrap(); }
+    if (n == 59) { print("alloc_rounding_wrap"); return c_alloc_rounding_wrap(); }
+    if (n == 114) { print("wait_not_a_child"); return c_wait_not_a_child(); }
+    return run_wired(n);
+}
+
+int run_wired(int n) {
+    if (n == 36) { print("writefile_sentinel_buffer"); return c_writefile_sentinel_buffer(); }
+    if (n == 37) { print("readfile_sentinel_buffer"); return c_readfile_sentinel_buffer(); }
+    if (n == 38) { print("glyph_sentinel_buffer"); return c_glyph_sentinel_buffer(); }
+    if (n == 39) { print("sound_sentinel_buffer"); return c_sound_sentinel_buffer(); }
+    if (n == 40) { print("debug_print_kernel_heap"); return c_debug_print_kernel_heap(); }
+    if (n == 41) { print("blit_unmapped_source"); return c_blit_unmapped_source(); }
+    if (n == 42) { print("present_unmapped_source"); return c_present_unmapped_source(); }
+    if (n == 43) { print("info_wrapping_length"); return c_info_wrapping_length(); }
+    if (n == 44) { print("readfile_unmapped_path"); return c_readfile_unmapped_path(); }
+    if (n == 45) { print("writefile_unmapped_path"); return path_pointer(15, p_unmapped(), 0 - 1); }
+    if (n == 46) { print("listdir_unmapped_path"); return path_pointer(19, p_unmapped(), 0 - 1); }
+    if (n == 47) { print("spawn_unmapped_line"); return path_pointer(20, p_unmapped(), 1); }
+    if (n == 48) { print("edit_unmapped_path"); return path_pointer(22, p_unmapped(), 0); }
+    if (n == 49) { print("open_unmapped_path"); return path_pointer(23, p_unmapped(), 0); }
+    if (n == 50) { print("remove_unmapped_path"); return path_pointer(30, p_unmapped(), 0); }
+    if (n == 51) { print("shell_unmapped_line"); return path_pointer(28, p_unmapped(), 0); }
+    if (n == 52) { print("sound_length_past_buffer"); return c_sound_length_past_buffer(); }
+    if (n == 53) { print("protect_wrapped_range"); return c_protect_wrapped_range(); }
+    if (n == 33) { print("present_arguments"); return c_present_arguments(); }
+    if (n == 34) { print("glyph_arguments"); return c_glyph_arguments(); }
+    if (n == 35) { print("sound_arguments"); return c_sound_arguments(); }
+    return run_base(n);
+}
+
+int run_base(int n) {
+    if (n == 1) { print("exit_huge_code"); return c_exit_huge_code(); }
+    if (n == 2) { print("exit_close_huge_code"); return c_exit_close_huge_code(); }
+    if (n == 3) { print("unknown_numbers"); return c_unknown_numbers(); }
+    if (n == 4) { print("debug_print_lengths"); return c_debug_print_lengths(); }
+    if (n == 5) { print("no_argument_calls"); return c_no_argument_calls(); }
+    if (n == 6) { print("fill_geometry"); return c_fill_geometry(); }
+    if (n == 7) { print("blit_empty_and_offscreen"); return c_blit_empty_and_offscreen(); }
+    if (n == 8) { print("alloc_sizes"); return c_alloc_sizes(); }
+    if (n == 9) { print("dealloc_handles"); return c_dealloc_handles(); }
+    if (n == 10) { print("sleep_lengths"); return c_sleep_lengths(); }
+    if (n == 11) { print("argv_indices"); return c_argv_indices(); }
+    if (n == 12) { print("readfile_pointers"); return c_readfile_pointers(); }
+    if (n == 13) { print("readfile_lengths"); return c_readfile_lengths(); }
+    if (n == 14) { print("writefile_arguments"); return c_writefile_arguments(); }
+    if (n == 15) { print("listdir_arguments"); return c_listdir_arguments(); }
+    if (n == 16) { print("spawn_arguments"); return c_spawn_arguments(); }
+    if (n == 17) { print("protect_arguments"); return c_protect_arguments(); }
+    if (n == 18) { print("edit_pointers"); return c_edit_pointers(); }
+    if (n == 19) { print("open_arguments"); return c_open_arguments(); }
+    if (n == 20) { print("open_exhaust"); return c_open_exhaust(); }
+    if (n == 21) { print("bad_handles"); return c_bad_handles(); }
+    if (n == 22) { print("read_buffers_and_lengths"); return c_read_buffers_and_lengths(); }
+    if (n == 23) { print("write_buffers_and_lengths"); return c_write_buffers_and_lengths(); }
+    if (n == 24) { print("remove_arguments"); return c_remove_arguments(); }
+    if (n == 25) { print("shell_arguments"); return c_shell_arguments(); }
+    if (n == 26) { print("wait_ids"); return c_wait_ids(); }
+    if (n == 27) { print("sound_format_values"); return c_sound_format_values(); }
+    if (n == 28) { print("close_key_values"); return c_close_key_values(); }
+    if (n == 29) { print("clock_values"); return c_clock_values(); }
+    if (n == 30) { print("info_arguments"); return c_info_arguments(); }
+    if (n == 31) { print("kill_ids"); return c_kill_ids(); }
+    if (n == 32) { print("pointer_shapes"); return c_pointer_shapes(); }
+    print("none");
+    return 0 - 2;
+}
+
+// Runs a case and prints its line for the script, 0 when it holds, the number
+// of the check that did not otherwise, and -2 for a number with no case.
+int report(int id) {
+    if (!lbuf) { lbuf = alloc(96); }
+    llen = 0;
+    lput("[hostile] ");
+    lnum(id);
+    lput(" ");
+    print(lbuf);
+    int r = run_case(id);
+    llen = 0;
+    lput("\n[hostile] ");
+    lnum(id);
+    if (r == 0 - 2) { lput(" none\n"); print(lbuf); return r; }
+    if (r == 0) { lput(" pass\n"); print(lbuf); return 0; }
+    lput(" FAIL ");
+    lnum(r);
+    lput("\n");
+    print(lbuf);
+    return r;
+}
+
+int digits(int s) {
+    if (!load8(s)) { return 0; }
+    int i = 0;
+    while (load8(s + i) != 0) {
+        if (load8(s + i) < '0' || load8(s + i) > '9') { return 0; }
+        i += 1;
+    }
+    return 1;
+}
+
+int number(int s) {
+    int n = 0;
+    int i = 0;
+    while (load8(s + i) != 0) { n = n * 10 + load8(s + i) - '0'; i += 1; }
+    return n;
+}
+
+int canary_byte(int i) { return (i * 7 + 3) % 251; }
+
+int write_canary() {
+    int b = alloc(256);
+    int i = 0;
+    for (i = 0; i < 256; i += 1) { store8(b + i, canary_byte(i)); }
+    return syscall(15, "test/et29.can", b, 256, 0, 0);
+}
+
+int canary_file_intact() {
+    int b = alloc(256);
+    if (syscall(8, "test/et29.can", b, 256, 0, 0) != 256) { return 0; }
+    int i = 0;
+    for (i = 0; i < 256; i += 1) {
+        if (load8(b + i) != canary_byte(i)) { return 0; }
+    }
+    return 1;
+}
+
+// The second copy. It holds a pattern in its heap and re-reads the canary
+// file until the first copy leaves a stop file, so a hostile call that
+// changed another program's memory or the filesystem is seen.
+int witness() {
+    int words = 512;
+    int h = alloc(words * 8);
+    int i = 0;
+    for (i = 0; i < words; i += 1) { store64(h + i * 8, i * 1000003 + 17); }
+    print("[hostile] witness ready\n");
+    while (syscall(8, "test/et29.stop", 0, 0, 0, 0) < 0) {
+        for (i = 0; i < words; i += 1) {
+            if (load64(h + i * 8) != i * 1000003 + 17) { return 21; }
+        }
+        if (canary_file_intact() == 0) { return 22; }
+        sleep(5);
+    }
+    return 77;
+}
+
+int main() {
+    int mine = 0;
+    if (argc() >= 2) {
+        int a = argv(1);
+        if (same(a, "x0") == 1) { return (1 << 40) + 5; }
+        if (same(a, "x27") == 1) { exit_close((1 << 40) + 6); }
+        if (same(a, "witness") == 1) { return witness(); }
+        mine = digits(a);
+        if (mine == 1) {
+            if (write_canary() != 256) { return 90; }
+            int id = number(a);
+            int r = report(id);
+            print("[hostile] end\n");
+            if (r == 0) { return 77; }
+            return r;
+        }
+        if (same(a, "all") != 1) { return 0; }
+    } else {
+        return 0;
+    }
+    syscall(30, "test/et29.stop", 0, 0, 0, 0);
+    if (write_canary() != 256) { return 90; }
+    int w = spawn_with("test/et29.elf witness", 1);
+    if (w < 0) { return 91; }
+    sleep(20);
+    int held = 0;
+    int id = 1;
+    for (id = 1; id <= WIRED_LAST; id += 1) {
+        if (report(id) == 0) { held += 1; }
+    }
+    syscall(15, "test/et29.stop", "x", 1, 0, 0);
+    int code = wait_for(w, 1000);
+    syscall(30, "test/et29.stop", 0, 0, 0, 0);
+    int kept = 0;
+    if (code == 77 && canary_file_intact() == 1) { kept = 1; }
+    if (kept == 1) { print("[hostile] canary kept\n"); }
+    print("[hostile] end\n");
+    return held + kept;
+}

@@ -63,12 +63,18 @@ void dispatch_set(int vector, int handler) {
 // still report which one fired; passing the RIP lets it report WHERE the fault occurred. The
 // interrupted code segment is kept in int_cs rather than passed on, for the
 // two handlers that need to know whether ring 3 was running.
+extern int ist_stop_landing;
 int int_cs = 0;
 
-void int_dispatch(int vector, int errcode, int cr2, int rip, int cs) {
+void int_dispatch(int vector, int errcode, int cr2, int rip, int cs, int frame) {
+    int prior_cs = int_cs;
     int_cs = cs;
+    if ((cs & 3) == 0 && (vector == 13 || vector == 14)) {
+        if (user_fault(vector, errcode, cr2, rip, frame)) { int_cs = prior_cs; return; }
+    }
     int h = load64(dispatch_start + vector * 8);
     h(vector, errcode, cr2, rip);
+    int_cs = prior_cs;
     return;
 }
 

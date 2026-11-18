@@ -1,0 +1,672 @@
+// Copyright (C) 2026 tavro
+// SPDX-License-Identifier GPL-3.0-or-later
+void users_check(int ok, int label) {
+    serial_print("[users-test] ");
+    if (ok) { serial_print("PASS "); } else { serial_print("FAIL "); }
+    serial_print(label); serial_print("\n");
+    return;
+}
+void users_line(int f, int text) {
+    int i = 0;
+    while (load8(text + i)) { shell_input(f, load8(text + i)); i += 1; }
+    shell_input(f, '\n');
+    return;
+}
+void users_probe() {
+    int f = 0;
+    kakel_locked = 0;
+    store64(raket_authed_base + f * 8, 1);
+    sk_user_set_pass(0, "rootsecret");
+    store64(sk_uid_base + f * 8, 1);
+    users_line(f, "login root");
+    users_check(load64(sk_uid_base + f * 8) == 1, "login waits for a password");
+    users_line(f, "wrongsecret");
+    users_check(load64(sk_uid_base + f * 8) == 1, "wrong password keeps guest identity");
+    users_line(f, "login root"); users_line(f, "rootsecret");
+    users_check(load64(sk_uid_base + f * 8) == 0, "correct password opens root");
+    users_line(f, "login guest"); users_line(f, "");
+    users_check(load64(sk_uid_base + f * 8) == 1, "empty password opens a passwordless account");
+    users_line(f, "passwd root");
+    users_check(sk_user_check_pass(0, "rootsecret"), "guest cannot replace root password");
+    users_line(f, "adduser intruder");
+    users_check(sk_user_lookup("intruder") < 0, "guest cannot create accounts");
+    users_line(f, "passwd"); users_line(f, "");
+    users_line(f, "guestsecret"); users_line(f, "guestsecret");
+    users_check(sk_user_check_pass(1, "guestsecret"), "self password uses old new and again");
+    users_line(f, "passwd"); users_line(f, "wrongsecret");
+    users_check(sk_user_check_pass(1, "guestsecret"), "wrong old password preserves password");
+    users_line(f, "passwd"); users_line(f, "guestsecret");
+    users_line(f, "newsecret"); users_line(f, "different");
+    users_check(sk_user_check_pass(1, "guestsecret"), "mismatched confirmation preserves password");
+    int a = kmalloc(66);
+    int i = 0;
+    for (i = 0; i < 64; i += 1) { store8(a + i, 'a'); }
+    store8(a + 64, 0);
+    sk_user_set_pass(1, a);
+    users_check(sk_user_check_pass(1, a), "64 byte password accepted");
+    store8(a + 64, 'x'); store8(a + 65, 0);
+    users_check(!sk_user_check_pass(1, a), "65 byte prefix extension rejected");
+    sk_user_set_pass(1, a);
+    store8(a + 64, 0);
+    users_check(sk_user_check_pass(1, a), "65 byte replacement preserves old password");
+    kfree(a);
+    int secret_history = 0;
+    for (i = 0; i < sk_hist_count; i += 1) {
+        int entry = sk_hist_buf + i * SHELL_LINE_MAX;
+        if (str_starts(entry, "login") >= 0 || str_starts(entry, "passwd") >= 0
+            || str_eq(entry, "rootsecret") || str_eq(entry, "guestsecret")
+            || str_eq(entry, "wrongsecret") || str_eq(entry, "newsecret")
+            || str_eq(entry, "different")) { secret_history += 1; }
+    }
+    users_check(secret_history == 0, "credentials never enter command history");
+    users_input_probe();
+    users_files_probe();
+    users_root_folder_probe();
+    users_zone_probe();
+    users_history_probe();
+    users_kill_probe();
+    users_syskill_probe();
+    users_slash_probe();
+    users_replace_probe();
+    users_fixed_path_probe();
+    users_trusted_path_probe();
+    users_stale_folder_probe();
+    users_stale_ids_probe();
+    users_trusted_source_probe();
+    users_stamp_probe();
+    users_cwd_stamp_probe();
+    users_language_probe();
+    users_close_probe();
+    serial_print("[users-test] DONE\n");
+    return;
+}
+
+void users_files_probe() {
+    int rootfile = jakel_make_file(JAKEL_SYSTEM, 0, "users-root.txt");
+    users_check(rootfile >= 0, "root file allocated");
+    if (rootfile < 0) { return; }
+    jakel_put(JAKEL_SYSTEM, rootfile, "rootdata", 8, 0);
+    users_check(jakel_put(1, rootfile, "hacked", 6, 0) == -1
+        && load64(jakel_size_base + rootfile * 8) == 8, "denied write preserves size");
+    users_check(jakel_put(1, rootfile, 0, 0, 0) == -1
+        && load64(jakel_size_base + rootfile * 8) == 8, "denied empty replacement preserves size");
+    users_check(jakel_set_owner(1, rootfile, 1) == -1, "guest cannot take ownership");
+    users_check(jakel_set_mode(1, rootfile, 2) == -1, "guest cannot change root mode");
+    users_check(jakel_remove(1, rootfile) == -3 && jakel_valid(rootfile), "guest cannot remove root file");
+    users_check(jakel_rename(1, rootfile, 0, "stolen.txt") == -1
+        && jakel_lookup(0, "users-root.txt") == rootfile, "denied rename preserves reachability");
+    jakel_set_mode(JAKEL_SYSTEM, rootfile, 0);
+    int buf = kmalloc(16);
+    users_check(jakel_read(1, rootfile, 0, buf, 8) == 0, "locked file denies guest read");
+    users_check(jakel_read(JAKEL_SYSTEM, rootfile, 0, buf, 8) == 8
+        && load8(buf) == 'r', "root control reads locked contents");
+    users_check(!jakel_can_read(-1, rootfile) && !jakel_can_write(-1, rootfile)
+        && !jakel_can_read(0, -1) && !jakel_can_write(0, JAKEL_MAX_NODES)
+        && jakel_make_file(-1, 0, "invalid.txt") < 0, "invalid principals and nodes fail closed");
+    int own = jakel_make_file(1, 0, "users-own.txt");
+    users_check(own >= 0 && load64(jakel_uid_base + own * 8) == 1
+        && jakel_put(1, own, "guestdata", 9, 0) == 0, "creator owns and writes its file");
+    users_check(jakel_put(1, own, "hi", 2, 0) == 0
+        && load64(jakel_size_base + own * 8) == 2, "whole replacement truncates on success");
+    users_check(jakel_put(1, own, 0, 0, 0) == 0
+        && load64(jakel_size_base + own * 8) == 0, "owner can empty its file");
+    int dir = jakel_mkdir(JAKEL_SYSTEM, 0, "users-dir");
+    int sub = jakel_mkdir(JAKEL_SYSTEM, dir, "sub");
+    users_check(jakel_rename(0, dir, sub, "cycle") < 0
+        && jakel_lookup(0, "users-dir") == dir, "directory cannot move into descendant");
+    users_check(jakel_rename(0, 0, dir, "root") < 0
+        && jakel_rename(0, dir, dir, "self") < 0, "root and self moves refused");
+    int arena_end = jakel_arena_end;
+    jakel_arena_end = jakel_arena_start;
+    int failed = jakel_rename(0, own, dir, "moved.txt");
+    jakel_arena_end = arena_end;
+    users_check(failed < 0 && jakel_lookup(0, "users-own.txt") == own
+        && jakel_lookup(dir, "moved.txt") < 0, "allocation failure preserves original rename");
+    users_check(jakel_rename(0, own, dir, "moved.txt") == 0
+        && jakel_lookup(dir, "moved.txt") == own
+        && jakel_lookup(0, "users-own.txt") < 0, "root control moves file");
+    jakel_remove(0, own); jakel_remove(0, sub); jakel_remove(0, dir);
+    jakel_remove(0, rootfile); kfree(buf);
+    return;
+}
+
+void users_input_probe() {
+    int f = 0;
+    store64(sk_uid_base + f * 8, 1);
+    store64(shell_len_base + f * 8, 0); store64(shell_cpos_base + f * 8, 0);
+    shell_input(f, 'a'); shell_input(f, 'b'); shell_input(f, 'c');
+    shell_input(f, SK_KEY_LEFT); shell_input(f, 'x');
+    int line = load64(shell_line_base + f * 8);
+    store8(line + 4, 0);
+    users_check(str_eq(line, "abxc"), "the left action moves where the next byte goes");
+    sk_secret_clear(line, SHELL_LINE_MAX);
+    store64(shell_len_base + f * 8, 0); store64(shell_cpos_base + f * 8, 0);
+    int text_bytes = 1;
+    int b = 0;
+    for (b = 128; b < 256; b += 1) {
+        shell_input(f, 'a'); shell_input(f, 'b');
+        shell_input(f, b);
+        if (load64(shell_len_base + f * 8) != 3 || load64(shell_cpos_base + f * 8) != 3
+            || load8(line) != 'a' || load8(line + 1) != 'b' || load8(line + 2) != b) {
+            text_bytes = 0;
+        }
+        sk_secret_clear(line, SHELL_LINE_MAX);
+        store64(shell_len_base + f * 8, 0); store64(shell_cpos_base + f * 8, 0);
+    }
+    users_check(text_bytes, "every byte from 128 to 255 is line text, not an editing action");
+    kakel_clear(f);
+    sk_ask_begin(f, 1, 0); sk_ask_prompt(f);
+    int row = load64(kakel_row_base + f * 8);
+    int col = load64(kakel_col_base + f * 8);
+    shell_input(f, 'q'); shell_input(f, 'z'); shell_input(f, 'v');
+    shell_input(f, 17); shell_input(f, 9); shell_input(f, 19);
+    shell_redraw_line(f);
+    int grid = kakel_grid(f);
+    int masked = 1;
+    int i = 0;
+    for (i = 0; i < 3; i += 1) {
+        if ((load32(grid + (row * GRID_COLS + col + i) * 4) & 255) != '*') { masked = 0; }
+    }
+    users_check(masked && load64(shell_len_base + f * 8) == 3, "secret redraw history and tab remain masked");
+    raket_user = 1;
+    shell_enqueue(f, 'q'); shell_enqueue(f, 'z'); shell_enqueue(f, 'v');
+    raket_lock();
+    users_check(sk_queue_count == 0 && sk_cancel_pending, "lock invalidates queued secrets");
+    shell_input(f, 'q');
+    users_check(load64(shell_len_base + f * 8) == 3, "locked input is discarded");
+    sk_cancel_prompts();
+    users_check(!sk_ask_stage(f) && load64(shell_len_base + f * 8) == 0
+        && load8(line) == 0, "deferred cancellation clears secret buffers");
+    kakel_locked = 0; raket_user = -1;
+    shell_prompt();
+    return;
+}
+
+void users_close_probe() {
+    int f = kakel_focus;
+    store64(sk_uid_base + f * 8, 1);
+    store64(raket_authed_base + f * 8, 1);
+    raket_user = 0;
+    users_check(kakel_rows == 1 && load64(kakel_ring_vis) == 1,
+        "close regression starts with one shell");
+    shell_enqueue(f, 's'); shell_enqueue(7, 'k'); shell_enqueue(f, 't');
+    kakel_close();
+    users_check(sk_queue_count == 1 && load8(sk_queue + sk_queue_head) == 'k'
+        && load8(sk_queue_sess + sk_queue_head) == 7, "closing a window drops only its queued keys");
+    sk_queue_drop(7);
+    f = kakel_focus;
+    users_check(raket_authed(f) && sk_uid(f) == 1 && !sk_pass_ok(0, ""),
+        "last guest shell replacement cannot become root");
+    raket_reset_session(f);
+    users_check(!raket_authed(f) && sk_uid(f) < 0,
+        "unassigned new sessions require authentication");
+    return;
+}
+
+void users_language_probe() {
+    int f = 0;
+    store64(sk_uid_base + f * 8, 0);
+    users_line(f, "eval accessprobe = 123");
+    int idx = repl_lookup("accessprobe", 11);
+    users_check(idx >= 0 && load64(repl_var_values + idx * 8) == 123,
+        "root control evaluates kernel expression");
+    jakel_seed_page(0, "users-eval.c0", "accessprobe = 999");
+    jakel_seed_page(0, "users-guard.sk", "eval accessprobe = 999\n");
+    store64(sk_uid_base + f * 8, 1);
+    users_line(f, "eval accessprobe = 999");
+    users_line(f, "eval -c accessprobe = 999");
+    users_line(f, "interpret users-eval.c0");
+    users_line(f, "runner = \"eval\"");
+    users_line(f, "$runner accessprobe = 999");
+    users_line(f, "run users-guard.sk");
+    users_check(idx >= 0 && load64(repl_var_values + idx * 8) == 123,
+        "guest direct expanded and scripted commands cannot enter kernel evaluator");
+    store64(sk_uid_base + f * 8, 0);
+    users_line(f, "privatevalue = \"rootvalue\"");
+    store64(sk_uid_base + f * 8, 1);
+    sks_vars = sks_session_table(f);
+    users_check(!sks_get("privatevalue", 12), "prompt variables are private to their user");
+    raket_reset_session(f);
+    store64(sk_uid_base + f * 8, 0); store64(raket_authed_base + f * 8, 1);
+    sks_vars = sks_session_table(f);
+    users_check(!sks_get("privatevalue", 12), "window reuse clears previous prompt variables");
+    jakel_remove(0, jakel_lookup(0, "users-eval.c0"));
+    jakel_remove(0, jakel_lookup(0, "users-guard.sk"));
+    return;
+}
+
+void users_root_folder_probe() {
+    int f = 0;
+    users_check(jakel_mkdir(1, 0, "users-gdir") < 0
+        && jakel_lookup(0, "users-gdir") < 0, "guest cannot make a folder in the root folder");
+    int gf = jakel_make_file(1, 0, "users-gfile.txt");
+    users_check(gf >= 0, "guest makes a file in the root folder");
+    int rd = jakel_mkdir(JAKEL_SYSTEM, 0, "users-rdir");
+    users_check(rd >= 0, "root makes a folder in the root folder");
+    int home = jakel_mkdir(JAKEL_SYSTEM, 0, "users-home");
+    jakel_set_owner(JAKEL_SYSTEM, home, 1);
+    int nest = jakel_mkdir(1, home, "a");
+    int squat = jakel_mkdir(1, nest, "users-squat");
+    users_check(nest >= 0 && squat >= 0, "guest makes folders inside its own folder");
+    users_check(jakel_rename(1, squat, 0, "users-squat") < 0
+        && jakel_lookup(0, "users-squat") < 0
+        && jakel_lookup(nest, "users-squat") == squat, "guest cannot move a nested folder into the root folder");
+    users_check(jakel_rename(1, home, 0, "users-home2") < 0
+        && jakel_lookup(0, "users-home") == home, "guest cannot rename its folder within the root folder");
+    users_check(jakel_rename(1, gf, home, "g.txt") == 0
+        && jakel_rename(1, gf, 0, "users-back.txt") == 0
+        && jakel_lookup(0, "users-back.txt") == gf, "guest moves its file out of and back into the root folder");
+    store64(sk_uid_base + f * 8, 1);
+    users_line(f, "make users-shdir");
+    users_line(f, "make users-shdir2/x.txt");
+    users_line(f, "rename users-home/a/users-squat users-squat");
+    users_line(f, "make users-sh.txt");
+    users_check(jakel_lookup(0, "users-shdir") < 0 && jakel_lookup(0, "users-shdir2") < 0
+        && jakel_lookup(0, "users-squat") < 0
+        && jakel_lookup(0, "users-sh.txt") >= 0, "guest shell refuses root folders and keeps root files");
+    store64(sk_uid_base + f * 8, 0);
+    users_check(jakel_rename(0, squat, 0, "users-squat") == 0
+        && jakel_lookup(0, "users-squat") == squat, "root moves a folder into the root folder");
+    jakel_remove(0, squat); jakel_remove(0, nest); jakel_remove(0, home);
+    jakel_remove(0, rd); jakel_remove(0, gf);
+    jakel_remove(0, jakel_lookup(0, "users-sh.txt"));
+    return;
+}
+
+void users_zone_probe() {
+    int f = 0;
+    int was = clock_offset;
+    users_check(jakel_lookup(0, "tid.zone") < 0, "zone probe starts without tid.zone");
+    int z = jakel_make_file(1, 0, "tid.zone");
+    jakel_put(1, z, "guestzone", 9, 0);
+    store64(sk_uid_base + f * 8, 1);
+    users_line(f, "zone +1");
+    users_check(z >= 0 && jakel_lookup(0, "tid.zone") == z
+        && load64(jakel_uid_base + z * 8) == 0
+        && load64(jakel_mode_base + z * 8) == JAKEL_MODE_PRIVATE
+        && load64(jakel_size_base + z * 8) == 3 && load8(load64(jakel_data_base + z * 8)) == '+',
+        "zone takes back a squatting tid.zone file");
+    users_check(jakel_put(1, z, "guestzone", 9, 0) == -1
+        && load64(jakel_size_base + z * 8) == 3, "guest cannot write tid.zone after zone");
+    jakel_remove(0, z);
+    int arena_end = jakel_arena_end;
+    jakel_arena_end = jakel_arena_start;
+    int full = clock_offset_save();
+    jakel_arena_end = arena_end;
+    jakel_remove(0, jakel_lookup(0, "tid.zone"));
+    int zd = jakel_mkdir(JAKEL_SYSTEM, 0, "tid.zone");
+    int folder = clock_offset_save();
+    jakel_remove(0, zd);
+    users_check(full == 5 && folder == 2, "zone tells a full file system from a tid.zone folder");
+    clock_offset_set(was);
+    return;
+}
+
+int users_recalled(int f, int text) {
+    int line = load64(shell_line_base + f * 8);
+    int len = load64(shell_len_base + f * 8);
+    int i = 0;
+    while (load8(text + i) != 0) {
+        if (i >= len || load8(line + i) != load8(text + i)) { return 0; }
+        i += 1;
+    }
+    return i == len;
+}
+
+void users_history_probe() {
+    int f = 0;
+    int g = 1;
+    sk_hist_count = 0; sk_hist_next = 0;
+    sk_hist_pos_set(f, -1); sk_hist_pos_set(g, -1);
+    store64(raket_authed_base + g * 8, 1);
+    store64(sk_uid_base + f * 8, 1);
+    users_line(f, "echo users-guest-own");
+    store64(sk_uid_base + f * 8, 0);
+    users_line(f, "echo users-root-private");
+    store64(sk_uid_base + f * 8, 1);
+    users_line(f, "echo users-guest-last");
+    shell_history_nav(f, -1);
+    users_check(users_recalled(f, "echo users-guest-last"), "history starts at the window user's newest entry");
+    shell_history_nav(f, -1);
+    users_check(users_recalled(f, "echo users-guest-own"), "history up skips another user's entries");
+    shell_history_nav(f, -1);
+    users_check(users_recalled(f, "echo users-guest-own"), "history up stops at the window user's oldest entry");
+    store64(sk_uid_base + g * 8, 1);
+    shell_history_nav(g, -1);
+    users_check(users_recalled(g, "echo users-guest-last"), "windows of one user share history from their own place");
+    shell_history_nav(f, 1);
+    users_check(users_recalled(f, "echo users-guest-last"), "history down skips another user's entries");
+    shell_history_nav(f, 1);
+    users_check(load64(shell_len_base + f * 8) == 0, "history down past newest clears the line");
+    raket_reset_session(g);
+    users_check(sk_hist_pos(g) == -1, "a reset window starts outside the history");
+    store64(shell_len_base + g * 8, 0); store64(shell_cpos_base + g * 8, 0);
+    store64(raket_authed_base + g * 8, 0);
+    store64(sk_uid_base + g * 8, -1);
+    store64(sk_uid_base + f * 8, 0);
+    sk_hist_pos_set(f, -1);
+    shell_history_nav(f, -1);
+    users_check(users_recalled(f, "echo users-root-private"), "root recalls its own entry");
+    store64(shell_len_base + f * 8, 0); store64(shell_cpos_base + f * 8, 0);
+    sk_hist_pos_set(f, -1);
+    return;
+}
+
+void users_kill_probe() {
+    int f = 0;
+    int states = kmalloc(MAX_TASKS * 8);
+    int uids = kmalloc(MAX_TASKS * 8);
+    int i = 0;
+    for (i = 0; i < MAX_TASKS; i += 1) {
+        store64(states + i * 8, TASK_RUNNABLE);
+        store64(uids + i * 8, 0);
+    }
+    store64(uids + 5 * 8, 1);
+    store64(uids + 6 * 8, 2);
+    store64(uids + 7 * 8, -1);
+    int old_states = task_state_base;
+    int old_uids = task_uid_base;
+    task_state_base = states;
+    task_uid_base = uids;
+    store64(sk_uid_base + f * 8, 1);
+    users_line(f, "kill 4");
+    users_check(load64(states + 4 * 8) == TASK_RUNNABLE, "guest cannot kill the shell task");
+    users_line(f, "kill 6");
+    users_check(load64(states + 6 * 8) == TASK_RUNNABLE, "guest cannot kill another user's task");
+    users_line(f, "kill 7");
+    users_check(load64(states + 7 * 8) == TASK_RUNNABLE, "guest cannot kill a task without a uid");
+    users_line(f, "kill 5");
+    users_check(load64(states + 5 * 8) == TASK_EXITED, "guest kills its own task");
+    store64(sk_uid_base + f * 8, 0);
+    users_line(f, "kill 6");
+    users_check(load64(states + 6 * 8) == TASK_EXITED, "root kills another user's task");
+    task_state_base = old_states;
+    task_uid_base = old_uids;
+    kfree(states); kfree(uids);
+    return;
+}
+
+int users_text_is(int id, int text) {
+    int buf = kmalloc(64);
+    int i = 0;
+    for (i = 0; i < 64; i += 1) { store8(buf + i, 0); }
+    int n = jakel_read(JAKEL_SYSTEM, id, 0, buf, 63);
+    int ok = n > 0 && str_eq(buf, text);
+    kfree(buf);
+    return ok;
+}
+
+void users_syskill_probe() {
+    int states = kmalloc(MAX_TASKS * 8);
+    int uids = kmalloc(MAX_TASKS * 8);
+    int parents = kmalloc(MAX_TASKS * 8);
+    int i = 0;
+    for (i = 0; i < MAX_TASKS; i += 1) {
+        store64(states + i * 8, TASK_RUNNABLE);
+        store64(uids + i * 8, 0);
+        store64(parents + i * 8, -1);
+    }
+    if (!task_presents_base) { task_info_reset(7); }
+    int os = task_state_base; int ou = task_uid_base; int op = task_parent_base;
+    int oc = sched_current;
+    int rf = read_flags; int saved = rf(); int off = disable_interrupts; off();
+    task_state_base = states; task_uid_base = uids; task_parent_base = parents;
+    sched_current = 5;
+    store64(uids + 5 * 8, 1);
+    store64(uids + 2 * 8, 1); store64(parents + 2 * 8, 5);
+    int own = sys_dispatch(SYS_KILL, 2, 0, 0, 0, 0, 0) == 0 && load64(states + 2 * 8) == TASK_EXITED;
+    store64(parents + 3 * 8, 5);
+    task_info_reset(5);
+    int cleared = load64(parents + 3 * 8) == -1;
+    store64(parents + 3 * 8, 5);
+    int refused = sys_dispatch(SYS_KILL, 3, 0, 0, 0, 0, 0) != 0 && load64(states + 3 * 8) == TASK_RUNNABLE;
+    sched_current = oc;
+    task_state_base = os; task_uid_base = ou; task_parent_base = op;
+    if ((saved & 512) != 0) { int on = enable_interrupts; on(); }
+    users_check(own, "a program stops a child of its own uid");
+    users_check(cleared, "a reset task slot drops every parent link to it");
+    users_check(refused, "a guest program cannot stop a root task through a parent link");
+    kfree(states); kfree(uids); kfree(parents);
+    return;
+}
+
+void users_slash_probe() {
+    int f = 0;
+    store64(sk_uid_base + f * 8, 0);
+    int d = jakel_mkdir(JAKEL_SYSTEM, 0, "users-sub");
+    int a = jakel_make_file(JAKEL_SYSTEM, d, "a.txt");
+    jakel_put(JAKEL_SYSTEM, a, "slash", 5, 0);
+    sk_set_cwd(f, d);
+    users_line(f, "rename a.txt /users-moved.txt");
+    users_line(f, "copy /users-moved.txt /users-copied.txt");
+    sk_set_cwd(f, 0);
+    int m = jakel_lookup(0, "users-moved.txt");
+    int c = jakel_lookup(0, "users-copied.txt");
+    users_check(m == a && c >= 0 && jakel_lookup(d, "users-moved.txt") < 0
+        && jakel_lookup(d, "users-copied.txt") < 0, "a destination starting with a slash is in the root folder");
+    jakel_remove(0, m); jakel_remove(0, c); jakel_remove(0, d);
+    return;
+}
+
+void users_replace_probe() {
+    int f = 0;
+    sk_set_cwd(f, 0);
+    store64(sk_uid_base + f * 8, 1);
+    users_line(f, "make users-notes.txt");
+    store64(sk_uid_base + f * 8, 0);
+    users_line(f, "write users-notes.txt rootsecret");
+    int n = jakel_lookup(0, "users-notes.txt");
+    users_check(n >= 0 && load64(jakel_uid_base + n * 8) == 1 && load64(jakel_size_base + n * 8) == 0,
+        "root write into a guest name in the root folder is refused");
+    int lk = jakel_make_file(JAKEL_SYSTEM, 0, "users-locked.txt");
+    jakel_put(JAKEL_SYSTEM, lk, "lockeddata", 10, 0);
+    jakel_set_mode(JAKEL_SYSTEM, lk, JAKEL_MODE_LOCKED);
+    store64(sk_uid_base + f * 8, 1);
+    users_line(f, "make users-backup.txt");
+    store64(sk_uid_base + f * 8, 0);
+    users_line(f, "copy users-locked.txt users-backup.txt");
+    int b = jakel_lookup(0, "users-backup.txt");
+    users_check(b >= 0 && load64(jakel_size_base + b * 8) == 0,
+        "root copy into a guest name in the root folder is refused");
+    int e = jakel_make_file(1, 0, "users-hello.elf");
+    users_check(e >= 0 && !jakel_can_replace(0, e) && jakel_open_or_make(0, 0, "users-hello.elf") < 0
+        && jakel_put(0, e, "ROOTBUILD", 9, 0) == -1 && load64(jakel_size_base + e * 8) == 0,
+        "root build output into a guest name in the root folder is refused");
+    users_check(sk_foreign_output(f, 0, "users-hello.elf") == 1
+        && sk_foreign_output(f, 0, "users-locked.txt") == 0, "execute refuses outputs of another owner");
+    int own = jakel_make_file(0, 0, "users-rootown.txt");
+    users_check(jakel_put(0, own, "mine", 4, 0) == 0 && jakel_put(1, e, "guestown", 8, 0) == 0
+        && users_text_is(own, "mine") && users_text_is(e, "guestown"), "owners still replace their own files");
+    int home = jakel_mkdir(JAKEL_SYSTEM, 0, "users-home3");
+    jakel_set_owner(JAKEL_SYSTEM, home, 1);
+    int hf = jakel_make_file(1, home, "g.txt");
+    users_check(jakel_put(0, hf, "rootin", 6, 0) == 0, "root writes in a folder that is not public");
+    users_line(f, "remove users-notes.txt");
+    users_line(f, "write users-notes.txt rootsecret");
+    n = jakel_lookup(0, "users-notes.txt");
+    users_check(n >= 0 && load64(jakel_uid_base + n * 8) == 0 && users_text_is(n, "rootsecret"),
+        "root removes a guest file and then writes the name");
+    jakel_remove(0, n); jakel_remove(0, b); jakel_remove(0, lk); jakel_remove(0, e);
+    jakel_remove(0, own); jakel_remove(0, hf); jakel_remove(0, home);
+    return;
+}
+
+void users_fixed_path_probe() {
+    int g = jakel_make_file(1, 0, "users-fixed.elf");
+    jakel_put(1, g, "guestprogram", 12, 0);
+    int r = jakel_make_file(JAKEL_SYSTEM, 0, "users-rootfixed.elf");
+    users_check(spawn_system_program(0, 0, 0, "/users-fixed.elf", SPAWN_WINDOWED) == -8
+        && spawn_system_program(0, 0, 0, "/users-rootfixed.elf", SPAWN_WINDOWED) == -4,
+        "a kernel program path starts only from a file root owns");
+    jakel_remove(0, g); jakel_remove(0, r);
+    return;
+}
+
+void users_trusted_path_probe() {
+    int f = 0;
+    sk_set_cwd(f, 0);
+    int g = jakel_make_file(1, 0, "users-calc.elf");
+    jakel_put(1, g, "guestprogram", 12, 0);
+    int ge = jakel_make_file(1, 0, "users-gempty.elf");
+    int re = jakel_make_file(JAKEL_SYSTEM, 0, "users-rempty.elf");
+    int oe = jakel_make_file(2, 0, "users-oempty.elf");
+    users_check(spawn_program(0, 0, 0, "users-calc.elf") == -8, "root does not start a guest program");
+    users_check(spawn_program(1, 0, 0, "users-gempty.elf") == -4
+        && spawn_program(1, 0, 0, "users-rempty.elf") == -4, "a guest starts its own and root's programs");
+    users_check(spawn_program(1, 0, 0, "users-oempty.elf") == -8, "a guest does not start another user's program");
+    users_check(spawn_owned_quoted(1, 0, 0, "users-rempty.elf", 1) == -8
+        && spawn_owned_quoted(1, 0, 0, "users-gempty.elf", 1) == -4, "execute starts only an output its user owns");
+    store64(sk_uid_base + f * 8, 0);
+    users_line(f, "start users-calc.elf");
+    int sg = jakel_make_file(1, 0, "users-setup.sk");
+    jakel_put(1, sg, "write users-ran.txt guest\n", 26, 0);
+    users_line(f, "run users-setup.sk");
+    int ran_guest = jakel_lookup(0, "users-ran.txt") >= 0;
+    int sr = jakel_make_file(JAKEL_SYSTEM, 0, "users-rsetup.sk");
+    jakel_put(JAKEL_SYSTEM, sr, "write users-ran2.txt root\n", 26, 0);
+    users_line(f, "run users-rsetup.sk");
+    int ran_root = jakel_lookup(0, "users-ran2.txt") >= 0;
+    store64(sk_uid_base + f * 8, 1);
+    users_line(f, "run users-setup.sk");
+    int ran_own = jakel_lookup(0, "users-ran.txt") >= 0;
+    users_check(!ran_guest && ran_root && ran_own,
+        "root does not run a guest script and each user runs its own");
+    users_check(jakel_remove_at(0, 0, "users-nothing.txt") == -4
+        && jakel_remove_at(0, 0, "users-ran2.txt") == 0
+        && jakel_lookup(0, "users-ran2.txt") < 0, "remove by name acts on the node the name leads to");
+    store64(sk_uid_base + f * 8, 0);
+    jakel_remove(0, g); jakel_remove(0, ge); jakel_remove(0, re); jakel_remove(0, oe);
+    jakel_remove(0, sg); jakel_remove(0, sr); jakel_remove(0, jakel_lookup(0, "users-ran.txt"));
+    return;
+}
+
+void users_stale_folder_probe() {
+    int f = 0;
+    store64(sk_uid_base + f * 8, 0);
+    sk_set_cwd(f, 0);
+    int home = jakel_mkdir(JAKEL_SYSTEM, 0, "users-fh");
+    jakel_set_owner(JAKEL_SYSTEM, home, 1);
+    store64(sk_uid_base + f * 8, 1);
+    users_line(f, "make users-fh/d");
+    int d = jakel_lookup(home, "d");
+    users_line(f, "change users-fh/d");
+    int entered = sk_cwd(f) == d;
+    users_line(f, "remove ../d");
+    int evil = jakel_make_file(1, home, "evil.bin");
+    jakel_put(1, evil, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 32, 0);
+    users_line(f, "write users-fx.txt hi");
+    int fx = jakel_lookup(0, "users-fx.txt");
+    users_check(entered && d >= 0 && evil == d && fx >= 0 && sk_cwd(f) == 0,
+        "a working folder whose slot now holds a file falls back to the root folder");
+    users_line(f, "make users-fh/d2");
+    int d2 = jakel_lookup(home, "d2");
+    users_line(f, "change users-fh/d2");
+    users_line(f, "remove ../d2");
+    int d3 = jakel_mkdir(1, home, "d3");
+    users_line(f, "write users-fy.txt hi");
+    users_check(d3 == d2 && jakel_lookup(0, "users-fy.txt") >= 0 && jakel_lookup(d3, "users-fy.txt") < 0,
+        "a working folder whose slot now holds another folder falls back to the root folder");
+    users_check(jakel_lookup(evil, "x") == -1 && jakel_open(evil, "x") == -1
+        && jakel_open(0, "users-fh/evil.bin/x") == -1, "lookups refuse a file as a folder");
+    users_check(jakel_open(evil, "") == -1, "a path from a file as its folder names nothing");
+    jakel_list(evil);
+    users_check(1, "listing a file as a folder lists nothing");
+    jakel_where(d2 + JAKEL_MAX_NODES);
+    int gone = jakel_mkdir(JAKEL_SYSTEM, 0, "users-gone");
+    jakel_remove(0, gone);
+    jakel_where(gone);
+    users_check(1, "the path of a removed node prints without a fault");
+    store64(sk_uid_base + f * 8, 0);
+    sk_set_cwd(f, 0);
+    jakel_remove(0, fx); jakel_remove(0, jakel_lookup(0, "users-fy.txt"));
+    jakel_remove(0, evil); jakel_remove(0, d3); jakel_remove(0, home);
+    return;
+}
+
+void users_stale_ids_probe() {
+    if (!task_cwd_base) {
+        task_cwd_base = kmalloc(MAX_TASKS * 8);
+        task_cwd_stamp_base = kmalloc(MAX_TASKS * 8);
+        int ci = 0;
+        for (ci = 0; ci < MAX_TASKS; ci += 1) {
+            store64(task_cwd_base + ci * 8, 0);
+            store64(task_cwd_stamp_base + ci * 8, 0);
+        }
+    }
+    int d = jakel_mkdir(JAKEL_SYSTEM, 0, "users-td");
+    store64(task_cwd_base + 3 * 8, d);
+    store64(task_cwd_stamp_base + 3 * 8, jakel_stamp(d));
+    int live = task_cwd(3) == d;
+    jakel_remove(0, d);
+    int d2 = jakel_mkdir(JAKEL_SYSTEM, 0, "users-td2");
+    users_check(live && d2 == d && task_cwd(3) == 0, "a task's removed folder falls back to the root folder");
+    jakel_remove(0, d2);
+    fd_reset(3);
+    int k = 3 * FD_SLOTS;
+    int a = jakel_make_file(JAKEL_SYSTEM, 0, "users-fd.txt");
+    store64(fd_file_base + k * 8, a + 1);
+    store64(fd_stamp_base + k * 8, jakel_stamp(a));
+    int open_live = fd_live(k);
+    jakel_remove(0, a);
+    int b = jakel_make_file(JAKEL_SYSTEM, 0, "users-fd2.txt");
+    users_check(open_live && b == a && !fd_live(k), "an fd of a removed file never reaches the file in its slot");
+    store64(fd_file_base + k * 8, 0);
+    jakel_remove(0, b);
+    return;
+}
+
+void users_trusted_source_probe() {
+    int f = 0;
+    store64(sk_uid_base + f * 8, 0);
+    sk_set_cwd(f, 0);
+    users_line(f, "eval accessprobe = 123");
+    int idx = repl_lookup("accessprobe", 11);
+    int g = jakel_make_file(1, 0, "users-g.c0");
+    jakel_put(1, g, "accessprobe = 777", 17, 0);
+    users_line(f, "interpret users-g.c0");
+    users_check(idx >= 0 && load64(repl_var_values + idx * 8) == 123,
+        "root does not interpret a guest file");
+    int gd = jakel_mkdir(JAKEL_SYSTEM, 0, "users-gd");
+    jakel_set_owner(JAKEL_SYSTEM, gd, 1);
+    int r = jakel_make_file(JAKEL_SYSTEM, gd, "r.c0");
+    jakel_put(JAKEL_SYSTEM, r, "accessprobe = 778", 17, 0);
+    users_line(f, "interpret users-gd/r.c0");
+    users_check(load64(repl_var_values + idx * 8) == 123,
+        "root does not interpret a file in a guest folder");
+    users_line(f, "execute users-g.c0");
+    int own = jakel_make_file(JAKEL_SYSTEM, 0, "users-r.c0");
+    jakel_put(JAKEL_SYSTEM, own, "accessprobe = 124", 17, 0);
+    users_line(f, "interpret users-r.c0");
+    users_check(load64(repl_var_values + idx * 8) == 124, "root interprets its own file");
+    jakel_remove(0, g); jakel_remove(0, r); jakel_remove(0, gd); jakel_remove(0, own);
+    return;
+}
+
+void users_stamp_probe() {
+    int dup = 0;
+    int i = 0;
+    int j = 0;
+    for (i = 0; i < JAKEL_MAX_NODES; i += 1) {
+        for (j = i + 1; j < JAKEL_MAX_NODES; j += 1) {
+            if (jakel_valid(i) && jakel_valid(j) && jakel_stamp(i) == jakel_stamp(j)) { dup += 1; }
+        }
+    }
+    users_check(dup == 0, "no two live nodes share a creation stamp");
+    return;
+}
+
+void users_cwd_stamp_probe() {
+    int f = 0;
+    int d = jakel_mkdir(JAKEL_SYSTEM, 0, "users-cs");
+    int e = jakel_make_file(JAKEL_SYSTEM, d, "e.elf");
+    int st = jakel_stamp(d);
+    users_check(spawn_program(0, d, st, "e.elf") == -4 && spawn_program(0, d, st + 1000, "e.elf") == -2,
+        "a spawn from a folder that lost its stamp finds nothing there");
+    sk_set_cwd_stamped(f, d, st + 1000);
+    int stale = sk_cwd(f) == 0;
+    sk_set_cwd_stamped(f, d, st);
+    users_check(stale && sk_cwd(f) == d, "a window gets a folder only with the stamp it was found with");
+    sk_set_cwd(f, 0);
+    jakel_remove(0, e); jakel_remove(0, d);
+    return;
+}

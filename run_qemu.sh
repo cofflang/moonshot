@@ -30,9 +30,14 @@ cd "$(dirname "$0")"
 
 ./build.sh || exit 1
 
-if [ ! -f disk.img ]; then
-  dd if=/dev/zero of=disk.img bs=512 count=20480 2>/dev/null
-fi
+disk=$(mktemp /tmp/moonshot-boot-disk.XXXXXX)
+trap 'rm -f "$disk"' EXIT
+python3 - "$disk" <<'PYDISK'
+import sys
+with open(sys.argv[1], "wb") as f:
+    f.truncate(512 * 20480)
+    f.write(b"JAKELBK\0")
+PYDISK
 
 isodir=isoroot
 rm -rf "$isodir" moonshot.iso
@@ -49,7 +54,7 @@ fi
 rm -f serial.log
 timeout 5 qemu-system-x86_64 -cdrom moonshot.iso \
   -serial file:serial.log -display none -no-reboot -m 128 \
-  -drive file=disk.img,format=raw,if=ide,index=0,media=disk
+  -drive file="$disk",format=raw,if=ide,index=0,media=disk
 
 # Exact KB values are not checked (they depend on QEMU's default memory
 # layout / -m value, not on anything this kernel controls) -- what matters

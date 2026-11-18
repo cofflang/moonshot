@@ -1,0 +1,97 @@
+// Copyright (C) 2026 tavro
+// SPDX-License-Identifier GPL-3.0-or-later
+// The caller supplies immutable, readable storage for size bytes. Physical
+// addresses are translated into offsets, never dereferenced as pointers.
+// No discovery, mapping, AML execution or device access occurs here.
+// Limits bound work as well as memory reads. Unsupported revisions fail closed.
+
+int kraft_range(int size, int off, int len) {
+    if (off < 0 || len < 0 || off > size) { return 0; }
+    if (len > size - off) { return 0; }
+    return 1;
+}
+
+int kraft_sum(int blob, int off, int len) {
+    int sum = 0;
+    int i = 0;
+    while (i < len) {
+        sum = (sum + load8(blob + off + i)) & 255;
+        i += 1;
+    }
+    return sum;
+}
+
+int kraft_sig(int blob, int off, int sig, int len) {
+    int i = 0;
+    while (i < len) {
+        if (load8(blob + off + i) != load8(sig + i)) { return 0; }
+        i += 1;
+    }
+    return 1;
+}
+
+// The address space is deliberately limited to nonnegative signed addresses.
+// Subtract before comparing so a hostile address cannot wrap an end pointer.
+int kraft_offset(int blob, int size, int base, int field) {
+    int addr = load64(blob + field);
+    if (addr < base) { return -1; }
+    int off = addr - base;
+    if (off >= size) { return -1; }
+    return off;
+}
+
+// Return the validated SDT length or zero. Header reads follow the range check.
+int kraft_sdt(int blob, int size, int off) {
+    if (kraft_range(size, off, 36) == 0) { return 0; }
+    int len = load32(blob + off + 4);
+    if (len < 36 || len > 1048576) { return 0; }
+    if (kraft_range(size, off, len) == 0) { return 0; }
+    if (load8(blob + off + 8) == 0) { return 0; }
+    if (kraft_sum(blob, off, len) != 0) { return 0; }
+    return len;
+}
+
+// Return the FADT offset on success, or a negative error. No partial result is
+// published. RSDP revisions zero and one require RSDT support and are refused.
+// RSDP revision two and later use the bounded extended structure. XSDT revision
+// one and FADT revisions one, three through six are supported. Revision two of
+// the FADT is reserved. Unknown SDTs are checksum validated but not interpreted.
+// Errors group the input contract, RSDP, XSDT, entry and FADT failures.
+int kraft_parse(int blob, int size, int base, int rsdp) {
+    if (blob <= 0 || size < 0 || size > 16777216 || base < 0) { return -1; }
+    if (blob > 0x7fffffffffffffff - size || base > 0x7fffffffffffffff - size) { return -1; }
+    if (kraft_range(size, rsdp, 20) == 0) { return -2; }
+    if (kraft_sig(blob, rsdp, "RSD PTR ", 8) == 0) { return -2; }
+    if (kraft_sum(blob, rsdp, 20) != 0) { return -2; }
+    if (load8(blob + rsdp + 15) < 2) { return -2; }
+    if (kraft_range(size, rsdp, 36) == 0) { return -2; }
+    int rlen = load32(blob + rsdp + 20);
+    if (rlen < 36 || rlen > 4096 || kraft_range(size, rsdp, rlen) == 0) { return -2; }
+    if (kraft_sum(blob, rsdp, rlen) != 0) { return -2; }
+    int xsdt = kraft_offset(blob, size, base, rsdp + 24);
+    int xlen = kraft_sdt(blob, size, xsdt);
+    if (xlen == 0) { return -3; }
+    if (kraft_sig(blob, xsdt, "XSDT", 4) == 0 || load8(blob + xsdt + 8) != 1) { return -3; }
+    int entries = (xlen - 36) / 8;
+    if ((xlen - 36) % 8 != 0 || entries > 1024) { return -3; }
+    int found = -1;
+    int i = 0;
+    while (i < entries) {
+        int off = kraft_offset(blob, size, base, xsdt + 36 + i * 8);
+        int len = kraft_sdt(blob, size, off);
+        if (len == 0) { return -4; }
+        if (kraft_sig(blob, off, "FACP", 4) == 1) {
+            int rev = load8(blob + off + 8);
+            int minimum = 0;
+            if (rev == 1) { minimum = 116; }
+            if (rev == 3 || rev == 4) { minimum = 244; }
+            if (rev == 5) { minimum = 268; }
+            if (rev == 6) { minimum = 276; }
+            if (minimum == 0 || len < minimum || found != -1) { return -5; }
+            found = off;
+        }
+        i += 1;
+    }
+    if (found == -1) { return -5; }
+    return found;
+}

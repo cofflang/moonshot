@@ -48,24 +48,19 @@ int pml4_phys = 0;
 //    exactly this reason, since the patched immediate would truncate.
 // 2. Since every representable address is < 4GB, it unavoidably falls
 //    inside PML4 index 0 -- the SAME top-level entry the kernel's own 16MB
-//    identity map lives in (one PML4 entry spans 512GB). pt_create()
-//    copies that entry by value, so the copy is a shared POINTER to the
-//    kernel's own PDPT frame, present but WITHOUT the U bit (it was built
-//    by paging_init via plain map_page/next_table, kernel-only). The first
-//    attempt at 2GB below index 0 still faulted (present-but-protection-
-//    violation on the very first ring-3 instruction fetch) until
-//    next_table_user (below) was taught to upgrade an already-present
-//    entry's permissions in place rather than trusting it as-is.
+//    identity map lives in (one PML4 entry spans 512GB). So pt_create()
+//    gives every process its own copy of the kernel's PDPT 0 and marks the
+//    edge to that copy user-traversable. The entries copied into it still
+//    point at the kernel's own tables, supervisor-only, and stay that way.
+//    The CPU checks U/S at every level of a walk, so ring 3 reaches none of
+//    the pages under them, and no mapper ever writes through such an entry
+//    or raises its U bit (see pt_map).
 //
-// 2GB (PDPT index 2 within that shared PML4[0]) is chosen specifically
-// clear of the kernel's actual populated ranges. The 16MB identity map
-// (PDPT index 0), the 4GB sentinel and 5GB demand-paging test address
-// (both >= 4GB, excluded by constraint 1 anyway). Setting U on the shared
-// PML4[0] entry is safe -- it is a permission CEILING, not a grant, and the
-// kernel's own leaf PTEs (built via plain map_page, never map_page_user)
-// keep U unset, so kernel pages stay inaccessible from ring 3 regardless.
-// Only the fresh, process-private PDPT[2]/PD/PT chain map_page_user builds
-// underneath it is ever actually user-accessible.
+// 2GB (PDPT index 2 of that copy) is chosen specifically clear of the
+// kernel's actual populated ranges. The 16MB identity map (PDPT index 0),
+// the framebuffer, the 4GB sentinel and the 5GB demand-paging test address.
+// Only the fresh, process-private PD/PT chains map_page_user builds in
+// slots the kernel left empty are ever actually user-accessible.
 int PRESENT_WRITE_USER = 0x7;
 
 // The physical address bits of a page-table entry. Bit 63 is NX, so an entry
@@ -74,6 +69,12 @@ int PRESENT_WRITE_USER = 0x7;
 int PTE_ADDR = 0xFFFFFFFFFF000;
 int USER_VIRT_BASE = 0x80000000;
 
+// VIRT_LIMIT is 2^47, the end of the lower canonical half. No mapping is made
+// at or above it. USER_TOP ends the user range one page short of it, so the
+// last canonical page is never a user page.
+int VIRT_LIMIT = 0x800000000000;
+int USER_TOP = 0x7FFFFFFFF000;
+
 // Demand-paging test (see page_fault_handler/knekt.c0's kernel_post_init).
 // a virtual address deliberately left unmapped (5GB, hence 0x140000000 --
 // above the 16MB identity map and the 4GB paging sentinel, so touching it
@@ -81,6 +82,7 @@ int USER_VIRT_BASE = 0x80000000;
 // freshly-mapped page with so the recovered read is verifiable.
 // FAULT_SENTINEL stays decimal for the same eyeballing reason as
 // SENTINEL_VALUE above.
+int boot_fault_authorized = 0;
 int FAULT_TEST_VIRT = 0x140000000;
 int FAULT_SENTINEL = 2020202020;
 
@@ -98,15 +100,21 @@ int pmm_free_head = 0;
 // yet — those are "available" rather than "freed."
 int pmm_free_count = 0;
 
+// 1 while pt_selftest runs jenna dry on purpose, so pmm_alloc_page does not
+// print the out-of-memory line that other tests read as a failure.
+int pmm_quiet = 0;
+
 // Walks the Multiboot memory map (a variable-length list of {size, addr,
 // len, type} entries, `size` NOT counting itself -- next entry is at
-// `entry + size + 4`) and picks the largest available (type 1) region
-// at-or-after kernel_end, clamped to the identity-map ceiling, as jenna's
+// `entry + size + 4`) and picks the largest available (type 1) region that
+// can actually hold something at-or-after kernel_end, as jenna's initial
 // physical-memory arena. Prints every region regardless of type/fit, so
 // the full map is visible over serial, not just whichever one got picked.
 //
 // addr/len are real 64-bit fields (unlike Multiboot's other u32 fields),
 // so this uses load64 directly -- no load32 reconstruction needed here.
+int hardware_map_count = 0;
+
 void pmm_init(int mb_info) {
     int flags = load32(mb_info);
     // bit 6 of flags means mmap_addr/mmap_length valid. Same isolate-one-bit
@@ -138,13 +146,11 @@ void pmm_init(int mb_info) {
         serial_print_int(type);
         serial_print("\n");
 
-        // The LARGEST usable region wins, not the first. Under BIOS the
-        // first region past the kernel is all of RAM, but UEFI firmware
-        // leaves its own code and data scattered through low memory, so the
-        // first one can be a few MB (7MB under OVMF), too small for pmm to
-        // get through boot, and the null pointers that follow an empty pmm
-        // fault somewhere unrelated. Only the part below the identity-map
-        // ceiling counts, since paging_init clamps pmm_limit to it anyway.
+        if (hardware_map_count < 128) {
+            int row = hardware_map + hardware_map_count * 24;
+            store64(row, base); store64(row + 8, len); store64(row + 16, type);
+            hardware_map_count += 1;
+        }
         if (type == 1) {
             int region_start = base;
             if (region_start < _kernel_end) { region_start = _kernel_end; }
@@ -203,18 +209,11 @@ int pmm_alloc_page() {
         return p;
     }
     if (pmm_next + 4096 > pmm_limit) {
-        serial_print("pmm: out of memory\n");
+        if (!pmm_quiet) { serial_print("pmm: out of memory\n"); }
         return 0;
     }
     p = pmm_next;
     pmm_next += 4096;
-    // A never-used page holds whatever the firmware left there. QEMU's
-    // BIOS boot hands over zeroed RAM, UEFI firmware (and real machines)
-    // do not, and code all over the kernel assumes the zeros (the window
-    // tables kakel allocates with kmalloc, for one, would read back as
-    // garbage geometry and fault in fb_get_pixel). So jenna makes the zeros
-    // real, once per page, the first time it hands it out. Pages from the
-    // free list come back with their old bytes.
     zero_page(p);
     return p;
 }
@@ -230,9 +229,8 @@ int pmm_alloc_run(int n) {
     }
     int p = pmm_next;
     pmm_next += n * 4096;
-    // Fresh pages, zeroed for the same reason as pmm_alloc_page's.
-    int z = zero_pages;
-    z(p, n);
+    int i = 0;
+    for (i = 0; i < n; i += 1) { zero_page(p + i * 4096); }
     return p;
 }
 
@@ -257,15 +255,15 @@ int pmm_total_pages() {
     return (pmm_limit - pmm_start) / 4096;
 }
 
-// pmm zeroes a page only the first time it hands it out; a page recycled
-// through the free list comes back with its old bytes -- unlike the
-// userspace alloc() builtin, which relies on the kernel zeroing brk pages --
-// so every page used as a page table MUST be zeroed first, or its garbage
-// entries would be read as present mappings to nonsense frames. Writes 512
-// zero quads (one 4096-byte page) with boot.s's zero_pages.
+// Fresh PMM pages contain arbitrary RAM. Zero every page-table page before
+// installing it, so its contents cannot be interpreted as present mappings
+// to unrelated frames.
+// Writes 512 zero quads (one 4096-byte page).
 void zero_page(int addr) {
-    int z = zero_pages;
-    z(addr, 1);
+    int i = 0;
+    for (i = 0; i < 512; i += 1) {
+        store64(addr + i * 8, 0);
+    }
     return;
 }
 
@@ -302,10 +300,12 @@ int heap_end = 0;
 // it ever stops holding. `who` names the arena in that warning.
 int arena_carve(int num_pages, int who) {
     int first = pmm_alloc_page();
+    if (!first) { jenna_stop("arena_carve: no pages at boot, halting\n"); }
     int expect = first + 4096;
     int i = 1;
     for (i = 1; i < num_pages; i += 1) {
         int pg = pmm_alloc_page();
+        if (!pg) { jenna_stop("arena_carve: no pages at boot, halting\n"); }
         if (pg != expect) {
             serial_print(who);
             serial_print(": NON-CONTIGUOUS pmm page, arena broken\n");
@@ -370,9 +370,11 @@ int arena_used(int start, int end) {
 int kmalloc(int n) {
     int p = arena_alloc(heap_start, heap_end, n);
     if (p == 0 && n > 0) {
+        int sl = serial_line_begin();
         serial_print("[jenna] kmalloc: no room for ");
         serial_print_int(n);
         serial_print(" bytes in the kernel heap\n");
+        serial_line_end(sl);
     }
     return p;
 }
@@ -426,18 +428,22 @@ void arena_free(int start, int end, int ptr, int who) {
     // caller's bad value, which is the difference between an afternoon and
     // a month.
     if (ptr < start + sizeof(HeapBlock) || ptr >= end) {
-        serial_print(who);
+        int sl = serial_line_begin();
+        serial_print_in(sl, who);
         serial_print(": pointer outside the heap, refusing: ");
         serial_print_int(ptr);
         serial_print("\n");
+        serial_line_end(sl);
         return;
     }
     int b = ptr - sizeof(HeapBlock);
     if (b.free == 1) {
-        serial_print(who);
+        int sl2 = serial_line_begin();
+        serial_print_in(sl2, who);
         serial_print(": double free at ");
         serial_print_int(ptr);
         serial_print("\n");
+        serial_line_end(sl2);
         return;
     }
     b.free = 1;
@@ -456,114 +462,177 @@ void kfree(int ptr) {
     return;
 }
 
-// Returns the physical address of the next-level table reached through
-// table[index], creating and zeroing a fresh one (allocated from jenna) if
-// that slot is not present yet. Entries are phys_addr + PRESENT_WRITE; since
-// phys is 4096-aligned the low bits are pure flags, so (e / 4096) * 4096
-// recovers the address and (e - (e / 2) * 2) isolates the present bit --
-// same no-bitwise-ops arithmetic as the rest of this file.
-int next_table(int table, int index) {
-    int e = load64(table + index * 8);
-    int present = e % 2;
-    if (present == 1) {
-        return (e / 4096) * 4096;
-    }
-    int frame = pmm_alloc_page();
-    zero_page(frame);
-    store64(table + index * 8, frame + PRESENT_WRITE);
-    return frame;
+// The index into the table at `level` (0 the PML4, 3 the page table) that
+// the lower-half address `virt` selects, always 0..511.
+int pt_index(int virt, int level) {
+    return (virt >> (39 - level * 9)) & 511;
 }
 
-// Maps one 4096-byte virtual page `virt` to physical page `phys` in the
-// 4-level hierarchy rooted at `pml4` (a physical address), creating any
-// missing PDPT/PD/PT tables along the way. Index extraction is pure
-// arithmetic (no shifts/masks). The linear page number split into five
-// 9-bit (0..511) fields by repeated divide-and-remainder, the same idiom
-// serial_print_int uses for decimal digits.
-void map_page(int pml4, int virt, int phys) {
-    int page = virt / 4096;
-    int pt_i = page % 512;
-    int pd_n = page / 512;
-    int pd_i = pd_n % 512;
-    int pdpt_n = pd_n / 512;
-    int pdpt_i = pdpt_n % 512;
-    int pml4_i = pdpt_n / 512;
-
-    int pdpt = next_table(pml4, pml4_i);
-    int pd = next_table(pdpt, pdpt_i);
-    int pt = next_table(pd, pd_i);
-    store64(pt + pt_i * 8, phys + PRESENT_WRITE);
-    return;
+// 1 when the entry `e` of a process's table and the entry `ke` of the
+// kernel's table at the same place in the tree both point at the same
+// frame. That frame and everything under it belong to the kernel and are
+// shared by every process. Only the frame address decides it, since the
+// flags of the two entries can differ.
+int pt_shared(int e, int ke) {
+    return (e & 1) == 1 && (ke & 1) == 1 && (e & PTE_ADDR) == (ke & PTE_ADDR);
 }
 
-// Same as next_table, but every table on this path is user-accessible, since a
-// freshly-created intermediate table gets U/S set (PRESENT_WRITE_USER)
-// instead of kernel-only PRESENT_WRITE, AND an already-present entry that
-// does NOT yet have U set gets upgraded in place. The CPU checks U/S at
-// EVERY level of a page-table walk, not just the leaf PTE, so a single
-// kernel-only entry anywhere in the chain -- including one this process's
-// table merely shares a pointer to via pt_create()'s top-level copy -- would
-// deny the whole walk even if every level below it is correctly marked
-// user. The upgrade is safe as a general policy, since it only ever raises an
-// intermediate directory's permission CEILING, never touches a leaf PTE, so
-// it cannot expose any actual page that was not already reachable through a
-// user-marked leaf entry elsewhere. See USER_VIRT_BASE's comment for why
-// the user range shares index 0 with the kernel.
-int next_table_user(int table, int index) {
-    int e = load64(table + index * 8);
-    int present = e % 2;
-    if (present == 1) {
-        int us = (e >> 2) & 1;
-        if (!us) {
-            e += 4;
-            store64(table + index * 8, e);
-        }
-        return (e / 4096) * 4096;
+// Maps the 4096-byte page `virt` to the frame `phys` under the root `pml4`
+// with the leaf flags `flags`, building any missing PDPT/PD/PT on the way.
+// `user` 1 makes the path user-accessible. Returns 1, or 0 with the tree
+// exactly as it was.
+//
+// What is checked before anything is written. `virt` is page-aligned and
+// below VIRT_LIMIT, and a user page lies in [USER_VIRT_BASE, USER_TOP).
+// `phys` is a nonzero aligned frame. Under a process's root it must be a
+// frame jenna hands out, because pt_free gives every leaf of a process
+// back to jenna. Only the kernel's own root takes borrowed frames, the
+// identity map and the framebuffer at boot, and no user page goes there.
+//
+// The walk compares each entry of a process's table with the kernel's
+// entry at the same place and refuses one that is shared, so a process
+// mapping never writes into a kernel table. It also refuses a large page,
+// and for a user page any entry without U, which keeps lager's
+// supervisor-only block table out of a user mapping's reach. A leaf that is
+// already present is refused rather than replaced, so its frame is never
+// lost.
+//
+// Missing tables are allocated, zeroed and linked to each other first, and
+// only then is the top one written into the tree. When an allocation fails
+// the ones already taken go back and the tree is untouched.
+int pt_map(int pml4, int virt, int phys, int flags, int user) {
+    if (pml4 <= 0 || pml4 % 4096 != 0) { return 0; }
+    if (virt < 0 || virt >= VIRT_LIMIT || virt % 4096 != 0) { return 0; }
+    if (phys <= 0 || phys % 4096 != 0 || phys > PTE_ADDR) { return 0; }
+    int own = pml4 != pml4_phys;
+    if (own && (phys < pmm_start || phys >= pmm_limit)) { return 0; }
+    if (user && (!own || virt < USER_VIRT_BASE || virt >= USER_TOP)) { return 0; }
+    int dir = PRESENT_WRITE;
+    if (user) { dir = PRESENT_WRITE_USER; }
+
+    // `t` is this root's table at `level`, `k` the kernel's table at the
+    // same place, or 0 where the kernel has none.
+    int t = pml4;
+    int k = 0;
+    if (own) { k = pml4_phys; }
+    int level = 0;
+    while (level < 3) {
+        int e = load64(t + pt_index(virt, level) * 8);
+        if ((e & 1) == 0) { break; }
+        if ((e & 128) != 0) { return 0; }
+        int ke = 0;
+        if (k) { ke = load64(k + pt_index(virt, level) * 8); }
+        if (pt_shared(e, ke)) { return 0; }
+        if (user && (e & 4) == 0) { return 0; }
+        k = 0;
+        if ((ke & 1) == 1 && (ke & 128) == 0) { k = ke & PTE_ADDR; }
+        t = e & PTE_ADDR;
+        level += 1;
     }
-    int frame = pmm_alloc_page();
-    zero_page(frame);
-    store64(table + index * 8, frame + PRESENT_WRITE_USER);
-    return frame;
+
+    if (level == 3) {
+        int leaf = t + pt_index(virt, 3) * 8;
+        if ((load64(leaf) & 1) == 1) { return 0; }
+        store64(leaf, phys | flags);
+        return 1;
+    }
+
+    // The tables for levels level+1 to 3, `a` the topmost.
+    int need = 3 - level;
+    int a = pmm_alloc_page();
+    int b = 0;
+    int c = 0;
+    if (a && need >= 2) { b = pmm_alloc_page(); }
+    if (b && need == 3) { c = pmm_alloc_page(); }
+    if (!a || (need >= 2 && !b) || (need == 3 && !c)) {
+        if (a) { pmm_free_page(a); }
+        if (b) { pmm_free_page(b); }
+        return 0;
+    }
+    zero_page(a);
+    int bottom = a;
+    if (b) {
+        zero_page(b);
+        store64(a + pt_index(virt, level + 1) * 8, b + dir);
+        bottom = b;
+    }
+    if (c) {
+        zero_page(c);
+        store64(b + pt_index(virt, level + 2) * 8, c + dir);
+        bottom = c;
+    }
+    store64(bottom + pt_index(virt, 3) * 8, phys | flags);
+    store64(t + pt_index(virt, level) * 8, a + dir);
+    return 1;
+}
+
+// Maps one 4096-byte virtual page `virt` to physical page `phys`, present
+// and writable, supervisor-only. On the kernel's root this is a boot-time
+// operation (the identity map, the sentinel, the framebuffer). On a
+// process's root it maps private kernel data, lager's block table, which
+// ring 3 never reaches. Returns 1, or 0 with nothing changed (see pt_map).
+int map_page(int pml4, int virt, int phys) {
+    return pt_map(pml4, virt, phys, PRESENT_WRITE, 0);
 }
 
 // Maps one 4096-byte virtual page as user-accessible (present|write|user at
-// every level) in the 4-level hierarchy rooted at `pml4`. Used exclusively
-// for a process's own pt_create()'d private range (USER_VIRT_BASE and up) --
-// mapping a page here never touches the kernel's own pml4_phys tables, since
-// pt_create() only shares kernel entries by VALUE (a copy), not by walking
-// into them.
-void map_page_user(int pml4, int virt, int phys) {
-    int page = virt / 4096;
-    int pt_i = page % 512;
-    int pd_n = page / 512;
-    int pd_i = pd_n % 512;
-    int pdpt_n = pd_n / 512;
-    int pdpt_i = pdpt_n % 512;
-    int pml4_i = pdpt_n / 512;
-
-    int pdpt = next_table_user(pml4, pml4_i);
-    int pd = next_table_user(pdpt, pdpt_i);
-    int pt = next_table_user(pd, pd_i);
-    store64(pt + pt_i * 8, phys + PRESENT_WRITE_USER);
-    return;
+// every level) in a process's own pt_create()'d root, inside the user range.
+// Returns 1, or 0 with nothing changed (see pt_map).
+int map_page_user(int pml4, int virt, int phys) {
+    return pt_map(pml4, virt, phys, PRESENT_WRITE_USER, 1);
 }
 
 // map_page_user for a page that holds data, the heap and the stack, which is
 // not executable (bit 63, NX). The only way to run code from one is
 // SYS_PROTECT, which makes it read-only first.
-void map_page_user_data(int pml4, int virt, int phys) {
-    map_page_user(pml4, virt, phys);
-    int leaf = pt_leaf(pml4, virt);
-    if (leaf) { store64(leaf, phys | PRESENT_WRITE_USER | (1 << 63)); }
-    return;
+int map_page_user_data(int pml4, int virt, int phys) {
+    return pt_map(pml4, virt, phys, PRESENT_WRITE_USER | (1 << 63), 1);
 }
 
-// Creates a fresh, process-private PML4. Starts as a shallow copy of all 512
-// top-level entries from the kernel's own page tables (pml4_phys) BY VALUE
-// -- every process shares the kernel's mappings (the 16MB identity map,
-// the scratch buffers, IDT, dispatch, the heap, the 4GB sentinel) without re-walking or
-// re-allocating a single frame for them, since copying a PML4 entry copies
-// only a pointer to the existing PDPT frame, not its contents.
+// 1 when every page of [lo, hi) is in the user range and none of it lies
+// under an entry the process root `pml4` shares with the kernel's root, so
+// pt_map can map anything in it. 0 for an empty or reversed range. Only the
+// PML4 and PDPT levels are looked at, since under a private PDPT entry the
+// whole subtree is the process's own (pt_create, pt_map). The ELF loader
+// asks this of every segment and of the stack, heap and block table it will
+// place after them, before it maps a single page.
+int pt_private_range(int pml4, int lo, int hi) {
+    if (pml4 <= 0 || pml4 % 4096 != 0 || pml4 == pml4_phys) { return 0; }
+    if (lo < USER_VIRT_BASE || lo >= hi || hi > USER_TOP) { return 0; }
+    int top_i = 0;
+    for (top_i = pt_index(lo, 0); top_i <= pt_index(hi - 1, 0); top_i += 1) {
+        int e = load64(pml4 + top_i * 8);
+        int ke = load64(pml4_phys + top_i * 8);
+        if (pt_shared(e, ke)) { return 0; }
+        if ((e & 1) == 1) {
+            if ((e & 128) != 0 || (e & 4) == 0) { return 0; }
+            int k = 0;
+            if ((ke & 1) == 1 && (ke & 128) == 0) { k = ke & PTE_ADDR; }
+            // The part of [lo, hi) under this PML4 entry, 512GB each.
+            int a = top_i * 0x8000000000;
+            int b = a + 0x8000000000;
+            if (a < lo) { a = lo; }
+            if (b > hi) { b = hi; }
+            int j = 0;
+            for (j = pt_index(a, 1); j <= pt_index(b - 1, 1); j += 1) {
+                int e3 = load64((e & PTE_ADDR) + j * 8);
+                int ke3 = 0;
+                if (k) { ke3 = load64(k + j * 8); }
+                if (pt_shared(e3, ke3)) { return 0; }
+                if ((e3 & 1) == 1 && ((e3 & 128) != 0 || (e3 & 4) == 0)) { return 0; }
+            }
+        }
+    }
+    return 1;
+}
+
+// Creates a fresh, process-private PML4, or returns 0 when jenna has no
+// pages left. Starts as a shallow copy of all 512 top-level entries from
+// the kernel's own page tables (pml4_phys) BY VALUE -- every process shares
+// the kernel's mappings (the 16MB identity map, the scratch buffers, IDT,
+// dispatch, the heap, the 4GB sentinel) without re-walking or re-allocating
+// a single frame for them, since copying a PML4 entry copies only a pointer
+// to the existing PDPT frame, not its contents.
 //
 // PML4 index 0 then gets special treatment, and this is NOT optional the
 // way it might look. USER_VIRT_BASE has to sit under 4GB (see its own
@@ -571,32 +640,33 @@ void map_page_user_data(int pml4, int virt, int phys) {
 // identity map lives in. A plain pointer copy, like every other index gets,
 // would leave every process sharing the SAME physical PDPT frame for index
 // 0 -- meaning USER_VIRT_BASE's own PDPT slot underneath it would be shared
-// too, not private. The second process's map_page_user call would find
-// the first one's PD frame already present at that PDPT slot and silently
-// reuse it instead of building its own -- both processes' "private" code
-// page would live in the same page table. So index 0 gets its own private PDPT frame
-// here, seeded with the SAME 512 entries the kernel's PDPT has (so the
-// identity map, sentinel, and fault-test region all stay reachable) except
+// too, not private. So index 0 gets its own private PDPT frame here, seeded
+// with the SAME 512 entries the kernel's PDPT has (so the identity map,
+// sentinel, and fault-test region all stay reachable from the kernel) except
 // for USER_VIRT_BASE's own slot, deliberately left absent so map_page_user
 // builds a fresh, PRIVATE PD/PT chain there -- once per process, not once
-// ever.
+// ever. The edge to that private PDPT is user-traversable. The kernel's
+// entries copied into it are not, and pt_map never changes them.
 int pt_create() {
     int new_pml4 = pmm_alloc_page();
+    if (!new_pml4) { return 0; }
+    int priv_pdpt0 = pmm_alloc_page();
+    if (!priv_pdpt0) {
+        pmm_free_page(new_pml4);
+        return 0;
+    }
     int i = 0;
     for (i = 0; i < 512; i += 1) {
         store64(new_pml4 + i * 8, load64(pml4_phys + i * 8));
     }
 
-    int kernel_pdpt0 = (load64(pml4_phys) / 4096) * 4096;
-    int priv_pdpt0 = pmm_alloc_page();
+    int kernel_pdpt0 = load64(pml4_phys) & PTE_ADDR;
     int j = 0;
     for (j = 0; j < 512; j += 1) {
         store64(priv_pdpt0 + j * 8, load64(kernel_pdpt0 + j * 8));
     }
-    int user_page = USER_VIRT_BASE / 4096;
-    int user_pdpt_i = user_page / 512 / 512;
-    store64(priv_pdpt0 + user_pdpt_i * 8, 0);
-    store64(new_pml4, priv_pdpt0 + PRESENT_WRITE);
+    store64(priv_pdpt0 + pt_index(USER_VIRT_BASE, 1) * 8, 0);
+    store64(new_pml4, priv_pdpt0 + PRESENT_WRITE_USER);
     return new_pml4;
 }
 
@@ -618,46 +688,64 @@ int pt_leaf(int pml4, int virt) {
     return leaf;
 }
 
-// Gives back everything private to an address space pt_create built. The
-// frames the user range maps (code, stack, heap, all of them the process's
-// own), the page tables above them, its own copy of PDPT 0 and the PML4
-// itself. Entries of that PDPT that point where the kernel's do are the
-// kernel's and stay. The caller must not be running on this address space.
-// Returns how many pages went back to pmm.
-int pt_free(int pml4) {
-    if (pml4 == 0 || pml4 == pml4_phys) { return 0; }
+// Gives back everything private under the table `t` at `level` of a
+// process's tree, children before the tables that hold them. `k` is the
+// kernel's table at the same place, or 0. An entry shared with it is the
+// kernel's and is skipped whole. A leaf outside jenna's range, or a large
+// page, cannot have been made by pt_map, so it is reported and kept rather
+// than handed to jenna as a free page. Returns how many pages went back.
+int pt_free_level(int t, int k, int level) {
     int freed = 0;
-    int kernel_pdpt0 = (load64(pml4_phys) / 4096) * 4096;
-    int pdpt0 = (load64(pml4) / 4096) * 4096;
-    int j = 0;
-    for (j = 0; j < 512; j += 1) {
-        int e = load64(pdpt0 + j * 8);
-        int pd = (e / 4096) * 4096;
-        if ((e & 1) == 1 && pd != (load64(kernel_pdpt0 + j * 8) / 4096) * 4096) {
-            int k = 0;
-            for (k = 0; k < 512; k += 1) {
-                int pde = load64(pd + k * 8);
-                if ((pde & 1) == 1) {
-                    int pt = (pde / 4096) * 4096;
-                    int m = 0;
-                    for (m = 0; m < 512; m += 1) {
-                        int pte = load64(pt + m * 8);
-                        if ((pte & 1) == 1) {
-                            pmm_free_page(pte & PTE_ADDR);
-                            freed += 1;
-                        }
-                    }
-                    pmm_free_page(pt);
-                    freed += 1;
-                }
+    int i = 0;
+    for (i = 0; i < 512; i += 1) {
+        int e = load64(t + i * 8);
+        int ke = 0;
+        if (k) { ke = load64(k + i * 8); }
+        if ((e & 1) == 1 && !pt_shared(e, ke)) {
+            int f = e & PTE_ADDR;
+            if (level < 3 && (e & 128) == 0) {
+                int nk = 0;
+                if ((ke & 1) == 1 && (ke & 128) == 0) { nk = ke & PTE_ADDR; }
+                freed += pt_free_level(f, nk, level + 1);
+                pmm_free_page(f);
+                freed += 1;
+            } else if (level == 3 && f >= pmm_start && f < pmm_limit) {
+                pmm_free_page(f);
+                freed += 1;
+            } else {
+                int sl = serial_line_begin();
+                serial_print("[jenna] pt_free: kept a frame it does not own, ");
+                serial_print_int(f);
+                serial_print("\n");
+                serial_line_end(sl);
             }
-            pmm_free_page(pd);
-            freed += 1;
         }
     }
-    pmm_free_page(pdpt0);
+    return freed;
+}
+
+// Gives back everything private to an address space pt_create built. Every
+// one of the 512 PML4 slots is walked, not only slot 0, so a page mapped
+// anywhere in the process's range comes back. The frames the user range
+// maps (code, stack, heap, all of them the process's own), lager's table,
+// the page tables above them, its own copy of PDPT 0 and the PML4 itself.
+// Entries that point where the kernel's do are the kernel's and stay. The
+// caller must not be running on this address space. Returns how many
+// pages went back to pmm.
+int pt_free(int pml4) {
+    if (pml4 == 0 || pml4 == pml4_phys) { return 0; }
+    int freed = pt_free_level(pml4, pml4_phys, 0);
     pmm_free_page(pml4);
-    return freed + 2;
+    return freed + 1;
+}
+
+// Stops the machine for good. Only for the kernel's own tables, at boot or
+// in a fault taken by kernel code, where no smaller thing can be given up.
+// A process that cannot be built gets an error instead (see pt_create).
+void jenna_stop(int why) {
+    serial_print(why);
+    while (1) { halt(); }
+    return;
 }
 
 // Builds a fresh 4-level page table (4KB granularity) entirely from
@@ -669,8 +757,20 @@ int pt_free(int pml4) {
 // from here on the kernel runs on tables IT built dynamically from
 // allocated frames -- the foundation every later VM feature (higher-half
 // kernel, per-process spaces, on-demand mapping) needs.
+//
+// Physical page 0 is left out, so a null pointer in kernel code faults
+// instead of reading or writing whatever lies at address 0, and
+// page_fault_handler never maps it back. Nothing in the kernel keeps data in
+// that page. The fixed hand-off slots start at 1MB (see linker.ld), and the
+// Multiboot structures GRUB leaves are read by main() before boot.s loads
+// these tables.
+//
+// The kernel's own tables must be whole before boot.s loads them, so a
+// frame that cannot be had or mapped here stops the machine, before CR3 is
+// ever pointed at a half-built tree.
 void paging_init() {
     pml4_phys = pmm_alloc_page();
+    if (!pml4_phys) { jenna_stop("Paging: no page for the PML4, halting\n"); }
     zero_page(pml4_phys);
 
     int pages = pmm_limit / 4096;
@@ -680,9 +780,11 @@ void paging_init() {
     }
     if (pages < IDMAP_PAGES) { pages = IDMAP_PAGES; }
     int i = 0;
-    for (i = 0; i < pages; i += 1) {
+    for (i = 1; i < pages; i += 1) {
         int p = i * 4096;
-        map_page(pml4_phys, p, p);
+        if (!map_page(pml4_phys, p, p)) {
+            jenna_stop("Paging: identity map could not be built, halting\n");
+        }
     }
     serial_print("Paging: identity map covers ");
     serial_print_int(pages * 4);
@@ -695,8 +797,11 @@ void paging_init() {
     // SENTINEL_VIRT, the CPU is provably using THESE tables -- a read
     // through 4GB would fault on boot.s's map.
     int sentinel_phys = pmm_alloc_page();
+    if (!sentinel_phys) { jenna_stop("Paging: no page for the sentinel, halting\n"); }
     store64(sentinel_phys, SENTINEL_VALUE);
-    map_page(pml4_phys, SENTINEL_VIRT, sentinel_phys);
+    if (!map_page(pml4_phys, SENTINEL_VIRT, sentinel_phys)) {
+        jenna_stop("Paging: sentinel could not be mapped, halting\n");
+    }
 
     // Hand the new PML4's physical address to boot.s, which does the actual
     // `mov cr3` (c0 cannot execute it) -- same fixed-slot technique as the
@@ -744,7 +849,7 @@ void page_fault_handler(int vector, int errcode, int cr2, int rip) {
     serial_print(" errcode=");
     serial_print_int(errcode);
     serial_print("\n");
-    int page_base = (cr2 / 4096) * 4096;
+    int page_base = cr2 - (cr2 & 4095);
 
     // A ring-3 program has no demand paging, its pages are all mapped when
     // it is loaded or asks for memory. So any fault it takes is a bad
@@ -753,23 +858,238 @@ void page_fault_handler(int vector, int errcode, int cr2, int rip) {
     // even help a program running on its own.
     if (sched_kill_faulted(vector, errcode, cr2, rip) == 1) { return; }
 
-    // Check errcode bit 0. If the page was NOT present, this is a genuine
-    // demand-paging request — allocate a frame and map it. If the page WAS
-    // present, the fault is a permission violation. Do NOT allocate on a
-    // present page — overwriting it with a fresh zeroed frame would destroy
-    // whatever was there (e.g., JIT-compiled code).
-    int bit0 = errcode % 2;
-    if (!bit0) {
+    int cr = read_cr3;
+    int site = boot_fault_probe_site;
+    if (boot_fault_authorized == 1 && page_base == FAULT_TEST_VIRT
+            && rip == site && (cr() & PTE_ADDR) == pml4_phys && errcode == 0) {
+        boot_fault_authorized = 0;
         int frame = pmm_alloc_page();
+        if (!frame) { jenna_stop("page fault: no page to map, halting\n"); }
         zero_page(frame);
         store64(frame, FAULT_SENTINEL);
-        map_page(pml4_phys, page_base, frame);
+        if (!map_page(pml4_phys, page_base, frame)) {
+            pmm_free_page(frame);
+            jenna_stop("page fault: address cannot be mapped, halting\n");
+        }
         return;
     }
+    jenna_stop("KERNEL PANIC: unguarded kernel page fault\n");
+    return;
+}
 
-    // Page IS present — permission fault. Halt (do not return — returning
-    // would re-execute the faulting instruction and loop forever).
-    serial_print("page fault: present page, halting\n");
-    while (1) { halt(); }
+// --- Boot checks of the page-table builders --------------------------------
+// Run by kernel_post_init on a kernel booted with `test` (see grub_test.cfg),
+// after the demand-paging probe and before any process exists, with
+// interrupts still off. Each check prints one "[jenna] check" line that
+// tests/test_page_tables.sh reads, ending in ok or FAIL.
+
+// What pt_check_walk found in the kernel's tree. Entries with U set above
+// the leaves and in the leaves, and a fingerprint of every present entry.
+// The fingerprint leaves out the accessed and dirty bits (5 and 6), which
+// the CPU sets on its own as the kernel runs.
+int pt_check_dir_u = 0;
+int pt_check_leaf_u = 0;
+int pt_check_sum = 0;
+
+void pt_check_walk(int t, int level) {
+    int i = 0;
+    for (i = 0; i < 512; i += 1) {
+        int e = load64(t + i * 8);
+        if ((e & 1) == 1) {
+            pt_check_sum = pt_check_sum * 31 + (e - (e & 0x60)) + i;
+            if (level < 3) {
+                if ((e & 4) != 0) { pt_check_dir_u += 1; }
+                if ((e & 128) == 0) { pt_check_walk(e & PTE_ADDR, level + 1); }
+            } else if ((e & 4) != 0) {
+                pt_check_leaf_u += 1;
+            }
+        }
+    }
+    return;
+}
+
+// Walks the whole kernel tree, the identity map over 0..16MB and every
+// subtree a process inherits, the framebuffer, the sentinel and the probe.
+void pt_check_tree() {
+    pt_check_dir_u = 0;
+    pt_check_leaf_u = 0;
+    pt_check_sum = 0;
+    pt_check_walk(pml4_phys, 0);
+    return;
+}
+
+void pt_check_end(int ok) {
+    if (ok) { serial_print(" ok\n"); } else { serial_print(" FAIL\n"); }
+    return;
+}
+
+// Every address a process must not get is refused, the kernel's tree is the
+// same entry for entry afterwards with no U bit anywhere in it, a duplicate
+// leaf keeps its first frame, lager-style supervisor tables refuse a user
+// page, and pt_free gives back exactly what the root took.
+void pt_check_refusals() {
+    pt_check_tree();
+    int sum0 = pt_check_sum;
+    int avail0 = pmm_available_pages();
+    int root = pt_create();
+    int f = pmm_alloc_page();
+    int g = pmm_alloc_page();
+    int h = pmm_alloc_page();
+    if (!root || !f || !g || !h) {
+        serial_print("[jenna] check refusals, no pages FAIL\n");
+        return;
+    }
+    int wrong = 0;
+    wrong += map_page_user(root, 0x200000, 0x200000);
+    wrong += map_page_user(root, 0x1000000000000, f);
+    wrong += map_page_user(root, 0 - 4096, f);
+    wrong += map_page_user(root, USER_VIRT_BASE + 8, f);
+    wrong += map_page_user(root, USER_TOP, f);
+    wrong += map_page_user(root, 0x7F000000, f);
+    wrong += map_page_user(root, SENTINEL_VIRT, f);
+    wrong += map_page_user(root, FAULT_TEST_VIRT, f);
+    wrong += map_page_user(root, USER_VIRT_BASE, 0);
+    wrong += map_page_user(pml4_phys, USER_VIRT_BASE, f);
+    wrong += map_page(root, 0x200000, f);
+    wrong += map_page(root, SENTINEL_VIRT + 4096, f);
+    wrong += map_page(root, USER_VIRT_BASE, 0x100000);
+
+    int good = map_page_user(root, USER_VIRT_BASE, f);
+    wrong += map_page_user(root, USER_VIRT_BASE, g);
+    int leaf = pt_leaf(root, USER_VIRT_BASE);
+    int kept = leaf != 0 && (load64(leaf) & PTE_ADDR) == f;
+    good = good && map_page(root, USER_VIRT_BASE + 0x400000, h);
+    wrong += map_page_user(root, USER_VIRT_BASE + 0x401000, g);
+    pmm_free_page(g);
+
+    pt_check_tree();
+    int same = pt_check_sum == sum0;
+    int freed = pt_free(root);
+    int avail1 = pmm_available_pages();
+
+    serial_print("[jenna] check refusals wrongly mapped=");
+    serial_print_int(wrong);
+    serial_print(" kernel U dirs=");
+    serial_print_int(pt_check_dir_u);
+    serial_print(" leaves=");
+    serial_print_int(pt_check_leaf_u);
+    serial_print(" tree same=");
+    serial_print_int(same);
+    serial_print(" first frame kept=");
+    serial_print_int(kept);
+    serial_print(" freed=");
+    serial_print_int(freed);
+    serial_print(" pages before=");
+    serial_print_int(avail0);
+    serial_print(" after=");
+    serial_print_int(avail1);
+    pt_check_end(wrong == 0 && good && kept && same && pt_check_dir_u == 0
+        && pt_check_leaf_u == 0 && avail0 == avail1);
+    return;
+}
+
+// A page mapped under PML4 slot 1, outside the slot pt_create copies, comes
+// back with its tables when the root is freed.
+void pt_check_reclaim() {
+    int before = pmm_available_pages();
+    int root = pt_create();
+    int f = pmm_alloc_page();
+    int mapped = 0;
+    if (root && f) { mapped = map_page_user(root, 0x8000000000, f); }
+    if (!mapped && f) { pmm_free_page(f); }
+    int freed = 0;
+    if (root) { freed = pt_free(root); }
+    int after = pmm_available_pages();
+    serial_print("[jenna] check reclaim at 0x8000000000 mapped=");
+    serial_print_int(mapped);
+    serial_print(" freed=");
+    serial_print_int(freed);
+    serial_print(" pages before=");
+    serial_print_int(before);
+    serial_print(" after=");
+    serial_print_int(after);
+    pt_check_end(mapped && before == after);
+    return;
+}
+
+// With jenna run dry, free list and all, pt_create returns 0 and writes
+// nothing at physical page 0. With one page left it gives that page back
+// when the second allocation fails, and a mapping that needs three new
+// tables fails with the tree and the page count as they were.
+//
+// Page 0 is not mapped, so it is looked at through the sentinel's address,
+// whose leaf points at frame 0 for the length of this check only.
+void pt_check_exhaustion() {
+    int leaf = pt_leaf(pml4_phys, SENTINEL_VIRT);
+    int pr = pt_create();
+    int pf = pmm_alloc_page();
+    if (!leaf || !pr || !pf) {
+        serial_print("[jenna] check exhaustion, no pages FAIL\n");
+        return;
+    }
+    int flush = flush_tlb;
+    int saved_leaf = load64(leaf);
+    store64(leaf, PRESENT_WRITE);
+    flush();
+    int saved0 = load64(SENTINEL_VIRT);
+    int mark = 3141592653;
+    store64(SENTINEL_VIRT, mark);
+
+    int head = pmm_free_head;
+    int count = pmm_free_count;
+    int limit = pmm_limit;
+    int next = pmm_next;
+    pmm_quiet = 1;
+    pmm_free_head = 0;
+    pmm_free_count = 0;
+
+    pmm_limit = pmm_next;
+    int r0 = pt_create();
+    int marker = load64(SENTINEL_VIRT) == mark;
+
+    pmm_limit = pmm_next + 4096;
+    int r1 = pt_create();
+    int one_back = pmm_available_pages() == 1;
+    int r2 = map_page_user(pr, 0x8000000000, pf);
+    int still_one = pmm_available_pages() == 1;
+    int slot_empty = load64(pr + 8) == 0;
+
+    // Every page the check took came back, so jenna is put back exactly.
+    // Otherwise what was lost stays lost and the line says FAIL.
+    if (pmm_free_count == (pmm_next - next) / 4096) { pmm_next = next; }
+    pmm_free_head = head;
+    pmm_free_count = count;
+    pmm_limit = limit;
+    pmm_quiet = 0;
+
+    store64(SENTINEL_VIRT, saved0);
+    store64(leaf, saved_leaf);
+    flush();
+    if (!r2) { pmm_free_page(pf); }
+    pt_free(pr);
+
+    serial_print("[jenna] check exhaustion pt_create with none=");
+    serial_print_int(r0);
+    serial_print(" marker kept=");
+    serial_print_int(marker);
+    serial_print(" with one=");
+    serial_print_int(r1);
+    serial_print(" page back=");
+    serial_print_int(one_back);
+    serial_print(" map with one=");
+    serial_print_int(r2);
+    serial_print(" page back=");
+    serial_print_int(still_one);
+    serial_print(" slot empty=");
+    serial_print_int(slot_empty);
+    pt_check_end(r0 == 0 && marker && r1 == 0 && one_back && r2 == 0
+        && still_one && slot_empty);
+    return;
+}
+
+void pt_selftest() {
+    pt_check_refusals();
+    pt_check_reclaim();
+    pt_check_exhaustion();
     return;
 }

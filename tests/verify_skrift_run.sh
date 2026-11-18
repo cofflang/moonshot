@@ -15,6 +15,9 @@
 #      and the program it made ends with 42. F6 on `nope + 1` does not
 #      compile, and coff's own message reaches the serial line, since the
 #      background programs print there only.
+#   1a. F6 on code that prints one line in two writes with a long loop
+#      between them gets the line onto the serial line whole, though the
+#      timer switches tasks and logs it many times inside the loop.
 #   1b. F6 on code that never ends stops it after three seconds, and skrift
 #      goes on working.
 #   2. F5 saves the file and runs `execute` on it in a new shell window, so
@@ -72,7 +75,8 @@ def word(s):
     keymap = {".": "dot", " ": "spc", "-": "minus", "/": "slash", ";": "semicolon",
               "*": "shift-8", "+": "shift-equal", "(": "shift-9", ")": "shift-0",
               "{": "shift-bracket_left", "}": "shift-bracket_right",
-              '"': "shift-apostrophe", "\\": "backslash"}
+              '"': "shift-apostrophe", "\\": "backslash",
+              "=": "equal", "<": "shift-comma"}
     typ([keymap.get(c, c) for c in s])
 
 word("root"); typ(["ret"]); time.sleep(0.5)
@@ -83,6 +87,8 @@ word("edit calc.c0"); typ(["ret"]); time.sleep(3.0)
 word("6 * 7"); typ(["f6"]); time.sleep(8.0)
 send("screendump skrift_run_value.ppm", settle=0.8)
 typ(["ctrl-a"]); word("nope + 1"); typ(["f6"]); time.sleep(6.0)
+typ(["ctrl-a"]); word('print("held "); int i = 0; while (i < 20000000) { i += 1; } print("whole\\n"); return 7')
+typ(["f6"]); time.sleep(8.0)
 typ(["ctrl-a"]); word("while (1) { } return 1"); typ(["f6"]); time.sleep(10.0)
 typ(["ctrl-a"]); word('int main() { print("ran from skrift\\n"); return 5; }')
 typ(["f5"]); time.sleep(10.0)
@@ -111,6 +117,8 @@ check() { # description, extended regex
 }
 check "F6 on 6 * 7 ran a program that ended with 42" '^\[syscall\] exit code=42$'
 check "F6 on nope + 1 got coff's own message" "undeclared variable 'nope'"
+check "F6 on a line printed in two writes got it onto serial whole" '^held whole$'
+check "and ended with 7" '^\[syscall\] exit code=7$'
 check "F6 on a loop that never ends stopped it after three seconds" '^\[syscall\] task [0-9]+ stopped task [0-9]+$'
 check "F5 opened a shell window running execute" '^\[syscall\] shell execute calc\.c0 in window [0-9]+$'
 check "the program F5 built printed its line" 'ran from skrift'

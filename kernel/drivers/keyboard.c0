@@ -7,8 +7,9 @@
 // License version 3 or (at your option) any later version, WITHOUT ANY
 // WARRANTY; see the LICENSE file for the full text.
 // keyboard.c0 -- PS/2 scancode set 1 decoding, and the interrupt handler
-// that turns a real keypress into visible screen output (pixel framebuffer
-// when available, VGA text otherwise -- see punkt.c0/vga.c0).
+// that turns a real keypress into a queued shell key, an editing action or
+// a key event for the program that owns the focused window. The shell task
+// echoes queued keys (skalman.c0, shell_echo_key).
 
 // Tracks whether either Shift key is currently held, for scancode->ASCII
 // lookup -- updated by keyboard_handler on Shift's own make/break codes
@@ -39,10 +40,8 @@ int ctrl_down = 0;
 // from keypad keys. Persists for exactly one interrupt.
 int e0_prefix = 0;
 
-// Tab advances to the next multiple-of-TAB_WIDTH column by emitting spaces
-// (reusing fb_putc's/vga_putc's own wrap/scroll handling) rather than being
-// a special case inside punkt.c0/vga.c0 -- keeps Tab's meaning ("how many
-// columns") a keyboard/input-layer decision, same as Backspace already is.
+// The column multiple a Tab advances the cursor to when skalman.c0's
+// shell_echo_key echoes it.
 int TAB_WIDTH = 8;
 
 // --- Ring-3 key event queue (SYS_KEY_POLL) --------------------------------
@@ -208,9 +207,9 @@ void scmap(int code, int lo, int hi) {
 // enabled. Zeroed first so every unmapped code (modifier keys, function
 // keys, anything not below) resolves to 0, which keyboard_handler treats
 // as "no visible character." Covers letters, digits, common punctuation,
-// space, enter, backspace, and Tab (ASCII 9, same both shifted/unshifted --
-// keyboard_handler gives it dedicated column-advance handling, not a drawn
-// glyph); no arrow keys/F-keys/keypad, nothing needs them yet. CapsLock has
+// space, enter, backspace, and Tab (ASCII 9, same both shifted/unshifted).
+// Arrow keys, Home and End are extended keys that keyboard_process turns into
+// editing actions itself, and F-keys and the keypad map to nothing. CapsLock has
 // no ASCII of its own (it is a toggle, not a character -- see
 // caps_lock/keyboard_handler), so it is intercepted by scancode alone, not
 // looked up here.
@@ -282,27 +281,12 @@ void scancode_init() {
     return;
 }
 
-// Dispatched via int_dispatch(33) whenever a key event reaches the PS/2
-// controller. Reads the scancode from the controller's data port (0x60)
-// and always prints it raw first (so IRQ1 delivery is visible in the
-// serial log independent of anything below) -- then decodes it. Scancode
-// set 1 uses bit 7 to distinguish a key PRESS (make code, < 128) from a
-// key RELEASE (break code = make code + 128), so `scancode - 128` recovers
-// the make code either way. Left/right Shift (0x2A/0x36) update shift_down
-// on both press AND release; every other key only acts on press
-// (is_break == 0) -- looks its make code up in the unshifted or shifted
-// table depending on shift_down, and either erases (ASCII backspace, 8) or
-// draws (anything else nonzero) on the real screen. Draws via the pixel
-// framebuffer (fb_putc/fb_backspace) when one is available, since VGA text
-// mode is not usable at the same time as a real VESA graphics mode is
-// active -- see punkt.c0's fb_probe.
-// IRQ1. Reads the byte and hands it to keyboard_process -- unless there is
-// no byte. An interrupt that was latched while interrupts were still off
-// (klick_init's handshake runs then, see kernel_post_init) fires once they
-// come on, after the byte it was for has already been read. Reading port
-// 0x60 then returns whatever was read last, so without the check a
-// phantom "key scancode 250" (the mouse's last acknowledgement) would
-// appear after every boot.
+// IRQ1 reads a pending byte from the PS/2 data port and decodes scan-code
+// set 1. Shift and CapsLock select the character map. Shell characters and
+// editing actions enter one queue with the session captured at keypress.
+// The shell task echoes them according to the prompt state when consumed.
+// Raw scan codes are private input and are not printed to serial.
+// A controller-status check avoids reading a stale byte on an empty IRQ.
 int key_irqs = 0;          // keyboard interrupts since boot, for insyn
 
 void keyboard_handler() {
@@ -321,9 +305,20 @@ void keyboard_handler() {
 // are harmless in that case, since a non-specific EOI with no interrupt in
 // service does nothing.
 void keyboard_process(int scancode) {
-    serial_print("key scancode ");
-    serial_print_int(scancode);
-    serial_print("\n");
+    if (scancode == 88) {
+        if (boot_log_visible) {
+            boot_log_visible = 0;
+            if (kakel_locked) { raket_lock_draw(); }
+            else if (kakel_active) { kakel_reflow(); }
+            else { vga_clear(VGA_DEFAULT_ATTR); }
+        } else { boot_log_show(); }
+        outb(0x20, 0x20);
+        return;
+    }
+    if (boot_log_visible) { outb(0x20, 0x20); return; }
+    if (dvala_key(scancode)) { outb(0x20, 0x20); return; }
+    // Scan codes are not logged, since they reveal passwords even when the
+    // echo is masked.
 
     // 0xE0 is the extended-key prefix in PS/2 scancode set 1 — it signals
     // that the NEXT scancode is an extended key (arrow keys, etc.). Set the
@@ -365,7 +360,7 @@ void keyboard_process(int scancode) {
     // or the W of Alt+W would arrive as a typed letter in an editor that was
     // only asked to close, and Alt+M would also mute in lira.
     int chord = alt_down == 1 && (make_code == 0x11 || make_code == 0x32 || make_code == 0x0F
-                                  || make_code == 0x26);
+                                  || make_code == 0x26 || make_code == 0x1C);
     if (kakel_active == 1 && kakel_is_tavla(kakel_focus) == 1 && !chord && kakel_locked == 0) {
         key_task_push(load64(kakel_owner_base + kakel_focus * 8), make_code, is_break);
     }
@@ -412,6 +407,11 @@ void keyboard_process(int scancode) {
         }
         // --- Alt+M, the focused window fills the screen, or not ---
         // Before any routing, like Alt+W, so it works whatever has the focus.
+        if (ascii == 10 && alt_down == 1 && kakel_active == 1) {
+            kakel_fullscreen_toggle();
+            outb(0x20, 0x20);
+            return;
+        }
         if (ascii == 'm' && alt_down == 1 && kakel_active == 1) {
             kakel_maximize_toggle();
             shell_reprompt_others(0 - 1);
@@ -453,34 +453,34 @@ void keyboard_process(int scancode) {
         if (was_e0 == 1 && kakel_active == 1) {
             int sf = sk_console();
             if (make_code == 0x48) {  // Up arrow
-                shell_history_nav(sf, -1);
+                shell_enqueue(sf, SK_KEY_UP);
                 outb(0x20, 0x20);
                 return;
             }
             if (make_code == 0x50) {  // Down arrow
-                shell_history_nav(sf, 1);
+                shell_enqueue(sf, SK_KEY_DOWN);
                 outb(0x20, 0x20);
                 return;
             }
             // Left/right arrows move the cursor within the current shell line.
             if (make_code == 0x4B) {  // Left arrow
-                shell_cursor_move(sf, -1);
+                shell_enqueue(sf, SK_KEY_LEFT);
                 outb(0x20, 0x20);
                 return;
             }
             if (make_code == 0x4D) {  // Right arrow
-                shell_cursor_move(sf, 1);
+                shell_enqueue(sf, SK_KEY_RIGHT);
                 outb(0x20, 0x20);
                 return;
             }
             // Home (0x47) and End (0x4F) extended keys.
             if (make_code == 0x47) {  // Home
-                shell_cursor_home(sf);
+                shell_enqueue(sf, SK_KEY_HOME);
                 outb(0x20, 0x20);
                 return;
             }
             if (make_code == 0x4F) {  // End
-                shell_cursor_end(sf);
+                shell_enqueue(sf, SK_KEY_END);
                 outb(0x20, 0x20);
                 return;
             }
@@ -489,151 +489,26 @@ void keyboard_process(int scancode) {
         if (ctrl_down == 1 && kakel_active == 1) {
             int sf = sk_console();
             if (ascii == 'a') {       // Ctrl+A — Home
-                shell_cursor_home(sf);
+                shell_enqueue(sf, SK_KEY_HOME);
                 outb(0x20, 0x20);
                 return;
             }
             if (ascii == 'e') {       // Ctrl+E — End
-                shell_cursor_end(sf);
+                shell_enqueue(sf, SK_KEY_END);
                 outb(0x20, 0x20);
                 return;
             }
             if (ascii == 'w') {       // Ctrl+W — delete word
-                shell_cursor_delete_word(sf);
+                shell_enqueue(sf, SK_KEY_WORD);
                 outb(0x20, 0x20);
                 return;
             }
-            if (ascii == 'k') {       // Ctrl+K — kill to end of line
-                int sf_len = load64(shell_len_base + sf * 8);
-                int sf_cp  = load64(shell_cpos_base + sf * 8);
-                store64(shell_len_base + sf * 8, sf_cp);
-                if (sf_cp < sf_len && kakel_active == 1) {
-                    shell_redraw_line(sf);
-                }
-                outb(0x20, 0x20);
-                return;
+            if (ascii == 'k') {
+                shell_enqueue(sf, SK_KEY_CUT_END); outb(0x20, 0x20); return;
             }
-            if (ascii == 'u') {       // Ctrl+U — kill to start of line
-                int sf_len = load64(shell_len_base + sf * 8);
-                int sf_cp  = load64(shell_cpos_base + sf * 8);
-                if (sf_cp > 0) {
-                    int line = load64(shell_line_base + sf * 8);
-                    int si = 0;
-                    for (si = 0; si < sf_len - sf_cp; si += 1) {
-                        store8(line + si, load8(line + sf_cp + si));
-                    }
-                    store64(shell_len_base + sf * 8, sf_len - sf_cp);
-                    store64(shell_cpos_base + sf * 8, 0);
-                    if (kakel_active == 1) { shell_redraw_line(sf); }
-                }
-                outb(0x20, 0x20);
-                return;
+            if (ascii == 'u') {
+                shell_enqueue(sf, SK_KEY_CUT_START); outb(0x20, 0x20); return;
             }
-        }
-        if (ascii == 9) {
-            if (kakel_active == 1) {
-                kakel_putc(kakel_focus, ' ');
-                while ((kakel_get_col(kakel_focus) - (kakel_get_col(kakel_focus) / TAB_WIDTH) * TAB_WIDTH) != 0) {
-                    kakel_putc(kakel_focus, ' ');
-                }
-                serial_print("kakel tab: win=");
-                serial_print_int(kakel_focus);
-                serial_print(" row=");
-                serial_print_int(kakel_get_row(kakel_focus));
-                serial_print(" col=");
-                serial_print_int(kakel_get_col(kakel_focus));
-            } else if (fb_available == 1) {
-                fb_putc(' ', FB_FG, FB_BG);
-                while (fb_col % TAB_WIDTH != 0) {
-                    fb_putc(' ', FB_FG, FB_BG);
-                }
-                serial_print("fb tab: row=");
-                serial_print_int(fb_row);
-                serial_print(" col=");
-                serial_print_int(fb_col);
-            } else {
-                vga_putc(' ', VGA_DEFAULT_ATTR);
-                vga_move_cursor();
-                while (vga_col % TAB_WIDTH != 0) {
-                    vga_putc(' ', VGA_DEFAULT_ATTR);
-                    vga_move_cursor();
-                }
-                serial_print("vga tab: row=");
-                serial_print_int(vga_row);
-                serial_print(" col=");
-                serial_print_int(vga_col);
-            }
-            serial_print("\n");
-        } else if (ascii == 8) {
-            if (kakel_active == 1) {
-                int pc = load64(kakel_prompt_col_base + kakel_focus * 8);
-                if (kakel_get_col(kakel_focus) > pc) {
-                    kakel_backspace(kakel_focus);
-                }
-                serial_print("kakel backspace: win=");
-                serial_print_int(kakel_focus);
-                serial_print(" row=");
-                serial_print_int(kakel_get_row(kakel_focus));
-                serial_print(" col=");
-                serial_print_int(kakel_get_col(kakel_focus));
-            } else if (fb_available == 1) {
-                fb_backspace(FB_FG, FB_BG);
-                serial_print("fb backspace: row=");
-                serial_print_int(fb_row);
-                serial_print(" col=");
-                serial_print_int(fb_col);
-            } else {
-                vga_backspace(VGA_DEFAULT_ATTR);
-                vga_move_cursor();
-                serial_print("vga backspace: row=");
-                serial_print_int(vga_row);
-                serial_print(" col=");
-                serial_print_int(vga_col);
-            }
-            serial_print("\n");
-        } else if (ascii > 0) {
-            // While the focused session is at raket's password prompt, echo
-            // '*' instead of the real character -- the actual keystroke
-            // still reaches shell_input/raket_login_line unmasked via the
-            // input queue below, only the on-screen glyph is substituted.
-            // Enter reaches this branch too (scmap maps 0x1C to '\n'), and
-            // masking every character alike turned the newline itself into a
-            // '*' -- so submitting a password printed a stray asterisk
-            // instead of breaking the line, most visibly on an empty one.
-            // Only real typed glyphs get masked; the newline stays a newline.
-            int echo_ch = ascii;
-            if (ascii != '\n') {
-                if (raket_should_mask(sk_console()) == 1) { echo_ch = '*'; }
-            }
-            if (kakel_active == 1) {
-                kakel_putc(kakel_focus, echo_ch);
-                serial_print("kakel typed: win=");
-                serial_print_int(kakel_focus);
-                serial_print(" char=");
-                serial_print_int(ascii);
-                serial_print(" row=");
-                serial_print_int(kakel_get_row(kakel_focus));
-                serial_print(" col=");
-                serial_print_int(kakel_get_col(kakel_focus));
-            } else if (fb_available == 1) {
-                fb_putc(echo_ch, FB_FG, FB_BG);
-                serial_print("fb typed: char=");
-                serial_print_int(ascii);
-                serial_print(" row=");
-                serial_print_int(fb_row);
-                serial_print(" col=");
-                serial_print_int(fb_col);
-            } else {
-                vga_putc(echo_ch, VGA_DEFAULT_ATTR);
-                vga_move_cursor();
-                serial_print("vga typed: char=");
-                serial_print_int(ascii);
-                serial_print(" row=");
-                serial_print_int(vga_row);
-                serial_print(" col=");
-                serial_print_int(vga_col);
-            }
-            serial_print("\n");
         }
         // Deposit the decoded key into the shell's input queue. shell_enqueue
         // captures the focused session id NOW (keypress time), so shell_task

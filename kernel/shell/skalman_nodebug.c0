@@ -16,3 +16,11 @@ void sk_debug_cmds() {
 int sk_debug_run(int f, int cmd) {
     return 0;
 }
+
+void sk_debug_mirror_point(int i) {
+    return;
+}
+
+void sk_debug_sync_pause() {
+    return;
+}

@@ -1,0 +1,163 @@
+// Copyright (C) 2026 tavro
+// SPDX-License-Identifier GPL-3.0-or-later
+
+int dvala_timeout = 0;
+int dvala_stamp = 0;
+int dvala_pending = 0;
+int dvala_active = 0;
+int dvala_stop = 0;
+int dvala_tid = -1;
+int dvala_wid = -1;
+int dvala_focus = -1;
+int dvala_max = -1;
+int dvala_full = -1;
+int dvala_full_max = -1;
+int dvala_keys = 0;
+int dvala_e0 = 0;
+int dvala_mouse_mask = 0;
+int dvala_mouse_physical = 0;
+
+int dvala_activity() {
+    dvala_stamp = pit_ticks;
+    if (!dvala_active) { return 0; }
+    dvala_stop = 1;
+    dvala_pending = 1;
+    if (shell_task_id >= 0) { task_wake(shell_task_id); }
+    return 1;
+}
+
+// Keep every waking make and its release out of the restored session.
+int dvala_key(int code) {
+    int spent = dvala_activity();
+    if (!dvala_keys) { return spent; }
+    if (code == 0xE0) { dvala_e0 = 1; return spent; }
+    int key = (code & 127) + dvala_e0 * 128;
+    dvala_e0 = 0;
+    if (load8(dvala_keys + key)) { spent = 1; }
+    if (code >= 128) { store8(dvala_keys + key, 0); }
+    else if (spent) { store8(dvala_keys + key, 1); }
+    if (spent) { shift_down = 0; alt_down = 0; ctrl_down = 0; e0_prefix = 0; }
+    return spent;
+}
+
+void dvala_tick() {
+    if (!dvala_timeout || kakel_active != 1 || kakel_locked || raket_user < 0) { return; }
+    if (!dvala_active && pit_ticks - dvala_stamp >= dvala_timeout) {
+        dvala_pending = 1;
+        if (shell_task_id >= 0) { task_wake(shell_task_id); }
+    }
+    return;
+}
+
+void dvala_reaped(int tid) {
+    if (tid != dvala_tid) { return; }
+    dvala_tid = 0 - 1;
+    dvala_stop = 1;
+    dvala_pending = 1;
+    if (shell_task_id >= 0) { task_wake(shell_task_id); }
+    return;
+}
+
+void dvala_ready(int tid, int wid) {
+    if (!dvala_active || tid != dvala_tid) { return; }
+    dvala_wid = wid;
+    klick_hide();
+    kakel_focus = wid;
+    kakel_full_saved_max = kakel_max;
+    kakel_full = wid;
+    kakel_reflow();
+    kakel_nudge_live();
+    klick_show();
+    int sl = serial_line_begin();
+    serial_print("[dvala] running task=");
+    serial_print_int(tid);
+    serial_print("\n");
+    serial_line_end(sl);
+    return;
+}
+
+// All loading, stopping and relayout runs on the shell task.
+void dvala_work() {
+    proc_irq_off();
+    dvala_pending = 0;
+    if (dvala_active) {
+        if (!dvala_stop) { proc_irq_on(); return; }
+        if (dvala_tid >= 0) {
+            store64(task_state_base + dvala_tid * 8, TASK_EXITED);
+            store64(task_win_base + dvala_tid * 8, 0 - 1);
+        }
+        dvala_tid = 0 - 1;
+        if (dvala_wid >= 0) { kakel_win_free(dvala_wid); }
+        if (dvala_full >= 0 && load64(kakel_rows_base + dvala_full * 8) == 0) { dvala_full = 0 - 1; }
+        if (dvala_max >= 0 && load64(kakel_rows_base + dvala_max * 8) == 0) { dvala_max = 0 - 1; }
+        kakel_full = dvala_full;
+        kakel_full_saved_max = dvala_full_max;
+        kakel_max = dvala_max;
+        if (dvala_focus >= 0 && load64(kakel_rows_base + dvala_focus * 8) > 0) {
+            kakel_focus = dvala_focus;
+        }
+        kakel_reflow();
+        kakel_nudge_live();
+        kakel_paint_titles();
+        stats_last_secs = 0 - 1;
+        shell_reprompt_others(0 - 1);
+        dvala_active = 0;
+        dvala_stop = 0;
+        dvala_wid = 0 - 1;
+        dvala_stamp = pit_ticks;
+        serial_print("[dvala] stopped\n");
+        proc_irq_on();
+        return;
+    }
+    if (!dvala_timeout || kakel_locked || pit_ticks - dvala_stamp < dvala_timeout) {
+        proc_irq_on(); return;
+    }
+    dvala_focus = kakel_focus;
+    dvala_max = kakel_max;
+    dvala_full = kakel_full;
+    dvala_full_max = kakel_full_saved_max;
+    dvala_active = 1;
+    dvala_stop = 0;
+    dvala_tid = spawn_system_program(raket_user, 0, 0, "/dvala.elf", SPAWN_WINDOWED | SPAWN_QUIET);
+    if (dvala_tid < 0) {
+        dvala_active = 0;
+        dvala_stamp = pit_ticks;
+        serial_print("[dvala] start failed\n");
+    }
+    proc_irq_on();
+    return;
+}
+
+void dvala_command(int arg) {
+    int seconds = 0;
+    if (!arg) {
+        sk_print("dvala seconds "); sk_print_int(dvala_timeout / 100); sk_putc(10);
+        return;
+    }
+    if (str_eq(arg, "on")) { seconds = 300; }
+    else if (str_eq(arg, "off")) { seconds = 0; }
+    else {
+        int i = 0;
+        while (load8(arg + i)) {
+            int c = load8(arg + i);
+            if (c < '0' || c > '9' || seconds > 8640) {
+                sk_print("dvala [on | off | seconds 1..86400]\n"); return;
+            }
+            seconds = seconds * 10 + c - '0';
+            i += 1;
+        }
+        if (seconds < 1 || seconds > 86400) {
+            sk_print("dvala [on | off | seconds 1..86400]\n"); return;
+        }
+    }
+    if (seconds && !dvala_keys) {
+        dvala_keys = kmalloc(512);
+        if (!dvala_keys) { sk_print("dvala no memory\n"); return; }
+        int k = 0;
+        for (k = 0; k < 512; k += 1) { store8(dvala_keys + k, 0); }
+    }
+    dvala_timeout = seconds * 100;
+    dvala_stamp = pit_ticks;
+    sk_print("dvala seconds "); sk_print_int(seconds); sk_putc(10);
+    return;
+}

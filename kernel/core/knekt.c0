@@ -100,12 +100,20 @@ void kernel_post_init() {
     }
 
     serial_print("demand-paging test: touching unmapped 5GB\n");
-    int v = load64(FAULT_TEST_VIRT);
+    boot_fault_authorized = 1;
+    int probe = boot_fault_probe;
+    int v = probe();
+    boot_fault_authorized = 0;
     if (v == FAULT_SENTINEL) {
         serial_print("demand paging OK: fault recovered, sentinel read back\n");
     } else {
         serial_print("demand paging FAIL: unexpected value\n");
     }
+
+    // The page-table builders' own checks, on a test boot only. They run
+    // here because the kernel's tree is complete once the probe above has
+    // mapped its page, and no process has been built from it yet.
+    if (boot_test) { pt_selftest(); }
 
     // Carve the screen into kakel's windows (two side-by-side tiles)
     // and give each a banner. This deliberately runs AFTER the full-screen
@@ -213,6 +221,7 @@ void kernel_post_init() {
     jakel_init();
     jakel_big_file_test();
     jakel_append_test();
+    jakel_bounds_test();
     // The wall clock after jakel, since its offset is a file.
     clock_init();
 
@@ -226,6 +235,9 @@ void kernel_post_init() {
     // oljud after klick, since klick writes the master PIC's whole mask, and
     // oljud only clears its own bit in whatever mask it finds.
     oljud_init();
+    serial_print("Boot log ready - F12 to view\n");
+    boot_log_frozen = 1;
+    boot_log_persist();
 
     return;
 }
@@ -258,6 +270,9 @@ int main() {
 
     int mb_info = load32(MBINFO_ADDR);
     boot_test = boot_cmdline_word(mb_info, "test");
+    int pling_enabled = boot_cmdline_word(mb_info, "pling");
+    pling_muted = boot_cmdline_word(mb_info, "tyst");
+    if (boot_test && !pling_enabled) { pling_muted = 1; }
     if (boot_test) { serial_print("boot: test mode\n"); }
     fb_probe(mb_info);
 
@@ -474,6 +489,12 @@ int main() {
     // register, so IST index 1 makes the CPU switch to that stack on #8 entry.
     idt_set(8, isr_doublefault_entry);
     store8(idt_start + 8 * 16 + 4, 1);
+
+    // #DB, NMI and #MC run on their own IST stacks (IST2/3/4), so a fault on
+    // one of those vectors never executes on the interrupted task's stack.
+    store8(idt_start + 1 * 16 + 4, 2);
+    store8(idt_start + 2 * 16 + 4, 3);
+    store8(idt_start + 18 * 16 + 4, 4);
 
     store16_le(IDTR_ADDR, 4095); // limit = 256 entries * 16 bytes - 1
     store64(IDTR_ADDR + 2, idt_start);

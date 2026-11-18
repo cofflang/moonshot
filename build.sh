@@ -30,6 +30,94 @@
 set -eu
 cd "$(dirname "$0")"
 
+# BEGIN SITE GUARD
+site_guard() {
+  local requested="$1" list="$2" rel part current rest
+  local config="${3:-$HOME/.config/moonshot/site-root}" root
+  SITE_FILES=()
+  if [ ! -e "$config" ] && [ ! -L "$config" ]; then
+    echo "site folder configuration absent, skipping /site" >&2
+    return 0
+  fi
+  if [ -L "$config" ] || [ ! -f "$config" ]; then
+    echo "site copy refuses a non-regular root configuration" >&2
+    return 1
+  fi
+  local roots=()
+  mapfile -t roots < "$config"
+  if [ "${#roots[@]}" != 1 ]; then
+    echo "site copy refuses an empty or multi-line root configuration" >&2
+    return 1
+  fi
+  root="${roots[0]}"
+  case "$root" in
+    /*) ;;
+    *) echo "site copy refuses a relative site folder" >&2; return 1 ;;
+  esac
+  case "$root" in
+    /|*/|*//*|*/.*|*[!a-zA-Z0-9_./-]*)
+      echo "site copy refuses a site folder outside the safe path pattern" >&2; return 1 ;;
+  esac
+  SITE_ROOT="$root"
+  if [ -z "$requested" ]; then requested="$root"; fi
+  if [ "$requested" != "$root" ]; then
+    echo "site copy refuses a source outside the named folder" >&2
+    return 1
+  fi
+  SITE_FILES=()
+  if [ -L "$root" ]; then
+    echo "site copy refuses a symbolic link at the source root" >&2
+    return 1
+  fi
+  if [ ! -e "$root" ]; then
+    echo "site source folder absent, skipping /site" >&2
+    return 0
+  fi
+  if [ ! -d "$root" ]; then
+    echo "site copy refuses a source root that is not a directory" >&2
+    return 1
+  fi
+  if [ ! -e "$list" ]; then
+    echo "site subset list absent, skipping /site" >&2
+    return 0
+  fi
+  while IFS= read -r rel || [ -n "$rel" ]; do
+    case "$rel" in
+      ''|/*|*/|*//*|.*|*/.*|*[!a-zA-Z0-9_./-]*)
+        echo "site copy refuses a path outside the named subset" >&2
+        return 1 ;;
+    esac
+    current="$root"
+    rest="$rel"
+    while :; do
+      part="${rest%%/*}"
+      current="$current/$part"
+      if [ -L "$current" ]; then
+        echo "site copy refuses a symbolic link in $rel" >&2
+        return 1
+      fi
+      if [ "$rest" = "$part" ]; then break; fi
+      if [ ! -d "$current" ]; then
+        echo "site copy refuses a non-directory component in $rel" >&2
+        return 1
+      fi
+      rest="${rest#*/}"
+    done
+    if [ ! -f "$current" ]; then
+      echo "site copy refuses a non-regular or missing file in $rel" >&2
+      return 1
+    fi
+    if [ "$(stat -c %h -- "$current")" != 1 ]; then
+      echo "site copy refuses a hard link in $rel" >&2
+      return 1
+    fi
+    SITE_FILES+=("$current")
+  done < "$list"
+}
+# END SITE GUARD
+site_guard "" "$HOME/.config/moonshot/site-files"
+SITE_CHECKED=("${SITE_FILES[@]}")
+
 COFF1=../c0-coff/coff1
 COFF_SRC=../c0-coff/c0/coff.c0
 SMED=../c0-coff/smed
@@ -224,3 +312,37 @@ sed -i '1i .global main\n.global int_dispatch\n.global paging_verify\n.global ke
   kernel/core/ring3_handlers.s build/moonshot.elf
 
 echo "built build/moonshot.elf"
+
+# The private payload stays in the ignored build directory.
+"$COFF1" tools/site_copy.c0 build/site_copy.s
+"$SMED" build/site_copy.s build/site_copy
+chmod +x build/site_copy
+"$COFF1" tools/site_images.c0 build/site_images.s
+"$SMED" build/site_images.s build/site_images
+chmod +x build/site_images
+site_work=$(mktemp -d "${TMPDIR:-/tmp}/moonshot-site.XXXXXXXX")
+site_cleanup() {
+  rm -rf "$site_work"
+}
+trap site_cleanup EXIT
+site_guard "" "$HOME/.config/moonshot/site-files"
+if [ "${SITE_FILES[*]}" != "${SITE_CHECKED[*]}" ]; then
+  echo "site copy refuses a changed resolved subset" >&2
+  exit 1
+fi
+site_args=()
+site_index=0
+for site_file in "${SITE_FILES[@]}"; do
+  site_relative="${site_file#"$SITE_ROOT/"}"
+  case "$site_relative" in
+    *.jpg|*.png|*.gif)
+      ./build/site_images "$site_file" "$site_work/$site_index.spr"
+      site_args+=("$site_relative" "$site_work/$site_index.spr") ;;
+    *) site_args+=("$site_relative" "$site_file") ;;
+  esac
+  site_index=$((site_index + 1))
+done
+./build/site_copy "$site_work/disk.img" "${site_args[@]}"
+mv -f "$site_work/disk.img" build/site-disk.img
+printf '%s\n' "$PWD/build/site-disk.img" > build/site-disk.path
+echo "private site disk at $PWD/build/site-disk.img"

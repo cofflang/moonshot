@@ -1,0 +1,666 @@
+// Copyright (C) 2026 tavro
+// SPDX-License-Identifier GPL-3.0-or-later
+
+int input = 0;
+int size = 0;
+int pos = 0;
+int pixels = 0;
+int width = 0;
+int height = 0;
+int bits = 0;
+int bitcount = 0;
+int stream = 0;
+int stream_size = 0;
+int stream_pos = 0;
+int gif_buffer = 0;
+int allocated = 0;
+int gif_prefix = 0;
+int gif_suffix = 0;
+int gif_stack = 0;
+
+void die(int message) {
+    print("site image refuses "); print(message); print("\n"); exit(1);
+}
+int bounded_alloc(int n) {
+    if (n < 0 || n > 402653184-allocated) { die("the 384 MiB conversion memory budget"); }
+    allocated+=n;
+    int p=alloc(n);
+    if (!p) { die("a host allocation failure"); }
+    return p;
+}
+int byte() {
+    if (pos >= size) { die("a truncated image"); }
+    int value = load8(input+pos); pos += 1; return value;
+}
+int be16() { int a = byte(); return a*256+byte(); }
+int le16() { int a = byte(); return a+byte()*256; }
+int be32() { int a = be16(); return a*65536+be16(); }
+void dimensions(int w, int h) {
+    if (w < 1 || h < 1 || w > 8192 || h > 8192 || w*h > 16777216) { die("oversized image dimensions"); }
+    width = w; height = h;
+}
+int clamp(int n) { if (n < 0) { return 0; } if (n > 255) { return 255; } return n; }
+void pixel(int p, int r, int g, int b, int a) {
+    store8(p,b); store8(p+1,g); store8(p+2,r); store8(p+3,a);
+}
+int take_bits(int n) {
+    while (bitcount < n) {
+        if (stream_pos >= stream_size) { die("a truncated compressed stream"); }
+        bits = bits | (load8(stream+stream_pos) << bitcount);
+        stream_pos += 1; bitcount += 8;
+    }
+    int v = bits & ((1 << n)-1);
+    bits = bits >> n; bitcount -= n; return v;
+}
+int tree(int lengths, int count, int table, int counts, int next) {
+    int i = 0;
+    for (i=0; i<32768; i+=1) { store64(table+i*8,0); }
+    for (i=0; i<16; i+=1) { store64(counts+i*8,0); }
+    for (i=0; i<count; i+=1) {
+        int n = load64(lengths+i*8);
+        if (n < 0 || n > 15) { die("an invalid Huffman length"); }
+        if (n > 0) { store64(counts+n*8,load64(counts+n*8)+1); }
+    }
+    int code = 0;
+    for (i=1; i<=15; i+=1) {
+        code = (code+load64(counts+(i-1)*8))*2;
+        if (code+load64(counts+i*8) > (1 << i)) { die("an oversubscribed Huffman tree"); }
+        store64(next+i*8,code);
+    }
+    for (i=0; i<count; i+=1) {
+        int n = load64(lengths+i*8);
+        if (n > 0) {
+            int c = load64(next+n*8); store64(next+n*8,c+1);
+            int reverse = 0; int k = 0;
+            for (k=0; k<n; k+=1) { reverse = reverse*2+((c >> k)&1); }
+            for (k=reverse; k<32768; k+=(1 << n)) { store64(table+k*8,n*65536+i+1); }
+        }
+    }
+    return table;
+}
+int symbol(int table) {
+    int value = 0; int n = 0;
+    for (n=1; n<=15; n+=1) {
+        value = value | (take_bits(1) << (n-1));
+        int entry = load64(table+value*8);
+        if (entry/65536 == n) { return (entry%65536)-1; }
+    }
+    die("an invalid Huffman symbol"); return 0;
+}
+int inflate(int data, int len, int expected) {
+    if (len < 6) { die("a truncated zlib stream"); }
+    int header = load8(data)*256+load8(data+1);
+    if (header%31 != 0 || (load8(data)&15) != 8 || load8(data) > 120 || (load8(data+1)&32)) { die("an unsupported zlib header"); }
+    stream = data+2; stream_size = len-6; stream_pos = 0; bits = 0; bitcount = 0;
+    int out = bounded_alloc(expected+1); int used = 0; int final = 0;
+    int lens = bounded_alloc(320*8); int dists = bounded_alloc(32*8); int order = bounded_alloc(19*8);
+    int lt = bounded_alloc(32768*8); int dt = bounded_alloc(32768*8); int ct = bounded_alloc(32768*8);
+    int counts = bounded_alloc(16*8); int next = bounded_alloc(16*8); int cl = bounded_alloc(19*8);
+    int fixed_lt = bounded_alloc(32768*8); int fixed_dt = bounded_alloc(32768*8);
+    int fixed_ready = 0; int blocks = 0;
+    int k = 0;
+    store64(order,16); store64(order+8,17); store64(order+16,18); store64(order+24,0);
+    for (k=4; k<19; k+=1) {
+        int value=0;
+        if (k%2 == 0) { value=8+(k-4)/2; } else { value=7-(k-5)/2; }
+        store64(order+k*8,value);
+    }
+    while (!final) {
+        blocks += 1;
+        if (blocks > 4096+expected/1024) { die("the deflate block budget"); }
+        int active_lt = lt; int active_dt = dt;
+        final = take_bits(1); int type = take_bits(2);
+        if (type == 0) {
+            bits = 0; bitcount = 0;
+            int n = take_bits(16); int inverse = take_bits(16);
+            if ((n ^ inverse) != 65535 || n > expected-used) { die("an invalid stored deflate block"); }
+            for (k=0; k<n; k+=1) { store8(out+used,take_bits(8)); used+=1; }
+        } else {
+            if (type == 1) {
+                if (!fixed_ready) {
+                    for (k=0; k<288; k+=1) {
+                        int n = 8;
+                        if (k >= 144 && k < 256) { n = 9; }
+                        if (k >= 256 && k < 280) { n = 7; }
+                        store64(lens+k*8,n);
+                    }
+                    for (k=0; k<32; k+=1) { store64(dists+k*8,5); }
+                    fixed_lt = tree(lens,288,fixed_lt,counts,next); fixed_dt = tree(dists,32,fixed_dt,counts,next);
+                    fixed_ready = 1;
+                }
+                active_lt = fixed_lt; active_dt = fixed_dt;
+            } else {
+                if (type != 2) { die("an invalid deflate block type"); }
+                int nl = take_bits(5)+257; int nd = take_bits(5)+1; int nc = take_bits(4)+4;
+                for (k=0; k<19; k+=1) { store64(cl+k*8,0); }
+                for (k=0; k<nc; k+=1) { store64(cl+load64(order+k*8)*8,take_bits(3)); }
+                ct = tree(cl,19,ct,counts,next); int i = 0;
+                while (i < nl+nd) {
+                    int value = symbol(ct); int run = 1;
+                    if (value == 16) {
+                        if (i == 0) { die("a deflate repeat without a predecessor"); }
+                        value = load64(lens+(i-1)*8); run = take_bits(2)+3;
+                    } else {
+                        if (value == 17) { value=0; run=take_bits(3)+3; }
+                        else { if (value == 18) { value=0; run=take_bits(7)+11; } }
+                    }
+                    if (run > nl+nd-i) { die("a deflate repeat overflow"); }
+                    for (k=0; k<run; k+=1) { store64(lens+i*8,value); i+=1; }
+                }
+                if (load64(lens+256*8) == 0) { die("a deflate tree without an end code"); }
+                lt = tree(lens,nl,lt,counts,next); dt = tree(lens+nl*8,nd,dt,counts,next);
+            }
+            while (1) {
+                int value = symbol(active_lt);
+                if (value == 256) { break; }
+                if (value < 256) {
+                    if (used >= expected) { die("excess decoded image bytes"); }
+                    store8(out+used,value); used+=1;
+                } else {
+                    if (value > 285) { die("an invalid deflate length"); }
+                    int v = value-257; int extra = 0; int n = 0;
+                    if (v < 8) { n=v+3; } else {
+                        if (v == 28) { n=258; } else { extra=(v-4)/4; n=3+((4+(v%4)) << extra); }
+                    }
+                    n += take_bits(extra);
+                    int d = symbol(active_dt);
+                    if (d > 29) { die("an invalid deflate distance"); }
+                    int distance = d+1; extra=0;
+                    if (d >= 4) { extra=d/2-1; distance=1+((2+(d%2)) << extra); }
+                    distance += take_bits(extra);
+                    if (distance > used || n > expected-used) { die("an out of bounds deflate copy"); }
+                    for (k=0; k<n; k+=1) { store8(out+used,load8(out+used-distance)); used+=1; }
+                }
+            }
+        }
+    }
+    if (used != expected || stream_pos != stream_size) { die("an incorrect decoded image size"); }
+    int a=1; int b=0;
+    for (k=0; k<used; k+=1) { a=(a+load8(out+k))%65521; b=(b+a)%65521; }
+    int checksum=load8(data+len-4)*16777216+load8(data+len-3)*65536+load8(data+len-2)*256+load8(data+len-1);
+    if (checksum != b*65536+a) { die("a zlib checksum mismatch"); }
+    return out;
+}
+int crc(int data, int len) {
+    int c=4294967295; int i=0; int k=0;
+    for (i=0; i<len; i+=1) {
+        c=c ^ load8(data+i);
+        for (k=0; k<8; k+=1) { if (c&1) { c=(c >> 1)^3988292384; } else { c=c >> 1; } }
+    }
+    return c ^ 4294967295;
+}
+int absolute(int n) { if (n < 0) { return -n; } return n; }
+void png() {
+    pos=8;
+    int compressed=bounded_alloc(size); int used=0; int seen=0; int ended=0; int channels=0; int palette=0; int palette_n=0; int alpha=0; int alpha_n=0;
+    while (pos < size) {
+        int n=be32(); int start=pos; int type=be32();
+        if (n < 0 || n > size-pos-4) { die("a truncated PNG chunk"); }
+        int data=pos;
+        if (type == 1229472850) {
+            if (seen || n != 13 || start != 12) { die("an invalid PNG header"); }
+            int w=be32(); int h=be32(); dimensions(w,h);
+            if (byte() != 8) { die("a PNG depth other than eight"); }
+            int colour=byte();
+            if (colour == 0) { channels=1; }
+            if (colour == 2) { channels=3; }
+            if (colour == 3) { channels=1; }
+            if (colour == 4) { channels=2; }
+            if (colour == 6) { channels=4; }
+            if (!channels || byte() != 0 || byte() != 0 || byte() != 0) { die("an unsupported PNG encoding"); }
+            seen=colour+1;
+        } else {
+            if (!seen || ended) { die("an invalid PNG chunk order"); }
+            if (type == 1229209940) {
+                int k=0;
+                for (k=0; k<n; k+=1) { store8(compressed+used,load8(input+data+k)); used+=1; }
+            } else {
+                if (type == 1347179589) { if (n%3 || n > 768) { die("an invalid PNG palette"); } palette=input+data; palette_n=n/3; }
+                else { if (type == 1951551059) { alpha=input+data; alpha_n=n; }
+                else { if (type == 1229278788) { if (n || pos+4 != size) { die("an invalid PNG end"); } ended=1; }
+                else { if ((type&536870912) == 0) { die("an unknown critical PNG chunk"); } } } }
+            }
+        }
+        pos=data+n; int check=be32();
+        if (crc(input+start,n+4) != check) { die("a PNG CRC mismatch"); }
+    }
+    if (!ended || !used) { die("a PNG without image data or end"); }
+    int stride=width*channels;
+    int raw=inflate(compressed,used,(stride+1)*height);
+    int y=0; int x=0;
+    for (y=0; y<height; y+=1) {
+        int row=raw+y*(stride+1)+1; int filter=load8(row-1);
+        if (filter > 4) { die("an invalid PNG filter"); }
+        for (x=0; x<stride; x+=1) {
+            int a=0; int b=0; int c=0;
+            if (x >= channels) { a=load8(row+x-channels); }
+            if (y > 0) { b=load8(row+x-stride-1); if (x >= channels) { c=load8(row+x-stride-1-channels); } }
+            int predictor=0;
+            if (filter == 1) { predictor=a; }
+            if (filter == 2) { predictor=b; }
+            if (filter == 3) { predictor=(a+b)/2; }
+            if (filter == 4) {
+                int p=a+b-c; int pa=absolute(p-a); int pb=absolute(p-b); int pc=absolute(p-c);
+                predictor=c; if (pa <= pb && pa <= pc) { predictor=a; } else { if (pb <= pc) { predictor=b; } }
+            }
+            store8(row+x,(load8(row+x)+predictor)&255);
+        }
+    }
+    pixels=bounded_alloc(width*height*4);
+    for (y=0; y<height; y+=1) {
+        for (x=0; x<width; x+=1) {
+            int p=raw+y*(stride+1)+1+x*channels; int r=load8(p); int g=r; int b=r; int a=255;
+            if (seen == 4) {
+                int index=r; if (index >= palette_n) { die("a PNG palette index overflow"); }
+                r=load8(palette+index*3); g=load8(palette+index*3+1); b=load8(palette+index*3+2);
+                if (index < alpha_n) { a=load8(alpha+index); }
+            } else {
+                if (channels >= 3) { g=load8(p+1); b=load8(p+2); }
+                if (channels == 2 || channels == 4) { a=load8(p+channels-1); }
+            }
+            pixel(pixels+(y*width+x)*4,r,g,b,a);
+        }
+    }
+}
+
+int jt = 0;
+int jc = 0;
+int quant = 0;
+int component_count = 0;
+int maxh = 0;
+int maxv = 0;
+int cols = 0;
+int rows = 0;
+int progressive = 0;
+int restart = 0;
+int eob = 0;
+int jpeg_byte() {
+    int v=byte();
+    if (v == 255) { if (byte() != 0) { die("an unexpected JPEG entropy marker"); } }
+    return v;
+}
+int jbits(int n) {
+    int v=0; int i=0;
+    for (i=0; i<n; i+=1) {
+        if (!bitcount) { bits=jpeg_byte(); bitcount=8; }
+        bitcount-=1; v=v*2+((bits >> bitcount)&1);
+    }
+    return v;
+}
+int jsymbol(int id) {
+    if (id < 0 || id > 7) { die("an invalid JPEG Huffman selector"); }
+    int t=load64(jt+id*8);
+    if (!t) { die("a missing JPEG Huffman table"); }
+    int code=0; int first=0; int offset=0; int n=0;
+    for (n=1; n<=16; n+=1) {
+        code=code*2+jbits(1); int count=load8(t+n-1);
+        if (code >= first && code < first+count) { return load8(t+16+offset+code-first); }
+        offset+=count; first=(first+count)*2;
+    }
+    die("an invalid JPEG Huffman code"); return 0;
+}
+int extend(int n) {
+    if (n < 0 || n > 16) { die("an invalid JPEG magnitude"); }
+    if (!n) { return 0; }
+    int v=jbits(n); if (v < (1 << (n-1))) { v-=((1 << n)-1); } return v;
+}
+void refine(int pointer, int bit) {
+    int value=load64(pointer);
+    if (jbits(1) && (absolute(value)&bit) == 0) {
+        if (value >= 0) { value+=bit; } else { value-=bit; }
+        store64(pointer,value);
+    }
+}
+void block(int comp, int pointer, int td, int ta, int ss, int se, int ah, int al) {
+    int k=ss; int bit=1 << al;
+    if (!ss) {
+        if (!ah) {
+            int n=jsymbol(td);
+            if (n > 11) { die("an invalid JPEG DC magnitude"); }
+            int dc=load64(comp+48)+extend(n); store64(comp+48,dc); store64(pointer,dc*bit);
+        } else { if (jbits(1)) { store64(pointer,load64(pointer)|bit); } }
+        k=1;
+    }
+    if (se < k) { return; }
+    if (!ah) {
+        if (eob) { eob-=1; return; }
+        while (k <= se) {
+            int rs=jsymbol(ta+4); int run=rs/16; int n=rs%16;
+            if (!n) {
+                if (run == 15) { k+=16; if (k > se+1) { die("a JPEG zero run overflow"); } }
+                else {
+                    if (!progressive) { if (run) { die("an invalid sequential JPEG zero run"); } return; }
+                    eob=(1 << run)+jbits(run)-1; return;
+                }
+            } else {
+                if (n > 10 || k+run > se) { die("a JPEG AC run overflow"); }
+                k+=run; store64(pointer+k*8,extend(n)*bit); k+=1;
+            }
+        }
+    } else {
+        if (!eob) {
+            while (k <= se) {
+                int rs=jsymbol(ta+4); int run=rs/16; int n=rs%16; int value=0;
+                if (n) { if (n != 1) { die("an invalid JPEG refinement magnitude"); } value=bit; if (!jbits(1)) { value=-bit; } }
+                else { if (run != 15) { eob=(1 << run)+jbits(run); break; } }
+                while (k <= se) {
+                    int p=pointer+k*8;
+                    if (load64(p) != 0) { refine(p,bit); }
+                    else { if (!run) { break; } run-=1; }
+                    k+=1;
+                }
+                if (value) { if (k > se) { die("a JPEG refinement run overflow"); } store64(pointer+k*8,value); }
+                else { if (run || k > se) { die("a JPEG refinement zero run overflow"); } }
+                k+=1;
+            }
+        }
+        if (eob) {
+            while (k <= se) { if (load64(pointer+k*8) != 0) { refine(pointer+k*8,bit); } k+=1; }
+            eob-=1;
+        }
+    }
+}
+void jpeg_scan(int end) {
+    int ns=byte();
+    if (ns < 1 || ns > component_count) { die("an invalid JPEG scan component count"); }
+    int selected=bounded_alloc(3*8); int selectors=bounded_alloc(3*8); int i=0; int j=0;
+    for (i=0; i<ns; i+=1) {
+        int id=byte(); int found=-1;
+        for (j=0; j<component_count; j+=1) { if (load64(jc+j*80) == id) { found=j; } }
+        if (found < 0) { die("an unknown JPEG scan component"); }
+        for (j=0; j<i; j+=1) { if (load64(selected+j*8) == found) { die("a repeated JPEG scan component"); } }
+        store64(selected+i*8,found); int tables=byte();
+        if (tables/16 > 3 || tables%16 > 3) { die("an invalid JPEG scan table"); }
+        store64(selectors+i*8,tables);
+    }
+    int ss=byte(); int se=byte(); int approx=byte(); int ah=approx/16; int al=approx%16;
+    if (pos != end || ss > se || se > 63 || al > 13 || ah > 13 || (ah && ah != al+1)) { die("an invalid JPEG scan header"); }
+    if (!progressive && (ss || se != 63 || approx)) { die("an invalid sequential JPEG scan"); }
+    if (progressive && ((!ss && se) || (ss && ns != 1))) { die("an invalid progressive JPEG scan"); }
+    int sx=cols; int sy=rows;
+    if (ns == 1) {
+        int comp=jc+load64(selected)*80;
+        sx=(width*load64(comp+8)+maxh*8-1)/(maxh*8);
+        sy=(height*load64(comp+16)+maxv*8-1)/(maxv*8);
+    }
+    for (i=0; i<component_count; i+=1) { store64(jc+i*80+48,0); }
+    for (i=0; i<ns; i+=1) {
+        int comp=jc+load64(selected+i*8)*80;
+        int progression=load64(comp+56); int k=0;
+        for (k=ss; k<=se; k+=1) {
+            int prior=load8(progression+k);
+            if ((!ah && prior != 255) || (ah && prior != ah)) { die("an invalid JPEG coefficient progression"); }
+            store8(progression+k,al);
+        }
+    }
+    bits=0; bitcount=0; eob=0;
+    int unit=0; int sequence=0;
+    for (unit=0; unit<sx*sy; unit+=1) {
+        if (restart && unit && unit%restart == 0) {
+            bitcount=0;
+            if (byte() != 255 || byte() != 208+sequence%8 || eob) { die("an invalid JPEG restart marker"); }
+            sequence+=1;
+            for (i=0; i<component_count; i+=1) { store64(jc+i*80+48,0); }
+        }
+        for (i=0; i<ns; i+=1) {
+            int comp=jc+load64(selected+i*8)*80; int tables=load64(selectors+i*8);
+            int hs=load64(comp+8); int vs=load64(comp+16); int nx=hs; int ny=vs;
+            if (ns == 1) { nx=1; ny=1; }
+            int y=0; int x=0;
+            for (y=0; y<ny; y+=1) {
+                for (x=0; x<nx; x+=1) {
+                    int bx=(unit%sx)*nx+x; int by=(unit/sx)*ny+y;
+                    int ptr=load64(comp+40)+(by*cols*hs+bx)*512;
+                    block(comp,ptr,tables/16,tables%16,ss,se,ah,al);
+                }
+            }
+        }
+    }
+    if (eob) { die("a JPEG end run overflow"); }
+    bitcount=0;
+}
+void jpeg() {
+    pos=2; jt=bounded_alloc(8*8); jc=bounded_alloc(3*80); quant=bounded_alloc(4*8);
+    int i=0;
+    for (i=0; i<8; i+=1) { store64(jt+i*8,0); }
+    for (i=0; i<4; i+=1) { store64(quant+i*8,0); }
+    for (i=0; i<240; i+=1) { store8(jc+i,0); }
+    int scans=0; int done=0; int segments=0;
+    while (pos < size) {
+        if (byte() != 255) { die("a missing JPEG marker"); }
+        int marker=byte(); while (marker == 255) { marker=byte(); }
+        if (marker == 217) { done=1; break; }
+        int len=be16(); int end=pos+len-2;
+        segments+=1;
+        if (len < 2 || end > size || segments > 1024) { die("an invalid JPEG segment length"); }
+        if (marker == 192 || marker == 194) {
+            if (component_count || byte() != 8) { die("an unsupported JPEG frame"); }
+            int h=be16(); int w=be16(); dimensions(w,h); component_count=byte();
+            if (component_count != 1 && component_count != 3) { die("an unsupported JPEG colour space"); }
+            progressive=marker == 194;
+            for (i=0; i<component_count; i+=1) {
+                int comp=jc+i*80; int id=byte(); int sampling=byte(); int q=byte(); int hs=sampling/16; int vs=sampling%16;
+                if (hs < 1 || hs > 4 || vs < 1 || vs > 4 || q > 3) { die("unsupported JPEG sampling"); }
+                int j=0;
+                for (j=0; j<i; j+=1) { if (load64(jc+j*80) == id) { die("duplicate JPEG component identifiers"); } }
+                store64(comp,id); store64(comp+8,hs); store64(comp+16,vs); store64(comp+24,q);
+                if (hs > maxh) { maxh=hs; } if (vs > maxv) { maxv=vs; }
+            }
+            cols=(width+8*maxh-1)/(8*maxh); rows=(height+8*maxv-1)/(8*maxv);
+            for (i=0; i<component_count; i+=1) {
+                int comp=jc+i*80; int n=cols*rows*load64(comp+8)*load64(comp+16)*512;
+                if (n > 134217728) { die("the JPEG coefficient memory budget"); }
+                int data=bounded_alloc(n); int j=0;
+                for (j=0; j<n; j+=1) { store8(data+j,0); }
+                store64(comp+40,data);
+                int progression=bounded_alloc(64);
+                for (j=0; j<64; j+=1) { store8(progression+j,255); }
+                store64(comp+56,progression);
+            }
+            if (pos != end) { die("an invalid JPEG frame length"); }
+        } else {
+            if (marker == 219) {
+                while (pos < end) {
+                    int info=byte(); int q=info%16; int wide=info/16;
+                    if (q > 3 || wide > 1 || pos+64*(wide+1) > end) { die("an invalid JPEG quantization table"); }
+                    int k=0;
+                    for (k=0; k<64; k+=1) { int value=0; if (wide) { value=be16(); } else { value=byte(); } if (!value) { die("a zero JPEG quantizer"); } if (!k) { store64(quant+q*8,value); } }
+                }
+            } else {
+                if (marker == 196) {
+                    while (pos < end) {
+                        int info=byte(); int id=info%16; int cls=info/16;
+                        if (id > 3 || cls > 1 || pos+16 > end) { die("an invalid JPEG Huffman table"); }
+                        int t=bounded_alloc(272); int count=0; int k=0; int space=1;
+                        for (k=0; k<16; k+=1) { int n=byte(); space=space*2-n; if (space < 0) { die("an oversubscribed JPEG tree"); } store8(t+k,n); count+=n; }
+                        if (!count || count > 256 || pos+count > end) { die("an invalid JPEG symbol count"); }
+                        for (k=0; k<count; k+=1) { store8(t+16+k,byte()); }
+                        store64(jt+(id+cls*4)*8,t);
+                    }
+                } else {
+                    if (marker == 221) { if (len != 4) { die("an invalid JPEG restart interval"); } restart=be16(); }
+                    else {
+                        if (marker == 218) { scans+=1; if (!component_count || scans > 128) { die("an invalid JPEG scan order"); } jpeg_scan(end); }
+                        else { if (!((marker >= 224 && marker <= 239) || marker == 254)) { die("an unsupported JPEG marker"); } pos=end; }
+                    }
+                }
+            }
+        }
+        if (marker != 218 && pos != end) { die("an invalid JPEG segment size"); }
+    }
+    if (!done || !scans || pos != size) { die("a JPEG without a complete end marker"); }
+    for (i=0; i<component_count; i+=1) {
+        if (load8(load64(jc+i*80+56)) == 255) { die("a JPEG without all DC components"); }
+    }
+    int ow=(width+7)/8; int oh=(height+7)/8;
+    pixels=bounded_alloc(ow*oh*4);
+    int y=0; int x=0;
+    for (y=0; y<oh; y+=1) {
+        for (x=0; x<ow; x+=1) {
+            int values=bounded_alloc(3*8);
+            for (i=0; i<component_count; i+=1) {
+                int comp=jc+i*80; int hs=load64(comp+8); int vs=load64(comp+16); int q=load64(quant+load64(comp+24)*8);
+                if (!q) { die("a missing JPEG quantization table"); }
+                int bx=x*hs/maxh; int by=y*vs/maxv;
+                int dc=load64(load64(comp+40)+(by*cols*hs+bx)*512);
+                store64(values+i*8,clamp(128+dc*q/8));
+            }
+            int l=load64(values); int r=l; int g=l; int b=l;
+            if (component_count == 3) {
+                int cb=load64(values+8)-128; int cr=load64(values+16)-128;
+                r=clamp(l+1436*cr/1024); g=clamp(l-(352*cb+731*cr)/1024); b=clamp(l+1815*cb/1024);
+            }
+            pixel(pixels+(y*ow+x)*4,r,g,b,255);
+        }
+    }
+    width=ow; height=oh;
+}
+
+int gif_blocks() {
+    if (!gif_buffer) { gif_buffer=bounded_alloc(size); }
+    int data=gif_buffer; int count=0;
+    while (1) {
+        int n=byte(); if (!n) { break; }
+        if (n > size-pos) { die("a truncated GIF subblock"); }
+        int k=0; for (k=0; k<n; k+=1) { store8(data+count,byte()); count+=1; }
+    }
+    stream=data; stream_size=count; stream_pos=0; bits=0; bitcount=0;
+    return data;
+}
+void gif() {
+    pos=6; int w=le16(); int h=le16(); dimensions(w,h);
+    int flags=byte(); int background=byte(); byte();
+    int global=0; int global_n=0;
+    if (flags&128) {
+        global_n=1 << ((flags&7)+1); global=input+pos;
+        if (pos+global_n*3 > size) { die("a truncated GIF palette"); } pos+=global_n*3;
+    }
+    int frames=0; int transparent=-1; int done=0; int total_pixels=0;
+    while (pos < size) {
+        int kind=byte();
+        if (kind == 59) { done=1; break; }
+        if (kind == 33) {
+            int label=byte();
+            if (label == 249) {
+                if (byte() != 4) { die("an invalid GIF control block"); }
+                int control=byte(); le16(); int index=byte(); transparent=-1;
+                if (control&1) { transparent=index; }
+                if (byte() != 0) { die("an unterminated GIF control block"); }
+            } else { gif_blocks(); }
+        } else {
+            if (kind != 44) { die("an invalid GIF block"); }
+            int left=le16(); int top=le16(); int fw=le16(); int fh=le16(); int info=byte();
+            if (fw < 1 || fh < 1 || left+fw > width || top+fh > height) { die("an out of bounds GIF frame"); }
+            int palette=global; int palette_n=global_n;
+            if (info&128) {
+                palette_n=1 << ((info&7)+1); palette=input+pos;
+                if (pos+palette_n*3 > size) { die("a truncated GIF local palette"); } pos+=palette_n*3;
+            }
+            if (!palette) { die("a GIF without a palette"); }
+            total_pixels+=fw*fh;
+            if (total_pixels > 134217728) { die("the GIF decoded pixel budget"); }
+            int minimum=byte(); if (minimum < 2 || minimum > 8) { die("an invalid GIF code width"); }
+            gif_blocks();
+            if (!frames) {
+                pixels=bounded_alloc(width*height*4); int i=0;
+                for (i=0; i<width*height; i+=1) {
+                    int r=0; int g=0; int b=0; int a=0;
+                    if (global && background < global_n && background != transparent) {
+                        r=load8(global+background*3); g=load8(global+background*3+1); b=load8(global+background*3+2); a=255;
+                    }
+                    pixel(pixels+i*4,r,g,b,a);
+                }
+            }
+            {
+                if (!gif_prefix) { gif_prefix=bounded_alloc(4096*8); gif_suffix=bounded_alloc(4096); gif_stack=bounded_alloc(4096); }
+                int prefix=gif_prefix; int suffix=gif_suffix; int stack=gif_stack;
+                int clear=1 << minimum; int end=clear+1; int next=end+1; int nbits=minimum+1;
+                int previous=-1; int first=0; int used=0; int ended=0; int row=0; int pass=0; int col=0;
+                if (take_bits(nbits) != clear) { die("a GIF without an initial clear code"); }
+                while (1) {
+                    int code=take_bits(nbits);
+                    if (code == end) { ended=1; break; }
+                    if (code == clear) { next=end+1; nbits=minimum+1; previous=-1; continue; }
+                    int original=code; int count=0;
+                    if (code == next && previous >= 0) { store8(stack+count,first); count+=1; code=previous; }
+                    else { if (code >= next) { die("an invalid GIF dictionary code"); } }
+                    while (code >= clear) {
+                        if (code >= next || count >= 4095) { die("a cyclic GIF dictionary"); }
+                        store8(stack+count,load8(suffix+code)); count+=1; code=load64(prefix+code*8);
+                    }
+                    first=code; store8(stack+count,first); count+=1;
+                    if (count > fw*fh-used) { die("excess GIF pixels"); }
+                    while (count > 0) {
+                        count-=1; int index=load8(stack+count);
+                        if (index >= palette_n) { die("a GIF palette index overflow"); }
+                        if (!frames) {
+                        int p=pixels+((top+row)*width+left+col)*4;
+                        pixel(p,load8(palette+index*3),load8(palette+index*3+1),load8(palette+index*3+2),255);
+                        if (index == transparent) { store8(p+3,0); }
+                        }
+                        used+=1; col+=1;
+                        if (col == fw) {
+                            col=0;
+                            if (info&64) {
+                                int step=8; if (pass == 2) { step=4; } if (pass == 3) { step=2; }
+                                row+=step;
+                                while (row >= fh && pass < 3) {
+                                    pass+=1; row=4; if (pass == 2) { row=2; } if (pass == 3) { row=1; }
+                                }
+                            } else { row+=1; }
+                        }
+                    }
+                    if (previous >= 0 && next < 4096) {
+                        store64(prefix+next*8,previous); store8(suffix+next,first); next+=1;
+                        if (next == (1 << nbits) && nbits < 12) { nbits+=1; }
+                    }
+                    previous=original;
+                }
+                if (!ended || used != fw*fh) { die("an incomplete GIF frame"); }
+            }
+            frames+=1;
+            if (frames > 4096) { die("the GIF frame budget"); }
+            transparent=-1;
+        }
+    }
+    if (!done || !frames || pos != size) { die("an incomplete GIF container"); }
+}
+int main() {
+    if (argc() != 3) { die("arguments, expected input and output"); }
+    int fd=open_read(argv(1)); if (fd < 0) { die("an unreadable image"); }
+    input=bounded_alloc(67108865);
+    while (size < 67108865) {
+        int n=read(fd,input+size,67108865-size);
+        if (n < 0) { close(fd); die("an image read error"); }
+        if (!n) { break; } size+=n;
+    }
+    close(fd);
+    if (size > 67108864) { die("the 64 MiB encoded image budget"); }
+    if (size < 10) { die("a malformed image header"); }
+    if (load8(input) == 255 && load8(input+1) == 216) { jpeg(); }
+    else {
+        if (load8(input) == 137 && load8(input+1) == 80 && load8(input+2) == 78 && load8(input+3) == 71 && load8(input+4) == 13 && load8(input+5) == 10 && load8(input+6) == 26 && load8(input+7) == 10) { png(); }
+        else {
+            if (load8(input) == 'G' && load8(input+1) == 'I' && load8(input+2) == 'F' && load8(input+3) == '8' && (load8(input+4) == '7' || load8(input+4) == '9') && load8(input+5) == 'a') { gif(); }
+            else { die("a malformed or unsupported image header"); }
+        }
+    }
+    int scale=1;
+    while ((width+scale-1)/scale > 160 || (height+scale-1)/scale > 120) { scale+=1; }
+    int ow=(width+scale-1)/scale; int oh=(height+scale-1)/scale;
+    int out=bounded_alloc(24+ow*oh*4); store64(out,ow); store64(out+8,oh); store64(out+16,1);
+    int y=0; int x=0; int k=0;
+    for (y=0; y<oh; y+=1) {
+        for (x=0; x<ow; x+=1) {
+            for (k=0; k<4; k+=1) { store8(out+24+(y*ow+x)*4+k,load8(pixels+((y*scale)*width+x*scale)*4+k)); }
+        }
+    }
+    int length=24+ow*oh*4;
+    fd=open_write(argv(2)); if (fd < 0) { die("an unwritable sprite output"); }
+    int used=0;
+    while (used < length) {
+        int n=write(fd,out+used,length-used);
+        if (n <= 0) { close(fd); die("a sprite write error"); } used+=n;
+    }
+    close(fd); print("site image wrote a bounded sprite\n"); return 0;
+}

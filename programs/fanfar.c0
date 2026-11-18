@@ -1,0 +1,80 @@
+// Copyright (C) 2026 tavro
+// Distributed under the GNU General Public License version 3 or later.
+include "moon.c0";
+include "noter.c0";
+include "synth.c0";
+
+void print_int(int v) {
+    int b = alloc(32);
+    if (!b) { return; }
+    int i = 30;
+    store8(b + 31, 0);
+    store8(b + i, '0' + v % 10);
+    v /= 10;
+    while (v > 0) {
+        i -= 1;
+        store8(b + i, '0' + v % 10);
+        v /= 10;
+    }
+    print(b + i);
+    dealloc(b);
+    return;
+}
+
+int score() {
+    int s = noter_new(6, 4, 120);
+    if (!s) { return 0; }
+    noter_add_with(s, 6, 72, 0, 2, 90, 1);
+    noter_add_with(s, 6, 76, 2, 2, 90, 1);
+    noter_add_with(s, 6, 79, 4, 2, 90, 1);
+    noter_add_with(s, 6, 84, 6, 10, 100, 1);
+    noter_add_with(s, 6, 72, 6, 10, 60, 1);
+    return s;
+}
+
+int play() {
+    int s = score();
+    int out = alloc(4096 * 4);
+    int mix = alloc(4096 * 16);
+    if (!s || !out || !mix) { return 1; }
+    int before = ticks();
+    int rendered = 0;
+    int at = 0;
+    int len = synth_length(s);
+    while (at < len) {
+        int n = len - at;
+        if (n > 4096) { n = 4096; }
+        int begin = ticks();
+        synth_render16(s, at, n, out, mix);
+        int i = 0;
+        for (i = 0; i < n * 2; i += 1) {
+            int v = load8(out + i * 2) | (load8(out + i * 2 + 1) << 8);
+            if (v >= 32768) { v -= 65536; }
+            v *= 2;
+            store8(out + i * 2, v & 255);
+            store8(out + i * 2 + 1, (v >> 8) & 255);
+        }
+        rendered += ticks() - begin;
+        int sent = 0;
+        while (sent < n * 4) {
+            int took = sound(out + sent, n * 4 - sent);
+            if (took < 0) { return 2; }
+            sent += took;
+            if (sent < n * 4) { sleep(1); }
+        }
+        at += n;
+    }
+    while (sound(0, 0) > 0) { sleep(1); }
+    print("[fanfar] render_ticks="); print_int(rendered);
+    print(" elapsed_ticks="); print_int(ticks() - before); print("\n");
+    dealloc(s); dealloc(out); dealloc(mix);
+    return 0;
+}
+
+int main() {
+    if (sound_format(2) < 0) { return 2; }
+    int result = play();
+    if (result) { return result; }
+    print("[fanfar] done\n");
+    return 0;
+}

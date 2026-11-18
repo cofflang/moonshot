@@ -1,0 +1,44 @@
+// Copyright (C) 2026 tavro
+// SPDX-License-Identifier GPL-3.0-or-later
+// expect: 0
+// Exercise process credentials while a different user uses the shell.
+include "moon.c0";
+int denied() {
+    int a = open_read("uid-secret.txt");
+    int b = open_write("uid-victim.txt");
+    int c = remove("uid-victim.txt");
+    int d = readfile("uid-secret.txt", 0, 0);
+    if (a >= 0) { close(a); }
+    if (b >= 0) { close(b); }
+    return a == -1 && b == -1 && c == -1 && d == -1;
+}
+int main() {
+    if (argc() < 2) { return 0; }
+    if (load8(argv(1)) == 'r') {
+        int fd = open_read("uid-secret.txt");
+        if (fd < 0) { print("[uid-test] FAIL root control\n"); return 1; }
+        close(fd); print("[uid-test] PASS root control\n"); return 0;
+    }
+    if (load8(argv(1)) == 'c') {
+        if (!denied()) { print("[uid-test] FAIL child permissions\n"); return 1; }
+        print("[uid-test] PASS child permissions\n"); return 0;
+    }
+    if (load8(argv(1)) != 'g') { return 0; }
+    print("[uid-test] waiting for root activity\n");
+    sleep(1000);
+    if (!denied()) { print("[uid-test] FAIL guest permissions\n"); return 1; }
+    print("[uid-test] PASS guest permissions\n");
+    int fd = open_write("uid-own.txt");
+    if (fd < 0 || write(fd, "guest", 5) != 5) { print("[uid-test] FAIL creator write\n"); return 1; }
+    close(fd);
+    fd = open_read("uid-own.txt");
+    int buf = alloc(8);
+    if (fd < 0 || read(fd, buf, 8) != 5 || load8(buf) != 'g') { print("[uid-test] FAIL creator read\n"); return 1; }
+    close(fd); print("[uid-test] PASS creator read and write\n");
+    int child = spawn_with("/test/et32.elf child", 1);
+    if (child < 0 || wait_for(child, 500) != 0) { print("[uid-test] FAIL spawn inheritance\n"); return 1; }
+    print("[uid-test] PASS spawn inheritance\n");
+    if (shell("whoami") < 0) { print("[uid-test] FAIL shell inheritance\n"); return 1; }
+    print("[uid-test] DONE\n");
+    return 0;
+}

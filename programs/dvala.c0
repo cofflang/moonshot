@@ -1,0 +1,45 @@
+// Copyright (C) 2026 tavro
+// SPDX-License-Identifier GPL-3.0-or-later
+include "moon.c0";
+
+int seed = 71;
+int next() {
+    seed = (seed * 48271) % 2147483647;
+    return seed;
+}
+
+int main() {
+    if (argc() > 1) { return 3; }
+    int stars = alloc(96 * 24);
+    if (!stars) { return 1; }
+    int i = 0;
+    for (i = 0; i < 96; i += 1) {
+        store64(stars + i * 24, next() % 2048 - 1024);
+        store64(stars + i * 24 + 8, next() % 1536 - 768);
+        store64(stars + i * 24 + 16, next() % 256 + 1);
+    }
+    while (1) {
+        int wi = win_info();
+        int w = wi >> 16;
+        int h = wi & 65535;
+        if (!wi) { return 2; }
+        fill(0, 0, w, h, 0);
+        for (i = 0; i < 96; i += 1) {
+            int p = stars + i * 24;
+            int z = load64(p + 16) - 2;
+            if (z < 1) {
+                z = 256;
+                store64(p, next() % 2048 - 1024);
+                store64(p + 8, next() % 1536 - 768);
+            }
+            store64(p + 16, z);
+            int x = w / 2 + load64(p) * 64 / z;
+            int y = h / 2 + load64(p + 8) * 64 / z;
+            int size = 1 + (256 - z) / 64;
+            int light = 80 + (256 - z) * 175 / 256;
+            fill(x, y, size, size, light * 65793);
+        }
+        sleep(4);
+    }
+    return 0;
+}

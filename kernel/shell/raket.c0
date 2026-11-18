@@ -71,17 +71,27 @@ void raket_init() {
 // raket_init and shell_init have allocated any of these arrays, and storing
 // through a null base would write straight to physical address 0.
 void raket_reset_session(int f) {
-    // Once a user has logged in on the screen, a new window is theirs.
-    int who = 0;
+    if (sk_session_epoch_base) {
+        store64(sk_session_epoch_base + f * 8, load64(sk_session_epoch_base + f * 8) + 1);
+    }
+    sk_ask_reset(f);
+    if (shell_line_base && shell_len_base && shell_cpos_base) {
+        int line = load64(shell_line_base + f * 8);
+        if (line) { sk_secret_clear(line, SHELL_LINE_MAX); }
+        store64(shell_len_base + f * 8, 0);
+        store64(shell_cpos_base + f * 8, 0);
+    }
+    sk_hist_pos_set(f, -1);
+    // Creators explicitly grant a new shell its session identity.
+    int who = -1;
     int authed = 0;
-    if (raket_user >= 0) { who = raket_user; authed = 1; }
     if (raket_authed_base != 0) {
         store64(raket_authed_base + f * 8, authed);
         store64(raket_stage_base + f * 8, RAKET_STAGE_USER);
         store64(raket_pending_uid_base + f * 8, 0 - 1);
     }
     if (sk_uid_base != 0) { store64(sk_uid_base + f * 8, who); }
-    if (sk_cwd_base != 0) { store64(sk_cwd_base + f * 8, 0); }
+    sk_set_cwd(f, 0);
     return;
 }
 
@@ -95,11 +105,9 @@ int raket_authed(int f) {
     return load64(raket_authed_base + f * 8);
 }
 
-// Whether session f's next typed character should be masked ('*' instead
-// of the real glyph) as it echoes to the screen -- true only while at
-// raket's password stage. keyboard_handler (keyboard.c0) checks this at
-// echo time; the real character still reaches shell_input/raket_login_line
-// unmasked via the ordinary input queue, only the ON-SCREEN glyph differs.
+// Whether a text-login session is waiting for a password. sk_masked adds
+// account-command prompts; the shell task uses the combined state for echo,
+// redraw and diagnostics when consuming queued input.
 int raket_should_mask(int f) {
     if (!raket_authed_base) { return 0; }
     if (load64(raket_authed_base + f * 8) == 1) { return 0; }
@@ -151,13 +159,15 @@ void raket_login_line(int f, int line) {
         // unknown name, so the password stage below always rejects it,
         // regardless of what gets typed.
         int uid = sk_user_lookup(line);
+        int sl = serial_line_begin();
         serial_print("[raket] session ");
         serial_print_int(f);
         serial_print(" username='");
-        serial_print(line);
+        serial_print_in(sl, line);
         serial_print("' uid=");
         serial_print_int(uid);
         serial_print("\n");
+        serial_line_end(sl);
         store64(raket_pending_uid_base + f * 8, uid);
         store64(raket_stage_base + f * 8, RAKET_STAGE_PASS);
         if (kakel_active == 1) { kakel_print(f, "\n"); } else { sk_print("\n"); }
@@ -173,14 +183,12 @@ void raket_login_line(int f, int line) {
     // all -- `passwd` itself is a shell command, unreachable before login.
     int uid = load64(raket_pending_uid_base + f * 8);
     int ok = 0;
-    if (uid >= 0) {
-        if (sk_user_has_pass(uid) == 0) {
-            if (load8(line) == 0) { ok = 1; }
-        } else {
-            ok = sk_user_check_pass(uid, line);
-        }
+    if (uid >= 0 && !load64(sk_secret_overflow_base + f * 8)) {
+        ok = sk_pass_ok(uid, line);
     }
 
+    store64(sk_secret_overflow_base + f * 8, 0);
+    int sl2 = serial_line_begin();
     serial_print("[raket] session ");
     serial_print_int(f);
     serial_print(" password check uid=");
@@ -188,9 +196,10 @@ void raket_login_line(int f, int line) {
     serial_print(" ok=");
     serial_print_int(ok);
     serial_print("\n");
+    serial_line_end(sl2);
     if (ok == 1) {
         store64(sk_uid_base + f * 8, uid);
-        jakel_current_uid = uid;
+
         store64(raket_authed_base + f * 8, 1);
         store64(raket_stage_base + f * 8, RAKET_STAGE_USER);
         store64(raket_pending_uid_base + f * 8, 0 - 1);
@@ -228,6 +237,7 @@ int lock_name = 0;          // what is typed, 32 and 64 bytes
 int lock_pass = 0;
 int lock_name_n = 0;
 int lock_pass_n = 0;
+int lock_pass_overflow = 0;
 int lock_field = 0;         // 0 the username, 1 the password
 int lock_wrong = 0;
 
@@ -398,20 +408,20 @@ void raket_lock_try() {
     store8(lock_pass + lock_pass_n, 0);
     int uid = sk_user_lookup(lock_name);
     int ok = 0;
-    if (uid >= 0 && (raket_user < 0 || uid == raket_user)) {
-        if (sk_user_has_pass(uid) == 0) {
-            if (lock_pass_n == 0) { ok = 1; }
-        } else {
-            ok = sk_user_check_pass(uid, lock_pass);
-        }
+    if (!lock_pass_overflow && uid >= 0 && (raket_user < 0 || uid == raket_user)) {
+        ok = sk_pass_ok(uid, lock_pass);
     }
+    int sl = serial_line_begin();
     serial_print("[raket] screen login username='");
-    serial_print(lock_name);
+    serial_print_in(sl, lock_name);
     serial_print("' uid=");
     serial_print_int(uid);
     serial_print(" ok=");
     serial_print_int(ok);
     serial_print("\n");
+    serial_line_end(sl);
+    sk_secret_clear(lock_pass, 65);
+    lock_pass_overflow = 0;
     lock_pass_n = 0;
     if (!ok) {
         lock_wrong = 1;
@@ -436,7 +446,7 @@ void raket_lock_try() {
         if (shell_task_id >= 0) { task_wake(shell_task_id); }
     }
     raket_user = uid;
-    jakel_current_uid = uid;
+
     int w = 0;
     for (w = 0; w < KAKEL_MAX_WIN; w += 1) {
         store64(raket_authed_base + w * 8, 1);
@@ -475,9 +485,11 @@ void raket_lock_key(int make, int ascii) {
             store8(lock_name + lock_name_n, ascii);
             lock_name_n += 1;
         }
-        if (lock_field == 1 && lock_pass_n < 64) {
-            store8(lock_pass + lock_pass_n, ascii);
-            lock_pass_n += 1;
+        if (lock_field == 1) {
+            if (lock_pass_n < 64) {
+                store8(lock_pass + lock_pass_n, ascii);
+                lock_pass_n += 1;
+            } else { lock_pass_overflow = 1; }
         }
     }
     raket_lock_refresh();
@@ -503,7 +515,14 @@ void raket_lock_click(int px, int py) {
 // Alt+L. The screen locks for the user logged in.
 void raket_lock() {
     if (kakel_active != 1 || raket_user < 0 || lock_bufs() == 0) { return; }
+    // IRQ context invalidates queued input but leaves allocations to the
+    // shell task, which may be in the middle of comparing a password.
+    sk_cancel_pending = 1;
+    if (sk_queue) { sk_secret_clear(sk_queue, SK_QUEUE_MAX); }
+    sk_queue_head = 0; sk_queue_tail = 0; sk_queue_count = 0;
     kakel_locked = 1;
+    sk_secret_clear(lock_pass, 65);
+    lock_pass_overflow = 0;
     int name = sk_user_name(raket_user);
     lock_name_n = 0;
     while (name && load8(name + lock_name_n) != 0 && lock_name_n < 32) {

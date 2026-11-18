@@ -63,8 +63,11 @@ prog programs ticks_test.c0 ticks_test
 prog programs crash_test.c0 crash_test
 # The mouse tests' program, a square at the pointer while the button is held.
 prog programs mouse_probe.c0 mouse_probe
+prog programs dvala.c0 dvala
 # A square wave at the pitch given as its argument, for the mixing test.
 prog programs tone.c0 tone
+prog programs fanfar.c0 fanfar
+prog programs/tapet tapet.c0 tapet
 # Infecteria, the scrolling game built on Gnista's engine layer.
 prog "$GNISTA_DIR" infecteria.c0 infecteria
 # The full-frame render cost probe, 30 whole frames through SYS_PRESENT,
@@ -91,6 +94,6 @@ prog programs/form form.c0 form "$(cd "$GNISTA_DIR" && pwd)"
 prog "$(dirname "$COFF1")/c0" coff.c0 coff
 prog "$(dirname "$COFF1")/c0" smed.c0 smed
 
-for p in alloc_test ticks_test crash_test mouse_probe tone infecteria fps_probe utsikt lira hylla skrift pensel insyn form coff smed; do
+for p in alloc_test ticks_test crash_test mouse_probe dvala tone fanfar tapet infecteria fps_probe utsikt lira hylla skrift pensel insyn form coff smed; do
   printf '  build/%s.elf  %s bytes\n' "$p" "$(stat -c %s "$OUT/$p.elf")"
 done

@@ -13,6 +13,10 @@
 // verification channel alongside the real graphical output
 // (see vga.c0/punkt.c0).
 
+int boot_log_next = 0;
+int boot_log_count = 0;
+int boot_log_frozen = 0;
+
 int SERIAL_PORT = 0x3f8;
 
 // 1 once serial_init found a working UART. Until then, and on a machine
@@ -50,7 +54,15 @@ int serial_init() {
 // moment rather than a hung kernel.
 int serial_room = 0;
 
+// Bytes written since boot, for the bound on interrupts-off sections below.
+int serial_bytes = 0;
+
 void serial_putc(int c) {
+    if (!boot_log_frozen) {
+        store8(boot_log_data + boot_log_next, c);
+        boot_log_next = (boot_log_next + 1) % 8192;
+        if (boot_log_count < 8192) { boot_log_count += 1; }
+    }
     if (serial_ready == 1) {
         if (serial_room == 0) {
             int i = 0;
@@ -60,14 +72,84 @@ void serial_putc(int c) {
         serial_room -= 1;
     }
     outb(SERIAL_PORT, c);
+    serial_bytes += 1;
     return;
 }
 
-void serial_print(int msg) {
+// A log line that takes more than one serial call is written between these
+// two when it comes from a task, which the timer can interrupt or switch
+// away from. Interrupts are off only while the line is written, so a tick or
+// another task's line cannot land in its middle, which tests that read the
+// log would see as a broken line. Nested use keeps interrupts off until the
+// outermost end, and from an interrupt handler the pair changes nothing.
+//
+// A real UART at 115200 baud takes about 87 microseconds a byte, and the
+// timer ticks every 10 milliseconds with only one tick held pending, so a
+// section that writes many bytes would lose ticks. A section a task began
+// with interrupts on therefore lets them in for a moment after every
+// SERIAL_OFF_BYTES bytes (serial_line_room), at the cost of a line that
+// long being split by whatever arrives then. Short lines, which tests read,
+// stay whole.
+int SERIAL_OFF_BYTES = 128;
+int serial_off_start = 0;    // serial_bytes when the current task section began
+int serial_off_longest = 0;  // the most bytes one task section wrote, for a debug check
+
+int serial_line_begin() {
+    int rf = read_flags;
+    int saved = rf();
+    int off = disable_interrupts;
+    off();
+    if ((saved & 512) != 0) { serial_off_start = serial_bytes; }
+    return saved;
+}
+
+// Notes how long the current task section has run, for serial_off_longest.
+void serial_off_note() {
+    int n = serial_bytes - serial_off_start;
+    if (n > serial_off_longest) { serial_off_longest = n; }
+    return;
+}
+
+void serial_line_end(int saved) {
+    if ((saved & 512) != 0) {
+        serial_off_note();
+        int on = enable_interrupts;
+        on();
+    }
+    return;
+}
+
+// Called inside a section between bytes. When the section was begun with
+// interrupts on and has written SERIAL_OFF_BYTES bytes, interrupts come in
+// for a moment. Inside an interrupt handler, a syscall or an outer section
+// saved holds them off and this does nothing.
+void serial_line_room(int saved) {
+    if ((saved & 512) == 0) { return; }
+    if (serial_bytes - serial_off_start < SERIAL_OFF_BYTES) { return; }
+    serial_off_note();
+    int on = enable_interrupts;
+    on();
+    int off = disable_interrupts;
+    off();
+    serial_off_start = serial_bytes;
+    return;
+}
+
+// msg inside a section begun with `saved`, keeping that section's bound.
+void serial_print_in(int saved, int msg) {
     int i = 0;
     for (i = 0; load8(msg + i) != 0; i += 1) {
         serial_putc(load8(msg + i));
+        serial_line_room(saved);
     }
+    return;
+}
+
+// One call is one piece of a line, written whole when it is short.
+void serial_print(int msg) {
+    int sl = serial_line_begin();
+    serial_print_in(sl, msg);
+    serial_line_end(sl);
     return;
 }
 
@@ -75,6 +157,14 @@ void serial_print(int msg) {
 // no digits in memory, each nibble is shifted out of v as it is printed, so
 // an interrupt handler printing in the middle cannot change what this prints.
 void serial_print_hex(int v) {
+    int sl = serial_line_begin();
+    serial_print_hex_whole(v);
+    serial_line_end(sl);
+    return;
+}
+
+// serial_print_hex's body, for a caller that already holds a serial line.
+void serial_print_hex_whole(int v) {
     if (!v) { serial_putc('0'); return; }
     int k = 15;
     while (((v >> (k * 4)) & 15) == 0) { k -= 1; }
@@ -93,6 +183,14 @@ void serial_print_hex(int v) {
 // another's digits would rewrite the ones not printed yet. v is worked on
 // as a negative number, which every int has, -2^63 included.
 void serial_print_int(int v) {
+    int sl = serial_line_begin();
+    serial_print_int_whole(v);
+    serial_line_end(sl);
+    return;
+}
+
+// serial_print_int's body, for a caller that already holds a serial line.
+void serial_print_int_whole(int v) {
     if (v < 0) { serial_putc('-'); }
     else { v = 0 - v; }
     int p = 1;

@@ -1,0 +1,96 @@
+key scancode 18
+kakel typed: win=0 char=101 row=33 col=7
+key scancode 146
+tick 7080
+key scancode 45
+kakel typed: win=0 char=120 row=33 col=8
+key scancode 173
+key scancode 18
+kakel typed: win=0 char=101 row=33 col=9
+key scancode 146
+tick 7100
+key scancode 46
+kakel typed: win=0 char=99 row=33 col=10
+key scancode 174
+tick 7120
+key scancode 22
+kakel typed: win=0 char=117 row=33 col=11
+key scancode 150
+tick 7140
+key scancode 20
+kakel typed: win=0 char=116 row=33 col=12
+key scancode 148
+key scancode 18
+kakel typed: win=0 char=101 row=33 col=13
+key scancode 146
+tick 7160
+key scancode 57
+kakel typed: win=0 char=32 row=33 col=14
+key scancode 185
+tick 7180
+key scancode 35
+kakel typed: win=0 char=104 row=33 col=15
+key scancode 163
+tick 7200
+key scancode 18
+kakel typed: win=0 char=101 row=33 col=16
+key scancode 146
+key scancode 38
+kakel typed: win=0 char=108 row=33 col=17
+key scancode 166
+tick 7220
+key scancode 38
+kakel typed: win=0 char=108 row=33 col=18
+key scancode 166
+tick 7240
+key scancode 24
+kakel typed: win=0 char=111 row=33 col=19
+key scancode 152
+tick 7260
+key scancode 52
+kakel typed: win=0 char=46 row=33 col=20
+key scancode 180
+key scancode 46
+kakel typed: win=0 char=99 row=33 col=21
+key scancode 174
+tick 7280
+key scancode 11
+kakel typed: win=0 char=48 row=33 col=22
+key scancode 139
+tick 7300
+key scancode 28
+kakel typed: win=0 char=10 row=34 col=0
+[ea-input] 104,101,108,108,111,46,99,48,
+[ea] spawn|86|4|47,99,111,102,102,46,101,108,102,|45,45,101,108,102,|104,101,108,108,111,46,99,48,|104,101,108,108,111,46,115,|
+[sched] spawned task 0 stack=13361152
+[elf] loaded, entry=2147483824 stack=2147569664 heap=2147635200 pml4=16150528
+[sched] -> task 4 (counter=0)
+key scancode 156
+[sched] -> task 4 (counter=0)
+[syscall] exit code=0
+[ea-wait] tid=0 how=1 result=0
+[ea] spawn|86|5|47,115,109,101,100,46,101,108,102,|45,45,98,97,115,101,|48,120,56,48,48,48,48,48,48,48,|104,101,108,108,111,46,115,|104,101,108,108,111,46,101,108,102,|
+[sched] spawned task 1 stack=13312000
+[elf] loaded, entry=2147483824 stack=2147545088 heap=2147610624 pml4=20578304
+[sched] reaped task 0 stack=13361152
+[sched] freed address space of task 0, 1432 pages, pmm top=21004288 kheap=73872
+[sched] -> task 4 (counter=0)
+[syscall] exit code=0
+[ea-wait] tid=1 how=1 result=0
+[ea] spawn|86|1|104,101,108,108,111,46,101,108,102,|
+[sched] spawned task 0 stack=13361152
+[sched] reaped task 1 stack=13312000
+[sched] freed address space of task 1, 423 pages, pmm top=21004288 kheap=78040
+[sched] -> task 0 (counter=0)
+[elf] loaded, entry=2147483824 stack=2147495936 heap=2147561472 pml4=20578304
+[sh] startesplit: all 4 slots are full
+[elf] no window available, running unwindowed
+[sh] start: no free window, close one first
+hello from a program built on moonshot
+[sh] hello from a program built on moonshot
+[syscall] exit code=7
+[sh] d task 0
+[sh] prompt
+[sched] reaped task 0 stack=13361152
+[sched] freed address space of task 0, 22 pages, pmm top=21004288 kheap=73560
+tick 7320

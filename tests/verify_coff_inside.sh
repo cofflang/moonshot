@@ -30,10 +30,10 @@ cd "$(dirname "$0")/.."
 
 ./build.sh || exit 1
 
+mkdir -p out && cd out
+
 rm -f disk.img serial.log
 dd if=/dev/zero of=disk.img bs=512 count=20480 2>/dev/null
-
-mkdir -p out && cd out
 
 isodir=isoroot
 rm -rf "$isodir"
@@ -126,14 +126,17 @@ fi
 awk -F'"' '/^int jakel_hello_source\(\)/ {go=1; next} go && /^";/ {exit} go' ../kernel/files/jakel.c0 \
   | sed 's/^    return "//; s/\\"/"/g; s/\\\\/\\/g' >hello_host.c0
 ../../c0-coff/coff1 --elf hello_host.c0 host_hello.s
-# The kernel's "tick N" lines can land in the middle of the dump, so they
-# are taken out first.
+# Interleaved timer notifications and key-ring overflow diagnostics are
+# stripped before comparing the dump.
 python3 - "$(wc -c <host_hello.s)" <<'EOF' >inside_hello.s
 import re, sys
 log = open("serial.log", "rb").read()
 i = log.find(b"[echo] ")
 n = int(sys.argv[1])
-seg = re.sub(rb"tick \d+\n", b"", log[i + 7:i + 7 + n + 4096]) if i >= 0 else b""
+seg = log[i + 7:i + 7 + n + 4096] if i >= 0 else b""
+seg = re.sub(rb"tick \d+\n", b"", seg)
+seg = re.sub(rb"key scancode \d+\n", b"", seg)
+seg = re.sub(rb"\[keyboard\] key ring of task \d+ full \(\d+\), dropping keys\n", b"", seg)
 sys.stdout.buffer.write(seg[:n + 1])
 EOF
 echo >>host_hello.s
